@@ -1,8 +1,4 @@
-# =========================================================
-# pipeline.py
-# UNIVERSAL OCR + QA EXTRACTION PIPELINE
-# STREAMLIT DEPLOYABLE VERSION
-# =========================================================
+
 
 import os
 import io
@@ -15,17 +11,12 @@ from mistralai import Mistral
 from pdf2image import convert_from_bytes
 from rapidfuzz import fuzz
 
-# =========================================================
-# LOAD API KEY
-# =========================================================
 
 api_key = st.secrets["MISTRAL_API_KEY"]
 
 client = Mistral(api_key=api_key)
 
-# =========================================================
-# CONFIG
-# =========================================================
+
 
 SIMILARITY_THRESHOLD = 85
 
@@ -48,9 +39,7 @@ REMOVE_LINES_CONTAINING = [
     "email",
 ]
 
-# =========================================================
-# CLEANERS
-# =========================================================
+
 
 def normalize(text):
 
@@ -115,9 +104,7 @@ def is_noise(line):
 
     return False
 
-# =========================================================
-# OCR
-# =========================================================
+
 
 def preprocess_pdf(pdf_bytes):
 
@@ -167,9 +154,7 @@ def run_ocr(file_bytes, file_name):
 
     return response
 
-# =========================================================
-# OCR TO LINES
-# =========================================================
+
 
 def extract_lines(ocr_response):
 
@@ -195,9 +180,7 @@ def extract_lines(ocr_response):
 
     return all_lines
 
-# =========================================================
-# QUESTION DETECTOR
-# =========================================================
+
 
 def detect_question(line):
 
@@ -248,9 +231,6 @@ def detect_question(line):
 
     return None
 
-# =========================================================
-# SECTION DETECTOR
-# =========================================================
 
 def detect_section(line):
 
@@ -270,9 +250,7 @@ def detect_section(line):
 
     return None
 
-# =========================================================
-# EXTRACT QA
-# =========================================================
+
 
 def extract_qa(lines):
 
@@ -324,7 +302,7 @@ def extract_qa(lines):
 
             current_answer.append(line)
 
-    # FINAL SAVE
+
 
     if current_question:
 
@@ -338,9 +316,7 @@ def extract_qa(lines):
 
     return qa_pairs
 
-# =========================================================
-# MAIN PIPELINE
-# =========================================================
+
 
 def process_pdf(uploaded_pdf):
 
