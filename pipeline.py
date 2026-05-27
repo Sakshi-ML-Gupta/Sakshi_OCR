@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 #from dotenv import load_dotenv
 from mistralai.client import MistralClient
-from pdf2image import convert_from_path
+import fitz
 from rapidfuzz import fuzz
 import streamlit as st
 
@@ -45,36 +45,28 @@ REMOVE_LINES_CONTAINING = [
 # =========================================================
 
 
-def preprocess_pdf(file_path: str, dpi: int = 300) -> bytes:
 
-    print(f"Preprocessing {file_path}...")
 
-    try:
 
-        images = convert_from_path(file_path, dpi=dpi)
+def preprocess_pdf(file_path):
 
-        if images:
+    doc = fitz.open(file_path)
 
-            pdf_bytes = io.BytesIO()
+    output = fitz.open()
 
-            images[0].save(
-                pdf_bytes,
-                format="PDF",
-                save_all=True,
-                append_images=images[1:]
-            )
+    for page in doc:
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
 
-            pdf_bytes.seek(0)
+        img_pdf = fitz.open(
+            "pdf",
+            pix.pdfocr_tobytes()
+        )
 
-            print("Converted to image-based PDF")
+        output.insert_pdf(img_pdf)
 
-            return pdf_bytes.read()
+    pdf_bytes = output.tobytes()
 
-    except Exception as e:
-
-        print(f"Preprocessing failed: {e}")
-
-    return Path(file_path).read_bytes()
+    return pdf_bytes
 
 # =========================================================
 # OCR

@@ -1,7 +1,6 @@
 streamlit
 mistralai==0.4.2
-python-dotenv
-pdf2image
 rapidfuzz
 pillow
-pymupdf
+PyMuPDF
+python-dotenv
