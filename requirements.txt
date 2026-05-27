@@ -1,6 +1,10 @@
-streamlit==1.45.1
-mistralai==1.5.1
-rapidfuzz==3.13.0
-python-dotenv==1.1.0
-PyMuPDF==1.24.9
-Pillow==11.2.1
+# =========================================================
+# requirements.txt
+# =========================================================
+
+streamlit
+mistralai==1.2.3
+rapidfuzz
+pdf2image
+pillow
+pymupdf

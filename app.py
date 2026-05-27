@@ -1,32 +1,44 @@
-import os
+# =========================================================
+# app.py
+# =========================================================
+
+import json
 import streamlit as st
+
 from pipeline import process_pdf
 
+# =========================================================
+# PAGE CONFIG
+# =========================================================
+
 st.set_page_config(
-    page_title="OCR QA Extractor",
+    page_title="Universal OCR QA Extractor",
     layout="wide"
 )
 
-st.title("📘 OCR QA Extraction Pipeline")
+# =========================================================
+# UI
+# =========================================================
+
+st.title("📘 Universal OCR QA Extractor")
+
+st.write(
+    "Upload any assignment PDF and extract "
+    "questions + answers automatically."
+)
 
 uploaded_file = st.file_uploader(
     "Upload PDF",
     type=["pdf"]
 )
 
-if uploaded_file:
+# =========================================================
+# PROCESS
+# =========================================================
 
-    os.makedirs("uploads", exist_ok=True)
+if uploaded_file is not None:
 
-    pdf_path = os.path.join(
-        "uploads",
-        uploaded_file.name
-    )
-
-    with open(pdf_path, "wb") as f:
-        f.write(uploaded_file.read())
-
-    st.success("PDF Uploaded")
+    st.success("PDF Uploaded Successfully")
 
     if st.button("Run OCR Pipeline"):
 
@@ -34,19 +46,30 @@ if uploaded_file:
 
             try:
 
-                final_json_path = process_pdf(pdf_path)
+                output_path = process_pdf(
+                    uploaded_file
+                )
 
-                st.success("Pipeline Complete")
+                with open(
+                    output_path,
+                    "r",
+                    encoding="utf-8"
+                ) as f:
 
-                with open(final_json_path, "r", encoding="utf-8") as f:
-                    data = f.read()
+                    data = json.load(f)
+
+                st.success("OCR Completed")
 
                 st.json(data)
 
                 st.download_button(
                     label="Download JSON",
-                    data=data,
-                    file_name=os.path.basename(final_json_path),
+                    data=json.dumps(
+                        data,
+                        indent=4,
+                        ensure_ascii=False
+                    ),
+                    file_name="output.json",
                     mime="application/json"
                 )
 
