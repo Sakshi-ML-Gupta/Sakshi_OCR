@@ -1,5 +1,5 @@
 streamlit
-mistralai==1.2.3
+mistralai>=1.5.0
 rapidfuzz
 pdf2image
 pillow

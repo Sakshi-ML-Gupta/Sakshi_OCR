@@ -1,51 +1,31 @@
-
-
 import os
 import io
 import re
 import json
+import tempfile
 from pathlib import Path
 
 import streamlit as st
+
 from mistralai import Mistral
 from pdf2image import convert_from_bytes
 from rapidfuzz import fuzz
 
+# =========================================================
+# API KEY
+# =========================================================
 
 api_key = st.secrets["MISTRAL_API_KEY"]
 
 client = Mistral(api_key=api_key)
 
-
-
-SIMILARITY_THRESHOLD = 85
-
-NOISE_PATTERNS = [
-    r"^page\s+\d+$",
-    r"^\d+$",
-    r"^assignment$",
-    r"^tma$",
-    r"^topic$",
-    r"^date$",
-]
-
-REMOVE_LINES_CONTAINING = [
-    "enrolment",
-    "programme",
-    "course code",
-    "study centre",
-    "university",
-    "mobile no",
-    "email",
-]
-
-
+# =========================================================
+# CLEANERS
+# =========================================================
 
 def normalize(text):
 
     text = str(text).lower()
-
-    text = text.replace("—", "-")
 
     text = re.sub(r'[“”"\'`]', '', text)
 
@@ -60,98 +40,64 @@ def clean_text(text):
 
     text = str(text)
 
-    text = text.replace("\u201c", '"')
-    text = text.replace("\u201d", '"')
-
-    cleaned = []
-
-    for line in text.split("\n"):
-
-        line = line.strip()
-
-        if not line:
-            continue
-
-        skip = False
-
-        for item in REMOVE_LINES_CONTAINING:
-
-            if item.lower() in line.lower():
-                skip = True
-                break
-
-        if not skip:
-            cleaned.append(line)
-
-    text = "\n".join(cleaned)
+    text = text.replace("\n", " ")
 
     text = re.sub(r'\s+', ' ', text)
 
     return text.strip()
 
 
-def is_noise(line):
-
-    line = clean_text(line)
-
-    if not line:
-        return True
-
-    for pattern in NOISE_PATTERNS:
-
-        if re.match(pattern, line, re.IGNORECASE):
-            return True
-
-    return False
-
-
+# =========================================================
+# OCR
+# =========================================================
 
 def preprocess_pdf(pdf_bytes):
 
     try:
 
-        images = convert_from_bytes(pdf_bytes, dpi=300)
+        images = convert_from_bytes(
+            pdf_bytes,
+            dpi=300
+        )
 
-        temp_pdf = io.BytesIO()
+        pdf_buffer = io.BytesIO()
 
         images[0].save(
-            temp_pdf,
+            pdf_buffer,
             format="PDF",
             save_all=True,
             append_images=images[1:]
         )
 
-        temp_pdf.seek(0)
+        pdf_buffer.seek(0)
 
-        return temp_pdf.read()
+        return pdf_buffer.read()
 
     except Exception:
 
         return pdf_bytes
 
 
-def run_ocr(file_bytes, file_name):
+def run_ocr(pdf_bytes, file_name):
 
-    import tempfile
-
-    # =========================================
-    # SAVE TEMP PDF
-    # =========================================
+    # =====================================
+    # SAVE TEMP FILE
+    # =====================================
 
     with tempfile.NamedTemporaryFile(
         delete=False,
         suffix=".pdf"
     ) as tmp:
 
-        tmp.write(file_bytes)
+        tmp.write(pdf_bytes)
 
         temp_path = tmp.name
 
-    # =========================================
-    # UPLOAD FILE
-    # =========================================
+    # =====================================
+    # UPLOAD
+    # =====================================
 
-    uploaded_file = client.files.upload(
+    uploaded_pdf = client.files.upload(
         file={
             "file_name": file_name,
             "content": open(temp_path, "rb"),
@@ -159,46 +105,31 @@ def run_ocr(file_bytes, file_name):
         purpose="ocr"
     )
 
-    # =========================================
-    # OCR PROCESS
-    # =========================================
+    # =====================================
+    # GET URL
+    # =====================================
+
+    signed_url = client.files.get_signed_url(
+        file_id=uploaded_pdf.id
+    )
+
+    # =====================================
+    # OCR
+    # =====================================
 
     response = client.ocr.process(
         model="mistral-ocr-latest",
         document={
-            "type": "file",
-            "file_id": uploaded_file.id
+            "type": "document_url",
+            "document_url": signed_url.url
         }
     )
 
     return response
 
-
-def extract_lines(ocr_response):
-
-    all_lines = []
-
-    for page in ocr_response.pages:
-
-        page_text = page.markdown
-
-        lines = page_text.split("\n")
-
-        for line in lines:
-
-            line = clean_text(line)
-
-            if not line:
-                continue
-
-            if is_noise(line):
-                continue
-
-            all_lines.append(line)
-
-    return all_lines
-
-
+# =========================================================
+# QUESTION DETECTOR
+# =========================================================
 
 def detect_question(line):
 
@@ -224,12 +155,17 @@ def detect_question(line):
         if match:
 
             qnum = match.group(1)
+
             qtext = match.group(2).strip()
 
             if len(qtext) < 8:
                 continue
 
-            if re.match(r'^[ivxlcdm]+$', qnum, re.IGNORECASE):
+            if re.match(
+                r'^[ivxlcdm]+$',
+                qnum,
+                re.IGNORECASE
+            ):
 
                 qid = f"sub_{qnum.lower()}"
 
@@ -249,28 +185,24 @@ def detect_question(line):
 
     return None
 
+# =========================================================
+# EXTRACT QA
+# =========================================================
 
-def detect_section(line):
+def extract_qa(ocr_response):
 
-    line_lower = line.lower()
+    all_lines = []
 
-    if "section a" in line_lower:
-        return "Section A"
+    for page in ocr_response.pages:
 
-    if "section b" in line_lower:
-        return "Section B"
+        lines = page.markdown.split("\n")
 
-    if "part a" in line_lower:
-        return "Part A"
+        for line in lines:
 
-    if "part b" in line_lower:
-        return "Part B"
+            line = clean_text(line)
 
-    return None
-
-
-
-def extract_qa(lines):
+            if line:
+                all_lines.append(line)
 
     qa_pairs = []
 
@@ -278,15 +210,7 @@ def extract_qa(lines):
 
     current_answer = []
 
-    current_section = "General"
-
-    for line in lines:
-
-        section = detect_section(line)
-
-        if section:
-            current_section = section
-            continue
+    for line in all_lines:
 
         detected = detect_question(line)
 
@@ -296,7 +220,6 @@ def extract_qa(lines):
 
                 qa_pairs.append({
                     "question_id": current_question["question_id"],
-                    "section": current_section,
                     "question_type": current_question["question_type"],
                     "question": current_question["question"],
                     "answer": " ".join(current_answer).strip()
@@ -320,13 +243,14 @@ def extract_qa(lines):
 
             current_answer.append(line)
 
-
+    # =====================================
+    # LAST QA
+    # =====================================
 
     if current_question:
 
         qa_pairs.append({
             "question_id": current_question["question_id"],
-            "section": current_section,
             "question_type": current_question["question_type"],
             "question": current_question["question"],
             "answer": " ".join(current_answer).strip()
@@ -334,24 +258,28 @@ def extract_qa(lines):
 
     return qa_pairs
 
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
 
-
-def process_pdf(uploaded_pdf):
+def process_pdf(uploaded_file):
 
     os.makedirs("outputs", exist_ok=True)
 
-    pdf_bytes = uploaded_pdf.read()
+    pdf_bytes = uploaded_file.read()
 
-    processed_pdf = preprocess_pdf(pdf_bytes)
+    processed_pdf = preprocess_pdf(
+        pdf_bytes
+    )
 
     ocr_response = run_ocr(
         processed_pdf,
-        uploaded_pdf.name
+        uploaded_file.name
     )
 
-    lines = extract_lines(ocr_response)
-
-    qa_pairs = extract_qa(lines)
+    qa_pairs = extract_qa(
+        ocr_response
+    )
 
     final_json = {
         "total_qa_pairs": len(qa_pairs),
@@ -360,10 +288,14 @@ def process_pdf(uploaded_pdf):
 
     output_path = (
         f"outputs/"
-        f"{Path(uploaded_pdf.name).stem}.json"
+        f"{Path(uploaded_file.name).stem}.json"
     )
 
-    with open(output_path, "w", encoding="utf-8") as f:
+    with open(
+        output_path,
+        "w",
+        encoding="utf-8"
+    ) as f:
 
         json.dump(
             final_json,
