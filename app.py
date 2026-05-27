@@ -1,15 +1,13 @@
+import os
 import streamlit as st
-import tempfile
-import json
-
 from pipeline import process_pdf
 
 st.set_page_config(
-    page_title="Universal OCR Pipeline",
+    page_title="OCR QA Extractor",
     layout="wide"
 )
 
-st.title("📄 OCR Pipeline")
+st.title("📘 OCR QA Extraction Pipeline")
 
 uploaded_file = st.file_uploader(
     "Upload PDF",
@@ -18,16 +16,17 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file:
 
-    st.success("PDF uploaded successfully")
+    os.makedirs("uploads", exist_ok=True)
 
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".pdf"
-    ) as tmp_file:
+    pdf_path = os.path.join(
+        "uploads",
+        uploaded_file.name
+    )
 
-        tmp_file.write(uploaded_file.read())
+    with open(pdf_path, "wb") as f:
+        f.write(uploaded_file.read())
 
-        pdf_path = tmp_file.name
+    st.success("PDF Uploaded")
 
     if st.button("Run OCR Pipeline"):
 
@@ -35,19 +34,19 @@ if uploaded_file:
 
             try:
 
-                output_path = process_pdf(pdf_path)
+                final_json_path = process_pdf(pdf_path)
 
-                with open(output_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                st.success("Pipeline Complete")
 
-                st.success("Processing Complete")
+                with open(final_json_path, "r", encoding="utf-8") as f:
+                    data = f.read()
 
                 st.json(data)
 
                 st.download_button(
                     label="Download JSON",
-                    data=json.dumps(data, indent=4),
-                    file_name="final_output.json",
+                    data=data,
+                    file_name=os.path.basename(final_json_path),
                     mime="application/json"
                 )
 

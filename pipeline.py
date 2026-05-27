@@ -3,19 +3,18 @@ import io
 import re
 import json
 from pathlib import Path
-#from dotenv import load_dotenv
+from dotenv import load_dotenv
 from mistralai import Mistral
-
+from pdf2image import convert_from_path
 from rapidfuzz import fuzz
-import streamlit as st
 
 # =========================================================
 # LOAD ENV
 # =========================================================
 
-#load_dotenv()
+load_dotenv()
 
-api_key = st.secrets["MISTRAL_API_KEY"]
+api_key = os.getenv("MISTRAL_API_KEY")
 
 client = Mistral(api_key=api_key)
 
@@ -45,44 +44,71 @@ REMOVE_LINES_CONTAINING = [
 # =========================================================
 
 
+def preprocess_pdf(file_path: str, dpi: int = 300) -> bytes:
 
+    print(f"Preprocessing {file_path}...")
 
+    try:
 
-def preprocess_pdf(file_path):
+        images = convert_from_path(file_path, dpi=dpi)
 
-    with open(file_path, "rb") as f:
-        return f.read()
+        if images:
+
+            pdf_bytes = io.BytesIO()
+
+            images[0].save(
+                pdf_bytes,
+                format="PDF",
+                save_all=True,
+                append_images=images[1:]
+            )
+
+            pdf_bytes.seek(0)
+
+            print("Converted to image-based PDF")
+
+            return pdf_bytes.read()
+
+    except Exception as e:
+
+        print(f"Preprocessing failed: {e}")
+
+    return Path(file_path).read_bytes()
 
 # =========================================================
 # OCR
 # =========================================================
 
 
-def run_ocr(file_bytes, file_name):
+def run_ocr(file_content: bytes, file_name: str):
 
-    print("Running OCR...")
+    print("Uploading to Mistral...")
 
-    uploaded_pdf = client.files.upload(
+    uploaded_file = client.files.upload(
         file={
             "file_name": file_name,
-            "content": file_bytes,
+            "content": file_content,
         },
-        purpose="ocr"
+        purpose="ocr",
     )
 
     signed_url = client.files.get_signed_url(
-        file_id=uploaded_pdf.id
+        file_id=uploaded_file.id,
+        expiry=1
     )
 
-    ocr_response = client.ocr.process(
-        model="mistral-ocr-latest",
+    print("Running OCR...")
+
+    response = client.ocr.process(
         document={
             "type": "document_url",
-            "document_url": signed_url.url,
-        }
+            "document_url": signed_url.url
+        },
+        model="mistral-ocr-latest",
+        include_image_base64=False
     )
 
-    return ocr_response
+    return response
 
 # =========================================================
 # OCR TO CLEAN JSON
@@ -528,10 +554,8 @@ def build_json(qa_map):
 # =========================================================
 
 
-def load_pdf(pdf_path):
+def process_pdf(pdf_path):
 
-    with open(pdf_path, "rb") as f:
-        return f.read()
     pdf_file = Path(pdf_path)
 
     if not pdf_file.exists():
@@ -544,7 +568,7 @@ def load_pdf(pdf_path):
     # STEP 1 OCR
     # =====================================================
 
-    pdf_bytes = load_pdf(str(pdf_file))
+    pdf_bytes = preprocess_pdf(str(pdf_file))
 
     ocr_result = run_ocr(
         pdf_bytes,
