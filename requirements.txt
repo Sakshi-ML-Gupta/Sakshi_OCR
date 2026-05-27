@@ -1,6 +1,6 @@
-streamlit==1.45.1
-mistralai==0.1.8
+streamlit
+mistralai>=1.0.0
+pymupdf
 rapidfuzz
-pillow
-PyMuPDF
 python-dotenv
+Pillow

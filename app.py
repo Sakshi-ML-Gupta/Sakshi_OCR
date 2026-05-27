@@ -9,7 +9,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("📄 Universal OCR + QA Extraction")
+st.title("📄 OCR Pipeline")
 
 uploaded_file = st.file_uploader(
     "Upload PDF",

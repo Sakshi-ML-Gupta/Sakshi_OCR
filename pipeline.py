@@ -4,7 +4,7 @@ import re
 import json
 from pathlib import Path
 #from dotenv import load_dotenv
-from mistralai.client import MistralClient
+from mistralai import Mistral
 
 from rapidfuzz import fuzz
 import streamlit as st
@@ -17,7 +17,7 @@ import streamlit as st
 
 api_key = st.secrets["MISTRAL_API_KEY"]
 
-client = MistralClient(api_key=api_key)
+client = Mistral(api_key=api_key)
 
 # =========================================================
 # CONFIG
@@ -58,35 +58,31 @@ def preprocess_pdf(file_path):
 # =========================================================
 
 
-def run_ocr(file_content: bytes, file_name: str):
-
-    print("Uploading to Mistral...")
-
-    uploaded_file = client.files.upload(
-        file={
-            "file_name": file_name,
-            "content": file_content,
-        },
-        purpose="ocr",
-    )
-
-    signed_url = client.files.get_signed_url(
-        file_id=uploaded_file.id,
-        expiry=1
-    )
+def run_ocr(file_bytes, file_name):
 
     print("Running OCR...")
 
-    response = client.ocr.process(
-        document={
-            "type": "document_url",
-            "document_url": signed_url.url
+    uploaded_pdf = client.files.upload(
+        file={
+            "file_name": file_name,
+            "content": file_bytes,
         },
-        model="mistral-ocr-latest",
-        include_image_base64=False
+        purpose="ocr"
     )
 
-    return response
+    signed_url = client.files.get_signed_url(
+        file_id=uploaded_pdf.id
+    )
+
+    ocr_response = client.ocr.process(
+        model="mistral-ocr-latest",
+        document={
+            "type": "document_url",
+            "document_url": signed_url.url,
+        }
+    )
+
+    return ocr_response
 
 # =========================================================
 # OCR TO CLEAN JSON
@@ -532,8 +528,10 @@ def build_json(qa_map):
 # =========================================================
 
 
-def process_pdf(pdf_path):
+def load_pdf(pdf_path):
 
+    with open(pdf_path, "rb") as f:
+        return f.read()
     pdf_file = Path(pdf_path)
 
     if not pdf_file.exists():
@@ -546,7 +544,7 @@ def process_pdf(pdf_path):
     # STEP 1 OCR
     # =====================================================
 
-    pdf_bytes = preprocess_pdf(str(pdf_file))
+    pdf_bytes = load_pdf(str(pdf_file))
 
     ocr_result = run_ocr(
         pdf_bytes,
