@@ -7,6 +7,7 @@ from pathlib import Path
 from mistralai.client import MistralClient
 from pdf2image import convert_from_path
 from rapidfuzz import fuzz
+import streamlit as st
 
 # =========================================================
 # LOAD ENV
@@ -14,7 +15,7 @@ from rapidfuzz import fuzz
 
 #load_dotenv()
 
-api_key = os.getenv("MISTRAL_API_KEY")
+api_key = st.secrets["MISTRAL_API_KEY"]
 
 client = MistralClient(api_key=api_key)
 
