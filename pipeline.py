@@ -7,7 +7,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from mistralai import Mistral
+from mistralai.client import MistralClient
 from pdf2image import convert_from_bytes
 from rapidfuzz import fuzz
 
@@ -17,7 +17,7 @@ from rapidfuzz import fuzz
 
 api_key = st.secrets["MISTRAL_API_KEY"]
 
-client = Mistral(api_key=api_key)
+client = MistralClient(api_key=api_key)
 
 # =========================================================
 # CLEANERS
@@ -80,8 +80,10 @@ def preprocess_pdf(pdf_bytes):
 
 def run_ocr(pdf_bytes, file_name):
 
+    import tempfile
+
     # =====================================
-    # SAVE TEMP FILE
+    # SAVE TEMP PDF
     # =====================================
 
     with tempfile.NamedTemporaryFile(
@@ -94,10 +96,10 @@ def run_ocr(pdf_bytes, file_name):
         temp_path = tmp.name
 
     # =====================================
-    # UPLOAD
+    # UPLOAD FILE
     # =====================================
 
-    uploaded_pdf = client.files.upload(
+    uploaded_file = client.files.upload(
         file={
             "file_name": file_name,
             "content": open(temp_path, "rb"),
@@ -106,15 +108,16 @@ def run_ocr(pdf_bytes, file_name):
     )
 
     # =====================================
-    # GET URL
+    # GET SIGNED URL
     # =====================================
 
     signed_url = client.files.get_signed_url(
-        file_id=uploaded_pdf.id
+        file_id=uploaded_file.id,
+        expiry=1
     )
 
     # =====================================
-    # OCR
+    # OCR PROCESS
     # =====================================
 
     response = client.ocr.process(
@@ -126,64 +129,6 @@ def run_ocr(pdf_bytes, file_name):
     )
 
     return response
-
-# =========================================================
-# QUESTION DETECTOR
-# =========================================================
-
-def detect_question(line):
-
-    patterns = [
-
-        r'^q[\.\s]*(\d+)[\)\.\-\s]+(.+)',
-
-        r'^question[\s]*(\d+)[\)\.\-\s]+(.+)',
-
-        r'^(\d+)[\)\.\-\s]+(.+)',
-
-        r'^\(?([ivxlcdm]+)\)?[\)\.\-\s]+(.+)',
-    ]
-
-    for pattern in patterns:
-
-        match = re.match(
-            pattern,
-            line,
-            re.IGNORECASE
-        )
-
-        if match:
-
-            qnum = match.group(1)
-
-            qtext = match.group(2).strip()
-
-            if len(qtext) < 8:
-                continue
-
-            if re.match(
-                r'^[ivxlcdm]+$',
-                qnum,
-                re.IGNORECASE
-            ):
-
-                qid = f"sub_{qnum.lower()}"
-
-                qtype = "subquestion"
-
-            else:
-
-                qid = f"Q{qnum}"
-
-                qtype = "main"
-
-            return {
-                "question_id": qid,
-                "question_type": qtype,
-                "question": qtext
-            }
-
-    return None
 
 # =========================================================
 # EXTRACT QA
