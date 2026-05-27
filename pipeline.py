@@ -3,8 +3,8 @@ import io
 import re
 import json
 from pathlib import Path
-from dotenv import load_dotenv
-from mistralai import Mistral
+#from dotenv import load_dotenv
+from mistralai.client import MistralClient
 from pdf2image import convert_from_path
 from rapidfuzz import fuzz
 
@@ -12,11 +12,11 @@ from rapidfuzz import fuzz
 # LOAD ENV
 # =========================================================
 
-load_dotenv()
+#load_dotenv()
 
 api_key = os.getenv("MISTRAL_API_KEY")
 
-client = Mistral(api_key=api_key)
+client = MistralClient(api_key=api_key)
 
 # =========================================================
 # CONFIG
