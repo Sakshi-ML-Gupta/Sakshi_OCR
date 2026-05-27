@@ -7,7 +7,7 @@ from pathlib import Path
 import streamlit as st
 
 from mistralai.client import MistralClient
-from pdf2image import convert_from_bytes
+from pdf2image import convert_from_path
 from rapidfuzz import fuzz
 
 # =========================================================
@@ -31,25 +31,7 @@ SIMILARITY_THRESHOLD = 80
 def preprocess_pdf(pdf_path):
 
     with open(pdf_path, "rb") as f:
-        pdf_bytes = f.read()
-
-    images = convert_from_bytes(
-        pdf_bytes,
-        dpi=200
-    )
-
-    output = io.BytesIO()
-
-    images[0].save(
-        output,
-        format="PDF",
-        save_all=True,
-        append_images=images[1:]
-    )
-
-    output.seek(0)
-
-    return output.read()
+        return f.read()
 
 # =========================================================
 # OCR
