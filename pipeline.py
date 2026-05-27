@@ -132,28 +132,46 @@ def preprocess_pdf(pdf_bytes):
 
 def run_ocr(file_bytes, file_name):
 
+    import tempfile
+
+    # =========================================
+    # SAVE TEMP PDF
+    # =========================================
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".pdf"
+    ) as tmp:
+
+        tmp.write(file_bytes)
+
+        temp_path = tmp.name
+
+    # =========================================
+    # UPLOAD FILE
+    # =========================================
+
     uploaded_file = client.files.upload(
         file={
             "file_name": file_name,
-            "content": file_bytes,
+            "content": open(temp_path, "rb"),
         },
         purpose="ocr"
     )
 
-    signed_url = client.files.get_signed_url(
-        file_id=uploaded_file.id
-    )
+    # =========================================
+    # OCR PROCESS
+    # =========================================
 
     response = client.ocr.process(
         model="mistral-ocr-latest",
         document={
-            "type": "document_url",
-            "document_url": signed_url.url
+            "type": "file",
+            "file_id": uploaded_file.id
         }
     )
 
     return response
-
 
 
 def extract_lines(ocr_response):
