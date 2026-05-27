@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 #from dotenv import load_dotenv
 from mistralai.client import MistralClient
-import fitz
+
 from rapidfuzz import fuzz
 import streamlit as st
 
@@ -50,23 +50,8 @@ REMOVE_LINES_CONTAINING = [
 
 def preprocess_pdf(file_path):
 
-    doc = fitz.open(file_path)
-
-    output = fitz.open()
-
-    for page in doc:
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-
-        img_pdf = fitz.open(
-            "pdf",
-            pix.pdfocr_tobytes()
-        )
-
-        output.insert_pdf(img_pdf)
-
-    pdf_bytes = output.tobytes()
-
-    return pdf_bytes
+    with open(file_path, "rb") as f:
+        return f.read()
 
 # =========================================================
 # OCR
