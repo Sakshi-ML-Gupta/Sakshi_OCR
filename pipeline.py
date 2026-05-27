@@ -1,16 +1,38 @@
 import os
+import io
 import re
 import json
-from pathlib import Path
-
 import fitz
+
+from pathlib import Path
+from rapidfuzz import fuzz
+from pdf2image import convert_from_bytes
 import streamlit as st
 
 from mistralai.client import MistralClient
-from rapidfuzz import fuzz
 
 # =========================================================
-# API KEY
+# CONFIG
+# =========================================================
+
+SIMILARITY_THRESHOLD = 72
+
+NOISE_PATTERNS = [
+    r"^TOPIC$",
+    r"^DATE$",
+    r"^TOPIC\s*_*$",
+    r"^DATE\s*_*$",
+    r"^BEGIN-\d+$",
+    r"^\d+$",
+]
+
+REMOVE_LINES_CONTAINING = [
+    "TOPIC",
+    "DATE",
+]
+
+# =========================================================
+# MISTRAL
 # =========================================================
 
 api_key = st.secrets["MISTRAL_API_KEY"]
@@ -18,25 +40,101 @@ api_key = st.secrets["MISTRAL_API_KEY"]
 client = MistralClient(api_key=api_key)
 
 # =========================================================
-# CONFIG
+# PREPROCESS PDF
 # =========================================================
 
-SIMILARITY_THRESHOLD = 75
+def preprocess_pdf(file_bytes):
 
-NOISE_PATTERNS = [
-    r"^topic$",
-    r"^date$",
-    r"^\d+$",
-    r"^page\s+\d+$",
-]
+    try:
 
-REMOVE_LINES_CONTAINING = [
-    "topic",
-    "date",
-]
+        images = convert_from_bytes(file_bytes, dpi=300)
+
+        pdf_bytes = io.BytesIO()
+
+        images[0].save(
+            pdf_bytes,
+            format="PDF",
+            save_all=True,
+            append_images=images[1:]
+        )
+
+        pdf_bytes.seek(0)
+
+        return pdf_bytes.read()
+
+    except Exception as e:
+
+        print("Preprocessing failed:", e)
+
+        return file_bytes
 
 # =========================================================
-# NORMALIZE
+# OCR
+# =========================================================
+
+def run_ocr(file_bytes, filename):
+
+    uploaded_file = client.files.upload(
+        file={
+            "file_name": filename,
+            "content": file_bytes,
+        },
+        purpose="ocr"
+    )
+
+    signed_url = client.files.get_signed_url(
+        file_id=uploaded_file.id
+    )
+
+    response = client.ocr.process(
+        model="mistral-ocr-latest",
+        document={
+            "type": "document_url",
+            "document_url": signed_url.url,
+        }
+    )
+
+    return response
+
+# =========================================================
+# OCR JSON
+# =========================================================
+
+def build_ocr_json(ocr_response):
+
+    pages = []
+
+    for page in ocr_response.pages:
+
+        text = page.markdown
+
+        lines = []
+
+        seen = set()
+
+        for line in text.split("\n"):
+
+            line = line.strip()
+
+            if not line:
+                continue
+
+            if line not in seen:
+                seen.add(line)
+                lines.append(line)
+
+        pages.append({
+            "page_number": page.index + 1,
+            "text": lines
+        })
+
+    return {
+        "total_pages": len(pages),
+        "pages": pages
+    }
+
+# =========================================================
+# HELPERS
 # =========================================================
 
 def normalize(text):
@@ -49,10 +147,6 @@ def normalize(text):
 
     return text.strip()
 
-# =========================================================
-# CLEAN TEXT
-# =========================================================
-
 def clean_text(text):
 
     text = str(text)
@@ -62,9 +156,6 @@ def clean_text(text):
     for line in text.split("\n"):
 
         line = line.strip()
-
-        if not line:
-            continue
 
         skip = False
 
@@ -77,15 +168,13 @@ def clean_text(text):
         if not skip:
             cleaned.append(line)
 
-    return "\n".join(cleaned)
+    text = "\n".join(cleaned)
 
-# =========================================================
-# NOISE FILTER
-# =========================================================
+    text = re.sub(r'\s+', ' ', text)
+
+    return text.strip()
 
 def is_noise(line):
-
-    line = clean_text(line)
 
     if not line:
         return True
@@ -98,115 +187,112 @@ def is_noise(line):
     return False
 
 # =========================================================
-# OCR USING PYMUPDF
-# =========================================================
-
-def extract_pdf_text(pdf_path):
-
-    doc = fitz.open(pdf_path)
-
-    pages = []
-
-    for page_num in range(len(doc)):
-
-        page = doc.load_page(page_num)
-
-        text = page.get_text()
-
-        lines = []
-
-        for line in text.split("\n"):
-
-            line = line.strip()
-
-            if line:
-                lines.append(line)
-
-        pages.append({
-            "page_number": page_num + 1,
-            "text": lines
-        })
-
-    return {
-        "total_pages": len(pages),
-        "pages": pages
-    }
-
-# =========================================================
-# QUESTION EXTRACTION
+# EXTRACT QUESTIONS
 # =========================================================
 
 def extract_questions(pages):
 
     questions = []
 
-    seen = set()
-
-    patterns = [
-
-        r'^(\d+)\.\s+(.+)',
-        r'^(\d+)\)\s+(.+)',
-        r'^q\.?\s*(\d+)\s+(.+)',
-    ]
-
     for page in pages:
 
-        for line in page["text"]:
+        lines = page["text"]
+
+        for line in lines:
 
             line = clean_text(line)
 
             if is_noise(line):
                 continue
 
-            for pattern in patterns:
+            # SECTION A
+            roman_match = re.match(
+                r'^(?:\d+\s*\.?\s*)?\(?([ivxlcdm]+)\)?[\.\)]?\s*(.+)',
+                line,
+                re.IGNORECASE
+            )
 
-                match = re.match(
-                    pattern,
-                    line,
-                    re.IGNORECASE
-                )
+            if roman_match:
 
-                if match:
+                roman = roman_match.group(1)
+                qtext = roman_match.group(2)
 
-                    qid = f"Q{match.group(1)}"
+                if len(qtext) > 15:
 
-                    qtext = match.group(2).strip()
+                    questions.append({
+                        "id": f"A({roman.lower()})",
+                        "question": qtext
+                    })
 
-                    key = normalize(qtext)
+                    continue
 
-                    if key not in seen and len(qtext) > 10:
+            # SECTION B
+            normal_match = re.match(
+                r'^(\d+)[\.\)]\s*(.+)',
+                line
+            )
 
-                        seen.add(key)
+            if normal_match:
 
-                        questions.append({
-                            "id": qid,
-                            "question": qtext
-                        })
+                num = normal_match.group(1)
+                qtext = normal_match.group(2)
 
-    return questions
+                if len(qtext) > 15:
+
+                    questions.append({
+                        "id": f"B{num}",
+                        "question": qtext
+                    })
+
+    # remove duplicates
+
+    unique = []
+
+    seen = set()
+
+    for q in questions:
+
+        key = normalize(q["question"])
+
+        if key not in seen:
+
+            seen.add(key)
+
+            unique.append(q)
+
+    return unique
 
 # =========================================================
 # MATCH QUESTION
 # =========================================================
 
-def match_question(line, official_questions):
+def match_question(line, questions):
+
+    best_match = None
+
+    best_score = 0
 
     line_norm = normalize(line)
 
-    best_match = None
-    best_score = 0
-
-    for q in official_questions:
+    for q in questions:
 
         q_norm = normalize(q["question"])
 
-        # STRICT MATCHING
-        score = fuzz.ratio(line_norm, q_norm)
+        score = fuzz.partial_ratio(
+            line_norm,
+            q_norm
+        )
 
-        # BONUS if beginning matches
-        if line_norm[:40] in q_norm:
-            score += 10
+        if score > best_score:
 
+            best_score = score
+
+            best_match = q
+
+    if best_score >= SIMILARITY_THRESHOLD:
+        return best_match
+
+    return None
 
 # =========================================================
 # PARSE ANSWERS
@@ -217,24 +303,21 @@ def parse_answers(pages, questions):
     qa_map = {}
 
     current_qid = None
-
     current_question = None
-
-    current_answer_lines = []
+    current_answer = []
 
     for page in pages:
 
-        for raw_line in page["text"]:
+        lines = page["text"]
+
+        for raw_line in lines:
 
             line = clean_text(raw_line)
 
             if is_noise(line):
                 continue
 
-            matched = match_question(
-                line,
-                questions
-            )
+            matched = match_question(line, questions)
 
             if matched:
 
@@ -242,14 +325,14 @@ def parse_answers(pages, questions):
 
                     qa_map[current_qid] = {
                         "question": current_question,
-                        "answer": " ".join(current_answer_lines)
+                        "answer": " ".join(current_answer).strip()
                     }
 
                 current_qid = matched["id"]
 
                 current_question = matched["question"]
 
-                current_answer_lines = []
+                current_answer = []
 
                 continue
 
@@ -263,22 +346,22 @@ def parse_answers(pages, questions):
                 if similarity > 90:
                     continue
 
-                current_answer_lines.append(line)
+                current_answer.append(line)
 
     if current_qid:
 
         qa_map[current_qid] = {
             "question": current_question,
-            "answer": " ".join(current_answer_lines)
+            "answer": " ".join(current_answer).strip()
         }
 
     return qa_map
 
 # =========================================================
-# BUILD JSON
+# BUILD FINAL JSON
 # =========================================================
 
-def build_json(qa_map):
+def build_final_json(qa_map):
 
     qa_pairs = []
 
@@ -296,35 +379,39 @@ def build_json(qa_map):
     }
 
 # =========================================================
-# PROCESS PDF
+# COMPLETE PIPELINE
 # =========================================================
 
-def process_pdf(pdf_path):
+def process_pdf(uploaded_file):
 
-    os.makedirs("outputs", exist_ok=True)
+    file_bytes = uploaded_file.read()
 
-    ocr_json = extract_pdf_text(pdf_path)
+    processed_pdf = preprocess_pdf(file_bytes)
 
-    pages = ocr_json["pages"]
+    ocr_response = run_ocr(
+        processed_pdf,
+        uploaded_file.name
+    )
 
-    questions = extract_questions(pages)
+    # OCR JSON
+
+    ocr_json = build_ocr_json(ocr_response)
+
+    # QUESTION EXTRACTION
+
+    questions = extract_questions(
+        ocr_json["pages"]
+    )
+
+    # ANSWER PARSING
 
     qa_map = parse_answers(
-        pages,
+        ocr_json["pages"],
         questions
     )
 
-    final_json = build_json(qa_map)
+    # FINAL QA JSON
 
-    output_path = "outputs/final_output.json"
+    final_json = build_final_json(qa_map)
 
-    with open(output_path, "w", encoding="utf-8") as f:
-
-        json.dump(
-            final_json,
-            f,
-            indent=4,
-            ensure_ascii=False
-        )
-
-    return output_path
+    return ocr_json, final_json

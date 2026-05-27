@@ -1,55 +1,87 @@
-import os
 import json
 import streamlit as st
 
 from pipeline import process_pdf
+
+# =========================================================
+# PAGE CONFIG
+# =========================================================
 
 st.set_page_config(
     page_title="OCR QA Extractor",
     layout="wide"
 )
 
-st.title("📘 OCR QA Extractor")
+# =========================================================
+# TITLE
+# =========================================================
+
+st.title("📘 OCR Question Answer Extractor")
+
+# =========================================================
+# FILE UPLOAD
+# =========================================================
 
 uploaded_file = st.file_uploader(
     "Upload PDF",
     type=["pdf"]
 )
 
+# =========================================================
+# PROCESS
+# =========================================================
+
 if uploaded_file:
 
-    os.makedirs("uploads", exist_ok=True)
+    st.success("PDF Uploaded Successfully")
 
-    pdf_path = os.path.join(
-        "uploads",
-        uploaded_file.name
-    )
+    if st.button("Run OCR Pipeline"):
 
-    with open(pdf_path, "wb") as f:
-        f.write(uploaded_file.read())
-
-    st.success("PDF Uploaded")
-
-    if st.button("Run OCR"):
-
-        with st.spinner("Processing..."):
+        with st.spinner("Processing PDF..."):
 
             try:
 
-                output_path = process_pdf(pdf_path)
+                ocr_json, final_json = process_pdf(
+                    uploaded_file
+                )
 
-                with open(output_path, "r", encoding="utf-8") as f:
+                st.success("Pipeline Completed")
 
-                    data = json.load(f)
+                # =====================================================
+                # OCR JSON
+                # =====================================================
 
-                st.success("Done")
+                st.subheader("OCR JSON")
 
-                st.json(data)
+                st.json(ocr_json)
 
                 st.download_button(
-                    label="Download JSON",
-                    data=json.dumps(data, indent=4),
-                    file_name="output.json",
+                    label="Download OCR JSON",
+                    data=json.dumps(
+                        ocr_json,
+                        ensure_ascii=False,
+                        indent=4
+                    ),
+                    file_name="ocr_output.json",
+                    mime="application/json"
+                )
+
+                # =====================================================
+                # FINAL QA JSON
+                # =====================================================
+
+                st.subheader("Final QA JSON")
+
+                st.json(final_json)
+
+                st.download_button(
+                    label="Download QA JSON",
+                    data=json.dumps(
+                        final_json,
+                        ensure_ascii=False,
+                        indent=4
+                    ),
+                    file_name="qa_output.json",
                     mime="application/json"
                 )
 
