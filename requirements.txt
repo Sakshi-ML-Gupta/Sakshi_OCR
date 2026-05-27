@@ -1,6 +1,7 @@
-
 streamlit==1.45.1
 mistralai==0.4.2
 python-dotenv==1.0.1
-pdf2image==1.17
-
+pdf2image==1.17.0
+rapidfuzz==3.9.6
+Pillow==10.4.0
+pymupdf==1.24.9

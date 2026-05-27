@@ -78,47 +78,25 @@ def preprocess_pdf(pdf_bytes):
         return pdf_bytes
 
 
-def run_ocr(pdf_bytes, file_name):
+def run_ocr(file_content, file_name):
 
-    import tempfile
-
-    # =====================================
-    # SAVE TEMP PDF
-    # =====================================
-
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".pdf"
-    ) as tmp:
-
-        tmp.write(pdf_bytes)
-
-        temp_path = tmp.name
-
-    # =====================================
-    # UPLOAD FILE
-    # =====================================
+    print("Uploading to Mistral...")
 
     uploaded_file = client.files.upload(
         file={
             "file_name": file_name,
-            "content": open(temp_path, "rb"),
+            "content": file_content,
         },
         purpose="ocr"
     )
 
-    # =====================================
-    # GET SIGNED URL
-    # =====================================
+    print("Getting signed URL...")
 
     signed_url = client.files.get_signed_url(
-        file_id=uploaded_file.id,
-        expiry=1
+        uploaded_file.id
     )
 
-    # =====================================
-    # OCR PROCESS
-    # =====================================
+    print("Running OCR...")
 
     response = client.ocr.process(
         model="mistral-ocr-latest",
