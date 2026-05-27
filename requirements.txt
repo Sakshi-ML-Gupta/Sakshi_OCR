@@ -1,5 +1,5 @@
-streamlit
-mistralai==0.4.2
+streamlit==1.45.1
+mistralai==0.1.8
 rapidfuzz
 pillow
 PyMuPDF
