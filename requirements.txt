@@ -1,6 +1,7 @@
 streamlit
 mistralai
+python-dotenv
 pdf2image
 rapidfuzz
-python-dotenv
 pillow
+pymupdf
