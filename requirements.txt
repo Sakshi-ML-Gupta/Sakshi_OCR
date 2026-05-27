@@ -1,0 +1,6 @@
+streamlit
+mistralai
+pdf2image
+rapidfuzz
+python-dotenv
+pillow
