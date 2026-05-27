@@ -1,68 +1,20 @@
 import os
-import io
 import re
 import json
-from pathlib import Path
-
+import requests
 import streamlit as st
 
-from mistralai.client import MistralClient
-from pdf2image import convert_from_path
+from pathlib import Path
 from rapidfuzz import fuzz
 
 # =========================================================
-# API
+# API KEY
 # =========================================================
 
-api_key = st.secrets["MISTRAL_API_KEY"]
-
-client = MistralClient(api_key=api_key)
+API_KEY = st.secrets["MISTRAL_API_KEY"]
 
 # =========================================================
-# CONFIG
-# =========================================================
-
-SIMILARITY_THRESHOLD = 80
-
-# =========================================================
-# PDF PREPROCESS
-# =========================================================
-
-def preprocess_pdf(pdf_path):
-
-    with open(pdf_path, "rb") as f:
-        return f.read()
-
-# =========================================================
-# OCR
-# =========================================================
-
-def run_ocr(file_content, file_name):
-
-    uploaded_file = client.files.upload(
-        file={
-            "file_name": file_name,
-            "content": file_content,
-        },
-        purpose="ocr"
-    )
-
-    signed_url = client.files.get_signed_url(
-        uploaded_file.id
-    )
-
-    response = client.ocr.process(
-        model="mistral-ocr-latest",
-        document={
-            "type": "document_url",
-            "document_url": signed_url.url
-        }
-    )
-
-    return response
-
-# =========================================================
-# CLEAN
+# NORMALIZE
 # =========================================================
 
 def normalize(text):
@@ -76,32 +28,116 @@ def normalize(text):
     return text.strip()
 
 # =========================================================
-# OCR TO LINES
+# OCR USING RAW HTTP API
 # =========================================================
 
-def extract_lines(ocr_response):
+def run_ocr(pdf_path):
 
-    lines = []
+    headers = {
+        "Authorization": f"Bearer {API_KEY}"
+    }
 
-    for page in ocr_response.pages:
+    # =========================================
+    # STEP 1 UPLOAD FILE
+    # =========================================
 
-        page_lines = page.markdown.split("\n")
+    with open(pdf_path, "rb") as f:
 
-        for line in page_lines:
+        files = {
+            "file": (
+                Path(pdf_path).name,
+                f,
+                "application/pdf"
+            )
+        }
+
+        data = {
+            "purpose": "ocr"
+        }
+
+        upload_response = requests.post(
+            "https://api.mistral.ai/v1/files",
+            headers=headers,
+            files=files,
+            data=data
+        )
+
+    upload_json = upload_response.json()
+
+    if "id" not in upload_json:
+        raise Exception(upload_json)
+
+    file_id = upload_json["id"]
+
+    # =========================================
+    # STEP 2 GET SIGNED URL
+    # =========================================
+
+    signed_response = requests.get(
+        f"https://api.mistral.ai/v1/files/{file_id}/url",
+        headers=headers
+    )
+
+    signed_json = signed_response.json()
+
+    if "url" not in signed_json:
+        raise Exception(signed_json)
+
+    signed_url = signed_json["url"]
+
+    # =========================================
+    # STEP 3 OCR
+    # =========================================
+
+    payload = {
+        "model": "mistral-ocr-latest",
+        "document": {
+            "type": "document_url",
+            "document_url": signed_url
+        }
+    }
+
+    ocr_response = requests.post(
+        "https://api.mistral.ai/v1/ocr",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json=payload
+    )
+
+    return ocr_response.json()
+
+# =========================================================
+# EXTRACT LINES
+# =========================================================
+
+def extract_lines(ocr_json):
+
+    all_lines = []
+
+    pages = ocr_json.get("pages", [])
+
+    for page in pages:
+
+        markdown = page.get("markdown", "")
+
+        lines = markdown.split("\n")
+
+        for line in lines:
 
             line = line.strip()
 
             if line:
+                all_lines.append(line)
 
-                lines.append(line)
-
-    return lines
+    return all_lines
 
 # =========================================================
 # QUESTION DETECTOR
 # =========================================================
 
-def detect_question(line):
+def is_question(line):
 
     patterns = [
 
@@ -115,13 +151,12 @@ def detect_question(line):
     for p in patterns:
 
         if re.match(p, line, re.IGNORECASE):
-
             return True
 
     return False
 
 # =========================================================
-# PARSER
+# QA PARSER
 # =========================================================
 
 def parse_qa(lines):
@@ -136,9 +171,9 @@ def parse_qa(lines):
 
     for line in lines:
 
-        line_clean = line.strip()
+        line = line.strip()
 
-        if detect_question(line_clean):
+        if is_question(line):
 
             if current_question:
 
@@ -150,15 +185,14 @@ def parse_qa(lines):
 
                 qid += 1
 
-            current_question = line_clean
+            current_question = line
 
             current_answer = []
 
         else:
 
             if current_question:
-
-                current_answer.append(line_clean)
+                current_answer.append(line)
 
     if current_question:
 
@@ -176,14 +210,9 @@ def parse_qa(lines):
 
 def process_pdf(pdf_path):
 
-    pdf_bytes = preprocess_pdf(pdf_path)
+    ocr_json = run_ocr(pdf_path)
 
-    ocr_response = run_ocr(
-        pdf_bytes,
-        Path(pdf_path).name
-    )
-
-    lines = extract_lines(ocr_response)
+    lines = extract_lines(ocr_json)
 
     qa_pairs = parse_qa(lines)
 
@@ -194,7 +223,7 @@ def process_pdf(pdf_path):
 
     os.makedirs("outputs", exist_ok=True)
 
-    output_path = "outputs/final.json"
+    output_path = "outputs/output.json"
 
     with open(output_path, "w", encoding="utf-8") as f:
 
