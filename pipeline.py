@@ -2,7 +2,6 @@ import os
 import io
 import re
 import json
-import tempfile
 from pathlib import Path
 
 import streamlit as st
@@ -12,7 +11,7 @@ from pdf2image import convert_from_bytes
 from rapidfuzz import fuzz
 
 # =========================================================
-# API KEY
+# API
 # =========================================================
 
 api_key = st.secrets["MISTRAL_API_KEY"]
@@ -20,67 +19,43 @@ api_key = st.secrets["MISTRAL_API_KEY"]
 client = MistralClient(api_key=api_key)
 
 # =========================================================
-# CLEANERS
+# CONFIG
 # =========================================================
 
-def normalize(text):
+SIMILARITY_THRESHOLD = 80
 
-    text = str(text).lower()
+# =========================================================
+# PDF PREPROCESS
+# =========================================================
 
-    text = re.sub(r'[“”"\'`]', '', text)
+def preprocess_pdf(pdf_path):
 
-    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
 
-    text = re.sub(r'\s+', ' ', text)
+    images = convert_from_bytes(
+        pdf_bytes,
+        dpi=200
+    )
 
-    return text.strip()
+    output = io.BytesIO()
 
+    images[0].save(
+        output,
+        format="PDF",
+        save_all=True,
+        append_images=images[1:]
+    )
 
-def clean_text(text):
+    output.seek(0)
 
-    text = str(text)
-
-    text = text.replace("\n", " ")
-
-    text = re.sub(r'\s+', ' ', text)
-
-    return text.strip()
-
+    return output.read()
 
 # =========================================================
 # OCR
 # =========================================================
 
-def preprocess_pdf(pdf_bytes):
-
-    try:
-
-        images = convert_from_bytes(
-            pdf_bytes,
-            dpi=300
-        )
-
-        pdf_buffer = io.BytesIO()
-
-        images[0].save(
-            pdf_buffer,
-            format="PDF",
-            save_all=True,
-            append_images=images[1:]
-        )
-
-        pdf_buffer.seek(0)
-
-        return pdf_buffer.read()
-
-    except Exception:
-
-        return pdf_bytes
-
-
 def run_ocr(file_content, file_name):
-
-    print("Uploading to Mistral...")
 
     uploaded_file = client.files.upload(
         file={
@@ -90,13 +65,9 @@ def run_ocr(file_content, file_name):
         purpose="ocr"
     )
 
-    print("Getting signed URL...")
-
     signed_url = client.files.get_signed_url(
         uploaded_file.id
     )
-
-    print("Running OCR...")
 
     response = client.ocr.process(
         model="mistral-ocr-latest",
@@ -109,23 +80,69 @@ def run_ocr(file_content, file_name):
     return response
 
 # =========================================================
-# EXTRACT QA
+# CLEAN
 # =========================================================
 
-def extract_qa(ocr_response):
+def normalize(text):
 
-    all_lines = []
+    text = str(text).lower()
+
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+
+    text = re.sub(r'\s+', ' ', text)
+
+    return text.strip()
+
+# =========================================================
+# OCR TO LINES
+# =========================================================
+
+def extract_lines(ocr_response):
+
+    lines = []
 
     for page in ocr_response.pages:
 
-        lines = page.markdown.split("\n")
+        page_lines = page.markdown.split("\n")
 
-        for line in lines:
+        for line in page_lines:
 
-            line = clean_text(line)
+            line = line.strip()
 
             if line:
-                all_lines.append(line)
+
+                lines.append(line)
+
+    return lines
+
+# =========================================================
+# QUESTION DETECTOR
+# =========================================================
+
+def detect_question(line):
+
+    patterns = [
+
+        r'^\d+\.',
+        r'^\d+\)',
+        r'^q\s*\d+',
+        r'^question\s*\d+',
+        r'^\(?[ivxlcdm]+\)',
+    ]
+
+    for p in patterns:
+
+        if re.match(p, line, re.IGNORECASE):
+
+            return True
+
+    return False
+
+# =========================================================
+# PARSER
+# =========================================================
+
+def parse_qa(lines):
 
     qa_pairs = []
 
@@ -133,49 +150,39 @@ def extract_qa(ocr_response):
 
     current_answer = []
 
-    for line in all_lines:
+    qid = 1
 
-        detected = detect_question(line)
+    for line in lines:
 
-        if detected:
+        line_clean = line.strip()
+
+        if detect_question(line_clean):
 
             if current_question:
 
                 qa_pairs.append({
-                    "question_id": current_question["question_id"],
-                    "question_type": current_question["question_type"],
-                    "question": current_question["question"],
+                    "question_id": f"Q{qid}",
+                    "question": current_question,
                     "answer": " ".join(current_answer).strip()
                 })
 
-            current_question = detected
+                qid += 1
+
+            current_question = line_clean
 
             current_answer = []
 
-            continue
+        else:
 
-        if current_question:
+            if current_question:
 
-            similarity = fuzz.partial_ratio(
-                normalize(line),
-                normalize(current_question["question"])
-            )
-
-            if similarity > 92:
-                continue
-
-            current_answer.append(line)
-
-    # =====================================
-    # LAST QA
-    # =====================================
+                current_answer.append(line_clean)
 
     if current_question:
 
         qa_pairs.append({
-            "question_id": current_question["question_id"],
-            "question_type": current_question["question_type"],
-            "question": current_question["question"],
+            "question_id": f"Q{qid}",
+            "question": current_question,
             "answer": " ".join(current_answer).strip()
         })
 
@@ -185,40 +192,29 @@ def extract_qa(ocr_response):
 # MAIN PIPELINE
 # =========================================================
 
-def process_pdf(uploaded_file):
+def process_pdf(pdf_path):
 
-    os.makedirs("outputs", exist_ok=True)
-
-    pdf_bytes = uploaded_file.read()
-
-    processed_pdf = preprocess_pdf(
-        pdf_bytes
-    )
+    pdf_bytes = preprocess_pdf(pdf_path)
 
     ocr_response = run_ocr(
-        processed_pdf,
-        uploaded_file.name
+        pdf_bytes,
+        Path(pdf_path).name
     )
 
-    qa_pairs = extract_qa(
-        ocr_response
-    )
+    lines = extract_lines(ocr_response)
+
+    qa_pairs = parse_qa(lines)
 
     final_json = {
         "total_qa_pairs": len(qa_pairs),
         "qa_pairs": qa_pairs
     }
 
-    output_path = (
-        f"outputs/"
-        f"{Path(uploaded_file.name).stem}.json"
-    )
+    os.makedirs("outputs", exist_ok=True)
 
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8"
-    ) as f:
+    output_path = "outputs/final.json"
+
+    with open(output_path, "w", encoding="utf-8") as f:
 
         json.dump(
             final_json,
