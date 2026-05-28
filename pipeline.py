@@ -309,64 +309,136 @@ def match_question(line, questions):
 # PARSE ANSWERS
 # =========================================================
 
-def parse_answers(pages, questions):
+def parse_answers(pages, official_questions):
 
     qa_map = {}
 
-    current_qid = None
-    current_question = None
-    current_answer = []
+    # =====================================================
+    # CREATE QUESTION PATTERNS
+    # =====================================================
+
+    normalized_questions = []
+
+    for q in official_questions:
+
+        normalized_questions.append({
+            "id": q["id"],
+            "question": q["question"],
+            "normalized": normalize(q["question"])
+        })
+
+    # =====================================================
+    # MERGE ALL PAGES
+    # =====================================================
+
+    full_text = ""
 
     for page in pages:
 
-        lines = page["text"]
+        page_text = extract_text(page)
 
-        for raw_line in lines:
+        full_text += "\n" + page_text
 
-            line = clean_text(raw_line)
+    lines = full_text.split("\n")
+
+    # =====================================================
+    # FIND QUESTION POSITIONS
+    # =====================================================
+
+    question_positions = []
+
+    for idx, raw_line in enumerate(lines):
+
+        line = clean_text(raw_line)
+
+        if is_noise(line):
+            continue
+
+        line_norm = normalize(line)
+
+        best_match = None
+        best_score = 0
+
+        for q in normalized_questions:
+
+            score = fuzz.partial_ratio(
+                line_norm,
+                q["normalized"]
+            )
+
+            if score > best_score:
+
+                best_score = score
+                best_match = q
+
+        if best_match and best_score >= SIMILARITY_THRESHOLD:
+
+            question_positions.append({
+                "line_index": idx,
+                "qid": best_match["id"],
+                "question": best_match["question"]
+            })
+
+    # =====================================================
+    # REMOVE DUPLICATES
+    # =====================================================
+
+    filtered_positions = []
+
+    seen_qids = set()
+
+    for item in question_positions:
+
+        if item["qid"] not in seen_qids:
+
+            filtered_positions.append(item)
+            seen_qids.add(item["qid"])
+
+    # =====================================================
+    # EXTRACT ANSWERS BETWEEN QUESTIONS
+    # =====================================================
+
+    for i in range(len(filtered_positions)):
+
+        current = filtered_positions[i]
+
+        start_idx = current["line_index"] + 1
+
+        if i < len(filtered_positions) - 1:
+            end_idx = filtered_positions[i + 1]["line_index"]
+        else:
+            end_idx = len(lines)
+
+        answer_lines = []
+
+        for j in range(start_idx, end_idx):
+
+            line = clean_text(lines[j])
 
             if is_noise(line):
                 continue
 
-            matched = match_question(line, questions)
+            similarity = fuzz.partial_ratio(
+                normalize(line),
+                normalize(current["question"])
+            )
 
-            if matched:
-
-                if current_qid:
-
-                    qa_map[current_qid] = {
-                        "question": current_question,
-                        "answer": " ".join(current_answer).strip()
-                    }
-
-                current_qid = matched["id"]
-
-                current_question = matched["question"]
-
-                current_answer = []
-
+            if similarity > 90:
                 continue
 
-            if current_qid:
+            answer_lines.append(line)
 
-                similarity = fuzz.partial_ratio(
-                    normalize(line),
-                    normalize(current_question)
-                )
+        final_answer = clean_answer(
+            " ".join(answer_lines)
+        )
 
-                if similarity > 90:
-                    continue
-
-                current_answer.append(line)
-
-    if current_qid:
-
-        qa_map[current_qid] = {
-            "question": current_question,
-            "answer": " ".join(current_answer).strip()
+        qa_map[current["qid"]] = {
+            "question": current["question"],
+            "answer": final_answer
         }
 
     return qa_map
+
 
 # =========================================================
 # BUILD FINAL JSON
