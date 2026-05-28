@@ -2,7 +2,7 @@ import os
 import io
 import re
 import json
-import fitz
+
 
 from pathlib import Path
 from rapidfuzz import fuzz
@@ -72,26 +72,37 @@ def preprocess_pdf(file_bytes):
 # OCR
 # =========================================================
 
-def run_ocr(file_bytes, filename):
+def run_ocr(file_content: bytes, file_name: str):
 
-    uploaded_file = client.files.upload(
-        file={
-            "file_name": filename,
-            "content": file_bytes,
-        },
+    print("Uploading to Mistral...")
+
+    uploaded_file = client.files.create(
+        file=(
+            file_name,
+            file_content
+        ),
         purpose="ocr"
     )
 
-    signed_url = client.files.get_signed_url(
-        file_id=uploaded_file.id
-    )
+    print("Running OCR...")
 
-    response = client.ocr.process(
-        model="mistral-ocr-latest",
-        document={
-            "type": "document_url",
-            "document_url": signed_url.url,
-        }
+    response = client.chat.complete(
+        model="mistral-large-latest",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document_url",
+                        "document_url": uploaded_file.url
+                    },
+                    {
+                        "type": "text",
+                        "text": "Extract all text from this PDF exactly as it appears."
+                    }
+                ]
+            }
+        ]
     )
 
     return response
