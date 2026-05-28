@@ -471,34 +471,68 @@ def build_final_json(qa_map):
 # PROCESS PDF
 # =========================================================
 
+# =========================================================
+# COMPLETE PIPELINE
+# =========================================================
+
 def process_pdf(uploaded_file):
+
+    # =====================================================
+    # READ FILE
+    # =====================================================
 
     file_bytes = uploaded_file.read()
 
+    file_name = uploaded_file.name
+
+    # =====================================================
+    # PREPROCESS PDF
+    # =====================================================
+
     processed_pdf = preprocess_pdf(file_bytes)
 
-    # OCR RESPONSE
+    # =====================================================
+    # OCR
+    # =====================================================
 
     ocr_response = run_ocr(
-        processed_bytes,
+        processed_pdf,
         file_name
     )
 
-# OCR JSON
+    # =====================================================
+    # OCR JSON
+    # =====================================================
 
     ocr_json = ocr_to_clean_json(
         ocr_response
     )
 
-    questions = extract_questions(
-        ocr_json["pages"]
+    # =====================================================
+    # EXTRACT QUESTIONS
+    # =====================================================
+
+    pages = ocr_json["pages"]
+
+    official_questions = extract_official_questions(
+        pages
     )
+
+    # =====================================================
+    # PARSE ANSWERS
+    # =====================================================
 
     qa_map = parse_answers(
-        ocr_json["pages"],
-        questions
+        pages,
+        official_questions
     )
 
-    final_json = build_final_json(qa_map)
+    # =====================================================
+    # FINAL JSON
+    # =====================================================
+
+    final_json = build_json(
+        qa_map
+    )
 
     return ocr_json, final_json
