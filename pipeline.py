@@ -2,18 +2,15 @@ import os
 import io
 import re
 import json
-
-from pdf2image import convert_from_bytes
+import fitz  # PyMuPDF
 from rapidfuzz import fuzz
+from dotenv import load_dotenv
 
 import streamlit as st
-
 from mistralai.client import MistralClient
 
 # =========================================================
-
 # CONFIG
-
 # =========================================================
 
 SIMILARITY_THRESHOLD = 72
@@ -33,36 +30,48 @@ REMOVE_LINES_CONTAINING = [
 ]
 
 # =========================================================
-
-# MISTRAL
-
+# INITIALIZATION
 # =========================================================
 
-api_key = st.secrets["MISTRAL_API_KEY"]
+# Load environment variables (for local .env file)
+load_dotenv()
+
+# Initialize Mistral Client
+# Uses st.secrets if running in Streamlit Cloud, otherwise falls back to .env/os.environ
+try:
+    api_key = st.secrets["MISTRAL_API_KEY"]
+except (AttributeError, KeyError):
+    api_key = os.getenv("MISTRAL_API_KEY")
+
+if not api_key:
+    st.error("Mistral API Key not found. Please set it in .env or Streamlit secrets.")
+    st.stop()
 
 client = MistralClient(api_key=api_key)
 
 # =========================================================
-
-# PREPROCESS PDF
-
+# PREPROCESS PDF (Using PyMuPDF)
 # =========================================================
 
 def preprocess_pdf(file_bytes):
+    """
+    Converts PDF bytes to a high-quality PDF byte stream using PyMuPDF.
+    This replaces the pdf2image implementation for better performance.
+    """
     try:
-        images = convert_from_bytes(file_bytes, dpi=300)
-
+        # Open the PDF from bytes
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        
+        # Create a buffer to save the optimized PDF
         pdf_bytes = io.BytesIO()
-
-        images[0].save(
-            pdf_bytes,
-            format="PDF",
-            save_all=True,
-            append_images=images[1:]
-        )
-
+        
+        # Save it back to the buffer (optional: can apply filters like grayscale here)
+        # We just pass the bytes through effectively, or you could convert pages to images
+        # if you specifically needed image-based PDF, but text extraction works best on native PDF.
+        doc.save(pdf_bytes)
+        doc.close()
+        
         pdf_bytes.seek(0)
-
         return pdf_bytes.read()
 
     except Exception as e:
@@ -70,9 +79,7 @@ def preprocess_pdf(file_bytes):
         return file_bytes
 
 # =========================================================
-
 # OCR
-
 # =========================================================
 
 def run_ocr(file_content, file_name):
@@ -93,9 +100,7 @@ PDF filename:
     return response
 
 # =========================================================
-
 # OCR JSON
-
 # =========================================================
 
 def ocr_to_clean_json(raw_text):
@@ -128,9 +133,7 @@ def ocr_to_clean_json(raw_text):
     }
 
 # =========================================================
-
 # HELPERS
-
 # =========================================================
 
 def extract_text(page):
@@ -179,9 +182,7 @@ def is_noise(line):
     return False
 
 # =========================================================
-
 # EXTRACT QUESTIONS
-
 # =========================================================
 
 def extract_questions(pages):
@@ -242,9 +243,7 @@ def extract_questions(pages):
     return unique
 
 # =========================================================
-
 # PARSE ANSWERS
-
 # =========================================================
 
 def parse_answers(pages, official_questions):
@@ -344,9 +343,7 @@ def parse_answers(pages, official_questions):
     return qa_map
 
 # =========================================================
-
 # FINAL JSON
-
 # =========================================================
 
 def build_final_json(qa_map):
@@ -365,9 +362,7 @@ def build_final_json(qa_map):
     }
 
 # =========================================================
-
 # COMPLETE PIPELINE
-
 # =========================================================
 
 def process_pdf(uploaded_file):
