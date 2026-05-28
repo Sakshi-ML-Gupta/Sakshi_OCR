@@ -295,40 +295,126 @@ def is_noise(line):
 # EXTRACT QUESTIONS
 # =========================================================
 
-def extract_questions(pages):
+# =========================================================
+# EXTRACT OFFICIAL QUESTIONS
+# =========================================================
 
-    questions = []
+def extract_official_questions(pages):
+
+    assignment_page = None
+
+    # =====================================================
+    # FIND PAGE CONTAINING QUESTIONS
+    # =====================================================
 
     for page in pages:
 
-        for line in page["text"]:
+        text = extract_text(page)
 
-            line = clean_text(line)
+        normalized = normalize(text)
 
-            if is_noise(line):
+        if (
+            "section a" in normalized
+            or "section b" in normalized
+        ):
 
-                continue
+            assignment_page = text
+            break
+
+    # fallback
+    if not assignment_page:
+
+        assignment_page = extract_text(pages[0])
+
+    lines = assignment_page.split("\n")
+
+    questions = []
+
+    current_section = None
+
+    # =====================================================
+    # EXTRACT QUESTIONS
+    # =====================================================
+
+    for line in lines:
+
+        line = clean_text(line)
+
+        if is_noise(line):
+            continue
+
+        # SECTION A
+
+        if "section a" in line.lower():
+
+            current_section = "A"
+
+            continue
+
+        # SECTION B
+
+        if "section b" in line.lower():
+
+            current_section = "B"
+
+            continue
+
+        # =================================================
+        # SECTION A QUESTIONS
+        # =================================================
+
+        if current_section == "A":
 
             match = re.match(
-                r'^(\d+|[ivxlcdm]+)[\.\)]\s*(.+)',
+                r'^(?:\d+\s*\.?\s*)?\(?([ivxlcdm]+)\)?[\.\)]?\s*(.+)',
                 line,
                 re.IGNORECASE
             )
 
             if match:
 
-                qid = match.group(1)
+                roman = match.group(1)
 
                 qtext = match.group(2)
 
-                if len(qtext) > 15:
+                if is_roman(roman) and len(qtext) > 15:
+
+                    qid = f"A1({roman.lower()})"
 
                     questions.append({
                         "id": qid,
                         "question": qtext
                     })
 
-    unique = []
+        # =================================================
+        # SECTION B QUESTIONS
+        # =================================================
+
+        elif current_section == "B":
+
+            match = re.match(
+                r'^(\d+)[\.\)]\s*(.+)',
+                line
+            )
+
+            if match:
+
+                num = match.group(1)
+
+                qtext = match.group(2)
+
+                if len(qtext) > 10:
+
+                    questions.append({
+                        "id": f"B{num}",
+                        "question": qtext
+                    })
+
+    # =====================================================
+    # REMOVE DUPLICATES
+    # =====================================================
+
+    unique_questions = []
 
     seen = set()
 
@@ -340,10 +426,9 @@ def extract_questions(pages):
 
             seen.add(key)
 
-            unique.append(q)
+            unique_questions.append(q)
 
-    return unique
-
+    return unique_questions
 # =========================================================
 # PARSE ANSWERS
 # =========================================================
