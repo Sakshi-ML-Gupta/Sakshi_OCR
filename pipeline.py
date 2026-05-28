@@ -6,7 +6,7 @@ import fitz  # PyMuPDF
 from pathlib import Path
 from dotenv import load_dotenv
 # CORRECTED IMPORT for mistralai >= 1.0.0
-from mistralai import Mistral
+from mistralai.client import MistralClient
 from rapidfuzz import fuzz
 import streamlit as st
 
@@ -27,7 +27,7 @@ if not api_key:
     st.stop()
 
 # CORRECTED INITIALIZATION
-client = Mistral(api_key=api_key)
+client = MistralClient(api_key=api_key)
 
 # =========================================================
 # CONFIG
