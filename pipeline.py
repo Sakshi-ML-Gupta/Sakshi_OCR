@@ -7,8 +7,8 @@ from rapidfuzz import fuzz
 from dotenv import load_dotenv
 
 import streamlit as st
-from mistralai.client import MistralClient
-
+# This is the line that is failing in your logs:
+from mistralai.client import MistralClient 
 # =========================================================
 # CONFIG
 # =========================================================
