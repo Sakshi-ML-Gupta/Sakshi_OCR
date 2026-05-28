@@ -5,7 +5,7 @@ import json
 import fitz  # PyMuPDF
 from pathlib import Path
 from dotenv import load_dotenv
-from mistralai import Mistral
+from mistralai.client import MistralClient
 from rapidfuzz import fuzz
 import streamlit as st
 
@@ -25,7 +25,7 @@ if not api_key:
     st.error("Mistral API Key not found.")
     st.stop()
 
-client = Mistral(api_key=api_key)
+client = MistralClient(api_key=api_key)
 
 # =========================================================
 # CONFIG
