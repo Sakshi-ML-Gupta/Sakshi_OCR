@@ -372,21 +372,38 @@ def parse_answers(pages, questions):
 # BUILD FINAL JSON
 # =========================================================
 
-def build_final_json(qa_map):
+def ocr_to_clean_json(ocr_response):
 
-    qa_pairs = []
+    text = ocr_response.choices[0].message.content
 
-    for qid, qa in qa_map.items():
+    pages = text.split("\n\n")
 
-        qa_pairs.append({
-            "question_id": qid,
-            "question": qa["question"],
-            "answer": qa["answer"]
+    pages_data = []
+
+    for idx, page_text in enumerate(pages):
+
+        lines = []
+
+        seen = set()
+
+        for line in page_text.split("\n"):
+
+            line = line.strip()
+
+            if line and line not in seen:
+
+                seen.add(line)
+
+                lines.append(line)
+
+        pages_data.append({
+            "page_number": idx + 1,
+            "text": lines
         })
 
     return {
-        "total_qa_pairs": len(qa_pairs),
-        "qa_pairs": qa_pairs
+        "total_pages": len(pages_data),
+        "pages": pages_data
     }
 
 # =========================================================
