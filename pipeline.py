@@ -84,36 +84,22 @@ def preprocess_pdf(file_bytes: bytes, dpi: int = 300) -> bytes:
         return file_bytes
 
 # =========================================================
-# OCR
+# OCR (FIXED FOR MISTRAL 1.0+)
 # =========================================================
 
 def run_ocr(file_content: bytes, file_name: str):
-    print("Uploading to Mistral...")
+    print("Running OCR directly on file bytes...")
     
-    # CORRECTED: Use 'upload_file' instead of 'upload'
-    uploaded_file = client.files.upload_file(
+    # MISTRAL 1.0+ SDK:
+    # Use 'process_ocr' to upload and process in one step.
+    # This avoids the need for 'upload_file' or 'signed_url'.
+    
+    response = client.ocr.process_ocr(
         file={
             "file_name": file_name,
             "content": file_content,
         },
-        purpose="ocr",
-    )
-
-    signed_url = client.files.get_signed_url(
-        file_id=uploaded_file.id,
-        expiry=1
-    )
-
-    print("Running OCR...")
-
-    # CORRECTED: Ensure correct structure for the 'document' argument
-    response = client.ocr.process(
-        document={
-            "type": "document_url",
-            "document_url": signed_url.url
-        },
         model="mistral-ocr-latest",
-        include_image_base64=False
     )
 
     return response
