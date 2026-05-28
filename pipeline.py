@@ -7,83 +7,37 @@ from rapidfuzz import fuzz
 from dotenv import load_dotenv
 
 import streamlit as st
-# This is the line that is failing in your logs:
-from mistralai.client import MistralClient 
-# =========================================================
-# CONFIG
-# =========================================================
+# UPDATED IMPORT FOR MISTRAL 1.0+
+from mistralai import Mistral
 
-SIMILARITY_THRESHOLD = 72
-
-NOISE_PATTERNS = [
-    r"^TOPIC$",
-    r"^DATE$",
-    r"^TOPIC\s*_*$",
-    r"^DATE\s*_*$",
-    r"^BEGIN-\d+$",
-    r"^\d+$",
-]
-
-REMOVE_LINES_CONTAINING = [
-    "TOPIC",
-    "DATE",
-]
+# ... (Keep your CONFIG section as is) ...
 
 # =========================================================
 # INITIALIZATION
 # =========================================================
-
-# Load environment variables (for local .env file)
 load_dotenv()
 
-# Initialize Mistral Client
-# Uses st.secrets if running in Streamlit Cloud, otherwise falls back to .env/os.environ
 try:
     api_key = st.secrets["MISTRAL_API_KEY"]
 except (AttributeError, KeyError):
     api_key = os.getenv("MISTRAL_API_KEY")
 
 if not api_key:
-    st.error("Mistral API Key not found. Please set it in .env or Streamlit secrets.")
+    st.error("Mistral API Key not found.")
     st.stop()
 
-client = MistralClient(api_key=api_key)
+# UPDATED CLIENT INITIALIZATION
+client = Mistral(api_key=api_key)
 
-# =========================================================
-# PREPROCESS PDF (Using PyMuPDF)
-# =========================================================
-
-def preprocess_pdf(file_bytes):
-    """
-    Converts PDF bytes to a high-quality PDF byte stream using PyMuPDF.
-    This replaces the pdf2image implementation for better performance.
-    """
-    try:
-        # Open the PDF from bytes
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        
-        # Create a buffer to save the optimized PDF
-        pdf_bytes = io.BytesIO()
-        
-        # Save it back to the buffer (optional: can apply filters like grayscale here)
-        # We just pass the bytes through effectively, or you could convert pages to images
-        # if you specifically needed image-based PDF, but text extraction works best on native PDF.
-        doc.save(pdf_bytes)
-        doc.close()
-        
-        pdf_bytes.seek(0)
-        return pdf_bytes.read()
-
-    except Exception as e:
-        print("Preprocessing failed:", e)
-        return file_bytes
+# ... (Keep preprocess_pdf and helpers as is) ...
 
 # =========================================================
 # OCR
 # =========================================================
 
 def run_ocr(file_content, file_name):
-    response = client.chat(
+    # UPDATED API CALL METHOD
+    response = client.chat.complete(
         model="mistral-large-latest",
         messages=[
             {
@@ -98,6 +52,8 @@ PDF filename:
         ]
     )
     return response
+
+# ... (The rest of your file remains the same) ...
 
 # =========================================================
 # OCR JSON

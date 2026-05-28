@@ -1,5 +1,5 @@
 streamlit
-mistralai
+mistralai==0.4.2
 pdf2image
 rapidfuzz
 python-dotenv
