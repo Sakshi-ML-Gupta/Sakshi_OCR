@@ -49,7 +49,7 @@ REMOVE_LINES_CONTAINING = [
 ]
 
 # =========================================================
-# PREPROCESS PDF (Using PyMuPDF instead of pdf2image)
+# PREPROCESS PDF (Using PyMuPDF)
 # =========================================================
 
 def preprocess_pdf(file_bytes: bytes, dpi: int = 300) -> bytes:
@@ -59,23 +59,16 @@ def preprocess_pdf(file_bytes: bytes, dpi: int = 300) -> bytes:
     """
     print("Preprocessing PDF...")
     try:
-        # Open source PDF from bytes
         src_doc = fitz.open(stream=file_bytes, filetype="pdf")
-        
-        # Create a new PDF to store images
         out_doc = fitz.open()
 
         for page in src_doc:
-            # Render page to a pixmap (image)
+            # Render page to image
             pix = page.get_pixmap(dpi=dpi)
-            
-            # Create a new PDF page with the image dimensions
+            # Create new PDF page with the image
             new_page = out_doc.new_page(width=pix.width, height=pix.height)
-            
-            # Insert the image into the new page
             new_page.insert_image(new_page.rect, pixmap=pix)
 
-        # Save to bytes
         pdf_bytes = io.BytesIO()
         out_doc.save(pdf_bytes)
         
@@ -97,12 +90,8 @@ def preprocess_pdf(file_bytes: bytes, dpi: int = 300) -> bytes:
 def run_ocr(file_content: bytes, file_name: str):
     print("Uploading to Mistral...")
     
-    # Mistral SDK expects a file-like object or tuple for upload
-    # We wrap bytes in io.BytesIO to give it a 'read' method if needed, 
-    # or pass the bytes directly depending on exact SDK version expectations.
-    # Using the tuple format is usually safest.
-    
-    uploaded_file = client.files.upload(
+    # CORRECTED: Use 'upload_file' instead of 'upload'
+    uploaded_file = client.files.upload_file(
         file={
             "file_name": file_name,
             "content": file_content,
@@ -117,6 +106,7 @@ def run_ocr(file_content: bytes, file_name: str):
 
     print("Running OCR...")
 
+    # CORRECTED: Ensure correct structure for the 'document' argument
     response = client.ocr.process(
         document={
             "type": "document_url",
@@ -135,11 +125,10 @@ def run_ocr(file_content: bytes, file_name: str):
 def ocr_to_clean_json(ocr_response):
     pages_data = []
 
-    # Handle case where response might be dict or object
+    # Handle object or dict response
     pages = ocr_response.pages if hasattr(ocr_response, 'pages') else ocr_response.get('pages', [])
 
     for page in pages:
-        # Extract markdown content
         markdown_content = page.markdown if hasattr(page, 'markdown') else page.get('markdown', '')
         
         lines = markdown_content.split("\n")
@@ -154,7 +143,6 @@ def ocr_to_clean_json(ocr_response):
                 seen.add(line)
                 clean_lines.append(line)
 
-        # Extract page index if available, else use enumeration
         page_idx = page.index if hasattr(page, 'index') else page.get('index', len(pages_data))
 
         pages_data.append({
@@ -259,7 +247,6 @@ def is_roman(token):
 def extract_official_questions(pages):
     assignment_page = None
     
-    # Find the page containing "section a" and "section b"
     for page in pages:
         text = extract_text(page)
         normalized = normalize(text)
@@ -268,9 +255,7 @@ def extract_official_questions(pages):
             break
 
     if not assignment_page:
-        # Fallback or error handling
-        print("Warning: Assignment page with 'Section A' and 'Section B' not found. Attempting global extraction.")
-        # Optional: You could raise an error here if strict, or try to extract from all pages
+        print("Warning: Assignment page not found.")
         return []
 
     lines = assignment_page.split("\n")
@@ -289,9 +274,7 @@ def extract_official_questions(pages):
             current_section = "B"
             continue
 
-        # =====================================================
         # SECTION A
-        # =====================================================
         if current_section == "A":
             match = re.match(
                 r'^(?:\d+\s*\.?\s*)?\(?([ivxlcdm]+)\)?[\.\)]?\s*(.+)',
@@ -308,9 +291,7 @@ def extract_official_questions(pages):
                         "question": qtext
                     })
 
-        # =====================================================
         # SECTION B
-        # =====================================================
         elif current_section == "B":
             match = re.match(
                 r'^(\d+)\.\s*(.+)',
@@ -325,7 +306,6 @@ def extract_official_questions(pages):
                         "question": qtext
                     })
 
-    # Deduplicate
     unique_questions = []
     seen = set()
     for q in questions:
@@ -407,13 +387,11 @@ def parse_answers(pages, official_questions):
                     continue
 
             if current_qid:
-                # Avoid duplicating question text in answer
                 similarity = fuzz.partial_ratio(normalize(line), normalize(current_question))
                 if similarity > 90:
                     continue
                 current_answer_lines.append(line)
 
-    # Append the last collected answer
     if current_qid:
         qa_map[current_qid] = {
             "question": current_question,
@@ -446,7 +424,6 @@ def build_json(qa_map):
 def process_pdf(uploaded_file):
     """
     Main entry point for Streamlit.
-    Takes an UploadedFile object.
     """
     file_bytes = uploaded_file.read()
     file_name = uploaded_file.name
@@ -461,10 +438,7 @@ def process_pdf(uploaded_file):
     ocr_json = ocr_to_clean_json(ocr_result)
 
     # 4. Extract Questions
-    # (Saving ocr_json to disk is skipped for Streamlit live processing, 
-    # but you can uncomment if needed for debugging)
     pages = ocr_json["pages"]
-    
     official_questions = extract_official_questions(pages)
 
     # 5. Parse Answers
@@ -473,5 +447,4 @@ def process_pdf(uploaded_file):
     # 6. Build Final Output
     final_json = build_json(qa_map)
 
-    # Return both OCR text structure and Final QA pairs
     return ocr_json, final_json
