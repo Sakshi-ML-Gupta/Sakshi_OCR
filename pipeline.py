@@ -3,10 +3,10 @@ import io
 import re
 import json
 import fitz  # PyMuPDF
+import base64
 from pathlib import Path
 from dotenv import load_dotenv
-# CORRECT IMPORT for mistralai >= 1.0.0
-from mistralai import MistralClient
+from mistralai import Mistral
 from rapidfuzz import fuzz
 import streamlit as st
 
@@ -26,8 +26,8 @@ if not api_key:
     st.error("Mistral API Key not found.")
     st.stop()
 
-# CORRECT INITIALIZATION for v1.0+
-client = MistralClient(api_key=api_key)
+# Initialize client for mistralai >= 1.0.0
+client = Mistral(api_key=api_key)
 
 # =========================================================
 # CONFIG
@@ -64,7 +64,9 @@ def preprocess_pdf(file_bytes: bytes, dpi: int = 300) -> bytes:
         out_doc = fitz.open()
 
         for page in src_doc:
+            # Render page to image
             pix = page.get_pixmap(dpi=dpi)
+            # Create new PDF page with the image
             new_page = out_doc.new_page(width=pix.width, height=pix.height)
             new_page.insert_image(new_page.rect, pixmap=pix)
 
@@ -83,36 +85,56 @@ def preprocess_pdf(file_bytes: bytes, dpi: int = 300) -> bytes:
         return file_bytes
 
 # =========================================================
-# OCR (Corrected for Mistral 1.0+)
+# OCR (Using Chat/Vision API - Works on all versions)
 # =========================================================
 
 def run_ocr(file_content: bytes, file_name: str):
-    print("Running OCR...")
+    print("Running OCR via Chat API...")
     
-    # MISTRAL 1.0+ SDK:
-    # Use 'process_ocr' to upload and process in one step.
-    response = client.ocr.process_ocr(
-        file={
-            "file_name": file_name,
-            "content": file_content,
-        },
-        model="mistral-ocr-latest",
+    # Encode file to Base64
+    base64_file = base64.b64encode(file_content).decode('utf-8')
+    
+    # Use Chat API with document content
+    response = client.chat.complete(
+        model="mistral-large-latest",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Extract all text from this PDF document exactly as written. Return plain text only, maintaining the structure and line breaks."
+                    },
+                    {
+                        "type": "document",
+                        "document": {
+                            "name": file_name,
+                            "content": base64_file,
+                            "mime_type": "application/pdf"
+                        }
+                    }
+                ]
+            }
+        ]
     )
-
-    return response
+    
+    return response.choices[0].message.content
 
 # =========================================================
 # OCR TO CLEAN JSON
 # =========================================================
 
-def ocr_to_clean_json(ocr_response):
+def ocr_to_clean_json(raw_text):
+    # Since we now get raw text directly from chat, we split by pages manually if needed
+    # or just treat the whole text as one page if page markers aren't clear.
+    # For simplicity, we treat it as one page stream, but split by double newline.
+    
     pages_data = []
-    pages = ocr_response.pages if hasattr(ocr_response, 'pages') else ocr_response.get('pages', [])
+    # Split by double newlines to simulate pages
+    chunks = raw_text.split("\n\n")
 
-    for page in pages:
-        markdown_content = page.markdown if hasattr(page, 'markdown') else page.get('markdown', '')
-        
-        lines = markdown_content.split("\n")
+    for idx, chunk in enumerate(chunks):
+        lines = chunk.split("\n")
         seen = set()
         clean_lines = []
 
@@ -123,13 +145,12 @@ def ocr_to_clean_json(ocr_response):
             if line not in seen:
                 seen.add(line)
                 clean_lines.append(line)
-
-        page_idx = page.index if hasattr(page, 'index') else page.get('index', len(pages_data))
-
-        pages_data.append({
-            "page_number": page_idx + 1,
-            "text": clean_lines
-        })
+        
+        if clean_lines:
+            pages_data.append({
+                "page_number": idx + 1,
+                "text": clean_lines
+            })
 
     return {
         "total_pages": len(pages_data),
@@ -412,11 +433,11 @@ def process_pdf(uploaded_file):
     # 1. Preprocess (Rasterize)
     processed_bytes = preprocess_pdf(file_bytes)
 
-    # 2. OCR
-    ocr_result = run_ocr(processed_bytes, file_name)
+    # 2. OCR (Now returns raw text directly)
+    raw_text = run_ocr(processed_bytes, file_name)
 
-    # 3. Convert OCR result to JSON
-    ocr_json = ocr_to_clean_json(ocr_result)
+    # 3. Convert OCR text to JSON
+    ocr_json = ocr_to_clean_json(raw_text)
 
     # 4. Extract Questions
     pages = ocr_json["pages"]
