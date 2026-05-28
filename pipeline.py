@@ -175,19 +175,24 @@ Rules:
 # OCR TO CLEAN JSON
 # =========================================================
 
-def ocr_to_clean_json(ocr_response):
+# =========================================================
+# OCR TO CLEAN JSON
+# =========================================================
+
+def ocr_to_clean_json(raw_text):
 
     pages_data = []
 
-    for page in ocr_response.pages:
+    # split pseudo pages
+    raw_pages = raw_text.split("\n\n")
 
-        text = page.markdown
+    for idx, page_text in enumerate(raw_pages):
 
         lines = []
 
         seen = set()
 
-        for line in text.split("\n"):
+        for line in page_text.split("\n"):
 
             line = line.strip()
 
@@ -200,48 +205,12 @@ def ocr_to_clean_json(ocr_response):
 
                 lines.append(line)
 
-        pages_data.append({
-            "page_number": page.index + 1,
-            "text": lines
-        })
+        if lines:
 
-    return {
-        "total_pages": len(pages_data),
-        "pages": pages_data
-    }
-# =========================================================
-# OCR JSON
-# =========================================================
-
-def build_ocr_json(ocr_response):
-
-    pages_data = []
-
-    for page in ocr_response.pages:
-
-        lines = page.markdown.split("\n")
-
-        clean_lines = []
-
-        seen = set()
-
-        for line in lines:
-
-            line = line.strip()
-
-            if not line:
-                continue
-
-            if line not in seen:
-
-                seen.add(line)
-
-                clean_lines.append(line)
-
-        pages_data.append({
-            "page_number": page.index + 1,
-            "text": clean_lines
-        })
+            pages_data.append({
+                "page_number": idx + 1,
+                "text": lines
+            })
 
     return {
         "total_pages": len(pages_data),
