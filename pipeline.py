@@ -93,12 +93,16 @@ def preprocess_pdf(file_bytes, dpi=250):
 # OCR
 # =========================================================
 
+# =========================================================
+# OCR
+# =========================================================
+
 def run_ocr(file_content: bytes, file_name: str):
 
-    print("Starting OCR...")
+    print("Uploading PDF to Mistral...")
 
     # =====================================================
-    # SAVE TEMP PDF
+    # SAVE TEMP FILE
     # =====================================================
 
     temp_path = f"temp_{file_name}"
@@ -110,59 +114,23 @@ def run_ocr(file_content: bytes, file_name: str):
     # UPLOAD FILE
     # =====================================================
 
-    print("Uploading PDF...")
-
     uploaded_file = client.files.create(
         file=open(temp_path, "rb"),
         purpose="fine-tune"
     )
 
-    print("Upload successful")
+    print("File uploaded successfully")
 
     # =====================================================
-    # GET FILE URL
+    # RUN OCR
     # =====================================================
 
-    try:
-        file_url = uploaded_file.url
-    except:
-        file_url = None
-
-    if not file_url:
-        raise Exception("Could not get uploaded file URL")
-
-    # =====================================================
-    # OCR USING CHAT API
-    # =====================================================
-
-    print("Running OCR extraction...")
-
-    response = client.chat(
-        model="mistral-large-latest",
-        messages=[
-            {
-                "role": "user",
-                "content": f"""
-You are a PDF OCR engine.
-
-Read the PDF from this URL:
-
-{file_url}
-
-Extract ALL text exactly as written.
-
-Rules:
-- preserve questions
-- preserve answers
-- preserve numbering
-- preserve line breaks
-- preserve sections
-- do NOT summarize
-- do NOT explain
-- return only extracted text
-"""
-            }
-        ]
+    response = client.ocr.process(
+        model="mistral-ocr-latest",
+        document={
+            "type": "file",
+            "file_id": uploaded_file.id
+        }
     )
 
     # =====================================================
@@ -174,47 +142,46 @@ Rules:
     except:
         pass
 
-    # =====================================================
-    # RETURN RAW OCR TEXT
-    # =====================================================
-
-    return response.choices[0].message.content
+    return response
 
 # =========================================================
 # OCR TO CLEAN JSON
 # =========================================================
 
-def ocr_to_clean_json(raw_text):
+def ocr_to_clean_json(ocr_response):
 
     pages_data = []
 
-    lines = raw_text.split("\n")
+    for page in ocr_response.pages:
 
-    clean_lines = []
+        text = page.markdown
 
-    seen = set()
+        lines = []
 
-    for line in lines:
+        seen = set()
 
-        line = line.strip()
+        for line in text.split("\n"):
 
-        if not line:
-            continue
+            line = line.strip()
 
-        if line not in seen:
-            seen.add(line)
-            clean_lines.append(line)
+            if not line:
+                continue
 
-    pages_data.append({
-        "page_number": 1,
-        "text": clean_lines
-    })
+            if line not in seen:
+
+                seen.add(line)
+
+                lines.append(line)
+
+        pages_data.append({
+            "page_number": page.index + 1,
+            "text": lines
+        })
 
     return {
-        "total_pages": 1,
+        "total_pages": len(pages_data),
         "pages": pages_data
     }
-
 # =========================================================
 # OCR JSON
 # =========================================================
@@ -510,12 +477,18 @@ def process_pdf(uploaded_file):
 
     processed_pdf = preprocess_pdf(file_bytes)
 
+    # OCR RESPONSE
+
     ocr_response = run_ocr(
-        processed_pdf,
-        uploaded_file.name
+        processed_bytes,
+        file_name
     )
 
-    ocr_json = build_ocr_json(ocr_response)
+# OCR JSON
+
+    ocr_json = ocr_to_clean_json(
+        ocr_response
+    )
 
     questions = extract_questions(
         ocr_json["pages"]
