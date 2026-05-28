@@ -85,26 +85,96 @@ def preprocess_pdf(file_bytes, dpi=250):
 # OCR
 # =========================================================
 
-def run_ocr(file_content, file_name):
+# =========================================================
+# OCR
+# =========================================================
 
+def run_ocr(file_content: bytes, file_name: str):
+
+    print("Uploading file to Mistral...")
+
+    # Save temporary PDF
+    temp_path = f"temp_{file_name}"
+
+    with open(temp_path, "wb") as f:
+        f.write(file_content)
+
+    # Upload file
     uploaded_file = client.files.create(
-        file=(file_name, file_content),
+        file=open(temp_path, "rb"),
         purpose="fine-tune"
     )
 
-    signed_url = client.files.get_signed_url(
-        uploaded_file.id
+    print("File uploaded successfully")
+
+    # Get file URL
+    file_url = uploaded_file.url
+
+    print("Running OCR...")
+
+    response = client.chat(
+        model="mistral-large-latest",
+        messages=[
+            {
+                "role": "user",
+                "content": f"""
+Extract ALL text from this PDF exactly as written.
+
+Maintain:
+- line breaks
+- question numbering
+- section headings
+- formatting
+
+PDF URL:
+{file_url}
+"""
+            }
+        ]
     )
 
-    response = client.ocr.process(
-        model="mistral-ocr-latest",
-        document={
-            "type": "document_url",
-            "document_url": signed_url.url
-        }
-    )
+    # Cleanup temp file
+    try:
+        os.remove(temp_path)
+    except:
+        pass
 
-    return response
+    return response.choices[0].message.content
+
+# =========================================================
+# OCR TO CLEAN JSON
+# =========================================================
+
+def ocr_to_clean_json(raw_text):
+
+    pages_data = []
+
+    lines = raw_text.split("\n")
+
+    clean_lines = []
+
+    seen = set()
+
+    for line in lines:
+
+        line = line.strip()
+
+        if not line:
+            continue
+
+        if line not in seen:
+            seen.add(line)
+            clean_lines.append(line)
+
+    pages_data.append({
+        "page_number": 1,
+        "text": clean_lines
+    })
+
+    return {
+        "total_pages": 1,
+        "pages": pages_data
+    }
 
 # =========================================================
 # OCR JSON
