@@ -4,7 +4,7 @@ import re
 import json
 import fitz
 from pathlib import Path
-
+import base64
 from rapidfuzz import fuzz
 from mistralai.client import MistralClient
 
@@ -97,52 +97,79 @@ def preprocess_pdf(file_bytes, dpi=250):
 # OCR
 # =========================================================
 
-def run_ocr(file_content: bytes, file_name: str):
+# =========================================================
+# OCR
+# =========================================================
 
-    print("Uploading PDF to Mistral...")
+def run_ocr(file_content: bytes):
 
-    # =====================================================
-    # SAVE TEMP FILE
-    # =====================================================
-
-    temp_path = f"temp_{file_name}"
-
-    with open(temp_path, "wb") as f:
-        f.write(file_content)
+    print("Running OCR...")
 
     # =====================================================
-    # UPLOAD FILE
+    # OPEN PDF
     # =====================================================
 
-    uploaded_file = client.files.create(
-        file=open(temp_path, "rb"),
-        purpose="fine-tune"
+    pdf_document = fitz.open(
+        stream=file_content,
+        filetype="pdf"
     )
 
-    print("File uploaded successfully")
+    all_text = []
 
     # =====================================================
-    # RUN OCR
+    # OCR PAGE BY PAGE
     # =====================================================
 
-    response = client.ocr.process(
-        model="mistral-ocr-latest",
-        document={
-            "type": "file",
-            "file_id": uploaded_file.id
-        }
-    )
+    for page_num in range(len(pdf_document)):
 
-    # =====================================================
-    # CLEAN TEMP FILE
-    # =====================================================
+        print(f"OCR Page {page_num + 1}")
 
-    try:
-        os.remove(temp_path)
-    except:
-        pass
+        page = pdf_document[page_num]
 
-    return response
+        pix = page.get_pixmap(dpi=300)
+
+        img_bytes = pix.tobytes("png")
+
+        base64_image = base64.b64encode(
+            img_bytes
+        ).decode("utf-8")
+
+        response = client.chat(
+            model="mistral-large-latest",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """
+Extract ALL text exactly as written.
+
+Rules:
+- preserve line breaks
+- preserve numbering
+- preserve questions
+- preserve answers
+- no summarization
+- output plain text only
+"""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": f"data:image/png;base64,{base64_image}"
+                        }
+                    ]
+                }
+            ]
+        )
+
+        page_text = response.choices[0].message.content
+
+        all_text.append(page_text)
+
+    pdf_document.close()
+
+    return "\n\n".join(all_text)
 
 # =========================================================
 # OCR TO CLEAN JSON
@@ -495,19 +522,13 @@ def process_pdf(uploaded_file):
     # OCR
     # =====================================================
 
-    ocr_response = run_ocr(
-        processed_pdf,
-        file_name
+    raw_text = run_ocr(
+        processed_pdf  
     )
-
-    # =====================================================
-    # OCR JSON
-    # =====================================================
 
     ocr_json = ocr_to_clean_json(
-        ocr_response
+        raw_text
     )
-
     # =====================================================
     # EXTRACT QUESTIONS
     # =====================================================
@@ -531,7 +552,7 @@ def process_pdf(uploaded_file):
     # FINAL JSON
     # =====================================================
 
-    final_json = build_json(
+    final_json = build_final_json(
         qa_map
     )
 
