@@ -36,7 +36,7 @@ client = Mistral(api_key=api_key)
 # =========================================================
 
 def run_ocr(file_content, file_name):
-    # UPDATED API CALL METHOD
+    # UPDATED API CALL METHODresponse = client.chat.complete(
     response = client.chat.complete(
         model="mistral-large-latest",
         messages=[
@@ -51,6 +51,7 @@ PDF filename:
             }
         ]
     )
+    
     return response
 
 # ... (The rest of your file remains the same) ...
