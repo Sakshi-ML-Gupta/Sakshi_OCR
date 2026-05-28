@@ -1,1 +1,2 @@
 poppler-utils
+zlib1g-dev
