@@ -2,13 +2,13 @@ import os
 import io
 import re
 import json
-from pathlib import Path
-
 import fitz
-import streamlit as st
+from pathlib import Path
 
 from rapidfuzz import fuzz
 from mistralai.client import MistralClient
+
+import streamlit as st
 
 # =========================================================
 # MISTRAL
@@ -89,28 +89,53 @@ def preprocess_pdf(file_bytes, dpi=250):
 # OCR
 # =========================================================
 
+# =========================================================
+# OCR
+# =========================================================
+
 def run_ocr(file_content: bytes, file_name: str):
 
-    print("Uploading file to Mistral...")
+    print("Starting OCR...")
 
-    # Save temporary PDF
+    # =====================================================
+    # SAVE TEMP PDF
+    # =====================================================
+
     temp_path = f"temp_{file_name}"
 
     with open(temp_path, "wb") as f:
         f.write(file_content)
 
-    # Upload file
+    # =====================================================
+    # UPLOAD FILE
+    # =====================================================
+
+    print("Uploading PDF...")
+
     uploaded_file = client.files.create(
         file=open(temp_path, "rb"),
         purpose="fine-tune"
     )
 
-    print("File uploaded successfully")
+    print("Upload successful")
 
-    # Get file URL
-    file_url = uploaded_file.url
+    # =====================================================
+    # GET FILE URL
+    # =====================================================
 
-    print("Running OCR...")
+    try:
+        file_url = uploaded_file.url
+    except:
+        file_url = None
+
+    if not file_url:
+        raise Exception("Could not get uploaded file URL")
+
+    # =====================================================
+    # OCR USING CHAT API
+    # =====================================================
+
+    print("Running OCR extraction...")
 
     response = client.chat(
         model="mistral-large-latest",
@@ -118,26 +143,40 @@ def run_ocr(file_content: bytes, file_name: str):
             {
                 "role": "user",
                 "content": f"""
-Extract ALL text from this PDF exactly as written.
+You are a PDF OCR engine.
 
-Maintain:
-- line breaks
-- question numbering
-- section headings
-- formatting
+Read the PDF from this URL:
 
-PDF URL:
 {file_url}
+
+Extract ALL text exactly as written.
+
+Rules:
+- preserve questions
+- preserve answers
+- preserve numbering
+- preserve line breaks
+- preserve sections
+- do NOT summarize
+- do NOT explain
+- return only extracted text
 """
             }
         ]
     )
 
-    # Cleanup temp file
+    # =====================================================
+    # CLEAN TEMP FILE
+    # =====================================================
+
     try:
         os.remove(temp_path)
     except:
         pass
+
+    # =====================================================
+    # RETURN RAW OCR TEXT
+    # =====================================================
 
     return response.choices[0].message.content
 
