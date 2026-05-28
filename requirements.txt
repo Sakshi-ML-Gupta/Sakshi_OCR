@@ -1,8 +1,7 @@
 streamlit
-mistralai==0.4.2
+mistralai>=1.0.0
 pdf2image
 rapidfuzz
 python-dotenv
 Pillow
 PyMuPDF
-orjson

@@ -5,7 +5,8 @@ import json
 import fitz  # PyMuPDF
 from pathlib import Path
 from dotenv import load_dotenv
-from mistralai.client import MistralClient
+# CORRECTED IMPORT for mistralai >= 1.0.0
+from mistralai import Mistral
 from rapidfuzz import fuzz
 import streamlit as st
 
@@ -15,7 +16,7 @@ import streamlit as st
 
 load_dotenv()
 
-# Initialize Mistral Client
+# Initialize Mistral Client (Corrected for v1.0+)
 try:
     api_key = st.secrets["MISTRAL_API_KEY"]
 except (AttributeError, KeyError):
@@ -25,7 +26,8 @@ if not api_key:
     st.error("Mistral API Key not found.")
     st.stop()
 
-client = MistralClient(api_key=api_key)
+# CORRECTED INITIALIZATION
+client = Mistral(api_key=api_key)
 
 # =========================================================
 # CONFIG
@@ -84,7 +86,7 @@ def preprocess_pdf(file_bytes: bytes, dpi: int = 300) -> bytes:
         return file_bytes
 
 # =========================================================
-# OCR (FIXED FOR MISTRAL 1.0+)
+# OCR (Fixed for Mistral 1.0+)
 # =========================================================
 
 def run_ocr(file_content: bytes, file_name: str):
@@ -92,8 +94,6 @@ def run_ocr(file_content: bytes, file_name: str):
     
     # MISTRAL 1.0+ SDK:
     # Use 'process_ocr' to upload and process in one step.
-    # This avoids the need for 'upload_file' or 'signed_url'.
-    
     response = client.ocr.process_ocr(
         file={
             "file_name": file_name,
