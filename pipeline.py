@@ -5,8 +5,8 @@ import json
 import fitz  # PyMuPDF
 from pathlib import Path
 from dotenv import load_dotenv
-# CORRECTED IMPORT for mistralai >= 1.0.0
-from mistralai.client import MistralClient
+# CORRECT IMPORT for mistralai >= 1.0.0
+from mistralai import Mistral
 from rapidfuzz import fuzz
 import streamlit as st
 
@@ -16,7 +16,7 @@ import streamlit as st
 
 load_dotenv()
 
-# Initialize Mistral Client (Corrected for v1.0+)
+# Initialize Mistral Client
 try:
     api_key = st.secrets["MISTRAL_API_KEY"]
 except (AttributeError, KeyError):
@@ -26,8 +26,8 @@ if not api_key:
     st.error("Mistral API Key not found.")
     st.stop()
 
-# CORRECTED INITIALIZATION
-client = MistralClient(api_key=api_key)
+# CORRECT INITIALIZATION for v1.0+
+client = Mistral(api_key=api_key)
 
 # =========================================================
 # CONFIG
@@ -57,7 +57,6 @@ REMOVE_LINES_CONTAINING = [
 def preprocess_pdf(file_bytes: bytes, dpi: int = 300) -> bytes:
     """
     Rasterizes the PDF (converts pages to images) to ensure clean OCR.
-    Uses PyMuPDF (fitz) to avoid external dependencies like poppler.
     """
     print("Preprocessing PDF...")
     try:
@@ -65,9 +64,7 @@ def preprocess_pdf(file_bytes: bytes, dpi: int = 300) -> bytes:
         out_doc = fitz.open()
 
         for page in src_doc:
-            # Render page to image
             pix = page.get_pixmap(dpi=dpi)
-            # Create new PDF page with the image
             new_page = out_doc.new_page(width=pix.width, height=pix.height)
             new_page.insert_image(new_page.rect, pixmap=pix)
 
@@ -86,11 +83,11 @@ def preprocess_pdf(file_bytes: bytes, dpi: int = 300) -> bytes:
         return file_bytes
 
 # =========================================================
-# OCR (Fixed for Mistral 1.0+)
+# OCR (Corrected for Mistral 1.0+)
 # =========================================================
 
 def run_ocr(file_content: bytes, file_name: str):
-    print("Running OCR directly on file bytes...")
+    print("Running OCR...")
     
     # MISTRAL 1.0+ SDK:
     # Use 'process_ocr' to upload and process in one step.
@@ -110,8 +107,6 @@ def run_ocr(file_content: bytes, file_name: str):
 
 def ocr_to_clean_json(ocr_response):
     pages_data = []
-
-    # Handle object or dict response
     pages = ocr_response.pages if hasattr(ocr_response, 'pages') else ocr_response.get('pages', [])
 
     for page in pages:
