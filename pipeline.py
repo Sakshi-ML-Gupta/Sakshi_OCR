@@ -7,54 +7,94 @@ from rapidfuzz import fuzz
 from dotenv import load_dotenv
 
 import streamlit as st
-# UPDATED IMPORT FOR MISTRAL 1.0+
-from mistralai import Mistral
+# CORRECTED IMPORT FOR VERSION 0.4.2
+from mistralai.client import MistralClient
+from mistralai.models.chat_completion import ChatMessage
 
-# ... (Keep your CONFIG section as is) ...
+# =========================================================
+# CONFIG
+# =========================================================
+
+SIMILARITY_THRESHOLD = 72
+
+NOISE_PATTERNS = [
+    r"^TOPIC$",
+    r"^DATE$",
+    r"^TOPIC\s*_*$",
+    r"^DATE\s*_*$",
+    r"^BEGIN-\d+$",
+    r"^\d+$",
+]
+
+REMOVE_LINES_CONTAINING = [
+    "TOPIC",
+    "DATE",
+]
 
 # =========================================================
 # INITIALIZATION
 # =========================================================
+
+# Load environment variables
 load_dotenv()
 
+# Initialize Mistral Client
 try:
     api_key = st.secrets["MISTRAL_API_KEY"]
 except (AttributeError, KeyError):
     api_key = os.getenv("MISTRAL_API_KEY")
 
 if not api_key:
-    st.error("Mistral API Key not found.")
+    st.error("Mistral API Key not found. Please set it in .env or Streamlit secrets.")
     st.stop()
 
-# UPDATED CLIENT INITIALIZATION
-client = Mistral(api_key=api_key)
+# USING MistralClient FOR VERSION 0.4.2
+client = MistralClient(api_key=api_key)
 
-# ... (Keep preprocess_pdf and helpers as is) ...
+# =========================================================
+# PREPROCESS PDF (Using PyMuPDF)
+# =========================================================
+
+def preprocess_pdf(file_bytes):
+    try:
+        # Open the PDF from bytes
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        
+        # Create a buffer to save the optimized PDF
+        pdf_bytes = io.BytesIO()
+        
+        # Save it back to the buffer
+        doc.save(pdf_bytes)
+        doc.close()
+        
+        pdf_bytes.seek(0)
+        return pdf_bytes.read()
+
+    except Exception as e:
+        print("Preprocessing failed:", e)
+        return file_bytes
 
 # =========================================================
 # OCR
 # =========================================================
 
 def run_ocr(file_content, file_name):
-    # UPDATED API CALL METHODresponse = client.chat.complete(
-    response = client.chat.complete(
+    # CORRECTED API CALL FOR VERSION 0.4.2
+    response = client.chat(
         model="mistral-large-latest",
         messages=[
-            {
-                "role": "user",
-                "content": f"""
+            ChatMessage(
+                role="user",
+                content=f"""
 Extract all text from this PDF exactly as written.
 Return plain text only.
 PDF filename:
 {file_name}
 """
-            }
+            )
         ]
     )
-    
     return response
-
-# ... (The rest of your file remains the same) ...
 
 # =========================================================
 # OCR JSON
