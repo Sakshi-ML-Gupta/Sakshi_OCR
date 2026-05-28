@@ -79,7 +79,7 @@ def run_ocr(file_content, file_name):
             file_name,
             file_content
         ),
-        purpose="ocr"
+        purpose="fine-tune"
     )
 
     print("Running OCR...")
