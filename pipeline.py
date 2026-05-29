@@ -123,144 +123,91 @@ import time
 import time
 import base64
 
+# =========================================================
+# OCR
+# =========================================================
+
 def run_ocr(file_content: bytes, file_name: str):
 
-    print("Running OCR...")
+    try:
 
-    # =====================================================
-    # CONVERT PDF TO BASE64
-    # =====================================================
+        st.write("Uploading PDF to Mistral OCR...")
 
-    base64_pdf = base64.b64encode(
-        file_content
-    ).decode("utf-8")
+        # =====================================================
+        # SAVE TEMP PDF
+        # =====================================================
 
-    # =====================================================
-    # RETRY CONFIG
-    # =====================================================
+        temp_path = f"temp_{file_name}"
 
-    max_retries = 5
+        with open(temp_path, "wb") as f:
+            f.write(file_content)
 
-    retry_delay = 10
+        # =====================================================
+        # UPLOAD FILE
+        # =====================================================
 
-    # =====================================================
-    # OCR LOOP
-    # =====================================================
+        uploaded_file = client.files.create(
+            file=open(temp_path, "rb"),
+            purpose="fine-tune"
+        )
 
-    for attempt in range(max_retries):
+        st.write("File uploaded successfully")
 
-        try:
+        # =====================================================
+        # GET FILE URL
+        # =====================================================
 
-            print(
-                f"OCR Attempt {attempt + 1}/{max_retries}"
-            )
+        file_url = uploaded_file.url
 
-            response = client.chat(
+        st.write("Running OCR extraction...")
 
-                model="mistral-large-latest",
+        # =====================================================
+        # OCR USING CHAT API
+        # =====================================================
 
-                messages=[
-                    {
-                        "role": "user",
-
-                        "content": f"""
+        response = client.chat.complete(
+            model="mistral-large-latest",
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""
 Extract ALL text from this PDF exactly as written.
 
-IMPORTANT RULES:
-- preserve line breaks
-- preserve question numbering
-- preserve sections
-- preserve answers
-- no summarization
-- no formatting changes
-- no markdown
-- no explanations
+Preserve:
+- Questions
+- Answers
+- Line breaks
+- Sections
+- Numbering
 
-Return ONLY plain text.
-
-PDF FILE:
-data:application/pdf;base64,{base64_pdf}
+PDF URL:
+{file_url}
 """
-                    }
-                ]
-            )
+                }
+            ]
+        )
 
-            # =================================================
-            # EXTRACT TEXT
-            # =================================================
+        # =====================================================
+        # CLEANUP
+        # =====================================================
 
-            extracted_text = (
-                response
-                .choices[0]
-                .message
-                .content
-            )
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
-            # =================================================
-            # VALIDATION
-            # =================================================
+        # =====================================================
+        # RETURN TEXT
+        # =====================================================
 
-            if not extracted_text:
+        extracted_text = response.choices[0].message.content
 
-                raise Exception(
-                    "OCR returned empty text"
-                )
+        if not extracted_text:
+            raise Exception("OCR returned empty text")
 
-            print("OCR Success")
+        return extracted_text
 
-            return extracted_text
+    except Exception as e:
 
-        except Exception as e:
-
-            error_message = str(e)
-
-            print(
-                f"Attempt {attempt + 1} failed:"
-            )
-
-            print(error_message)
-
-            # =============================================
-            # RATE LIMIT HANDLING
-            # =============================================
-
-            if "429" in error_message:
-
-                print(
-                    f"Rate limit hit. Waiting {retry_delay} seconds..."
-                )
-
-                time.sleep(retry_delay)
-
-                continue
-
-            # =============================================
-            # OTHER ERRORS
-            # =============================================
-
-            if attempt == max_retries - 1:
-
-                raise Exception(
-                    f"OCR failed after {max_retries} attempts:\n{error_message}"
-                )
-
-            time.sleep(retry_delay)
-
-    # =====================================================
-    # FAIL SAFE
-    # =====================================================
-
-    raise Exception(
-        "OCR failed completely"
-    )
-
-
-
-
-
-# =========================================================
-# OCR TO CLEAN JSON
-# =========================================================
+        raise Exception(f"OCR failed completely: {str(e)}")
 
 # =========================================================
 # OCR TO CLEAN JSON
