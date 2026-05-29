@@ -108,69 +108,62 @@ import base64
 # =========================================================
 
 def run_ocr(file_content: bytes, file_name: str):
-
     print("Starting OCR...")
 
     try:
-
         # ============================================
-        # UPLOAD FILE
+        # CONVERT PDF PAGES TO IMAGES (base64)
         # ============================================
-
-        uploaded_pdf = client.files.upload(
-            file={
-                "file_name": file_name,
-                "content": file_content
-            },
-            purpose="ocr"
-        )
-
-        print("PDF uploaded successfully")
-
-        # ============================================
-        # OCR PROCESS
-        # ============================================
-
-        ocr_response = client.ocr.process(
-            model="mistral-ocr-latest",
-            document={
-                "type": "file",
-                "file_id": uploaded_pdf.id
-            },
-            include_image_base64=False
-        )
-
-        print("OCR processing completed")
-
-        # ============================================
-        # EXTRACT TEXT
-        # ============================================
-
+        src_doc = fitz.open(stream=file_content, filetype="pdf")
         all_text = []
 
-        for page in ocr_response.pages:
+        for page_num, page in enumerate(src_doc):
+            pix = page.get_pixmap(dpi=200)
+            img_bytes = pix.tobytes("png")
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-            page_text = page.markdown
+            # ============================================
+            # SEND EACH PAGE TO PIXTRAL FOR OCR
+            # ============================================
+            response = client.chat.complete(
+                model="pixtral-12b-2409",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{img_b64}"
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": "Extract ALL text from this image exactly as it appears. Preserve structure, numbering, and formatting. Output only the raw extracted text."
+                            }
+                        ]
+                    }
+                ]
+            )
 
+            page_text = response.choices[0].message.content
             if page_text:
-
                 all_text.append(page_text)
+
+            print(f"Page {page_num + 1} OCR done")
+
+        src_doc.close()
 
         final_text = "\n\n".join(all_text)
 
         if not final_text.strip():
-
             raise Exception("No OCR text extracted")
 
         print("OCR extraction successful")
-
         return final_text
 
     except Exception as e:
-
-        raise Exception(
-            f"OCR failed completely: {str(e)}"
-        )
+        raise Exception(f"OCR failed completely: {str(e)}")
 
 
 
@@ -566,12 +559,16 @@ def build_json(qa_map):
 # =========================================================
 
 def process_pdf(uploaded_file):
-
     print("Starting pipeline...")
 
     file_bytes = uploaded_file.read()
-
     file_name = uploaded_file.name
+
+    # No preprocessing needed — run_ocr handles it
+    raw_text = run_ocr(file_bytes, file_name)
+    print("OCR text extracted")
+
+  
 
     # ================================================
     # PREPROCESS PDF
