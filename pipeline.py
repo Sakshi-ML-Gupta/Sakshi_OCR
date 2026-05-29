@@ -98,56 +98,63 @@ import time
 import base64
 
 
-
-
 # =========================================================
 # OCR
 # =========================================================
 
 def run_ocr(file_content: bytes, file_name: str):
 
-    print("Uploading file to Mistral OCR...")
+    print("Starting OCR...")
 
     try:
+
+        # ================================================
+        # UPLOAD FILE
+        # ================================================
 
         uploaded_file = client.files.upload(
             file={
                 "file_name": file_name,
                 "content": file_content,
             },
-            purpose="ocr",
+            purpose="ocr"
         )
 
-        print("Getting signed URL...")
+        print("File uploaded")
 
-        signed_url = client.files.get_signed_url(
-            file_id=uploaded_file.id,
-            expiry=1
-        )
-
-        print("Running OCR...")
+        # ================================================
+        # RUN OCR
+        # ================================================
 
         response = client.ocr.process(
             model="mistral-ocr-latest",
             document={
-                "type": "document_url",
-                "document_url": signed_url.url
+                "type": "file",
+                "file_id": uploaded_file.id
             }
         )
+
+        print("OCR completed")
+
+        # ================================================
+        # EXTRACT TEXT
+        # ================================================
 
         all_text = []
 
         for page in response.pages:
 
-            all_text.append(page.markdown)
+            page_text = page.markdown
+
+            if page_text:
+
+                all_text.append(page_text)
 
         final_text = "\n\n".join(all_text)
 
         if not final_text.strip():
 
             raise Exception("No OCR text extracted")
-
-        print("OCR completed successfully")
 
         return final_text
 
@@ -156,7 +163,6 @@ def run_ocr(file_content: bytes, file_name: str):
         raise Exception(
             f"OCR failed completely: {str(e)}"
         )
-
 
 
 # =========================================================
