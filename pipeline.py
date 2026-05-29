@@ -98,6 +98,11 @@ import base64
 # OCR
 # =========================================================
 
+
+# =========================================================
+# OCR
+# =========================================================
+
 def run_ocr(file_content: bytes, file_name: str):
 
     import time
@@ -115,6 +120,7 @@ def run_ocr(file_content: bytes, file_name: str):
 
         all_text = []
 
+        # limit pages to avoid rate limit
         MAX_PAGES = min(total_pages, 5)
 
         for page_number in range(MAX_PAGES):
@@ -123,7 +129,20 @@ def run_ocr(file_content: bytes, file_name: str):
 
             page = pdf_document.load_page(page_number)
 
-            pix = page.get_pixmap(dpi=120)
+            # extract text directly first
+            direct_text = page.get_text()
+
+            # if text exists use it
+            if direct_text and len(direct_text.strip()) > 50:
+
+                print(f"Direct text extracted from page {page_number + 1}")
+
+                all_text.append(direct_text)
+
+                continue
+
+            # fallback OCR
+            pix = page.get_pixmap(dpi=180)
 
             image_bytes = pix.tobytes("png")
 
@@ -133,41 +152,42 @@ def run_ocr(file_content: bytes, file_name: str):
 
             retry = 0
 
+            page_text = ""
+
             while retry < 5:
 
                 try:
 
                     response = client.chat(
 
-                        model="mistral-large-latest",
+                        model="open-mistral-7b",
 
                         messages=[
                             {
                                 "role": "user",
                                 "content": f"""
-Extract all text exactly from this image.
+You are an OCR engine.
 
-Return only plain text.
+Extract all readable text from this image.
 
+Return plain text only.
+
+IMAGE:
 data:image/png;base64,{base64_image}
 """
                             }
-                        ],
-
-                        temperature=0
+                        ]
 
                     )
 
-                    extracted_text = (
+                    page_text = (
                         response
                         .choices[0]
                         .message
                         .content
                     )
 
-                    all_text.append(extracted_text)
-
-                    print(f"Page {page_number + 1} OCR completed")
+                    print(f"OCR completed for page {page_number + 1}")
 
                     break
 
@@ -179,9 +199,9 @@ data:image/png;base64,{base64_image}
 
                     if "429" in error_message:
 
-                        print("Rate limit hit. Waiting 15 seconds...")
+                        print("Rate limit hit. Waiting 20 seconds...")
 
-                        time.sleep(15)
+                        time.sleep(20)
 
                         retry += 1
 
@@ -189,13 +209,15 @@ data:image/png;base64,{base64_image}
 
                         raise Exception(error_message)
 
+            all_text.append(page_text)
+
         pdf_document.close()
 
         final_text = "\n\n".join(all_text)
 
         if not final_text.strip():
 
-            raise Exception("No OCR text extracted")
+            raise Exception("No text extracted from PDF")
 
         print("OCR Finished Successfully")
 
@@ -207,10 +229,6 @@ data:image/png;base64,{base64_image}
             f"OCR failed completely: {str(e)}"
         )
 
-
-# =========================================================
-# OCR TO CLEAN JSON
-# =========================================================
 
 # =========================================================
 # OCR TO CLEAN JSON
@@ -563,6 +581,8 @@ def parse_answers(pages, official_questions):
         }
 
     return qa_map
+
+
 
 # =========================================================
 # FINAL JSON
