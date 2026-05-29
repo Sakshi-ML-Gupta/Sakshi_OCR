@@ -102,47 +102,53 @@ import base64
 # OCR
 # =========================================================
 
+
+# =========================================================
+# OCR
+# =========================================================
+
 def run_ocr(file_content: bytes, file_name: str):
 
     print("Starting OCR...")
 
     try:
 
-        # ================================================
+        # ============================================
         # UPLOAD FILE
-        # ================================================
+        # ============================================
 
-        uploaded_file = client.files.upload(
+        uploaded_pdf = client.files.upload(
             file={
                 "file_name": file_name,
-                "content": file_content,
+                "content": file_content
             },
             purpose="ocr"
         )
 
-        print("File uploaded")
+        print("PDF uploaded successfully")
 
-        # ================================================
-        # RUN OCR
-        # ================================================
+        # ============================================
+        # OCR PROCESS
+        # ============================================
 
-        response = client.ocr.process(
+        ocr_response = client.ocr.process(
             model="mistral-ocr-latest",
             document={
                 "type": "file",
-                "file_id": uploaded_file.id
-            }
+                "file_id": uploaded_pdf.id
+            },
+            include_image_base64=False
         )
 
-        print("OCR completed")
+        print("OCR processing completed")
 
-        # ================================================
+        # ============================================
         # EXTRACT TEXT
-        # ================================================
+        # ============================================
 
         all_text = []
 
-        for page in response.pages:
+        for page in ocr_response.pages:
 
             page_text = page.markdown
 
@@ -156,6 +162,8 @@ def run_ocr(file_content: bytes, file_name: str):
 
             raise Exception("No OCR text extracted")
 
+        print("OCR extraction successful")
+
         return final_text
 
     except Exception as e:
@@ -163,6 +171,7 @@ def run_ocr(file_content: bytes, file_name: str):
         raise Exception(
             f"OCR failed completely: {str(e)}"
         )
+
 
 
 # =========================================================
