@@ -101,75 +101,47 @@ def preprocess_pdf(file_bytes, dpi=250):
 # OCR
 # =========================================================
 
-def run_ocr(file_content: bytes):
+# =========================================================
+# OCR
+# =========================================================
+
+def run_ocr(file_content, file_name):
 
     print("Running OCR...")
 
-    # =====================================================
-    # OPEN PDF
-    # =====================================================
+    base64_pdf = base64.b64encode(
+        file_content
+    ).decode("utf-8")
 
-    pdf_document = fitz.open(
-        stream=file_content,
-        filetype="pdf"
+    response = client.chat.complete(
+
+        model="mistral-large-latest",
+
+        messages=[
+            {
+                "role": "user",
+
+                "content": f"""
+Extract ALL text from this PDF exactly as written.
+
+Preserve:
+- questions
+- answers
+- sections
+- line breaks
+
+Return ONLY plain text.
+
+PDF:
+data:application/pdf;base64,{base64_pdf}
+"""
+            }
+        ]
     )
 
-    all_text = []
+    extracted_text = response.choices[0].message.content
 
-    # =====================================================
-    # OCR PAGE BY PAGE
-    # =====================================================
-
-    for page_num in range(len(pdf_document)):
-
-        print(f"OCR Page {page_num + 1}")
-
-        page = pdf_document[page_num]
-
-        pix = page.get_pixmap(dpi=300)
-
-        img_bytes = pix.tobytes("png")
-
-        base64_image = base64.b64encode(
-            img_bytes
-        ).decode("utf-8")
-
-        response = client.chat(
-            model="mistral-large-latest",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": """
-Extract ALL text exactly as written.
-
-Rules:
-- preserve line breaks
-- preserve numbering
-- preserve questions
-- preserve answers
-- no summarization
-- output plain text only
-"""
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": f"data:image/png;base64,{base64_image}"
-                        }
-                    ]
-                }
-            ]
-        )
-
-        page_text = response.choices[0].message.content
-
-        all_text.append(page_text)
-
-    pdf_document.close()
-
-    return "\n\n".join(all_text)
+    return extracted_text
 
 # =========================================================
 # OCR TO CLEAN JSON
