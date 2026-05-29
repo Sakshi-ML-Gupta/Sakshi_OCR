@@ -127,29 +127,38 @@ import base64
 # OCR
 # =========================================================
 
+# =========================================================
+# OCR
+# =========================================================
+
 def run_ocr(file_content: bytes, file_name: str):
 
     print("Starting OCR...")
 
     try:
 
-        # Convert PDF to images
         pdf_document = fitz.open(
             stream=file_content,
             filetype="pdf"
         )
 
-        all_text = []
-
         total_pages = len(pdf_document)
 
-        for page_number in range(total_pages):
+        all_text = []
 
-            print(f"OCR Processing Page {page_number + 1}/{total_pages}")
+        # ================================================
+        # LIMIT PAGES TO PREVENT RATE LIMIT
+        # ================================================
+
+        MAX_PAGES = min(total_pages, 5)
+
+        for page_number in range(MAX_PAGES):
+
+            print(f"OCR Page {page_number + 1}/{MAX_PAGES}")
 
             page = pdf_document.load_page(page_number)
 
-            pix = page.get_pixmap(dpi=200)
+            pix = page.get_pixmap(dpi=150)
 
             image_bytes = pix.tobytes("png")
 
@@ -157,32 +166,70 @@ def run_ocr(file_content: bytes, file_name: str):
                 image_bytes
             ).decode("utf-8")
 
-            # Send image directly to chat model
-            response = client.chat(
-                model="mistral-large-latest",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"""
-Extract all text exactly from this image.
+            success = False
+
+            retry_count = 0
+
+            while not success and retry_count < 5:
+
+                try:
+
+                    response = client.chat(
+
+                        model="mistral-large-latest",
+
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": f"""
+Extract ALL text exactly from this document image.
 
 Return ONLY plain text.
 
-Image:
 data:image/png;base64,{base64_image}
 """
-                    }
-                ],
-                temperature=0
-            )
+                            }
+                        ],
 
-            page_text = response.choices[0].message.content
+                        temperature=0
 
-            all_text.append(page_text)
+                    )
+
+                    page_text = response.choices[0].message.content
+
+                    all_text.append(page_text)
+
+                    success = True
+
+                except Exception as e:
+
+                    error_message = str(e)
+
+                    # ====================================
+                    # HANDLE RATE LIMIT
+                    # ====================================
+
+                    if "429" in error_message:
+
+                        print("Rate limit hit. Waiting 15 seconds...")
+
+                        import time
+
+                        time.sleep(15)
+
+                        retry_count += 1
+
+                    else:
+
+                        raise Exception(error_message)
 
         pdf_document.close()
 
         final_text = "\n\n".join(all_text)
+
+        if not final_text.strip():
+
+            raise Exception("OCR returned empty text")
 
         print("OCR Completed Successfully")
 
@@ -190,9 +237,9 @@ data:image/png;base64,{base64_image}
 
     except Exception as e:
 
-        raise Exception(f"OCR failed completely: {str(e)}")
-
-
+        raise Exception(
+            f"OCR failed completely: {str(e)}"
+        )
 
 
 
@@ -594,6 +641,18 @@ def process_pdf(uploaded_file):
     # =====================================================
     # STEP 1 PREPROCESS
     # =====================================================
+
+    # ================================================
+# REDUCE PDF SIZE
+# ================================================
+
+    MAX_FILE_SIZE = 8 * 1024 * 1024
+
+    if len(file_bytes) > MAX_FILE_SIZE:
+
+        st.warning(
+            "Large PDF detected. OCR may take longer."
+        )
 
     processed_bytes = preprocess_pdf(file_bytes)
 
