@@ -107,65 +107,90 @@ import base64
 # OCR
 # =========================================================
 
-def run_ocr(file_content: bytes, file_name: str):
-    print("Starting OCR...")
+def run_ocr(file_content: bytes, file_name: str, status_callback=None):
+
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    log("Starting OCR — uploading file to Mistral...")
 
     try:
+        import io as _io
+
         # ============================================
-        # CONVERT PDF PAGES TO IMAGES (base64)
+        # UPLOAD FILE
         # ============================================
-        src_doc = fitz.open(stream=file_content, filetype="pdf")
-        all_text = []
 
-        for page_num, page in enumerate(src_doc):
-            pix = page.get_pixmap(dpi=200)
-            img_bytes = pix.tobytes("png")
-            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+        uploaded_pdf = client.files.upload(
+            file={
+                "file_name": file_name,
+                "content": file_content
+            },
+            purpose="ocr"
+        )
 
-            # ============================================
-            # SEND EACH PAGE TO PIXTRAL FOR OCR
-            # ============================================
-            response = client.chat.complete(
-                model="pixtral-12b-2409",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{img_b64}"
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": "Extract ALL text from this image exactly as it appears. Preserve structure, numbering, and formatting. Output only the raw extracted text."
-                            }
-                        ]
-                    }
-                ]
-            )
+        log(f"File uploaded: {uploaded_pdf.id}")
 
-            page_text = response.choices[0].message.content
-            if page_text:
-                all_text.append(page_text)
+        # ============================================
+        # GET SIGNED URL
+        # ============================================
 
-            print(f"Page {page_num + 1} OCR done")
+        signed = client.files.get_signed_url(file_id=uploaded_pdf.id)
 
-        src_doc.close()
+        log("Signed URL obtained, running OCR model...")
 
-        final_text = "\n\n".join(all_text)
+        # ============================================
+        # OCR via CHAT with document_url
+        # ============================================
 
-        if not final_text.strip():
-            raise Exception("No OCR text extracted")
+        response = client.chat.complete(
+            model="mistral-ocr-latest",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document_url",
+                            "document_url": signed.url
+                        },
+                        {
+                            "type": "text",
+                            "text": "Extract ALL text from this document exactly as it appears. Preserve structure, section headings, numbering, and formatting. Output only the raw extracted text."
+                        }
+                    ]
+                }
+            ]
+        )
 
-        print("OCR extraction successful")
+        log("OCR model responded")
+
+        # ============================================
+        # EXTRACT TEXT
+        # ============================================
+
+        final_text = response.choices[0].message.content
+
+        if not final_text or not final_text.strip():
+            raise Exception("OCR returned empty text")
+
+        log(f"OCR complete — extracted {len(final_text)} characters")
+
+        # ============================================
+        # CLEANUP
+        # ============================================
+
+        try:
+            client.files.delete(file_id=uploaded_pdf.id)
+            log("Temp file deleted from Mistral")
+        except Exception:
+            pass
+
         return final_text
 
     except Exception as e:
-        raise Exception(f"OCR failed completely: {str(e)}")
-
-
+        raise Exception(f"OCR failed: {str(e)}\n{traceback.import_module('traceback').format_exc() if False else ''}")
 
 # =========================================================
 # OCR TO CLEAN JSON
@@ -558,76 +583,37 @@ def build_json(qa_map):
 # COMPLETE PIPELINE
 # =========================================================
 
-def process_pdf(uploaded_file):
-    print("Starting pipeline...")
+def process_pdf(uploaded_file, status_callback=None):
 
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    log("Reading uploaded file...")
     file_bytes = uploaded_file.read()
     file_name = uploaded_file.name
 
-    # No preprocessing needed — run_ocr handles it
-    raw_text = run_ocr(file_bytes, file_name)
-    print("OCR text extracted")
-
-  
-
-    # ================================================
-    # PREPROCESS PDF
-    # ================================================
-
+    log("Preprocessing PDF (rasterizing pages)...")
     processed_bytes = preprocess_pdf(file_bytes)
 
-    print("PDF preprocessing completed")
+    log("Running OCR...")
+    raw_text = run_ocr(processed_bytes, file_name, status_callback=status_callback)
 
-    # ================================================
-    # OCR
-    # ================================================
-
-    raw_text = run_ocr(
-        processed_bytes,
-        file_name
-    )
-
-    print("OCR text extracted")
-
-    # ================================================
-    # OCR JSON
-    # ================================================
-
+    log("Building OCR JSON...")
     ocr_json = ocr_to_clean_json(raw_text)
-
-    print("OCR JSON created")
-
-    # ================================================
-    # EXTRACT QUESTIONS
-    # ================================================
 
     pages = ocr_json["pages"]
 
-    official_questions = extract_official_questions(
-        pages
-    )
+    log("Extracting official questions...")
+    official_questions = extract_official_questions(pages)
+    log(f"Found {len(official_questions)} questions")
 
-    print(
-        f"Questions extracted: {len(official_questions)}"
-    )
+    log("Mapping answers...")
+    qa_map = parse_answers(pages, official_questions)
 
-    # ================================================
-    # PARSE ANSWERS
-    # ================================================
-
-    qa_map = parse_answers(
-        pages,
-        official_questions
-    )
-
-    print("Answers mapped")
-
-    # ================================================
-    # FINAL JSON
-    # ================================================
-
+    log("Building final JSON...")
     final_json = build_json(qa_map)
 
-    print("Pipeline completed")
-
+    log(f"Done — {final_json['total_qa_pairs']} QA pairs extracted")
     return ocr_json, final_json
