@@ -135,6 +135,10 @@ import base64
 # OCR
 # =========================================================
 
+# =========================================================
+# OCR
+# =========================================================
+
 def run_ocr(file_content: bytes, file_name: str):
 
     print("Starting OCR...")
@@ -149,10 +153,6 @@ def run_ocr(file_content: bytes, file_name: str):
         total_pages = len(pdf_document)
 
         all_text = []
-
-        # ================================================
-        # LIMIT PAGES
-        # ================================================
 
         MAX_PAGES = min(total_pages, 5)
 
@@ -176,23 +176,20 @@ def run_ocr(file_content: bytes, file_name: str):
 
                 try:
 
-                    response = client.chat.complete(
+                    response = client.chat(
 
                         model="mistral-large-latest",
 
                         messages=[
                             {
                                 "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "Extract all text exactly from this image."
-                                    },
-                                    {
-                                        "type": "image_url",
-                                        "image_url": f"data:image/png;base64,{base64_image}"
-                                    }
-                                ]
+                                "content": f"""
+Extract all text exactly from this image.
+
+Return only plain text.
+
+data:image/png;base64,{base64_image}
+"""
                             }
                         ],
 
@@ -209,7 +206,7 @@ def run_ocr(file_content: bytes, file_name: str):
 
                     all_text.append(extracted_text)
 
-                    print(f"Page {page_number + 1} OCR done")
+                    print(f"Page {page_number + 1} OCR completed")
 
                     break
 
@@ -219,21 +216,11 @@ def run_ocr(file_content: bytes, file_name: str):
 
                     print(error_message)
 
-                    # ====================================
-                    # HANDLE RATE LIMIT
-                    # ====================================
-
                     if "429" in error_message:
 
-                        import time
+                        print("Rate limit hit. Waiting...")
 
-                        wait_time = 15
-
-                        print(
-                            f"Rate limit hit. Waiting {wait_time} sec..."
-                        )
-
-                        time.sleep(wait_time)
+                        time.sleep(15)
 
                         retry += 1
 
@@ -247,9 +234,9 @@ def run_ocr(file_content: bytes, file_name: str):
 
         if not final_text.strip():
 
-            raise Exception("No text extracted from OCR")
+            raise Exception("No OCR text extracted")
 
-        print("OCR Completed")
+        print("OCR Finished Successfully")
 
         return final_text
 
@@ -258,7 +245,6 @@ def run_ocr(file_content: bytes, file_name: str):
         raise Exception(
             f"OCR failed completely: {str(e)}"
         )
-
 # =========================================================
 # OCR TO CLEAN JSON
 # =========================================================
