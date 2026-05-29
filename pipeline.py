@@ -131,6 +131,10 @@ import base64
 # OCR
 # =========================================================
 
+# =========================================================
+# OCR
+# =========================================================
+
 def run_ocr(file_content: bytes, file_name: str):
 
     print("Starting OCR...")
@@ -147,18 +151,18 @@ def run_ocr(file_content: bytes, file_name: str):
         all_text = []
 
         # ================================================
-        # LIMIT PAGES TO PREVENT RATE LIMIT
+        # LIMIT PAGES
         # ================================================
 
         MAX_PAGES = min(total_pages, 5)
 
         for page_number in range(MAX_PAGES):
 
-            print(f"OCR Page {page_number + 1}/{MAX_PAGES}")
+            print(f"Processing page {page_number + 1}")
 
             page = pdf_document.load_page(page_number)
 
-            pix = page.get_pixmap(dpi=150)
+            pix = page.get_pixmap(dpi=120)
 
             image_bytes = pix.tobytes("png")
 
@@ -166,28 +170,29 @@ def run_ocr(file_content: bytes, file_name: str):
                 image_bytes
             ).decode("utf-8")
 
-            success = False
+            retry = 0
 
-            retry_count = 0
-
-            while not success and retry_count < 5:
+            while retry < 5:
 
                 try:
 
-                    response = client.chat(
+                    response = client.chat.complete(
 
                         model="mistral-large-latest",
 
                         messages=[
                             {
                                 "role": "user",
-                                "content": f"""
-Extract ALL text exactly from this document image.
-
-Return ONLY plain text.
-
-data:image/png;base64,{base64_image}
-"""
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Extract all text exactly from this image."
+                                    },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": f"data:image/png;base64,{base64_image}"
+                                    }
+                                ]
                             }
                         ],
 
@@ -195,15 +200,24 @@ data:image/png;base64,{base64_image}
 
                     )
 
-                    page_text = response.choices[0].message.content
+                    extracted_text = (
+                        response
+                        .choices[0]
+                        .message
+                        .content
+                    )
 
-                    all_text.append(page_text)
+                    all_text.append(extracted_text)
 
-                    success = True
+                    print(f"Page {page_number + 1} OCR done")
+
+                    break
 
                 except Exception as e:
 
                     error_message = str(e)
+
+                    print(error_message)
 
                     # ====================================
                     # HANDLE RATE LIMIT
@@ -211,13 +225,17 @@ data:image/png;base64,{base64_image}
 
                     if "429" in error_message:
 
-                        print("Rate limit hit. Waiting 15 seconds...")
-
                         import time
 
-                        time.sleep(15)
+                        wait_time = 15
 
-                        retry_count += 1
+                        print(
+                            f"Rate limit hit. Waiting {wait_time} sec..."
+                        )
+
+                        time.sleep(wait_time)
+
+                        retry += 1
 
                     else:
 
@@ -229,9 +247,9 @@ data:image/png;base64,{base64_image}
 
         if not final_text.strip():
 
-            raise Exception("OCR returned empty text")
+            raise Exception("No text extracted from OCR")
 
-        print("OCR Completed Successfully")
+        print("OCR Completed")
 
         return final_text
 
@@ -240,8 +258,6 @@ data:image/png;base64,{base64_image}
         raise Exception(
             f"OCR failed completely: {str(e)}"
         )
-
-
 
 # =========================================================
 # OCR TO CLEAN JSON
@@ -632,48 +648,48 @@ def build_json(qa_map):
 # COMPLETE PIPELINE
 # =========================================================
 
+# =========================================================
+# COMPLETE PIPELINE
+# =========================================================
+
 def process_pdf(uploaded_file):
+
+    print("Starting pipeline...")
 
     file_bytes = uploaded_file.read()
 
     file_name = uploaded_file.name
 
-    # =====================================================
-    # STEP 1 PREPROCESS
-    # =====================================================
-
     # ================================================
-# REDUCE PDF SIZE
-# ================================================
-
-    MAX_FILE_SIZE = 8 * 1024 * 1024
-
-    if len(file_bytes) > MAX_FILE_SIZE:
-
-        st.warning(
-            "Large PDF detected. OCR may take longer."
-        )
+    # PREPROCESS PDF
+    # ================================================
 
     processed_bytes = preprocess_pdf(file_bytes)
 
-    # =====================================================
-    # STEP 2 OCR
-    # =====================================================
+    print("PDF preprocessing completed")
+
+    # ================================================
+    # OCR
+    # ================================================
 
     raw_text = run_ocr(
         processed_bytes,
         file_name
     )
 
-    # =====================================================
-    # STEP 3 OCR JSON
-    # =====================================================
+    print("OCR text extracted")
+
+    # ================================================
+    # OCR JSON
+    # ================================================
 
     ocr_json = ocr_to_clean_json(raw_text)
 
-    # =====================================================
-    # STEP 4 EXTRACT QUESTIONS
-    # =====================================================
+    print("OCR JSON created")
+
+    # ================================================
+    # EXTRACT QUESTIONS
+    # ================================================
 
     pages = ocr_json["pages"]
 
@@ -681,19 +697,27 @@ def process_pdf(uploaded_file):
         pages
     )
 
-    # =====================================================
-    # STEP 5 PARSE ANSWERS
-    # =====================================================
+    print(
+        f"Questions extracted: {len(official_questions)}"
+    )
+
+    # ================================================
+    # PARSE ANSWERS
+    # ================================================
 
     qa_map = parse_answers(
         pages,
         official_questions
     )
 
-    # =====================================================
-    # STEP 6 FINAL JSON
-    # =====================================================
+    print("Answers mapped")
+
+    # ================================================
+    # FINAL JSON
+    # ================================================
 
     final_json = build_json(qa_map)
+
+    print("Pipeline completed")
 
     return ocr_json, final_json
