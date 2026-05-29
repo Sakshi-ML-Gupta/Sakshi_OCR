@@ -249,19 +249,58 @@ def is_roman(token):
 
 def extract_official_questions(pages):
 
-    assignment_page = None
+    # =========================================================
+    # STEP 1: Find pages containing Section A and Section B
+    # They may be on different pages
+    # =========================================================
+
+    section_a_text = None
+    section_b_text = None
 
     for page in pages:
+
         text = extract_text(page)
         normalized = normalize(text)
-        if "section a" in normalized and "section b" in normalized:
-            assignment_page = text
-            break
 
-    if not assignment_page:
-        raise Exception("Assignment page (Section A + B) not found in OCR output")
+        if "section a" in normalized and section_a_text is None:
+            section_a_text = text
 
-    lines = assignment_page.split("\n")
+        if "section b" in normalized and section_b_text is None:
+            section_b_text = text
+
+    # fallback: if both on same page
+    if section_a_text is None and section_b_text is None:
+
+        # try to find any page with question-like content
+        all_text = "\n".join(extract_text(p) for p in pages)
+        normalized_all = normalize(all_text)
+
+        if "section a" not in normalized_all and "section b" not in normalized_all:
+            raise Exception(
+                f"Assignment page (Section A + B) not found.\n"
+                f"Debug — first 500 chars of OCR output:\n"
+                f"{all_text[:500]}"
+            )
+
+        section_a_text = all_text
+        section_b_text = all_text
+
+    # if one is missing, try using all pages combined
+    combined = "\n".join(extract_text(p) for p in pages)
+
+    if section_a_text is None:
+        section_a_text = combined
+
+    if section_b_text is None:
+        section_b_text = combined
+
+    # =========================================================
+    # STEP 2: Parse combined text in one pass
+    # =========================================================
+
+    full_text = combined
+    lines = full_text.split("\n")
+
     questions = []
     current_section = None
 
@@ -272,45 +311,79 @@ def extract_official_questions(pages):
         if is_noise(line):
             continue
 
-        if re.search(r'section\s+a', line, re.IGNORECASE):
+        # flexible section detection — handles bold markdown (**Section A**)
+        clean_line = re.sub(r'[*_#]', '', line).strip()
+
+        if re.search(r'section\s*a\b', clean_line, re.IGNORECASE):
             current_section = "A"
             continue
 
-        if re.search(r'section\s+b', line, re.IGNORECASE):
+        if re.search(r'section\s*b\b', clean_line, re.IGNORECASE):
             current_section = "B"
             continue
 
+        # =====================================================
+        # SECTION A — roman numeral questions
+        # =====================================================
+
         if current_section == "A":
+
             match = re.match(
-                r'^(?:\d+\s*\.?\s*)?\(?([ivxlcdm]+)\)?[\.\)]?\s*(.+)',
-                line, re.IGNORECASE
+                r'^(?:\d+\s*\.?\s*)?\(?([ivxlcdm]+)\)?[\.\):\s]\s*(.+)',
+                line,
+                re.IGNORECASE
             )
+
             if match:
-                roman, qtext = match.group(1), match.group(2)
-                if is_roman(roman) and len(qtext) > 15:
+                roman = match.group(1)
+                qtext = match.group(2).strip()
+
+                if is_roman(roman) and len(qtext) > 10:
                     questions.append({
                         "id": f"A1({roman.lower()})",
                         "question": qtext
                     })
 
+        # =====================================================
+        # SECTION B — numbered questions
+        # =====================================================
+
         elif current_section == "B":
-            match = re.match(r'^(\d+)[\.\)]\s*(.+)', line)
+
+            match = re.match(
+                r'^(\d+)[\.\)\s]\s*(.+)',
+                line
+            )
+
             if match:
-                num, qtext = match.group(1), match.group(2)
+                num = match.group(1)
+                qtext = match.group(2).strip()
+
                 if len(qtext) > 10:
                     questions.append({
                         "id": f"B{num}",
                         "question": qtext
                     })
 
-    # deduplicate
+    # =========================================================
+    # STEP 3: Deduplicate
+    # =========================================================
+
     seen = set()
     unique = []
+
     for q in questions:
         key = normalize(q["question"])
         if key not in seen:
             seen.add(key)
             unique.append(q)
+
+    if not unique:
+        raise Exception(
+            f"Sections found but no questions extracted.\n"
+            f"Debug — first 800 chars of OCR:\n"
+            f"{combined[:800]}"
+        )
 
     return unique
 
