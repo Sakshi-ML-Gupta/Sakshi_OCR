@@ -105,6 +105,11 @@ def preprocess_pdf(file_bytes, dpi=250):
 # OCR
 # =========================================================
 
+
+# =========================================================
+# OCR
+# =========================================================
+
 def run_ocr(file_content, file_name):
 
     print("Running OCR...")
@@ -113,7 +118,7 @@ def run_ocr(file_content, file_name):
         file_content
     ).decode("utf-8")
 
-    response = client.chat.complete(
+    response = client.chat(
 
         model="mistral-large-latest",
 
@@ -124,11 +129,13 @@ def run_ocr(file_content, file_name):
                 "content": f"""
 Extract ALL text from this PDF exactly as written.
 
-Preserve:
-- questions
-- answers
-- sections
-- line breaks
+Rules:
+- preserve line breaks
+- preserve sections
+- preserve numbering
+- preserve questions
+- preserve answers
+- no summarization
 
 Return ONLY plain text.
 
@@ -142,6 +149,8 @@ data:application/pdf;base64,{base64_pdf}
     extracted_text = response.choices[0].message.content
 
     return extracted_text
+
+
 
 # =========================================================
 # OCR TO CLEAN JSON
