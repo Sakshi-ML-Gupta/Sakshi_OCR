@@ -503,7 +503,7 @@ def parse_answers(pages, official_questions):
 # FINAL JSON
 # =========================================================
 
-def build_final_json(qa_map):
+def build_json(qa_map):
 
     qa_pairs = []
 
@@ -531,7 +531,7 @@ def build_final_json(qa_map):
 def process_pdf(uploaded_file):
 
     # =====================================================
-    # READ FILE
+    # READ PDF
     # =====================================================
 
     file_bytes = uploaded_file.read()
@@ -539,22 +539,22 @@ def process_pdf(uploaded_file):
     file_name = uploaded_file.name
 
     # =====================================================
-    # PREPROCESS PDF
-    # =====================================================
-
-    processed_pdf = preprocess_pdf(file_bytes)
-
-    # =====================================================
     # OCR
     # =====================================================
 
     raw_text = run_ocr(
-        processed_pdf  
+        file_bytes,
+        file_name
     )
+
+    # =====================================================
+    # OCR JSON
+    # =====================================================
 
     ocr_json = ocr_to_clean_json(
         raw_text
     )
+
     # =====================================================
     # EXTRACT QUESTIONS
     # =====================================================
@@ -575,11 +575,57 @@ def process_pdf(uploaded_file):
     )
 
     # =====================================================
-    # FINAL JSON
+    # FINAL QA JSON
     # =====================================================
 
-    final_json = build_final_json(
+    final_json = build_json(
         qa_map
     )
 
-    return ocr_json, final_json
+    # =====================================================
+    # SAVE OUTPUTS
+    # =====================================================
+
+    os.makedirs("outputs", exist_ok=True)
+
+    ocr_output_path = "outputs/ocr_output.json"
+
+    qa_output_path = "outputs/qa_output.json"
+
+    with open(
+        ocr_output_path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            ocr_json,
+            f,
+            ensure_ascii=False,
+            indent=4
+        )
+
+    with open(
+        qa_output_path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            final_json,
+            f,
+            ensure_ascii=False,
+            indent=4
+        )
+
+    # =====================================================
+    # RETURN
+    # =====================================================
+
+    return (
+        ocr_json,
+        final_json,
+        ocr_output_path,
+        qa_output_path
+    )
+
