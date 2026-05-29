@@ -190,7 +190,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         return final_text
 
     except Exception as e:
-        raise Exception(f"OCR failed: {str(e)}\n{traceback.import_module('traceback').format_exc() if False else ''}")
+        raise Exception(f"OCR failed: {str(e)}")
 
 # =========================================================
 # OCR TO CLEAN JSON
