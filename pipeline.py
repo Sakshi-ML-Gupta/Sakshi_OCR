@@ -172,23 +172,31 @@ def build_ocr_json(pages_output: list) -> dict:
 # EXTRACT Q&A — Claude does the smart extraction
 # =========================================================
 
-def extract_qa_with_claude(ocr_json: dict, status_callback=None) -> dict:
-    """
-    Sends the full OCR text to Claude and asks it to:
-    1. Identify all questions (whatever structure exists in the doc)
-    2. Find the corresponding answers
-    3. Return structured JSON
+def extract_qa_with_groq(ocr_json: dict, status_callback=None) -> dict:
 
-    No hardcoded section names — works for any document format.
-    """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    log("Sending OCR text to Claude for Q&A extraction...")
+    # ── Get Groq API key ───────────────────────────────────
+    try:
+        import streamlit as st
+        groq_key = st.secrets["GROQ_API_KEY"]
+    except Exception:
+        from dotenv import load_dotenv
+        load_dotenv()
+        groq_key = os.getenv("GROQ_API_KEY")
 
-    # Build full text with page markers so Claude knows the layout
+    if not groq_key:
+        raise Exception("GROQ_API_KEY not found in secrets or environment")
+
+    from groq import Groq
+    groq_client = Groq(api_key=groq_key)
+
+    log("Building full OCR text...")
+
+    # ── Build full text with real page markers ─────────────
     full_text_parts = []
     for page in ocr_json["pages"]:
         page_text = "\n".join(page["text"])
@@ -214,7 +222,7 @@ Below is the full OCR text of a document (with page markers). Your job is to:
   "total_qa_pairs": <number>,
   "qa_pairs": [
     {{
-      "question_id": "<a short unique id, e.g. Q1, A1(i), B3 — infer from the document structure>",
+      "question_id": "<unique id inferred from document structure, e.g. Q1, A1(i), B3>",
       "question": "<full question text>",
       "answer": "<full answer text, or empty string if no answer found>"
     }}
@@ -224,54 +232,44 @@ Below is the full OCR text of a document (with page markers). Your job is to:
 Rules:
 - Do NOT invent questions or answers
 - If a question has no answer, set answer to ""
-- Clean up obvious OCR artifacts (garbled characters, stray symbols) in both questions and answers
-- Preserve the meaning and wording faithfully
-- question_id should reflect the document's own numbering/lettering scheme
+- Clean up obvious OCR artifacts in both questions and answers
+- Preserve meaning and wording faithfully
+- question_id should reflect the document's own numbering scheme
 
 OCR TEXT:
 {full_text}"""
 
-    # Use Anthropic API (Claude) for intelligent extraction
-    import urllib.request
+    log("Sending OCR text to Groq for Q&A extraction...")
 
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": "",   # handled by proxy
-        "anthropic-version": "2023-06-01"
-    }
-
-    body = json.dumps({
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 4096,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers=headers,
-        method="POST"
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",  # free, fast, very capable
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a precise document extraction assistant. You always respond with valid JSON only — no markdown, no explanation, no code blocks."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0,           # deterministic output
+        max_tokens=4096,
+        response_format={"type": "json_object"}  # forces valid JSON
     )
 
-    with urllib.request.urlopen(req) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
+    raw_response = response.choices[0].message.content.strip()
+    log("Groq responded — parsing JSON...")
 
-    raw_response = result["content"][0]["text"].strip()
-
-    log("Claude responded — parsing JSON...")
-
-    # Strip markdown code fences if present
+    # Strip markdown fences just in case
     clean = re.sub(r'^```(?:json)?\s*', '', raw_response, flags=re.MULTILINE)
-    clean = re.sub(r'\s*```$', '', clean, flags=re.MULTILINE)
-    clean = clean.strip()
+    clean = re.sub(r'\s*```$', '', clean, flags=re.MULTILINE).strip()
 
     try:
         qa_json = json.loads(clean)
     except json.JSONDecodeError as e:
         raise Exception(
-            f"Claude returned invalid JSON: {e}\n"
+            f"Groq returned invalid JSON: {e}\n"
             f"Raw response (first 500 chars):\n{raw_response[:500]}"
         )
 
@@ -322,7 +320,7 @@ def process_pdf(file_input, status_callback=None):
     log(f"OCR JSON ready — {ocr_json['total_pages']} pages")
 
     # ── Step 4: Extract Q&A with Claude ───────────────────
-    qa_json = extract_qa_with_claude(
+    qa_json = extract_qa_with_groq(
         ocr_json,
         status_callback=status_callback
     )

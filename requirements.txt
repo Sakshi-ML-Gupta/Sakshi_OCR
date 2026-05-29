@@ -3,3 +3,4 @@ mistralai==1.7.0
 pymupdf
 rapidfuzz
 python-dotenv
+groq
