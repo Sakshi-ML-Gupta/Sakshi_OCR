@@ -194,7 +194,7 @@ def extract_qa_with_groq(ocr_json: dict, status_callback=None) -> dict:
     from groq import Groq
     groq_client = Groq(api_key=groq_key)
 
-    # ── Helper: call Groq safely ───────────────────────────
+    # ── Helper: call Groq ──────────────────────────────────
     def groq_call(messages, max_tokens=2048):
         return groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -225,8 +225,7 @@ def extract_qa_with_groq(ocr_json: dict, status_callback=None) -> dict:
     if not pages:
         raise Exception("OCR output is empty — nothing to extract")
 
-    # ── Chunk pages so each chunk stays under ~6000 tokens ─
-    # ~4 chars per token → 6000 tokens ≈ 24000 chars, use 20000 to be safe
+    # ── Chunk pages ~20000 chars each ─────────────────────
     CHUNK_CHAR_LIMIT = 20000
 
     chunks = []
@@ -250,49 +249,118 @@ def extract_qa_with_groq(ocr_json: dict, status_callback=None) -> dict:
 
     log(f"Document split into {len(chunks)} chunk(s) for processing")
 
-    # ── Process each chunk ─────────────────────────────────
-    all_qa_pairs = []
+    # ── Step 1: Extract ALL questions first from full doc ──
+    # Use first chunk + last chunk to get complete question list
+    # This ensures no question is missed even if doc is large
 
-    for i, chunk in enumerate(chunks):
-        chunk_text = "\n\n".join(chunk)
-        log(f"Processing chunk {i + 1} of {len(chunks)} ({len(chunk_text)} chars)...")
+    full_text_for_questions = "\n\n".join(
+        "\n\n".join(c) for c in chunks
+    )
 
-        prompt = f"""You are extracting question-answer pairs from a scanned assignment document.
+    # If full text too large for one call, use first 18000 chars
+    # Questions are usually in the beginning of the document
+    questions_text = full_text_for_questions[:18000]
 
-Below is a portion of the OCR text. Extract ALL question-answer pairs you find.
+    log("Step 1: Extracting complete question list...")
 
-CRITICAL RULES:
-- Capture the student's COMPLETE answer — every word, do not truncate or summarize
-- Answer starts right after the question text
-- Answer ends where the next question begins or the chunk ends
-- If no answer is written, use ""
-- Do NOT include question text in the answer field
-- question_id should reflect the document's own numbering (e.g. Q1, A1(i), B3)
+    questions_prompt = f"""You are reading a scanned assignment document.
 
-Return ONLY this JSON — no markdown, no explanation:
+Your ONLY task: list every single question present in this document.
 
+STRICT RULES:
+- Copy question text EXACTLY as it appears — do not fix spelling, grammar, or punctuation
+- Do not paraphrase, correct, or modify any text in any way
+- Copy the raw OCR text verbatim, including any OCR errors or odd characters
+- Do not skip any question even if it looks incomplete or garbled
+- Infer question_id from the document's own numbering scheme
+
+Return ONLY this JSON:
 {{
-  "qa_pairs": [
+  "questions": [
     {{
-      "question_id": "<id from document>",
-      "question": "<full question text>",
-      "answer": "<student's complete answer — every word>"
+      "question_id": "<id from document e.g. Q1, A1(i), B3>",
+      "question": "<exact question text copied verbatim from OCR>"
     }}
   ]
 }}
 
-OCR TEXT:
+DOCUMENT TEXT:
+{questions_text}"""
+
+    q_raw = groq_call(
+        messages=[
+            {
+                "role": "system",
+                "content": "You copy text verbatim. No corrections, no improvements. Return valid JSON only."
+            },
+            {
+                "role": "user",
+                "content": questions_prompt
+            }
+        ],
+        max_tokens=2048
+    )
+
+    q_data = parse_json_safe(q_raw, label="question extraction")
+    all_questions = q_data.get("questions", [])
+
+    if not all_questions:
+        raise Exception("No questions found in the document")
+
+    log(f"Found {len(all_questions)} questions total")
+
+    # ── Step 2: Extract answers chunk by chunk ─────────────
+    all_qa_pairs = []
+
+    for i, chunk in enumerate(chunks):
+        chunk_text = "\n\n".join(chunk)
+        log(f"Extracting answers from chunk {i + 1} of {len(chunks)}...")
+
+        # Pass the full question list so LLM knows what to look for
+        questions_list_str = "\n".join([
+            f"- {q['question_id']}: {q['question']}"
+            for q in all_questions
+        ])
+
+        answers_prompt = f"""You are extracting raw student answers from a scanned assignment document.
+
+THESE ARE ALL THE QUESTIONS IN THE DOCUMENT:
+{questions_list_str}
+
+For each question that appears in the text chunk below, extract the student's answer.
+
+STRICT RULES — CRITICAL:
+- Copy answer text EXACTLY as it appears in the OCR — do not fix spelling, grammar, punctuation, or any errors
+- Do not paraphrase, summarize, correct, or improve the text in any way
+- Copy raw OCR text verbatim, including typos, OCR artifacts, odd characters
+- Capture the COMPLETE answer — every single word until the next question starts
+- If a question does not appear in this chunk, do not include it
+- If a question appears but has no answer written, set answer to ""
+- Do NOT include the question text itself inside the answer field
+
+Return ONLY this JSON:
+{{
+  "qa_pairs": [
+    {{
+      "question_id": "<id matching the question list above>",
+      "question": "<exact question text verbatim>",
+      "answer": "<exact raw answer text verbatim — complete, unmodified>"
+    }}
+  ]
+}}
+
+TEXT CHUNK:
 {chunk_text}"""
 
         raw = groq_call(
             messages=[
                 {
                     "role": "system",
-                    "content": "You extract complete question-answer pairs. Return valid JSON only."
+                    "content": "You copy text verbatim without any corrections or modifications. Return valid JSON only."
                 },
                 {
                     "role": "user",
-                    "content": prompt
+                    "content": answers_prompt
                 }
             ],
             max_tokens=3000
@@ -300,15 +368,11 @@ OCR TEXT:
 
         data = parse_json_safe(raw, label=f"chunk {i+1}")
         pairs = data.get("qa_pairs", [])
-        log(f"Chunk {i + 1}: found {len(pairs)} Q&A pair(s)")
+        log(f"Chunk {i + 1}: {len(pairs)} pair(s) found")
         all_qa_pairs.extend(pairs)
 
-    if not all_qa_pairs:
-        raise Exception("No Q&A pairs found across all chunks")
-
-    # ── Merge duplicate question_ids across chunks ─────────
-    # (a question + its answer may span a chunk boundary)
-    log("Merging and deduplicating across chunks...")
+    # ── Step 3: Merge answers for same question_id ─────────
+    log("Merging results across chunks...")
 
     merged = {}
     for qa in all_qa_pairs:
@@ -316,39 +380,53 @@ OCR TEXT:
         if qid not in merged:
             merged[qid] = qa
         else:
-            # merge answers if the same question appeared in two chunks
             existing = merged[qid]["answer"]
             new = qa["answer"]
             if new and new not in existing:
                 merged[qid]["answer"] = (existing + " " + new).strip()
 
-    final_pairs = list(merged.values())
+    # ── Step 4: Ensure EVERY question is in output ─────────
+    # Fill in any missing questions with empty answer
+    for q in all_questions:
+        qid = q["question_id"]
+        if qid not in merged:
+            log(f"Question {qid} had no answer found — adding with empty answer")
+            merged[qid] = {
+                "question_id": qid,
+                "question": q["question"],
+                "answer": ""
+            }
 
-    # ── Check for suspiciously short answers and retry ─────
-    SHORT_THRESHOLD = 60  # chars — tune to your document
+    # ── Step 5: Retry questions with missing/short answers ─
+    SHORT_THRESHOLD = 60
 
-    short_ones = [
-        q for q in final_pairs
-        if 0 < len(q.get("answer", "")) < SHORT_THRESHOLD
+    need_retry = [
+        q for q in merged.values()
+        if len(q.get("answer", "")) < SHORT_THRESHOLD
     ]
 
-    if short_ones:
-        log(f"{len(short_ones)} short answer(s) detected — retrying individually...")
+    if need_retry:
+        log(f"{len(need_retry)} question(s) need answer retry...")
 
-        for qa in short_ones:
-            # find which chunk contains this question
+        for qa in need_retry:
+            # Find the chunk most likely to contain this answer
             best_chunk_text = max(
                 ["\n\n".join(c) for c in chunks],
                 key=lambda ct: fuzz_score(qa["question"], ct)
             )
 
-            retry_prompt = f"""From the document text below, extract the student's COMPLETE answer to this question.
+            retry_prompt = f"""From the document text below, find and copy the student's COMPLETE answer to this specific question.
 
 QUESTION ({qa['question_id']}): {qa['question']}
 
+STRICT RULES:
+- Copy the answer EXACTLY as written — no spelling fixes, no grammar fixes, no changes of any kind
+- Raw verbatim OCR text only
+- Include every word until the next question starts or document ends
+
 Return ONLY this JSON:
 {{
-  "answer": "<complete answer, every word the student wrote>"
+  "answer": "<complete verbatim answer text>"
 }}
 
 DOCUMENT TEXT:
@@ -356,18 +434,26 @@ DOCUMENT TEXT:
 
             raw = groq_call(
                 messages=[
-                    {"role": "system", "content": "Extract the complete answer. Return valid JSON only."},
-                    {"role": "user", "content": retry_prompt}
+                    {
+                        "role": "system",
+                        "content": "Copy text verbatim. No corrections. Return valid JSON only."
+                    },
+                    {
+                        "role": "user",
+                        "content": retry_prompt
+                    }
                 ],
                 max_tokens=1500
             )
+
             retry_data = parse_json_safe(raw, label=f"retry {qa['question_id']}")
             new_answer = retry_data.get("answer", "").strip()
 
             if new_answer and len(new_answer) > len(qa.get("answer", "")):
                 merged[qa["question_id"]]["answer"] = new_answer
-                log(f"  {qa['question_id']}: improved to {len(new_answer)} chars")
+                log(f"  {qa['question_id']}: {len(new_answer)} chars")
 
+    # ── Build final output ─────────────────────────────────
     final_pairs = list(merged.values())
 
     result = {
@@ -375,12 +461,11 @@ DOCUMENT TEXT:
         "qa_pairs": final_pairs
     }
 
-    log(f"Done — {len(final_pairs)} Q&A pairs extracted")
+    log(f"Complete — {len(final_pairs)} Q&A pairs (all questions accounted for)")
     return result
 
 
 def fuzz_score(question: str, text: str) -> int:
-    """Simple overlap score to find which chunk contains a question."""
     question_words = set(question.lower().split())
     text_words = set(text.lower().split())
     if not question_words:
