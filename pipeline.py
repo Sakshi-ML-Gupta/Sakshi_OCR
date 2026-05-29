@@ -263,23 +263,21 @@ def extract_qa_with_groq(ocr_json: dict, status_callback=None) -> dict:
 
     log("Step 1: Extracting complete question list...")
 
-    questions_prompt = f"""You are reading a scanned assignment document.
+    questions_prompt = f"""You are a text extraction robot. Copy text exactly as-is.
 
-Your ONLY task: list every single question present in this document.
+List every question in this document.
 
-STRICT RULES:
-- Copy question text EXACTLY as it appears — do not fix spelling, grammar, or punctuation
-- Do not paraphrase, correct, or modify any text in any way
-- Copy the raw OCR text verbatim, including any OCR errors or odd characters
-- Do not skip any question even if it looks incomplete or garbled
-- Infer question_id from the document's own numbering scheme
+RULES:
+- Copy question text EXACTLY — wrong spellings, bad grammar, OCR errors — copy all of it unchanged
+- Do not correct or improve anything
+- Do not skip any question
 
 Return ONLY this JSON:
 {{
   "questions": [
     {{
-      "question_id": "<id from document e.g. Q1, A1(i), B3>",
-      "question": "<exact question text copied verbatim from OCR>"
+      "question_id": "<id from document>",
+      "question": "<exact verbatim question text, copied character by character>"
     }}
   ]
 }}
@@ -322,31 +320,41 @@ DOCUMENT TEXT:
             for q in all_questions
         ])
 
-        answers_prompt = f"""You are extracting raw student answers from a scanned assignment document.
+        answers_prompt = f"""You are a text extraction robot. You copy text. You do NOT think, correct, improve, or skip anything.
 
-THESE ARE ALL THE QUESTIONS IN THE DOCUMENT:
+QUESTIONS LIST:
 {questions_list_str}
 
-For each question that appears in the text chunk below, extract the student's answer.
+TASK:
+For each question found in the text chunk below:
+1. Find the line where the question appears
+2. Everything AFTER that question line = the answer (including the very first line/paragraph immediately after)
+3. Copy the answer until the next question starts or chunk ends
 
-STRICT RULES — CRITICAL:
-- Copy answer text EXACTLY as it appears in the OCR — do not fix spelling, grammar, punctuation, or any errors
-- Do not paraphrase, summarize, correct, or improve the text in any way
-- Copy raw OCR text verbatim, including typos, OCR artifacts, odd characters
-- Capture the COMPLETE answer — every single word until the next question starts
-- If a question does not appear in this chunk, do not include it
-- If a question appears but has no answer written, set answer to ""
-- Do NOT include the question text itself inside the answer field
+ABSOLUTE RULES — NO EXCEPTIONS:
+- Copy every character EXACTLY as it appears in the OCR text
+- Do NOT skip the first paragraph or first line of any answer
+- Do NOT skip any sentence, paragraph, or line
+- Do NOT fix spelling mistakes — copy wrong spellings as-is
+- Do NOT fix grammar — copy bad grammar as-is  
+- Do NOT fix punctuation — copy as-is
+- Do NOT remove OCR artifacts or strange characters — copy as-is
+- Do NOT summarize or shorten anything
+- The answer begins IMMEDIATELY after the question text ends — do not skip anything
+- If a question is in this chunk but has no student response, set answer to ""
+- Do NOT include the question sentence itself in the answer
 
 Return ONLY this JSON:
 {{
   "qa_pairs": [
     {{
-      "question_id": "<id matching the question list above>",
+      "question_id": "<id from questions list>",
       "question": "<exact question text verbatim>",
-      "answer": "<exact raw answer text verbatim — complete, unmodified>"
+      "answer": "<every single word after the question, verbatim, starting from the very first word of the response>"
     }}
   ]
+
+""
 }}
 
 TEXT CHUNK:
@@ -415,19 +423,27 @@ TEXT CHUNK:
                 key=lambda ct: fuzz_score(qa["question"], ct)
             )
 
-            retry_prompt = f"""From the document text below, find and copy the student's COMPLETE answer to this specific question.
+            retry_prompt = f"""You are a text extraction robot. Copy text exactly. Do not think or correct anything.
 
 QUESTION ({qa['question_id']}): {qa['question']}
 
-STRICT RULES:
-- Copy the answer EXACTLY as written — no spelling fixes, no grammar fixes, no changes of any kind
-- Raw verbatim OCR text only
-- Include every word until the next question starts or document ends
+Find this question in the text below.
+Copy EVERYTHING written after this question — starting from the VERY FIRST WORD after the question ends.
+Stop only when the next question begins or the text ends.
+
+DO NOT:
+- Skip the first paragraph or first sentence
+- Fix any spelling mistakes
+- Fix any grammar
+- Change any word
+- Summarize anything
 
 Return ONLY this JSON:
 {{
-  "answer": "<complete verbatim answer text>"
+  "answer": "<verbatim complete answer starting from very first word after the question>"
 }}
+
+
 
 DOCUMENT TEXT:
 {best_chunk_text}"""
