@@ -110,45 +110,151 @@ def preprocess_pdf(file_bytes, dpi=250):
 # OCR
 # =========================================================
 
-def run_ocr(file_content, file_name):
+# =========================================================
+# OCR
+# =========================================================
+
+import time
+
+# =========================================================
+# OCR
+# =========================================================
+
+import time
+import base64
+
+def run_ocr(file_content: bytes, file_name: str):
 
     print("Running OCR...")
+
+    # =====================================================
+    # CONVERT PDF TO BASE64
+    # =====================================================
 
     base64_pdf = base64.b64encode(
         file_content
     ).decode("utf-8")
 
-    response = client.chat(
+    # =====================================================
+    # RETRY CONFIG
+    # =====================================================
 
-        model="mistral-large-latest",
+    max_retries = 5
 
-        messages=[
-            {
-                "role": "user",
+    retry_delay = 10
 
-                "content": f"""
+    # =====================================================
+    # OCR LOOP
+    # =====================================================
+
+    for attempt in range(max_retries):
+
+        try:
+
+            print(
+                f"OCR Attempt {attempt + 1}/{max_retries}"
+            )
+
+            response = client.chat(
+
+                model="mistral-large-latest",
+
+                messages=[
+                    {
+                        "role": "user",
+
+                        "content": f"""
 Extract ALL text from this PDF exactly as written.
 
-Rules:
+IMPORTANT RULES:
 - preserve line breaks
+- preserve question numbering
 - preserve sections
-- preserve numbering
-- preserve questions
 - preserve answers
 - no summarization
+- no formatting changes
+- no markdown
+- no explanations
 
 Return ONLY plain text.
 
-PDF:
+PDF FILE:
 data:application/pdf;base64,{base64_pdf}
 """
-            }
-        ]
+                    }
+                ]
+            )
+
+            # =================================================
+            # EXTRACT TEXT
+            # =================================================
+
+            extracted_text = (
+                response
+                .choices[0]
+                .message
+                .content
+            )
+
+            # =================================================
+            # VALIDATION
+            # =================================================
+
+            if not extracted_text:
+
+                raise Exception(
+                    "OCR returned empty text"
+                )
+
+            print("OCR Success")
+
+            return extracted_text
+
+        except Exception as e:
+
+            error_message = str(e)
+
+            print(
+                f"Attempt {attempt + 1} failed:"
+            )
+
+            print(error_message)
+
+            # =============================================
+            # RATE LIMIT HANDLING
+            # =============================================
+
+            if "429" in error_message:
+
+                print(
+                    f"Rate limit hit. Waiting {retry_delay} seconds..."
+                )
+
+                time.sleep(retry_delay)
+
+                continue
+
+            # =============================================
+            # OTHER ERRORS
+            # =============================================
+
+            if attempt == max_retries - 1:
+
+                raise Exception(
+                    f"OCR failed after {max_retries} attempts:\n{error_message}"
+                )
+
+            time.sleep(retry_delay)
+
+    # =====================================================
+    # FAIL SAFE
+    # =====================================================
+
+    raise Exception(
+        "OCR failed completely"
     )
 
-    extracted_text = response.choices[0].message.content
 
-    return extracted_text
 
 
 
