@@ -5,75 +5,56 @@ import json
 import fitz
 import base64
 from pathlib import Path
-from rapidfuzz import fuzz
-
-# =========================================================
-# MISTRAL CLIENT
-# =========================================================
-
-try:
-    import streamlit as st
-    api_key = st.secrets["MISTRAL_API_KEY"]
-except Exception:
-    from dotenv import load_dotenv
-    load_dotenv()
-    api_key = os.getenv("MISTRAL_API_KEY")
-
 from mistralai import Mistral
-client = Mistral(api_key=api_key)
 
 # =========================================================
-# CONFIG
+# CLIENT SETUP — works locally and on Streamlit Cloud
 # =========================================================
 
-SIMILARITY_THRESHOLD = 72
+def get_mistral_client():
+    try:
+        import streamlit as st
+        api_key = st.secrets["MISTRAL_API_KEY"]
+    except Exception:
+        from dotenv import load_dotenv
+        load_dotenv()
+        api_key = os.getenv("MISTRAL_API_KEY")
 
-NOISE_PATTERNS = [
-    r"^TOPIC$",
-    r"^DATE$",
-    r"^TOPIC\s*_*$",
-    r"^DATE\s*_*$",
-    r"^BEGIN-\d+$",
-    r"^\d+$",
-    r"^TOPIC\s+DATE$",
-]
+    if not api_key:
+        raise Exception("MISTRAL_API_KEY not found in secrets or environment")
 
-REMOVE_LINES_CONTAINING = [
-    "TOPIC",
-    "DATE",
-]
+    return Mistral(api_key=api_key)
+
 
 # =========================================================
-# PREPROCESS PDF
+# PREPROCESS PDF — rasterize to image-based PDF
 # =========================================================
 
-def preprocess_pdf(file_input, dpi=300):
-    """Accepts file path (str) or bytes."""
-
+def preprocess_pdf(file_input, dpi=250):
+    """
+    Accepts file path (str/Path) or raw bytes.
+    Returns rasterized PDF bytes (image-based, OCR-friendly).
+    """
     try:
         if isinstance(file_input, (str, Path)):
             file_bytes = Path(file_input).read_bytes()
         else:
-            file_bytes = file_input
+            file_bytes = bytes(file_input)
 
         src_doc = fitz.open(stream=file_bytes, filetype="pdf")
         out_doc = fitz.open()
 
         for page in src_doc:
             pix = page.get_pixmap(dpi=dpi)
-            new_page = out_doc.new_page(
-                width=pix.width,
-                height=pix.height
-            )
+            new_page = out_doc.new_page(width=pix.width, height=pix.height)
             new_page.insert_image(new_page.rect, pixmap=pix)
 
-        pdf_bytes = io.BytesIO()
-        out_doc.save(pdf_bytes)
+        buf = io.BytesIO()
+        out_doc.save(buf)
         src_doc.close()
         out_doc.close()
-        pdf_bytes.seek(0)
-
-        return pdf_bytes.read()
+        buf.seek(0)
+        return buf.read()
 
     except Exception as e:
         print(f"Preprocessing failed: {e}")
@@ -81,88 +62,94 @@ def preprocess_pdf(file_input, dpi=300):
             return Path(file_input).read_bytes()
         return file_input
 
+
 # =========================================================
-# OCR
+# OCR — one API call per page, tracks real page numbers
 # =========================================================
 
 def run_ocr(file_content: bytes, file_name: str, status_callback=None):
-
+    """
+    Rasterizes each PDF page and sends to Pixtral for OCR.
+    Returns a list of dicts: [{page_number, text}, ...]
+    Page numbers are REAL (1-indexed from the PDF).
+    """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    log("Starting OCR — converting pages to images...")
+    client = get_mistral_client()
 
-    try:
-        src_doc = fitz.open(stream=file_content, filetype="pdf")
-        all_text = []
+    log("Opening PDF for OCR...")
+    src_doc = fitz.open(stream=file_content, filetype="pdf")
+    total_pages = len(src_doc)
+    log(f"PDF has {total_pages} page(s)")
 
-        for page_num, page in enumerate(src_doc):
+    pages_output = []
 
-            pix = page.get_pixmap(dpi=200)
-            img_bytes = pix.tobytes("png")
-            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+    for page_num in range(total_pages):
+        page = src_doc[page_num]
+        pix = page.get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-            log(f"OCR processing page {page_num + 1} of {len(src_doc)}...")
+        log(f"OCR: page {page_num + 1} of {total_pages}...")
 
-            response = client.chat.complete(
-                model="pixtral-12b-2409",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{img_b64}"
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Extract ALL text from this image exactly as it appears. "
-                                    "Preserve structure, section headings, numbering and formatting. "
-                                    "Output only the raw extracted text, nothing else."
-                                )
+        response = client.chat.complete(
+            model="pixtral-12b-2409",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_b64}"
                             }
-                        ]
-                    }
-                ]
-            )
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Extract ALL text from this image exactly as it appears. "
+                                "Preserve the original structure, headings, numbering, "
+                                "and line breaks. Output ONLY the raw extracted text — "
+                                "no commentary, no markdown formatting, no code blocks."
+                            )
+                        }
+                    ]
+                }
+            ]
+        )
 
-            page_text = response.choices[0].message.content
-            if page_text:
-                all_text.append(page_text)
+        page_text = response.choices[0].message.content or ""
+        pages_output.append({
+            "page_number": page_num + 1,   # real 1-indexed page number
+            "text": page_text.strip()
+        })
 
-        src_doc.close()
+    src_doc.close()
+    log(f"OCR complete — {total_pages} pages extracted")
+    return pages_output
 
-        final_text = "\n\n".join(all_text)
-
-        if not final_text.strip():
-            raise Exception("OCR returned empty text")
-
-        log(f"OCR complete — {len(final_text)} characters extracted")
-        return final_text
-
-    except Exception as e:
-        raise Exception(f"OCR failed: {str(e)}")
 
 # =========================================================
-# OCR TO CLEAN JSON
+# BUILD OCR JSON — preserves real page structure
 # =========================================================
 
-def ocr_to_clean_json(raw_text: str):
-
+def build_ocr_json(pages_output: list) -> dict:
+    """
+    Takes the raw OCR output (list of {page_number, text})
+    and deduplicates lines within each page.
+    Does NOT split pages further — page count matches the PDF.
+    """
     pages_data = []
-    raw_pages = raw_text.split("\n\n")
 
-    for idx, page_text in enumerate(raw_pages):
-
+    for page in pages_output:
+        raw_lines = page["text"].split("\n")
         seen = set()
         clean_lines = []
 
-        for line in page_text.split("\n"):
+        for line in raw_lines:
             line = line.strip()
             if not line:
                 continue
@@ -170,307 +157,127 @@ def ocr_to_clean_json(raw_text: str):
                 seen.add(line)
                 clean_lines.append(line)
 
-        if clean_lines:
-            pages_data.append({
-                "page_number": idx + 1,
-                "text": clean_lines
-            })
+        pages_data.append({
+            "page_number": page["page_number"],
+            "text": clean_lines
+        })
 
     return {
         "total_pages": len(pages_data),
         "pages": pages_data
     }
 
+
 # =========================================================
-# TEXT HELPERS
+# EXTRACT Q&A — Claude does the smart extraction
 # =========================================================
 
-def extract_text(data):
+def extract_qa_with_claude(ocr_json: dict, status_callback=None) -> dict:
+    """
+    Sends the full OCR text to Claude and asks it to:
+    1. Identify all questions (whatever structure exists in the doc)
+    2. Find the corresponding answers
+    3. Return structured JSON
 
-    if data is None:
-        return ""
-    if isinstance(data, str):
-        return data
-    if isinstance(data, list):
-        return "\n".join([extract_text(x) for x in data])
-    if isinstance(data, dict):
-        parts = []
-        for key in ["text", "markdown", "content", "value"]:
-            if key in data:
-                parts.append(extract_text(data[key]))
-        if not parts:
-            for v in data.values():
-                parts.append(extract_text(v))
-        return "\n".join(parts)
-    return str(data)
+    No hardcoded section names — works for any document format.
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
 
-def normalize(text):
-    text = str(text).lower()
-    text = text.replace("—", "-")
-    text = re.sub(r'["""\'`]', '', text)
-    text = re.sub(r'[^a-z0-9\s]', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+    log("Sending OCR text to Claude for Q&A extraction...")
 
-def clean_text(text):
-    text = str(text)
-    text = text.replace("\u201c", '"').replace("\u201d", '"').replace("—", "-")
-    cleaned_lines = []
-    for line in text.split("\n"):
-        line_strip = line.strip()
-        skip = any(
-            item.lower() in line_strip.lower()
-            for item in REMOVE_LINES_CONTAINING
-        )
-        if not skip:
-            cleaned_lines.append(line_strip)
-    text = "\n".join(cleaned_lines)
-    return re.sub(r'\s+', ' ', text).strip()
+    # Build full text with page markers so Claude knows the layout
+    full_text_parts = []
+    for page in ocr_json["pages"]:
+        page_text = "\n".join(page["text"])
+        if page_text.strip():
+            full_text_parts.append(
+                f"[PAGE {page['page_number']}]\n{page_text}"
+            )
 
-def is_noise(line):
-    line = clean_text(line)
-    if not line:
-        return True
-    return any(
-        re.match(pattern, line, re.IGNORECASE)
-        for pattern in NOISE_PATTERNS
+    full_text = "\n\n".join(full_text_parts)
+
+    if not full_text.strip():
+        raise Exception("OCR output is empty — nothing to extract")
+
+    prompt = f"""You are an expert at extracting structured question-answer pairs from scanned assignment documents.
+
+Below is the full OCR text of a document (with page markers). Your job is to:
+
+1. Identify ALL questions in the document — they may be numbered, lettered, use roman numerals, or organized into sections. Do not assume any specific format.
+2. For each question, find its corresponding answer (the student's written response).
+3. Return a JSON object in EXACTLY this format — no extra text, no markdown, no code blocks:
+
+{{
+  "total_qa_pairs": <number>,
+  "qa_pairs": [
+    {{
+      "question_id": "<a short unique id, e.g. Q1, A1(i), B3 — infer from the document structure>",
+      "question": "<full question text>",
+      "answer": "<full answer text, or empty string if no answer found>"
+    }}
+  ]
+}}
+
+Rules:
+- Do NOT invent questions or answers
+- If a question has no answer, set answer to ""
+- Clean up obvious OCR artifacts (garbled characters, stray symbols) in both questions and answers
+- Preserve the meaning and wording faithfully
+- question_id should reflect the document's own numbering/lettering scheme
+
+OCR TEXT:
+{full_text}"""
+
+    # Use Anthropic API (Claude) for intelligent extraction
+    import urllib.request
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": "",   # handled by proxy
+        "anthropic-version": "2023-06-01"
+    }
+
+    body = json.dumps({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 4096,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers=headers,
+        method="POST"
     )
 
-def is_roman(token):
-    romans = [
-        "i","ii","iii","iv","v","vi","vii",
-        "viii","ix","x","xi","xii","xiii","xiv","xv"
-    ]
-    return token.lower().strip() in romans
+    with urllib.request.urlopen(req) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
 
-# =========================================================
-# EXTRACT OFFICIAL QUESTIONS
-# =========================================================
+    raw_response = result["content"][0]["text"].strip()
 
-def extract_official_questions(pages):
+    log("Claude responded — parsing JSON...")
 
-    # =========================================================
-    # STEP 1: Find pages containing Section A and Section B
-    # They may be on different pages
-    # =========================================================
+    # Strip markdown code fences if present
+    clean = re.sub(r'^```(?:json)?\s*', '', raw_response, flags=re.MULTILINE)
+    clean = re.sub(r'\s*```$', '', clean, flags=re.MULTILINE)
+    clean = clean.strip()
 
-    section_a_text = None
-    section_b_text = None
-
-    for page in pages:
-
-        text = extract_text(page)
-        normalized = normalize(text)
-
-        if "section a" in normalized and section_a_text is None:
-            section_a_text = text
-
-        if "section b" in normalized and section_b_text is None:
-            section_b_text = text
-
-    # fallback: if both on same page
-    if section_a_text is None and section_b_text is None:
-
-        # try to find any page with question-like content
-        all_text = "\n".join(extract_text(p) for p in pages)
-        normalized_all = normalize(all_text)
-
-        if "section a" not in normalized_all and "section b" not in normalized_all:
-            raise Exception(
-                f"Assignment page (Section A + B) not found.\n"
-                f"Debug — first 500 chars of OCR output:\n"
-                f"{all_text[:500]}"
-            )
-
-        section_a_text = all_text
-        section_b_text = all_text
-
-    # if one is missing, try using all pages combined
-    combined = "\n".join(extract_text(p) for p in pages)
-
-    if section_a_text is None:
-        section_a_text = combined
-
-    if section_b_text is None:
-        section_b_text = combined
-
-    # =========================================================
-    # STEP 2: Parse combined text in one pass
-    # =========================================================
-
-    full_text = combined
-    lines = full_text.split("\n")
-
-    questions = []
-    current_section = None
-
-    for line in lines:
-
-        line = clean_text(line)
-
-        if is_noise(line):
-            continue
-
-        # flexible section detection — handles bold markdown (**Section A**)
-        clean_line = re.sub(r'[*_#]', '', line).strip()
-
-        if re.search(r'section\s*a\b', clean_line, re.IGNORECASE):
-            current_section = "A"
-            continue
-
-        if re.search(r'section\s*b\b', clean_line, re.IGNORECASE):
-            current_section = "B"
-            continue
-
-        # =====================================================
-        # SECTION A — roman numeral questions
-        # =====================================================
-
-        if current_section == "A":
-
-            match = re.match(
-                r'^(?:\d+\s*\.?\s*)?\(?([ivxlcdm]+)\)?[\.\):\s]\s*(.+)',
-                line,
-                re.IGNORECASE
-            )
-
-            if match:
-                roman = match.group(1)
-                qtext = match.group(2).strip()
-
-                if is_roman(roman) and len(qtext) > 10:
-                    questions.append({
-                        "id": f"A1({roman.lower()})",
-                        "question": qtext
-                    })
-
-        # =====================================================
-        # SECTION B — numbered questions
-        # =====================================================
-
-        elif current_section == "B":
-
-            match = re.match(
-                r'^(\d+)[\.\)\s]\s*(.+)',
-                line
-            )
-
-            if match:
-                num = match.group(1)
-                qtext = match.group(2).strip()
-
-                if len(qtext) > 10:
-                    questions.append({
-                        "id": f"B{num}",
-                        "question": qtext
-                    })
-
-    # =========================================================
-    # STEP 3: Deduplicate
-    # =========================================================
-
-    seen = set()
-    unique = []
-
-    for q in questions:
-        key = normalize(q["question"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(q)
-
-    if not unique:
+    try:
+        qa_json = json.loads(clean)
+    except json.JSONDecodeError as e:
         raise Exception(
-            f"Sections found but no questions extracted.\n"
-            f"Debug — first 800 chars of OCR:\n"
-            f"{combined[:800]}"
+            f"Claude returned invalid JSON: {e}\n"
+            f"Raw response (first 500 chars):\n{raw_response[:500]}"
         )
 
-    return unique
+    log(f"Extracted {qa_json.get('total_qa_pairs', 0)} Q&A pairs")
+    return qa_json
 
-# =========================================================
-# PARSE ANSWERS
-# =========================================================
-
-def parse_answers(pages, official_questions):
-
-    qa_map = {}
-    current_qid = None
-    current_question = None
-    current_answer_lines = []
-
-    for page in pages:
-
-        page_text = extract_text(page)
-
-        for raw_line in page_text.split("\n"):
-
-            line = clean_text(raw_line)
-
-            if is_noise(line):
-                continue
-
-            # check if line matches a question
-            best_match = None
-            best_score = 0
-            for q in official_questions:
-                score = fuzz.partial_ratio(
-                    normalize(line), normalize(q["question"])
-                )
-                if score > best_score:
-                    best_score = score
-                    best_match = q
-
-            if best_match and best_score >= SIMILARITY_THRESHOLD:
-
-                if best_match["id"] != current_qid:
-
-                    # save previous
-                    if current_qid:
-                        qa_map[current_qid] = {
-                            "question": current_question,
-                            "answer": clean_answer(" ".join(current_answer_lines))
-                        }
-
-                    current_qid = best_match["id"]
-                    current_question = best_match["question"]
-                    current_answer_lines = []
-                    continue
-
-            if current_qid:
-                if fuzz.partial_ratio(normalize(line), normalize(current_question)) > 90:
-                    continue
-                current_answer_lines.append(line)
-
-    # save last question
-    if current_qid:
-        qa_map[current_qid] = {
-            "question": current_question,
-            "answer": clean_answer(" ".join(current_answer_lines))
-        }
-
-    return qa_map
-
-def clean_answer(answer):
-    answer = clean_text(answer)
-    answer = re.sub(r'TOPIC\s*_*\s*DATE\s*_*\s*', ' ', answer, flags=re.IGNORECASE)
-    return re.sub(r'\s+', ' ', answer).strip()
-
-# =========================================================
-# BUILD JSON
-# =========================================================
-
-def build_json(qa_map):
-    return {
-        "total_qa_pairs": len(qa_map),
-        "qa_pairs": [
-            {
-                "question_id": qid,
-                "question": qa["question"],
-                "answer": qa["answer"]
-            }
-            for qid, qa in qa_map.items()
-        ]
-    }
 
 # =========================================================
 # COMPLETE PIPELINE
@@ -478,45 +285,47 @@ def build_json(qa_map):
 
 def process_pdf(file_input, status_callback=None):
     """
-    Accepts either:
-    - a file path string (local usage)
-    - a Streamlit UploadedFile object (cloud usage)
-    """
+    Accepts:
+    - A Streamlit UploadedFile object
+    - A file path string or Path object (local use)
 
+    Returns: (ocr_json, qa_json)
+    """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    # ── read bytes ──────────────────────────────────────
+    # ── Read bytes ─────────────────────────────────────────
     if isinstance(file_input, (str, Path)):
         file_bytes = Path(file_input).read_bytes()
         file_name = Path(file_input).name
     else:
-        # Streamlit UploadedFile
         file_bytes = file_input.read()
-        file_name = file_input.name
+        file_name = getattr(file_input, "name", "document.pdf")
 
-    log("Preprocessing PDF...")
+    # ── Step 1: Preprocess ─────────────────────────────────
+    log("Preprocessing PDF (rasterizing pages)...")
     processed_bytes = preprocess_pdf(file_bytes)
+    log("Preprocessing complete")
 
-    log("Running OCR...")
-    raw_text = run_ocr(processed_bytes, file_name, status_callback=status_callback)
+    # ── Step 2: OCR ────────────────────────────────────────
+    pages_output = run_ocr(
+        processed_bytes,
+        file_name,
+        status_callback=status_callback
+    )
 
+    # ── Step 3: Build OCR JSON ─────────────────────────────
     log("Building OCR JSON...")
-    ocr_json = ocr_to_clean_json(raw_text)
+    ocr_json = build_ocr_json(pages_output)
+    log(f"OCR JSON ready — {ocr_json['total_pages']} pages")
 
-    pages = ocr_json["pages"]
+    # ── Step 4: Extract Q&A with Claude ───────────────────
+    qa_json = extract_qa_with_claude(
+        ocr_json,
+        status_callback=status_callback
+    )
 
-    log("Extracting questions...")
-    official_questions = extract_official_questions(pages)
-    log(f"Found {len(official_questions)} questions")
-
-    log("Mapping answers...")
-    qa_map = parse_answers(pages, official_questions)
-
-    log("Building final output...")
-    final_json = build_json(qa_map)
-
-    log(f"Done — {final_json['total_qa_pairs']} QA pairs extracted")
-    return ocr_json, final_json
+    log(f"Pipeline complete — {qa_json['total_qa_pairs']} Q&A pairs")
+    return ocr_json, qa_json
