@@ -6,7 +6,7 @@ import fitz
 from pathlib import Path
 import base64
 from rapidfuzz import fuzz
-from mistralai.client import MistralClient
+from mistralai import Mistral
 
 import streamlit as st
 
@@ -16,7 +16,12 @@ import streamlit as st
 
 api_key = st.secrets["MISTRAL_API_KEY"]
 
-client = MistralClient(api_key=api_key)
+
+
+client = Mistral(
+    api_key=api_key
+)
+
 
 # =========================================================
 # CONFIG
@@ -94,10 +99,6 @@ import base64
 
 
 
-# =========================================================
-# OCR
-# =========================================================
-
 
 # =========================================================
 # OCR
@@ -105,121 +106,48 @@ import base64
 
 def run_ocr(file_content: bytes, file_name: str):
 
-    import time
-
-    print("Starting OCR...")
+    print("Uploading file to Mistral OCR...")
 
     try:
 
-        pdf_document = fitz.open(
-            stream=file_content,
-            filetype="pdf"
+        uploaded_file = client.files.upload(
+            file={
+                "file_name": file_name,
+                "content": file_content,
+            },
+            purpose="ocr",
         )
 
-        total_pages = len(pdf_document)
+        print("Getting signed URL...")
+
+        signed_url = client.files.get_signed_url(
+            file_id=uploaded_file.id,
+            expiry=1
+        )
+
+        print("Running OCR...")
+
+        response = client.ocr.process(
+            model="mistral-ocr-latest",
+            document={
+                "type": "document_url",
+                "document_url": signed_url.url
+            }
+        )
 
         all_text = []
 
-        # limit pages to avoid rate limit
-        MAX_PAGES = min(total_pages, 5)
+        for page in response.pages:
 
-        for page_number in range(MAX_PAGES):
-
-            print(f"Processing page {page_number + 1}")
-
-            page = pdf_document.load_page(page_number)
-
-            # extract text directly first
-            direct_text = page.get_text()
-
-            # if text exists use it
-            if direct_text and len(direct_text.strip()) > 50:
-
-                print(f"Direct text extracted from page {page_number + 1}")
-
-                all_text.append(direct_text)
-
-                continue
-
-            # fallback OCR
-            pix = page.get_pixmap(dpi=180)
-
-            image_bytes = pix.tobytes("png")
-
-            base64_image = base64.b64encode(
-                image_bytes
-            ).decode("utf-8")
-
-            retry = 0
-
-            page_text = ""
-
-            while retry < 5:
-
-                try:
-
-                    response = client.chat(
-
-                        model="open-mistral-7b",
-
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": f"""
-You are an OCR engine.
-
-Extract all readable text from this image.
-
-Return plain text only.
-
-IMAGE:
-data:image/png;base64,{base64_image}
-"""
-                            }
-                        ]
-
-                    )
-
-                    page_text = (
-                        response
-                        .choices[0]
-                        .message
-                        .content
-                    )
-
-                    print(f"OCR completed for page {page_number + 1}")
-
-                    break
-
-                except Exception as e:
-
-                    error_message = str(e)
-
-                    print(error_message)
-
-                    if "429" in error_message:
-
-                        print("Rate limit hit. Waiting 20 seconds...")
-
-                        time.sleep(20)
-
-                        retry += 1
-
-                    else:
-
-                        raise Exception(error_message)
-
-            all_text.append(page_text)
-
-        pdf_document.close()
+            all_text.append(page.markdown)
 
         final_text = "\n\n".join(all_text)
 
         if not final_text.strip():
 
-            raise Exception("No text extracted from PDF")
+            raise Exception("No OCR text extracted")
 
-        print("OCR Finished Successfully")
+        print("OCR completed successfully")
 
         return final_text
 
@@ -228,6 +156,7 @@ data:image/png;base64,{base64_image}
         raise Exception(
             f"OCR failed completely: {str(e)}"
         )
+
 
 
 # =========================================================
