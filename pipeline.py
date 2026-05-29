@@ -194,9 +194,7 @@ def extract_qa_with_groq(ocr_json: dict, status_callback=None) -> dict:
     from groq import Groq
     groq_client = Groq(api_key=groq_key)
 
-    log("Building full OCR text...")
-
-    # ── Build full text with real page markers ─────────────
+    # ── Build full text with page markers ─────────────────
     full_text_parts = []
     for page in ocr_json["pages"]:
         page_text = "\n".join(page["text"])
@@ -210,71 +208,193 @@ def extract_qa_with_groq(ocr_json: dict, status_callback=None) -> dict:
     if not full_text.strip():
         raise Exception("OCR output is empty — nothing to extract")
 
-    prompt = f"""You are an expert at extracting structured question-answer pairs from scanned assignment documents.
+    log(f"Total OCR text length: {len(full_text)} characters")
 
-Below is the full OCR text of a document (with page markers). Your job is to:
+    # ── Step 1: Extract questions only first ───────────────
+    log("Step 1: Extracting questions structure...")
 
-1. Identify ALL questions in the document — they may be numbered, lettered, use roman numerals, or organized into sections. Do not assume any specific format.
-2. For each question, find its corresponding answer (the student's written response).
-3. Return a JSON object in EXACTLY this format — no extra text, no markdown, no code blocks:
+    questions_prompt = f"""You are analyzing a scanned assignment document.
+
+Your ONLY task right now is to identify and list ALL the questions in this document.
+
+Return a JSON object in EXACTLY this format — no markdown, no explanation:
 
 {{
-  "total_qa_pairs": <number>,
-  "qa_pairs": [
+  "questions": [
     {{
-      "question_id": "<unique id inferred from document structure, e.g. Q1, A1(i), B3>",
+      "question_id": "<id inferred from document, e.g. Q1, A1(i), B3>",
       "question": "<full question text>",
-      "answer": "<full answer text, or empty string if no answer found>"
+      "approximate_location": "<brief hint like 'page 2, after Section A heading'>"
     }}
   ]
 }}
 
-Rules:
-- Do NOT invent questions or answers
-- If a question has no answer, set answer to ""
-- Clean up obvious OCR artifacts in both questions and answers
-- Preserve meaning and wording faithfully
-- question_id should reflect the document's own numbering scheme
-
 OCR TEXT:
 {full_text}"""
 
-    log("Sending OCR text to Groq for Q&A extraction...")
-
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",  # free, fast, very capable
+    q_response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
         messages=[
             {
                 "role": "system",
-                "content": "You are a precise document extraction assistant. You always respond with valid JSON only — no markdown, no explanation, no code blocks."
+                "content": "You are a precise document extraction assistant. Respond with valid JSON only."
             },
             {
                 "role": "user",
-                "content": prompt
+                "content": questions_prompt
             }
         ],
-        temperature=0,           # deterministic output
-        max_tokens=4096,
-        response_format={"type": "json_object"}  # forces valid JSON
+        temperature=0,
+        max_tokens=2048,
+        response_format={"type": "json_object"}
     )
 
-    raw_response = response.choices[0].message.content.strip()
-    log("Groq responded — parsing JSON...")
+    questions_raw = q_response.choices[0].message.content.strip()
 
-    # Strip markdown fences just in case
-    clean = re.sub(r'^```(?:json)?\s*', '', raw_response, flags=re.MULTILINE)
+    try:
+        questions_data = json.loads(questions_raw)
+        questions_list = questions_data.get("questions", [])
+    except json.JSONDecodeError as e:
+        raise Exception(f"Failed to parse questions JSON: {e}\n{questions_raw[:300]}")
+
+    log(f"Found {len(questions_list)} questions — now extracting full answers...")
+
+    if not questions_list:
+        raise Exception("No questions found in the document")
+
+    # ── Step 2: Extract full answer for each question ──────
+    # Send all questions + full text in one focused call
+    # so Groq has complete context for answer boundaries
+
+    questions_formatted = "\n".join([
+        f"- {q['question_id']}: {q['question']}"
+        for q in questions_list
+    ])
+
+    answers_prompt = f"""You are extracting student answers from a scanned assignment document.
+
+Here are ALL the questions found in the document:
+{questions_formatted}
+
+Below is the full OCR text of the document. For each question above, extract the student's COMPLETE answer.
+
+CRITICAL RULES for answer extraction:
+- Capture the ENTIRE answer — do not truncate, summarize, or paraphrase
+- The answer starts immediately after the question text ends
+- The answer ends where the NEXT question begins (or at end of document)
+- Include every sentence, every word the student wrote
+- If a question has no answer written, use ""
+- Do NOT include the question text itself in the answer field
+- Do NOT add any commentary or notes
+
+Return a JSON object in EXACTLY this format — no markdown, no explanation:
+
+{{
+  "qa_pairs": [
+    {{
+      "question_id": "<same id as above>",
+      "question": "<full question text>",
+      "answer": "<student's COMPLETE answer — every word, nothing cut off>"
+    }}
+  ]
+}}
+
+FULL OCR TEXT:
+{full_text}"""
+
+    log("Extracting complete answers...")
+
+    a_response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a precise document extraction assistant. Extract complete, untruncated answers. Respond with valid JSON only."
+            },
+            {
+                "role": "user",
+                "content": answers_prompt
+            }
+        ],
+        temperature=0,
+        max_tokens=8192,        # increased for full answers
+        response_format={"type": "json_object"}
+    )
+
+    answers_raw = a_response.choices[0].message.content.strip()
+
+    clean = re.sub(r'^```(?:json)?\s*', '', answers_raw, flags=re.MULTILINE)
     clean = re.sub(r'\s*```$', '', clean, flags=re.MULTILINE).strip()
 
     try:
-        qa_json = json.loads(clean)
+        answers_data = json.loads(clean)
     except json.JSONDecodeError as e:
         raise Exception(
-            f"Groq returned invalid JSON: {e}\n"
-            f"Raw response (first 500 chars):\n{raw_response[:500]}"
+            f"Failed to parse answers JSON: {e}\n"
+            f"Raw response (first 500 chars):\n{answers_raw[:500]}"
         )
 
-    log(f"Extracted {qa_json.get('total_qa_pairs', 0)} Q&A pairs")
-    return qa_json
+    qa_pairs = answers_data.get("qa_pairs", [])
+
+    # ── Step 3: If answers still seem short, retry per-question ──
+    SHORT_ANSWER_THRESHOLD = 80   # characters — tune if needed
+
+    short_qa = [
+        q for q in qa_pairs
+        if len(q.get("answer", "")) < SHORT_ANSWER_THRESHOLD
+        and q.get("answer", "") != ""
+    ]
+
+    if short_qa:
+        log(f"{len(short_qa)} answers seem short — retrying those individually...")
+
+        for qa in short_qa:
+            retry_prompt = f"""From the document below, extract the student's COMPLETE answer to this specific question.
+
+QUESTION ({qa['question_id']}): {qa['question']}
+
+Rules:
+- Return ONLY the answer text, nothing else
+- Include every single word the student wrote in response to this question
+- Do not summarize or shorten
+- Stop only when the next question begins or the document ends
+
+FULL OCR TEXT:
+{full_text}"""
+
+            retry_response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Extract the complete answer text exactly as written. Return only the answer, no JSON, no labels."
+                    },
+                    {
+                        "role": "user",
+                        "content": retry_prompt
+                    }
+                ],
+                temperature=0,
+                max_tokens=2048
+            )
+
+            full_answer = retry_response.choices[0].message.content.strip()
+
+            # Update the answer in qa_pairs
+            for q in qa_pairs:
+                if q["question_id"] == qa["question_id"]:
+                    q["answer"] = full_answer
+                    break
+
+            log(f"Retried {qa['question_id']} — got {len(full_answer)} chars")
+
+    final_json = {
+        "total_qa_pairs": len(qa_pairs),
+        "qa_pairs": qa_pairs
+    }
+
+    log(f"Extraction complete — {len(qa_pairs)} Q&A pairs with full answers")
+    return final_json
 
 
 # =========================================================
