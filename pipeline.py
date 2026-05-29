@@ -129,85 +129,76 @@ import base64
 
 def run_ocr(file_content: bytes, file_name: str):
 
+    print("Starting OCR...")
+
     try:
 
-        st.write("Uploading PDF to Mistral OCR...")
-
-        # =====================================================
-        # SAVE TEMP PDF
-        # =====================================================
-
-        temp_path = f"temp_{file_name}"
-
-        with open(temp_path, "wb") as f:
-            f.write(file_content)
-
-        # =====================================================
-        # UPLOAD FILE
-        # =====================================================
-
-        uploaded_file = client.files.create(
-            file=open(temp_path, "rb"),
-            purpose="fine-tune"
+        # Convert PDF to images
+        pdf_document = fitz.open(
+            stream=file_content,
+            filetype="pdf"
         )
 
-        st.write("File uploaded successfully")
+        all_text = []
 
-        # =====================================================
-        # GET FILE URL
-        # =====================================================
+        total_pages = len(pdf_document)
 
-        file_url = uploaded_file.url
+        for page_number in range(total_pages):
 
-        st.write("Running OCR extraction...")
+            print(f"OCR Processing Page {page_number + 1}/{total_pages}")
 
-        # =====================================================
-        # OCR USING CHAT API
-        # =====================================================
+            page = pdf_document.load_page(page_number)
 
-        response = client.chat.complete(
-            model="mistral-large-latest",
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"""
-Extract ALL text from this PDF exactly as written.
+            pix = page.get_pixmap(dpi=200)
 
-Preserve:
-- Questions
-- Answers
-- Line breaks
-- Sections
-- Numbering
+            image_bytes = pix.tobytes("png")
 
-PDF URL:
-{file_url}
+            base64_image = base64.b64encode(
+                image_bytes
+            ).decode("utf-8")
+
+            # Send image directly to chat model
+            response = client.chat(
+                model="mistral-large-latest",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"""
+Extract all text exactly from this image.
+
+Return ONLY plain text.
+
+Image:
+data:image/png;base64,{base64_image}
 """
-                }
-            ]
-        )
+                    }
+                ],
+                temperature=0
+            )
 
-        # =====================================================
-        # CLEANUP
-        # =====================================================
+            page_text = response.choices[0].message.content
 
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+            all_text.append(page_text)
 
-        # =====================================================
-        # RETURN TEXT
-        # =====================================================
+        pdf_document.close()
 
-        extracted_text = response.choices[0].message.content
+        final_text = "\n\n".join(all_text)
 
-        if not extracted_text:
-            raise Exception("OCR returned empty text")
+        print("OCR Completed Successfully")
 
-        return extracted_text
+        return final_text
 
     except Exception as e:
 
         raise Exception(f"OCR failed completely: {str(e)}")
+
+
+
+
+
+# =========================================================
+# OCR TO CLEAN JSON
+# =========================================================
 
 # =========================================================
 # OCR TO CLEAN JSON
@@ -590,35 +581,39 @@ def build_json(qa_map):
 # COMPLETE PIPELINE
 # =========================================================
 
-def process_pdf(uploaded_file):
+# =========================================================
+# COMPLETE PIPELINE
+# =========================================================
 
-    # =====================================================
-    # READ PDF
-    # =====================================================
+def process_pdf(uploaded_file):
 
     file_bytes = uploaded_file.read()
 
     file_name = uploaded_file.name
 
     # =====================================================
-    # OCR
+    # STEP 1 PREPROCESS
+    # =====================================================
+
+    processed_bytes = preprocess_pdf(file_bytes)
+
+    # =====================================================
+    # STEP 2 OCR
     # =====================================================
 
     raw_text = run_ocr(
-        file_bytes,
+        processed_bytes,
         file_name
     )
 
     # =====================================================
-    # OCR JSON
+    # STEP 3 OCR JSON
     # =====================================================
 
-    ocr_json = ocr_to_clean_json(
-        raw_text
-    )
+    ocr_json = ocr_to_clean_json(raw_text)
 
     # =====================================================
-    # EXTRACT QUESTIONS
+    # STEP 4 EXTRACT QUESTIONS
     # =====================================================
 
     pages = ocr_json["pages"]
@@ -628,7 +623,7 @@ def process_pdf(uploaded_file):
     )
 
     # =====================================================
-    # PARSE ANSWERS
+    # STEP 5 PARSE ANSWERS
     # =====================================================
 
     qa_map = parse_answers(
@@ -637,57 +632,9 @@ def process_pdf(uploaded_file):
     )
 
     # =====================================================
-    # FINAL QA JSON
+    # STEP 6 FINAL JSON
     # =====================================================
 
-    final_json = build_json(
-        qa_map
-    )
+    final_json = build_json(qa_map)
 
-    # =====================================================
-    # SAVE OUTPUTS
-    # =====================================================
-
-    os.makedirs("outputs", exist_ok=True)
-
-    ocr_output_path = "outputs/ocr_output.json"
-
-    qa_output_path = "outputs/qa_output.json"
-
-    with open(
-        ocr_output_path,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            ocr_json,
-            f,
-            ensure_ascii=False,
-            indent=4
-        )
-
-    with open(
-        qa_output_path,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            final_json,
-            f,
-            ensure_ascii=False,
-            indent=4
-        )
-
-    # =====================================================
-    # RETURN
-    # =====================================================
-
-    return (
-        ocr_json,
-        final_json,
-        ocr_output_path,
-        qa_output_path
-    )
-
+    return ocr_json, final_json
