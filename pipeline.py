@@ -222,6 +222,20 @@ def is_noise_line(line: str) -> bool:
     return False
 
 
+def strip_leading_label(text: str) -> str:
+    """
+    Remove leading numbering artifacts students write before questions.
+    e.g. "1. (iii) blah" -> "(iii) blah"
+         "Q.1 (ii) blah" -> "(ii) blah"
+         "Ans. 1. blah"  -> "blah"
+    """
+    # strip "Ans." / "Answer" prefix
+    text = re.sub(r'^(?:Ans(?:wer)?[\.\s]+)', '', text.strip(), flags=re.IGNORECASE)
+    # strip leading number+dot/paren like "1. " or "Q1. "
+    text = re.sub(r'^(?:Q\.?\s*)?\d+[\.\)]\s*', '', text.strip(), flags=re.IGNORECASE)
+    return text.strip()
+
+
 def find_question_boundaries_in_answers(
     answer_lines: list,
     questions: list,
@@ -230,6 +244,8 @@ def find_question_boundaries_in_answers(
     """
     Scan answer page lines.
     When a line closely matches a known question, mark it as a boundary.
+    Strips leading number prefixes before matching so
+    "1. (iii) blah" correctly matches question "(iii) blah".
     Returns list of {question_text, line_index}
     """
     boundaries = []
@@ -240,13 +256,20 @@ def find_question_boundaries_in_answers(
         if len(stripped) < 15:
             continue
 
+        # strip leading number prefix that student may have added
+        stripped_clean = strip_leading_label(stripped)
+
         best_score = 0
         best_q = None
 
         for q in questions:
             if q in used_questions:
                 continue
-            score = similarity(stripped, q)
+            # compare both raw and cleaned versions — take best
+            score_raw   = similarity(stripped, q)
+            score_clean = similarity(stripped_clean, q)
+            score = max(score_raw, score_clean)
+
             if score > best_score:
                 best_score = score
                 best_q = q
