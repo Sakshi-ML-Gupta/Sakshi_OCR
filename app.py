@@ -3,21 +3,9 @@ import traceback
 import streamlit as st
 from pipeline import process_pdf
 
-# =========================================================
-# PAGE CONFIG
-# =========================================================
-
-st.set_page_config(
-    page_title="OCR QA Extractor",
-    layout="wide"
-)
-
+st.set_page_config(page_title="OCR QA Extractor", layout="wide")
 st.title("📘 OCR Question Answer Extractor")
-st.markdown("Upload a PDF to extract questions and answers as raw text.")
-
-# =========================================================
-# FILE UPLOAD
-# =========================================================
+st.markdown("Upload a PDF — get raw Q-A pairs, no modifications.")
 
 uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
 
@@ -39,7 +27,7 @@ if uploaded_file is not None:
                 log_lines.append(msg)
                 log_box.code("\n".join(log_lines), language="text")
 
-            status.info("🔄 Starting pipeline...")
+            status.info("🔄 Starting...")
             progress.progress(5)
 
             ocr_json, qa_pairs = process_pdf(
@@ -48,11 +36,11 @@ if uploaded_file is not None:
             )
 
             progress.progress(100)
-            status.success("✅ Pipeline complete!")
+            status.success("✅ Done!")
 
             # ── OCR JSON ──────────────────────────────────
             st.divider()
-            st.subheader("📄 OCR JSON Output")
+            st.subheader("📄 OCR JSON")
             st.json(ocr_json)
             st.download_button(
                 label="⬇ Download OCR JSON",
@@ -63,10 +51,8 @@ if uploaded_file is not None:
 
             # ── QA JSON ───────────────────────────────────
             st.divider()
-            st.subheader("🧠 Question Answer JSON")
-
+            st.subheader("🧠 Q-A Pairs (raw text)")
             st.json(qa_pairs)
-
             st.download_button(
                 label="⬇ Download QA JSON",
                 data=json.dumps(qa_pairs, ensure_ascii=False, indent=2),
