@@ -41,7 +41,7 @@ def preprocess_pdf(file_bytes, dpi=250):
 
 
 # =========================================================
-# OCR — mistral-ocr-latest
+# OCR
 # =========================================================
 
 def run_ocr(file_content: bytes, file_name: str, status_callback=None):
@@ -106,71 +106,47 @@ def build_ocr_json(pages: list) -> dict:
     return {
         "total_pages": len(pages),
         "pages": [
-            {
-                "page_number": p["page_number"],
-                "text": p["raw_text"]
-            }
+            {"page_number": p["page_number"], "text": p["raw_text"]}
             for p in pages
         ]
     }
 
 
 # =========================================================
-# DETECT SPLIT POINT
-# The question paper pages come first.
-# Answer pages start when we see "TOPIC" / "DATE" /
-# answer sheet headers — typical handwritten answer sheet markers.
+# DETECT WHERE ANSWER PAGES START
+# Answer sheets always have TOPIC + DATE printed on them
 # =========================================================
 
 def find_answer_start_page(pages: list) -> int:
-    """
-    Returns the page index (0-based) where answer sheets begin.
-    Heuristic: answer pages contain 'TOPIC' and 'DATE' fields
-    which are printed on answer sheet templates.
-    """
     for i, page in enumerate(pages):
         text = page["raw_text"]
-        # Answer sheet marker: has TOPIC/DATE fields AND question-like content
-        has_answer_marker = (
-            re.search(r'\bTOPIC\b', text) and
-            re.search(r'\bDATE\b', text)
-        )
-        if has_answer_marker:
+        if re.search(r'\bTOPIC\b', text) and re.search(r'\bDATE\b', text):
             return i
-    # fallback: second half
     return len(pages) // 2
 
 
 # =========================================================
 # EXTRACT QUESTIONS FROM QUESTION PAGES
-# Reads only question paper pages, returns list of raw question strings
 # =========================================================
 
-def extract_questions_from_pages(pages: list, end_page_idx: int) -> list:
-    """
-    Collects all question text from pages 0..end_page_idx-1.
-    A question is any line that starts with a question label pattern
-    AND is long enough to be a real question (not a heading).
-    """
+def extract_questions_from_pages(pages: list, end_idx: int) -> list:
     LABEL_PATTERNS = [
-        r'^\(?[ivxIVX]+[\.\)]\s+\S',       # (i) (ii) i. ii.
-        r'^\d+[\.\)]\s+\S',                  # 1. 2. 3)
-        r'^Q\.?\s*\d+[\.\):\s]',             # Q1. Q1) Q.1
+        r'^\(?[ivxIVX]+[\.\)]\s+\S',
+        r'^\d+[\.\)]\s+\S',
+        r'^Q\.?\s*\d+[\.\):\s]',
     ]
 
     questions = []
-    for page in pages[:end_page_idx]:
-        lines = page["raw_text"].split("\n")
-        for i, line in enumerate(lines):
+    for page in pages[:end_idx]:
+        for line in page["raw_text"].split("\n"):
             stripped = line.strip()
             if len(stripped) < 20:
-                continue  # too short to be a real question
+                continue
             for pat in LABEL_PATTERNS:
                 if re.match(pat, stripped):
                     questions.append(stripped)
                     break
 
-    # deduplicate while preserving order
     seen = set()
     unique = []
     for q in questions:
@@ -183,14 +159,10 @@ def extract_questions_from_pages(pages: list, end_page_idx: int) -> list:
 
 
 # =========================================================
-# EXTRACT ANSWERS FROM ANSWER PAGES
-# Each answer page has the question repeated at the top,
-# followed by the student's answer.
-# We split on those repeated question headers.
+# TEXT HELPERS
 # =========================================================
 
 def normalize(text: str) -> str:
-    """Lowercase, collapse whitespace, strip punctuation for fuzzy compare."""
     text = text.lower()
     text = re.sub(r'[^\w\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text)
@@ -198,7 +170,6 @@ def normalize(text: str) -> str:
 
 
 def similarity(a: str, b: str) -> float:
-    """Simple word-overlap similarity between two strings."""
     wa = set(normalize(a).split())
     wb = set(normalize(b).split())
     if not wa or not wb:
@@ -206,15 +177,20 @@ def similarity(a: str, b: str) -> float:
     return len(wa & wb) / max(len(wa), len(wb))
 
 
+def strip_leading_label(text: str) -> str:
+    text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text.strip(), flags=re.IGNORECASE)
+    text = re.sub(r'^(?:Q\.?\s*)?\d+[.)]\s*', '', text.strip(), flags=re.IGNORECASE)
+    return text.strip()
+
+
 def is_noise_line(line: str) -> bool:
-    """Lines that are printed on answer sheet template — not content."""
     patterns = [
         r'^\s*TOPIC\s*$',
         r'^\s*DATE\s*$',
         r'TOPIC\s*_+',
         r'DATE\s*_+',
-        r'^\s*\d+\s*$',           # lone page numbers
-        r'^\s*[-_]+\s*$',         # divider lines
+        r'^\s*\d+\s*$',
+        r'^\s*[-_]+\s*$',
     ]
     for p in patterns:
         if re.search(p, line, re.IGNORECASE):
@@ -222,79 +198,92 @@ def is_noise_line(line: str) -> bool:
     return False
 
 
-def strip_leading_label(text: str) -> str:
-    """
-    Remove leading numbering artifacts students write before questions.
-    e.g. "1. (iii) blah" -> "(iii) blah"
-         "Q.1 (ii) blah" -> "(ii) blah"
-         "Ans. 1. blah"  -> "blah"
-    """
-    # strip "Ans." / "Answer" prefix
-    text = re.sub(r'^(?:Ans(?:wer)?[\.\s]+)', '', text.strip(), flags=re.IGNORECASE)
-    # strip leading number+dot/paren like "1. " or "Q1. "
-    text = re.sub(r'^(?:Q\.?\s*)?\d+[\.\)]\s*', '', text.strip(), flags=re.IGNORECASE)
-    return text.strip()
+# =========================================================
+# FIND QUESTION BOUNDARIES IN ANSWER PAGES
+# Sliding window matcher — handles questions split across lines
+# Only triggers on lines that look like question labels
+# =========================================================
+
+# Matches lines that START with a question label pattern:
+# optional "1." prefix, then roman numeral / number / quote char
+LABEL_RE = re.compile(
+    r"^\s*(?:(?:Q\.?\s*)?\d+[.)]\s*)?"
+    r'(?:\(?[ivxIVX]+[.)]\s|\d+[.)]\s|")'
+)
 
 
 def find_question_boundaries_in_answers(
     answer_lines: list,
     questions: list,
-    similarity_threshold: float = 0.45
+    similarity_threshold: float = 0.40,
+    window: int = 4
 ) -> list:
     """
-    Scan answer page lines.
-    When a line closely matches a known question, mark it as a boundary.
-    Strips leading number prefixes before matching so
-    "1. (iii) blah" correctly matches question "(iii) blah".
-    Returns list of {question_text, line_index}
+    - Only inspects lines that match LABEL_RE (looks like a question start)
+    - Joins up to `window` consecutive lines before scoring
+      so questions split across multiple OCR lines are caught
+    - Strips "1. (iii)..." -> "(iii)..." before comparing
     """
     boundaries = []
     used_questions = set()
+    used_line_indices = set()
 
-    for i, line in enumerate(answer_lines):
-        stripped = line.strip()
-        if len(stripped) < 15:
+    for i in range(len(answer_lines)):
+
+        line_i = answer_lines[i].strip()
+
+        # skip lines that don't look like question labels at all
+        if not LABEL_RE.match(line_i):
             continue
 
-        # strip leading number prefix that student may have added
-        stripped_clean = strip_leading_label(stripped)
+        for w in range(1, window + 1):
+            if i + w > len(answer_lines):
+                break
 
-        best_score = 0
-        best_q = None
+            combined = " ".join(
+                answer_lines[i + k].strip()
+                for k in range(w)
+                if answer_lines[i + k].strip()
+            )
 
-        for q in questions:
-            if q in used_questions:
+            if len(combined) < 15:
                 continue
-            # compare both raw and cleaned versions — take best
-            score_raw   = similarity(stripped, q)
-            score_clean = similarity(stripped_clean, q)
-            score = max(score_raw, score_clean)
 
-            if score > best_score:
-                best_score = score
-                best_q = q
+            combined_clean = strip_leading_label(combined)
 
-        if best_q and best_score >= similarity_threshold:
-            boundaries.append({
-                "question": best_q,
-                "line_index": i
-            })
-            used_questions.add(best_q)
+            best_score = 0
+            best_q = None
 
+            for q in questions:
+                if q in used_questions:
+                    continue
+                score = max(
+                    similarity(combined, q),
+                    similarity(combined_clean, q)
+                )
+                if score > best_score:
+                    best_score = score
+                    best_q = q
+
+            if best_q and best_score >= similarity_threshold:
+                if i not in used_line_indices:
+                    boundaries.append({
+                        "question": best_q,
+                        "line_index": i
+                    })
+                    used_questions.add(best_q)
+                    used_line_indices.add(i)
+                break
+
+    boundaries.sort(key=lambda b: b["line_index"])
     return boundaries
 
 
 # =========================================================
-# SLICE RAW ANSWERS — zero LLM, pure text slicing
+# SLICE RAW ANSWERS
 # =========================================================
 
 def slice_raw_answers(answer_lines: list, boundaries: list) -> list:
-    """
-    For each boundary:
-      question = the matched question text (from question paper)
-      answer   = raw lines from (boundary line + 1) to (next boundary - 1)
-                 with noise lines removed
-    """
     qa_pairs = []
 
     for i, b in enumerate(boundaries):
@@ -305,17 +294,15 @@ def slice_raw_answers(answer_lines: list, boundaries: list) -> list:
         else:
             a_end = len(answer_lines)
 
-        raw_lines = []
-        for j in range(a_start, a_end):
-            line = answer_lines[j]
-            if not is_noise_line(line):
-                raw_lines.append(line)
-
-        answer_text = "\n".join(raw_lines).strip()
+        raw_lines = [
+            answer_lines[j]
+            for j in range(a_start, a_end)
+            if not is_noise_line(answer_lines[j])
+        ]
 
         qa_pairs.append({
-            "question": b["question"],   # clean question from question paper
-            "answer": answer_text         # raw OCR text from answer pages
+            "question": b["question"],
+            "answer": "\n".join(raw_lines).strip()
         })
 
     return qa_pairs
@@ -331,7 +318,6 @@ def process_pdf(file_input, status_callback=None):
         if status_callback:
             status_callback(msg)
 
-    # ── Read bytes ─────────────────────────────────────────
     if isinstance(file_input, (str, Path)):
         file_bytes = Path(file_input).read_bytes()
         file_name  = Path(file_input).name
@@ -339,54 +325,46 @@ def process_pdf(file_input, status_callback=None):
         file_bytes = file_input.read()
         file_name  = getattr(file_input, "name", "document.pdf")
 
-    # ── Preprocess ────────────────────────────────────────
     log("Preprocessing PDF...")
     processed = preprocess_pdf(file_bytes)
 
-    # ── OCR ───────────────────────────────────────────────
     pages = run_ocr(processed, file_name, status_callback)
 
-    # ── Build OCR JSON ────────────────────────────────────
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    # ── Find where answer pages start ─────────────────────
     answer_start = find_answer_start_page(pages)
-    log(f"Question pages: 1 to {answer_start} | Answer pages: {answer_start + 1} to {len(pages)}")
+    log(f"Question pages: 1-{answer_start} | Answer pages: {answer_start+1}-{len(pages)}")
 
-    # ── Extract questions from question pages ──────────────
-    log("Extracting questions from question paper...")
+    log("Extracting questions from question pages...")
     questions = extract_questions_from_pages(pages, answer_start)
-    log(f"Found {len(questions)} questions: {[q[:60] for q in questions]}")
+    log(f"Found {len(questions)} questions")
 
     if not questions:
         raise Exception(
-            "No questions found in question pages.\n"
+            "No questions found.\n"
             f"First page preview:\n{pages[0]['raw_text'][:400]}"
         )
 
-    # ── Flatten answer page lines ──────────────────────────
     log("Flattening answer pages...")
     answer_lines = []
     for page in pages[answer_start:]:
         for line in page["raw_text"].split("\n"):
             answer_lines.append(line)
 
-    # ── Find question boundaries in answer pages ───────────
-    log("Matching questions in answer pages...")
+    log("Matching question boundaries in answer pages...")
     boundaries = find_question_boundaries_in_answers(answer_lines, questions)
-    log(f"Matched {len(boundaries)} question boundaries")
+    log(f"Matched {len(boundaries)} of {len(questions)} question boundaries")
 
     if not boundaries:
         raise Exception(
             "Could not match any questions in answer pages.\n"
-            f"Questions found: {questions}\n"
+            f"Questions: {questions}\n"
             f"First 20 answer lines:\n" + "\n".join(answer_lines[:20])
         )
 
-    # ── Slice raw answers ──────────────────────────────────
-    log("Slicing raw answers (no LLM)...")
+    log("Slicing raw answers...")
     qa_pairs = slice_raw_answers(answer_lines, boundaries)
 
     log(f"Done — {len(qa_pairs)} Q-A pairs")
