@@ -4,6 +4,7 @@ import re
 import json
 import fitz
 import base64
+import httpx
 from pathlib import Path
 from mistralai import Mistral
 
@@ -11,30 +12,28 @@ from mistralai import Mistral
 # CLIENT SETUP
 # =========================================================
 
-def get_mistral_client():
+def get_api_key(name):
     try:
         import streamlit as st
-        api_key = st.secrets["MISTRAL_API_KEY"]
+        return st.secrets[name]
     except Exception:
         from dotenv import load_dotenv
         load_dotenv()
-        api_key = os.getenv("MISTRAL_API_KEY")
+        return os.getenv(name)
+
+
+def get_mistral_client():
+    api_key = get_api_key("MISTRAL_API_KEY")
     if not api_key:
         raise Exception("MISTRAL_API_KEY not found")
     return Mistral(api_key=api_key)
 
 
 def get_groq_client():
-    try:
-        import streamlit as st
-        groq_key = st.secrets["GROQ_API_KEY"]
-    except Exception:
-        from dotenv import load_dotenv
-        load_dotenv()
-        groq_key = os.getenv("GROQ_API_KEY")
+    from groq import Groq
+    groq_key = get_api_key("GROQ_API_KEY")
     if not groq_key:
         raise Exception("GROQ_API_KEY not found")
-    from groq import Groq
     return Groq(api_key=groq_key)
 
 
@@ -72,7 +71,7 @@ def preprocess_pdf(file_input, dpi=250):
 
 
 # =========================================================
-# OCR — one call per page, returns real page boundaries
+# OCR — dedicated mistral-ocr-latest, pure transcription
 # =========================================================
 
 def run_ocr(file_content: bytes, file_name: str, status_callback=None):
@@ -81,41 +80,20 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         if status_callback:
             status_callback(msg)
 
+    api_key = get_api_key("MISTRAL_API_KEY")
     client = get_mistral_client()
-
-    src_doc = fitz.open(stream=file_content, filetype="pdf")
-    total_pages = len(src_doc)
-    log(f"PDF has {total_pages} page(s)")
-    src_doc.close()
 
     log("Uploading PDF to Mistral OCR...")
 
-    # ── Upload file ────────────────────────────────────────
     uploaded = client.files.upload(
-        file={
-            "file_name": file_name,
-            "content": file_content
-        },
+        file={"file_name": file_name, "content": file_content},
         purpose="ocr"
     )
     log(f"Uploaded: {uploaded.id}")
 
-    # ── Get signed URL ─────────────────────────────────────
     signed = client.files.get_signed_url(file_id=uploaded.id, expiry=1)
-    log("Got signed URL, running OCR...")
+    log("Running mistral-ocr-latest (pure transcription)...")
 
-    # ── Run dedicated OCR model ────────────────────────────
-    import httpx, json as _json
-
-    try:
-        import streamlit as st
-        api_key = st.secrets["MISTRAL_API_KEY"]
-    except Exception:
-        from dotenv import load_dotenv
-        load_dotenv()
-        api_key = os.getenv("MISTRAL_API_KEY")
-
-    # Call OCR endpoint directly via httpx
     resp = httpx.post(
         "https://api.mistral.ai/v1/ocr",
         headers={
@@ -130,16 +108,14 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
             },
             "include_image_base64": False
         },
-        timeout=120
+        timeout=180
     )
 
     if resp.status_code != 200:
         raise Exception(f"OCR API error {resp.status_code}: {resp.text}")
 
     ocr_data = resp.json()
-    log("OCR complete — parsing pages...")
 
-    # ── Parse pages ────────────────────────────────────────
     pages_output = []
     for page in ocr_data.get("pages", []):
         pages_output.append({
@@ -147,35 +123,28 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
             "text": page.get("markdown", "").strip()
         })
 
-    log(f"Extracted {len(pages_output)} pages")
-
-    # ── Cleanup ────────────────────────────────────────────
     try:
         client.files.delete(file_id=uploaded.id)
-        log("Temp file deleted")
     except Exception:
         pass
 
+    log(f"OCR complete — {len(pages_output)} pages extracted")
     return pages_output
 
+
 # =========================================================
-# BUILD OCR JSON — real page structure, no fake splitting
+# BUILD OCR JSON
 # =========================================================
 
 def build_ocr_json(pages_output: list) -> dict:
     pages_data = []
-
     for page in pages_output:
-        # Keep lines as-is, just strip empty lines
-        raw_lines = page["text"].split("\n")
-        lines = [l for l in raw_lines if l.strip()]
-
+        raw_lines = [l for l in page["text"].split("\n") if l.strip()]
         pages_data.append({
             "page_number": page["page_number"],
-            "text": lines,
-            "raw_text": page["text"]   # preserve full raw text too
+            "text": raw_lines,
+            "raw_text": page["text"]
         })
-
     return {
         "total_pages": len(pages_data),
         "pages": pages_data
@@ -183,30 +152,16 @@ def build_ocr_json(pages_output: list) -> dict:
 
 
 # =========================================================
-# BUILD FLAT LINE INDEX
-# Each entry: {line_index, page_number, text}
-# This is what we slice for answers — pure OCR text
+# STEP 1 — GROQ: Find which pages have questions vs answers
 # =========================================================
 
-def build_line_index(ocr_json: dict) -> list:
-    line_index = []
-    for page in ocr_json["pages"]:
-        for line in page["text"]:
-            if line.strip():
-                line_index.append({
-                    "page_number": page["page_number"],
-                    "text": line          # raw, unmodified
-                })
-    return line_index
-
-
-# =========================================================
-# USE GROQ ONLY TO FIND QUESTION POSITIONS
-# Returns list of {question_id, question_text, line_hint}
-# Groq only identifies — it does NOT touch answer text
-# =========================================================
-
-def find_questions_with_groq(ocr_json: dict, status_callback=None) -> list:
+def detect_document_structure(ocr_json: dict, status_callback=None) -> dict:
+    """
+    Ask Groq to look at the full document and tell us:
+    - Which pages contain the questions
+    - Which pages contain the answers
+    - The list of all question IDs found
+    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -214,119 +169,210 @@ def find_questions_with_groq(ocr_json: dict, status_callback=None) -> list:
 
     groq_client = get_groq_client()
 
-    # Build full text with line numbers so Groq can reference them
-    line_index = build_line_index(ocr_json)
-    numbered_lines = "\n".join([
-        f"[L{i}] {entry['text']}"
-        for i, entry in enumerate(line_index)
-    ])
+    # Build a page summary — just first 300 chars per page so it fits
+    page_summaries = []
+    for page in ocr_json["pages"]:
+        preview = page["raw_text"][:300].replace("\n", " ")
+        page_summaries.append(f"[PAGE {page['page_number']}]: {preview}")
 
-    # Chunk if too large — only need first ~15000 chars for question detection
-    # Questions are usually not spread across the entire doc
-    text_for_groq = numbered_lines[:15000]
+    summary_text = "\n\n".join(page_summaries)
 
-    log("Asking Groq to locate questions (line numbers only)...")
+    prompt = f"""You are analyzing a scanned assignment document.
 
-    prompt = f"""You are reading a numbered line dump of a scanned assignment document.
-Each line is prefixed with its line number like [L0], [L1], [L2], etc.
+Below is a preview of each page. Based on the content:
+1. Identify which pages contain QUESTIONS
+2. Identify which pages contain ANSWERS (student responses)
+3. List all question IDs you can see (e.g. Q1, A1(i), B3, 1, i, ii, etc.)
 
-Your ONLY job: identify every question and return the line number where each question starts.
+Return ONLY this JSON:
+{{
+  "question_pages": [<list of page numbers that have questions>],
+  "answer_pages": [<list of page numbers that have answers>],
+  "question_ids": [<list of question ids in order as they appear>]
+}}
 
-Return ONLY this JSON — no markdown, no explanation:
+PAGE PREVIEWS:
+{summary_text}"""
+
+    resp = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You analyze document structure. Return valid JSON only."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0,
+        max_tokens=1024,
+        response_format={"type": "json_object"}
+    )
+
+    raw = resp.choices[0].message.content.strip()
+    clean = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+    clean = re.sub(r'\s*```$', '', clean, flags=re.MULTILINE).strip()
+
+    structure = json.loads(clean)
+    log(f"Document structure: question pages={structure.get('question_pages')}, answer pages={structure.get('answer_pages')}")
+    log(f"Question IDs found: {structure.get('question_ids')}")
+    return structure
+
+
+# =========================================================
+# STEP 2 — GROQ: Extract questions from question pages
+# =========================================================
+
+def extract_questions(ocr_json: dict, question_pages: list, status_callback=None) -> list:
+    """
+    From the question pages, extract each question with its ID.
+    Groq only reads question pages — copies verbatim.
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    groq_client = get_groq_client()
+
+    # Build text only from question pages
+    q_text_parts = []
+    for page in ocr_json["pages"]:
+        if page["page_number"] in question_pages:
+            q_text_parts.append(
+                f"[PAGE {page['page_number']}]\n{page['raw_text']}"
+            )
+
+    q_text = "\n\n".join(q_text_parts)[:14000]
+
+    prompt = f"""Extract every question from this text. Copy question text EXACTLY as it appears — no corrections.
+
+Return ONLY this JSON:
 {{
   "questions": [
     {{
-      "question_id": "<id from document numbering, e.g. Q1, A1(i), B3>",
-      "question_text": "<exact text of the question line, copied verbatim>",
-      "start_line": <integer line number where this question starts>
+      "question_id": "<id from document>",
+      "question": "<exact verbatim question text>"
     }}
   ]
 }}
 
-NUMBERED LINES:
-{text_for_groq}"""
+TEXT:
+{q_text}"""
 
-    response = groq_client.chat.completions.create(
+    resp = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {
-                "role": "system",
-                "content": "You identify question locations by line number. Return valid JSON only."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "system", "content": "Copy text verbatim. Return valid JSON only."},
+            {"role": "user", "content": prompt}
         ],
         temperature=0,
         max_tokens=2048,
         response_format={"type": "json_object"}
     )
 
-    raw = response.choices[0].message.content.strip()
-
+    raw = resp.choices[0].message.content.strip()
     clean = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
     clean = re.sub(r'\s*```$', '', clean, flags=re.MULTILINE).strip()
-
-    try:
-        data = json.loads(clean)
-    except json.JSONDecodeError as e:
-        raise Exception(f"Groq JSON parse error: {e}\n{raw[:400]}")
-
+    data = json.loads(clean)
     questions = data.get("questions", [])
-    log(f"Groq identified {len(questions)} question(s)")
-    return questions, line_index
+    log(f"Extracted {len(questions)} questions")
+    return questions
 
 
 # =========================================================
-# SLICE RAW OCR TEXT FOR ANSWERS
-# Pure text slicing — zero LLM involvement
+# STEP 3 — RAW SLICING: Extract answers from answer pages
+# No LLM touches the answer text at all
 # =========================================================
 
-def slice_answers_from_ocr(questions: list, line_index: list) -> list:
+def extract_answers_raw(ocr_json: dict, answer_pages: list, question_ids: list, status_callback=None) -> dict:
     """
-    For each question, the answer = all lines between
-    (question start line + 1) and (next question start line - 1).
-    Raw text only. No LLM. No modification.
+    Pure text slicing — zero LLM involvement.
+
+    Strategy:
+    - Concatenate all answer pages into one flat line list
+    - Each line gets a global index
+    - Scan lines to find where each question_id appears (as a header/label)
+    - Everything between question_id[n] marker and question_id[n+1] marker = raw answer
     """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
 
-    if not questions:
-        return []
+    # Build flat line list from answer pages only
+    all_lines = []
+    for page in ocr_json["pages"]:
+        if page["page_number"] in answer_pages:
+            for line in page["text"]:
+                all_lines.append({
+                    "page": page["page_number"],
+                    "text": line
+                })
 
-    # Sort questions by their start line
-    questions_sorted = sorted(questions, key=lambda q: q.get("start_line", 0))
+    if not all_lines:
+        log("No answer pages found — trying all pages")
+        for page in ocr_json["pages"]:
+            for line in page["text"]:
+                all_lines.append({
+                    "page": page["page_number"],
+                    "text": line
+                })
 
-    qa_pairs = []
+    log(f"Total lines in answer section: {len(all_lines)}")
 
-    for i, q in enumerate(questions_sorted):
-        start = q.get("start_line", 0)
+    # Find where each question_id appears as a label in the answer pages
+    # A question label line is a short line that matches the question_id pattern
+    def line_matches_qid(line_text, qid):
+        """Check if this line is the answer-section header for this question."""
+        stripped = line_text.strip().rstrip(".:)-").strip()
+        # exact match
+        if stripped.lower() == qid.lower():
+            return True
+        # line starts with the qid followed by punctuation/space
+        pattern = r'^' + re.escape(qid) + r'[\s\.\)\:\-]'
+        if re.match(pattern, line_text.strip(), re.IGNORECASE):
+            return True
+        return False
 
-        # Answer starts one line after the question
-        answer_start = start + 1
+    # Find start positions of each question_id in the answer lines
+    positions = {}   # qid -> line index
 
-        # Answer ends one line before the next question
-        if i + 1 < len(questions_sorted):
-            answer_end = questions_sorted[i + 1].get("start_line", len(line_index))
+    for qid in question_ids:
+        for i, line in enumerate(all_lines):
+            if line_matches_qid(line["text"], qid):
+                if qid not in positions:  # take first occurrence
+                    positions[qid] = i
+                    break
+
+    log(f"Found answer positions for {len(positions)} of {len(question_ids)} questions")
+    log(f"Matched: {list(positions.keys())}")
+
+    # Sort by position
+    sorted_qids = sorted(positions.keys(), key=lambda q: positions[q])
+
+    # Slice raw lines between markers
+    answers = {}
+
+    for idx, qid in enumerate(sorted_qids):
+        start = positions[qid] + 1   # line after the qid label
+
+        if idx + 1 < len(sorted_qids):
+            end = positions[sorted_qids[idx + 1]]
         else:
-            answer_end = len(line_index)
+            end = len(all_lines)
 
-        # Slice raw lines directly — no processing
         answer_lines = [
-            line_index[j]["text"]
-            for j in range(answer_start, answer_end)
-            if j < len(line_index)
+            all_lines[j]["text"]
+            for j in range(start, end)
+            if all_lines[j]["text"].strip()
         ]
 
-        # Join with newline to preserve paragraph structure
-        raw_answer = "\n".join(answer_lines).strip()
+        answers[qid] = "\n".join(answer_lines)   # raw, untouched
 
-        qa_pairs.append({
-            "question_id": q["question_id"],
-            "question": q["question_text"],
-            "answer": raw_answer      # 100% raw OCR text, untouched
-        })
+    # For any question_id with no position found, store empty string
+    for qid in question_ids:
+        if qid not in answers:
+            log(f"No answer marker found for {qid} — storing empty")
+            answers[qid] = ""
 
-    return qa_pairs
+    return answers
 
 
 # =========================================================
@@ -352,34 +398,57 @@ def process_pdf(file_input, status_callback=None):
     processed_bytes = preprocess_pdf(file_bytes)
 
     # ── Step 2: OCR ────────────────────────────────────────
-    pages_output = run_ocr(
-        processed_bytes,
-        file_name,
-        status_callback=status_callback
-    )
+    pages_output = run_ocr(processed_bytes, file_name, status_callback)
 
     # ── Step 3: Build OCR JSON ─────────────────────────────
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages_output)
-    log(f"OCR JSON ready — {ocr_json['total_pages']} real pages")
+    log(f"OCR complete — {ocr_json['total_pages']} real pages")
 
-    # ── Step 4: Groq locates questions (line numbers only) ─
-    questions, line_index = find_questions_with_groq(
-        ocr_json,
-        status_callback=status_callback
-    )
+    # ── Step 4: Detect structure ───────────────────────────
+    log("Detecting document structure (question pages vs answer pages)...")
+    structure = detect_document_structure(ocr_json, status_callback)
+
+    question_pages = structure.get("question_pages", [])
+    answer_pages   = structure.get("answer_pages", [])
+    question_ids   = structure.get("question_ids", [])
+
+    # Fallback if detection failed
+    if not question_pages:
+        log("Could not detect question pages — using first half of document")
+        mid = max(1, ocr_json["total_pages"] // 2)
+        question_pages = list(range(1, mid + 1))
+        answer_pages   = list(range(mid + 1, ocr_json["total_pages"] + 1))
+
+    # ── Step 5: Extract questions (Groq, verbatim copy) ────
+    log("Extracting questions from question pages...")
+    questions = extract_questions(ocr_json, question_pages, status_callback)
 
     if not questions:
-        raise Exception("No questions found in the document")
+        raise Exception("No questions found in question pages")
 
-    # ── Step 5: Slice raw OCR text for answers ─────────────
-    log("Slicing raw OCR text for answers (no LLM)...")
-    qa_pairs = slice_answers_from_ocr(questions, line_index)
+    # Use question_ids from structure detection if Groq extraction missed any
+    if not question_ids:
+        question_ids = [q["question_id"] for q in questions]
+
+    # ── Step 6: Extract answers (raw slicing, zero LLM) ───
+    log("Extracting raw answers from answer pages (no LLM)...")
+    answers = extract_answers_raw(ocr_json, answer_pages, question_ids, status_callback)
+
+    # ── Step 7: Build final JSON ───────────────────────────
+    qa_pairs = []
+    for q in questions:
+        qid = q["question_id"]
+        qa_pairs.append({
+            "question_id": qid,
+            "question": q["question"],
+            "answer": answers.get(qid, "")
+        })
 
     final_json = {
         "total_qa_pairs": len(qa_pairs),
         "qa_pairs": qa_pairs
     }
 
-    log(f"Done — {len(qa_pairs)} Q&A pairs, answers are raw OCR text")
+    log(f"Done — {len(qa_pairs)} Q&A pairs, answers are 100% raw OCR text")
     return ocr_json, final_json
