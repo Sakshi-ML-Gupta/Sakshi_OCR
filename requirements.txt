@@ -4,3 +4,4 @@ pymupdf
 rapidfuzz
 python-dotenv
 groq
+httpx

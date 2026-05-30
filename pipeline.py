@@ -82,55 +82,81 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
             status_callback(msg)
 
     client = get_mistral_client()
+
     src_doc = fitz.open(stream=file_content, filetype="pdf")
     total_pages = len(src_doc)
     log(f"PDF has {total_pages} page(s)")
+    src_doc.close()
 
+    log("Uploading PDF to Mistral OCR...")
+
+    # ── Upload file ────────────────────────────────────────
+    uploaded = client.files.upload(
+        file={
+            "file_name": file_name,
+            "content": file_content
+        },
+        purpose="ocr"
+    )
+    log(f"Uploaded: {uploaded.id}")
+
+    # ── Get signed URL ─────────────────────────────────────
+    signed = client.files.get_signed_url(file_id=uploaded.id, expiry=1)
+    log("Got signed URL, running OCR...")
+
+    # ── Run dedicated OCR model ────────────────────────────
+    import httpx, json as _json
+
+    try:
+        import streamlit as st
+        api_key = st.secrets["MISTRAL_API_KEY"]
+    except Exception:
+        from dotenv import load_dotenv
+        load_dotenv()
+        api_key = os.getenv("MISTRAL_API_KEY")
+
+    # Call OCR endpoint directly via httpx
+    resp = httpx.post(
+        "https://api.mistral.ai/v1/ocr",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": "mistral-ocr-latest",
+            "document": {
+                "type": "document_url",
+                "document_url": signed.url
+            },
+            "include_image_base64": False
+        },
+        timeout=120
+    )
+
+    if resp.status_code != 200:
+        raise Exception(f"OCR API error {resp.status_code}: {resp.text}")
+
+    ocr_data = resp.json()
+    log("OCR complete — parsing pages...")
+
+    # ── Parse pages ────────────────────────────────────────
     pages_output = []
-
-    for page_num in range(total_pages):
-        page = src_doc[page_num]
-        pix = page.get_pixmap(dpi=200)
-        img_bytes = pix.tobytes("png")
-        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-
-        log(f"OCR: page {page_num + 1} of {total_pages}...")
-
-        response = client.chat.complete(
-            model="pixtral-12b-2409",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                "Transcribe every character from this image exactly as it appears. "
-                                "Do not correct spelling, grammar, or punctuation. "
-                                "Do not add, remove, or change any word. "
-                                "Preserve all line breaks and paragraph structure. "
-                                "Output only the raw transcribed text, nothing else."
-                            )
-                        }
-                    ]
-                }
-            ]
-        )
-
-        page_text = response.choices[0].message.content or ""
+    for page in ocr_data.get("pages", []):
         pages_output.append({
-            "page_number": page_num + 1,
-            "text": page_text.strip()
+            "page_number": page.get("index", 0) + 1,
+            "text": page.get("markdown", "").strip()
         })
 
-    src_doc.close()
-    log(f"OCR complete — {total_pages} pages")
-    return pages_output
+    log(f"Extracted {len(pages_output)} pages")
 
+    # ── Cleanup ────────────────────────────────────────────
+    try:
+        client.files.delete(file_id=uploaded.id)
+        log("Temp file deleted")
+    except Exception:
+        pass
+
+    return pages_output
 
 # =========================================================
 # BUILD OCR JSON — real page structure, no fake splitting
