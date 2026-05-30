@@ -333,11 +333,9 @@ def find_answer_start_offset(answer_lines: list, boundary_idx: int, question: st
 
         overlap = len(line_words & q_words) / max(len(line_words), 1)
 
-        # Only skip if VERY high overlap AND looks like quote continuation
-        # (starts with lowercase letter or quote/dash character)
-        looks_like_continuation = bool(re.match(r'^[a-z"\-]', line))
-
-        if overlap >= 0.55 and looks_like_continuation:
+        # Skip if high overlap with question — it's still part of the quote
+        # regardless of capitalisation (OCR sometimes capitalises mid-quote)
+        if overlap >= 0.55:
             offset = k + 1
         else:
             break
