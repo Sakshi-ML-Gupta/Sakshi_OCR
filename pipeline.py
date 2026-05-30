@@ -194,24 +194,18 @@ def is_noise_line(line: str) -> bool:
     return False
 
 
+def is_quote_question(question: str) -> bool:
+    """
+    Section A questions start with roman numerals: (i), (ii), (iii)
+    Section B questions start with numbers: 1. 2. 3.
+    """
+    return bool(re.match(r'^\(?[ivxIVX]+[.)]\s', question.strip()))
+
+
 # =========================================================
 # FIND QUESTION BOUNDARIES IN ANSWER PAGES
-#
-# Two problems solved here:
-#
-# Problem 1 — OCR misreads roman numerals:
-#   "(i)" gets OCR'd as "(Tii)", "(1i)", etc.
-#   Fix: strip all non-alpha from roman numeral tokens before comparing,
-#   and also try matching by the question BODY (words after the label)
-#
-# Problem 2 — question split across lines:
-#   "1. (iii) This music hall is empty; where could"
-#   "the actors have gone?..."
-#   Fix: sliding window joins multiple lines before scoring
 # =========================================================
 
-# Lines that can start a question boundary:
-# optional "1." prefix, then roman/number/quote
 LABEL_RE = re.compile(
     r"^\s*(?:(?:Q\.?\s*)?\d+[.)]\s*)?"
     r"(?:\(?\w+[.)]\s|\"|\d+[.)]\s)"
@@ -255,17 +249,16 @@ def find_question_boundaries_in_answers(
                 if q in used_questions:
                     continue
 
-                # Score 1: full combined vs full question
                 s1 = similarity(combined, q)
-                # Score 2: strip label from both sides
                 s2 = similarity(combined_clean, strip_leading_label(q))
-                # Score 3: match just the body words (skip first token)
-                # handles OCR misread of roman numerals like (i) -> (Tii)
+
+                # body-only match — skips first token entirely
+                # handles OCR misreads like (i) -> (Tii)
                 combined_words = normalize(combined_clean).split()
                 q_words = normalize(strip_leading_label(q)).split()
-                body_combined = " ".join(combined_words[1:]) if len(combined_words) > 1 else ""
+                body_c = " ".join(combined_words[1:]) if len(combined_words) > 1 else ""
                 body_q = " ".join(q_words[1:]) if len(q_words) > 1 else ""
-                s3 = similarity(body_combined, body_q) if body_combined and body_q else 0
+                s3 = similarity(body_c, body_q) if body_c and body_q else 0
 
                 score = max(s1, s2, s3)
 
@@ -289,31 +282,33 @@ def find_question_boundaries_in_answers(
 
 # =========================================================
 # FIND WHERE ACTUAL ANSWER STARTS
-# After the boundary line, the student may repeat the full
-# question across multiple lines before writing the answer.
-# Skip all those question-continuation lines.
-# The answer starts at the first line that is NOT part of the question.
+#
+# Section B (numbered): answer starts at boundary+1 always.
+# The student writes the question as one line then answers.
+#
+# Section A (roman numeral quotes): student re-copies the
+# multi-line quote before answering — skip those lines.
+# Only skip lines with very high overlap AND look like
+# quote continuation (start with lowercase or quote char).
 # =========================================================
 
+STOPWORDS = {
+    'the','a','an','is','are','was','were','of','in','to','and','that',
+    'this','it','he','she','they','i','we','you','at','or','but','not',
+    'with','for','on','from','by','as','be','his','her','its','their'
+}
+
+
 def find_answer_start_offset(answer_lines: list, boundary_idx: int, question: str) -> int:
-    """
-    Starting from boundary_idx+1, skip lines that are still
-    part of the question text (high similarity to question words).
-    Returns the offset from boundary_idx where the real answer begins.
-    Minimum offset = 1 (always skip at least the boundary line itself).
-    """
-    q_words = set(normalize(question).split())
-    # remove very common words that appear in both question and answer
-    stopwords = {
-        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'of', 'in',
-        'to', 'and', 'that', 'this', 'it', 'he', 'she', 'they',
-        'i', 'we', 'you', 'at', 'or', 'but', 'not', 'with', 'for',
-        'on', 'from', 'by', 'as', 'be', 'his', 'her', 'its', 'their'
-    }
-    q_words = q_words - stopwords
+    # Section B — answer starts right after the boundary line, no skipping
+    if not is_quote_question(question):
+        return 1
+
+    # Section A — skip lines that are re-copied quote text
+    q_words = set(normalize(question).split()) - STOPWORDS
 
     offset = 1
-    max_skip = min(10, len(answer_lines) - boundary_idx - 1)
+    max_skip = min(8, len(answer_lines) - boundary_idx - 1)
 
     for k in range(1, max_skip + 1):
         idx = boundary_idx + k
@@ -321,23 +316,25 @@ def find_answer_start_offset(answer_lines: list, boundary_idx: int, question: st
             break
 
         line = answer_lines[idx].strip()
+
         if not line or is_noise_line(line):
             offset = k + 1
             continue
 
-        line_words = set(normalize(line).split()) - stopwords
+        line_words = set(normalize(line).split()) - STOPWORDS
         if not line_words:
             offset = k + 1
             continue
 
-        # how many words in this line overlap with the question
         overlap = len(line_words & q_words) / max(len(line_words), 1)
 
-        if overlap >= 0.5:
-            # still looks like question text — skip it
+        # Only skip if VERY high overlap AND looks like quote continuation
+        # (starts with lowercase letter or quote/dash character)
+        looks_like_continuation = bool(re.match(r'^[a-z"\-]', line))
+
+        if overlap >= 0.55 and looks_like_continuation:
             offset = k + 1
         else:
-            # this line looks like answer content — stop skipping
             break
 
     return offset
@@ -351,8 +348,6 @@ def slice_raw_answers(answer_lines: list, boundaries: list) -> list:
     qa_pairs = []
 
     for i, b in enumerate(boundaries):
-        # find where the actual answer content starts
-        # (skip question-repetition lines at the top)
         skip = find_answer_start_offset(answer_lines, b["line_index"], b["question"])
         a_start = b["line_index"] + skip
 
@@ -424,6 +419,12 @@ def process_pdf(file_input, status_callback=None):
     boundaries = find_question_boundaries_in_answers(answer_lines, questions)
     log(f"Matched {len(boundaries)} of {len(questions)} boundaries")
 
+    # Log which questions were not matched — helps diagnose missing ones
+    matched_qs = {b["question"] for b in boundaries}
+    for q in questions:
+        if q not in matched_qs:
+            log(f"WARNING: No boundary found for: {q[:80]}")
+
     if not boundaries:
         raise Exception(
             "Could not match any questions in answer pages.\n"
@@ -431,7 +432,7 @@ def process_pdf(file_input, status_callback=None):
             f"First 20 answer lines:\n" + "\n".join(answer_lines[:20])
         )
 
-    log("Slicing raw answers (skipping question repetitions)...")
+    log("Slicing raw answers...")
     qa_pairs = slice_raw_answers(answer_lines, boundaries)
 
     log(f"Done — {len(qa_pairs)} Q-A pairs")
