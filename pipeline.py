@@ -194,6 +194,11 @@ def is_noise_line(line: str) -> bool:
     return False
 
 
+def strip_markdown(line: str) -> str:
+    """Remove markdown bullet prefixes: '- ', '* ', '+ '"""
+    return re.sub(r'^\s*[-*+]\s+', '', line)
+
+
 def is_quote_question(question: str) -> bool:
     """
     Section A questions start with roman numerals: (i), (ii), (iii)
@@ -223,7 +228,7 @@ def find_question_boundaries_in_answers(
     used_line_indices = set()
 
     for i in range(len(answer_lines)):
-        line_i = answer_lines[i].strip()
+        line_i = strip_markdown(answer_lines[i].strip())
 
         if not LABEL_RE.match(line_i):
             continue
@@ -233,7 +238,7 @@ def find_question_boundaries_in_answers(
                 break
 
             combined = " ".join(
-                answer_lines[i + k].strip()
+                strip_markdown(answer_lines[i + k].strip())
                 for k in range(w)
                 if answer_lines[i + k].strip()
             )
