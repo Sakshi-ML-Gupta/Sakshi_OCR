@@ -367,7 +367,7 @@ def slice_raw_answers(answer_lines: list, boundaries: list) -> list:
 
         qa_pairs.append({
             "question": b["question"],
-            "answer": "\n".join(raw_lines).strip()
+            "answer": " ".join(raw_lines).strip()
         })
 
     return qa_pairs
