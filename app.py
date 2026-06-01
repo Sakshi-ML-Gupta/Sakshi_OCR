@@ -1,7 +1,7 @@
 import json
 import traceback
 import streamlit as st
-from pipeline import process_pdf, run_ocr, build_ocr_json, preprocess_pdf
+from pipeline import process_pdf, process_reference
 
 st.set_page_config(page_title="OCR QA Extractor", layout="wide")
 st.title("📘 OCR Question Answer Extractor")
@@ -23,7 +23,7 @@ mode = st.radio(
 st.divider()
 
 # =========================================================
-# FILE UPLOADERS based on mode
+# FILE UPLOADERS
 # =========================================================
 
 assignment_file = None
@@ -51,7 +51,7 @@ elif mode.startswith("📄 + 📚"):
         )
 
 # =========================================================
-# VALIDATE UPLOADS
+# VALIDATE
 # =========================================================
 
 ready = False
@@ -73,7 +73,7 @@ elif mode.startswith("📄 + 📚") and (assignment_file or reference_file):
     st.warning("⚠️ Please upload both files to continue")
 
 # =========================================================
-# RUN BUTTON
+# RUN PIPELINE
 # =========================================================
 
 if ready and st.button("🚀 Run Pipeline"):
@@ -102,7 +102,6 @@ if ready and st.button("🚀 Run Pipeline"):
                 assignment_file,
                 status_callback=update_status
             )
-
             progress.progress(100)
             status.success("✅ Done!")
 
@@ -133,21 +132,10 @@ if ready and st.button("🚀 Run Pipeline"):
         elif mode.startswith("📚 Reference Book only"):
 
             reference_file.seek(0)
-            file_bytes = reference_file.read()
-            file_name  = reference_file.name
-
-            update_status("Preprocessing reference book...")
-            processed = preprocess_pdf(file_bytes)
-            progress.progress(20)
-
-            pages = run_ocr(
-                processed,
-                file_name,
+            ref_ocr_json = process_reference(
+                reference_file,
                 status_callback=update_status
             )
-            progress.progress(90)
-
-            ref_ocr_json = build_ocr_json(pages)
             progress.progress(100)
             status.success("✅ Done!")
 
@@ -167,7 +155,7 @@ if ready and st.button("🚀 Run Pipeline"):
 
         elif mode.startswith("📄 + 📚"):
 
-            # -- Assignment --
+            # Assignment
             assignment_file.seek(0)
             update_status("Processing assignment PDF...")
             ocr_json, qa_pairs = process_pdf(
@@ -176,26 +164,17 @@ if ready and st.button("🚀 Run Pipeline"):
             )
             progress.progress(50)
 
-            # -- Reference --
+            # Reference
             reference_file.seek(0)
-            file_bytes = reference_file.read()
-            file_name  = reference_file.name
-
-            update_status("Preprocessing reference book...")
-            processed = preprocess_pdf(file_bytes)
-
-            pages = run_ocr(
-                processed,
-                file_name,
+            update_status("Processing reference book...")
+            ref_ocr_json = process_reference(
+                reference_file,
                 status_callback=update_status
             )
-            progress.progress(90)
-
-            ref_ocr_json = build_ocr_json(pages)
             progress.progress(100)
             status.success("✅ Done!")
 
-            # -- Output 1: Assignment OCR --
+            # Output 1
             st.divider()
             st.subheader("📄 Assignment OCR JSON")
             st.json(ocr_json)
@@ -206,7 +185,7 @@ if ready and st.button("🚀 Run Pipeline"):
                 mime="application/json"
             )
 
-            # -- Output 2: Reference OCR --
+            # Output 2
             st.divider()
             st.subheader("📚 Reference Book OCR JSON")
             st.json(ref_ocr_json)
@@ -217,7 +196,7 @@ if ready and st.button("🚀 Run Pipeline"):
                 mime="application/json"
             )
 
-            # -- Output 3: QA --
+            # Output 3
             st.divider()
             st.subheader("🧠 Q-A Pairs")
             st.json(qa_pairs)
