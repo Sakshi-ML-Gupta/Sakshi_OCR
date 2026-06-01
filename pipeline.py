@@ -3,6 +3,7 @@ import io
 import re
 import json
 import fitz
+import base64
 import httpx
 from pathlib import Path
 from mistralai import Mistral
@@ -112,14 +113,39 @@ def build_ocr_json(pages: list) -> dict:
 
 
 # =========================================================
-# REFERENCE BOOK OCR — page by page to save memory
+# REFERENCE BOOK OCR — page by page, base64 inline
+# No file upload — avoids 404 signed URL expiry errors
 # =========================================================
+
+def ocr_page_base64(page_b64: str, api_key: str) -> str:
+    """Send a single PDF page as base64 to mistral-ocr-latest."""
+    resp = httpx.post(
+        "https://api.mistral.ai/v1/ocr",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": "mistral-ocr-latest",
+            "document": {
+                "type": "document_url",
+                "document_url": f"data:application/pdf;base64,{page_b64}"
+            },
+            "include_image_base64": False
+        },
+        timeout=120
+    )
+    if resp.status_code == 200:
+        ocr_pages = resp.json().get("pages", [])
+        return ocr_pages[0].get("markdown", "") if ocr_pages else ""
+    raise Exception(f"OCR error {resp.status_code}: {resp.text[:200]}")
+
 
 def process_reference(file_input, status_callback=None):
     """
-    OCR a reference book PDF page by page.
-    Processes and discards each page to avoid loading everything into RAM.
-    Returns only ocr_json — no Q-A extraction.
+    OCR a reference book PDF page by page using base64 inline.
+    No file upload — no signed URL — no 404 errors.
+    Processes one page at a time to keep RAM usage flat.
     """
     def log(msg):
         print(msg)
@@ -128,85 +154,47 @@ def process_reference(file_input, status_callback=None):
 
     if isinstance(file_input, (str, Path)):
         file_bytes = Path(file_input).read_bytes()
-        file_name  = Path(file_input).name
     else:
         file_bytes = file_input.read()
-        file_name  = getattr(file_input, "name", "reference.pdf")
 
     api_key = get_api_key("MISTRAL_API_KEY")
-    client  = Mistral(api_key=api_key)
 
-    # Open source doc just to count pages
     src_doc     = fitz.open(stream=file_bytes, filetype="pdf")
     total_pages = len(src_doc)
     src_doc.close()
-    log(f"Reference book has {total_pages} page(s)")
+
+    log(f"Reference book: {total_pages} page(s)")
 
     pages_output = []
 
     for page_num in range(total_pages):
-        log(f"Processing page {page_num + 1} of {total_pages}...")
+        log(f"Page {page_num + 1} of {total_pages}...")
 
-        # Extract single page into its own PDF bytes
-        src_doc  = fitz.open(stream=file_bytes, filetype="pdf")
-        one_page = fitz.open()
-        one_page.insert_pdf(src_doc, from_page=page_num, to_page=page_num)
-
-        # Rasterize
-        pix      = one_page[0].get_pixmap(dpi=200)
-        out_doc  = fitz.open()
-        new_page = out_doc.new_page(width=pix.width, height=pix.height)
-        new_page.insert_image(new_page.rect, pixmap=pix)
-
-        buf = io.BytesIO()
-        out_doc.save(buf)
-        page_bytes = buf.getvalue()
-
-        src_doc.close()
-        one_page.close()
-        out_doc.close()
-        buf.close()
-
-        # Upload and OCR this single page
-        fname = f"{file_name}_p{page_num + 1}.pdf"
         try:
-            uploaded = client.files.upload(
-                file={"file_name": fname, "content": page_bytes},
-                purpose="ocr"
-            )
-            signed = client.files.get_signed_url(file_id=uploaded.id, expiry=1)
+            # Extract single page
+            src_doc  = fitz.open(stream=file_bytes, filetype="pdf")
+            one_page = fitz.open()
+            one_page.insert_pdf(src_doc, from_page=page_num, to_page=page_num)
+            src_doc.close()
 
-            resp = httpx.post(
-                "https://api.mistral.ai/v1/ocr",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "mistral-ocr-latest",
-                    "document": {
-                        "type": "document_url",
-                        "document_url": signed.url
-                    },
-                    "include_image_base64": False
-                },
-                timeout=120
-            )
+            # Rasterize to image-based single-page PDF
+            pix      = one_page[0].get_pixmap(dpi=200)
+            out_doc  = fitz.open()
+            new_page = out_doc.new_page(width=pix.width, height=pix.height)
+            new_page.insert_image(new_page.rect, pixmap=pix)
 
-            if resp.status_code == 200:
-                ocr_pages = resp.json().get("pages", [])
-                text = ocr_pages[0].get("markdown", "") if ocr_pages else ""
-            else:
-                log(f"  OCR error on page {page_num + 1}: {resp.status_code}")
-                text = ""
+            buf = io.BytesIO()
+            out_doc.save(buf)
+            page_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-            try:
-                client.files.delete(file_id=uploaded.id)
-            except Exception:
-                pass
+            one_page.close()
+            out_doc.close()
+            buf.close()
+
+            text = ocr_page_base64(page_b64, api_key)
 
         except Exception as e:
-            log(f"  Failed page {page_num + 1}: {e}")
+            log(f"  Page {page_num + 1} failed: {e}")
             text = ""
 
         pages_output.append({

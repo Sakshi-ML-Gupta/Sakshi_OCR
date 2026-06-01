@@ -1,10 +1,49 @@
+import io
 import json
+import zipfile
 import traceback
 import streamlit as st
 from pipeline import process_pdf, process_reference
 
 st.set_page_config(page_title="OCR QA Extractor", layout="wide")
 st.title("📘 OCR Question Answer Extractor")
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def clean_json(obj):
+    """Recursively replace \\n with space in all string values."""
+    if isinstance(obj, dict):
+        return {k: clean_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [clean_json(i) for i in obj]
+    if isinstance(obj, str):
+        return obj.replace("\n", " ").strip()
+    return obj
+
+
+def to_json_bytes(obj):
+    return json.dumps(clean_json(obj), ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def make_zip(files: dict) -> bytes:
+    """files = {filename: bytes}"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in files.items():
+            zf.writestr(name, data)
+    buf.seek(0)
+    return buf.read()
+
+
+def show_download(label, data_bytes, file_name):
+    st.download_button(
+        label=label,
+        data=data_bytes,
+        file_name=file_name,
+        mime="application/json"
+    )
 
 # =========================================================
 # MODE SELECTION
@@ -105,24 +144,30 @@ if ready and st.button("🚀 Run Pipeline"):
             progress.progress(100)
             status.success("✅ Done!")
 
+            ocr_bytes = to_json_bytes(ocr_json)
+            qa_bytes  = to_json_bytes(qa_pairs)
+
             st.divider()
             st.subheader("📄 Assignment OCR JSON")
-            st.json(ocr_json)
-            st.download_button(
-                label="⬇ Download Assignment OCR JSON",
-                data=json.dumps(ocr_json, ensure_ascii=False, indent=2),
-                file_name="assignment_ocr.json",
-                mime="application/json"
-            )
+            st.json(clean_json(ocr_json))
+            show_download("⬇ Download Assignment OCR JSON", ocr_bytes, "assignment_ocr.json")
 
             st.divider()
             st.subheader("🧠 Q-A Pairs")
-            st.json(qa_pairs)
+            st.json(clean_json(qa_pairs))
+            show_download("⬇ Download QA JSON", qa_bytes, "qa_output.json")
+
+            st.divider()
+            st.subheader("📦 Download All")
+            zip_bytes = make_zip({
+                "assignment_ocr.json": ocr_bytes,
+                "qa_output.json": qa_bytes
+            })
             st.download_button(
-                label="⬇ Download QA JSON",
-                data=json.dumps(qa_pairs, ensure_ascii=False, indent=2),
-                file_name="qa_output.json",
-                mime="application/json"
+                label="⬇ Download All as ZIP",
+                data=zip_bytes,
+                file_name="assignment_output.zip",
+                mime="application/zip"
             )
 
         # =====================================================
@@ -139,15 +184,12 @@ if ready and st.button("🚀 Run Pipeline"):
             progress.progress(100)
             status.success("✅ Done!")
 
+            ref_bytes = to_json_bytes(ref_ocr_json)
+
             st.divider()
             st.subheader("📚 Reference Book OCR JSON")
-            st.json(ref_ocr_json)
-            st.download_button(
-                label="⬇ Download Reference OCR JSON",
-                data=json.dumps(ref_ocr_json, ensure_ascii=False, indent=2),
-                file_name="reference_ocr.json",
-                mime="application/json"
-            )
+            st.json(clean_json(ref_ocr_json))
+            show_download("⬇ Download Reference OCR JSON", ref_bytes, "reference_ocr.json")
 
         # =====================================================
         # MODE 3 — Assignment + Reference
@@ -155,7 +197,6 @@ if ready and st.button("🚀 Run Pipeline"):
 
         elif mode.startswith("📄 + 📚"):
 
-            # Assignment
             assignment_file.seek(0)
             update_status("Processing assignment PDF...")
             ocr_json, qa_pairs = process_pdf(
@@ -164,7 +205,6 @@ if ready and st.button("🚀 Run Pipeline"):
             )
             progress.progress(50)
 
-            # Reference
             reference_file.seek(0)
             update_status("Processing reference book...")
             ref_ocr_json = process_reference(
@@ -174,37 +214,37 @@ if ready and st.button("🚀 Run Pipeline"):
             progress.progress(100)
             status.success("✅ Done!")
 
-            # Output 1
+            ocr_bytes = to_json_bytes(ocr_json)
+            qa_bytes  = to_json_bytes(qa_pairs)
+            ref_bytes = to_json_bytes(ref_ocr_json)
+
             st.divider()
             st.subheader("📄 Assignment OCR JSON")
-            st.json(ocr_json)
-            st.download_button(
-                label="⬇ Download Assignment OCR JSON",
-                data=json.dumps(ocr_json, ensure_ascii=False, indent=2),
-                file_name="assignment_ocr.json",
-                mime="application/json"
-            )
+            st.json(clean_json(ocr_json))
+            show_download("⬇ Download Assignment OCR JSON", ocr_bytes, "assignment_ocr.json")
 
-            # Output 2
             st.divider()
             st.subheader("📚 Reference Book OCR JSON")
-            st.json(ref_ocr_json)
-            st.download_button(
-                label="⬇ Download Reference OCR JSON",
-                data=json.dumps(ref_ocr_json, ensure_ascii=False, indent=2),
-                file_name="reference_ocr.json",
-                mime="application/json"
-            )
+            st.json(clean_json(ref_ocr_json))
+            show_download("⬇ Download Reference OCR JSON", ref_bytes, "reference_ocr.json")
 
-            # Output 3
             st.divider()
             st.subheader("🧠 Q-A Pairs")
-            st.json(qa_pairs)
+            st.json(clean_json(qa_pairs))
+            show_download("⬇ Download QA JSON", qa_bytes, "qa_output.json")
+
+            st.divider()
+            st.subheader("📦 Download All")
+            zip_bytes = make_zip({
+                "assignment_ocr.json": ocr_bytes,
+                "reference_ocr.json": ref_bytes,
+                "qa_output.json":     qa_bytes
+            })
             st.download_button(
-                label="⬇ Download QA JSON",
-                data=json.dumps(qa_pairs, ensure_ascii=False, indent=2),
-                file_name="qa_output.json",
-                mime="application/json"
+                label="⬇ Download All as ZIP",
+                data=zip_bytes,
+                file_name="all_outputs.zip",
+                mime="application/zip"
             )
 
     except Exception as e:
