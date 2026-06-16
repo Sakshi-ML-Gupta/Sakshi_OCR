@@ -152,7 +152,6 @@ def process_reference(file_input, status_callback=None):
         file_bytes = file_input.read()
 
     api_key = get_api_key("MISTRAL_API_KEY")
-
     src_doc     = fitz.open(stream=file_bytes, filetype="pdf")
     total_pages = len(src_doc)
     src_doc.close()
@@ -194,170 +193,281 @@ def process_reference(file_input, status_callback=None):
 
 # =========================================================
 # UNIVERSAL Q&A EXTRACTOR
-# No LLM. No structure assumptions.
 #
-# Strategy:
-#   1. Flatten all pages into one line list
-#   2. Score every line: does it look like a question/section START?
-#   3. Boundaries = lines whose score exceeds threshold
-#   4. If zero boundaries found, try progressively looser passes
-#   5. If still nothing, return the whole document as one block
+# KEY INSIGHT from real IGNOU documents:
 #
-# Boundary patterns (in order of confidence):
-#   HIGH   Q.1 / Q-1 / Q. 1 / Question 1 / Ques.1
-#          1. text  /  1) text  (digit-dot/paren then text)
-#          (a) text / (i) text / (iv) text   — lettered/roman sub-questions
-#          a) text  / i) text                — without parens
-#   MEDIUM ## Heading  /  **Bold label:**    — markdown structure
-#          WORD:  (all-caps word followed by colon, ≥4 chars)
-#   LOW    Any line that is SHORT (≤ 120 chars) and ends with ?
+#   The ANSWER always begins with an arrow marker:
+#     →   Ans→   AB→   A→   AB-   Ans-   Ans:   A.B→
+#     उत्तर→  उत्तर-  उत्तर:
 #
-# Answer text is everything between two boundaries — raw, unmodified.
+#   This is universal across English + Hindi, printed + handwritten,
+#   numbered + lettered, integrated + split formats.
+#
+# STRATEGY — Arrow-anchor extraction:
+#   1. Flatten all non-junk pages to a line list
+#   2. Find every line that STARTS WITH an arrow marker  → "answer anchors"
+#   3. For each anchor, backtrack up to find its question
+#      (question = labelled lines above the anchor, within a window)
+#   4. Answer = everything from the anchor until the next anchor
+#
+# FALLBACK CHAIN (if no arrow markers found):
+#   5. Question-label boundaries (Q.1, 1., (a), etc.)
+#   6. Paragraph blocks
+#   7. Whole document as one block
 # =========================================================
 
-# ── boundary detection patterns ───────────────────────────────────────────────
+# ── junk page filter ─────────────────────────────────────────────────────────
 
-# Each entry: (pattern, score)
-# Line is a boundary if total score ≥ THRESHOLD
-BOUNDARY_PATTERNS = [
-    # Q.1 / Q-1 / Q 1 / Q.1. / Ques.1 / Question 1
-    (re.compile(r'^\s*(?:Q(?:ues(?:tion)?)?[\.\-\s]*\d+[\.\):\-]?\s*)', re.I), 10),
-
-    # 1. text or 1) text — digit then dot/paren then space then non-digit content
-    (re.compile(r'^\s*\d{1,2}[\.\)]\s+[^\d\s]'), 8),
-
-    # (a) / (b) / (i) / (ii) / (iv) etc
-    (re.compile(r'^\s*\([a-zA-Z]{1,3}\)\s+\S'), 7),
-
-    # a) / b) / i) / ii) without parens
-    (re.compile(r'^\s*[a-zA-Z]{1,3}\)\s+[A-Z\u0900-\u097F]'), 6),
-
-    # Ans / Ans. / Ans- / Answer: — answer markers (lower confidence boundary)
-    (re.compile(r'^\s*Ans(?:wer)?[\.\-\:\s]', re.I), 5),
-
-    # ## Heading or ### Heading (markdown)
-    (re.compile(r'^\s*#{1,4}\s+\S'), 5),
-
-    # **Bold text** at start of line
-    (re.compile(r'^\s*\*{1,2}[^*]{3,}\*{1,2}\s*[\:\-]?'), 4),
-
-    # ALL-CAPS WORD: (like "TOPIC:", "NOTE:", "SECTION:")
-    (re.compile(r'^\s*[A-Z]{4,}[\s\:]+'), 4),
-
-    # Short line ending with ?
-    (re.compile(r'^.{10,120}\?\s*$'), 3),
-]
-
-# Noise lines — never a boundary
-NOISE_RE = re.compile(
-    r'^\s*$'                           # blank
-    r'|!\[.*?\]\(.*?\)'                # markdown images
-    r'|https?://\S+'                   # URLs
-    r'|^\s*[-_=]{3,}\s*$'             # horizontal rules
-    r'|^\s*\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\s*$'  # bare dates
-    r'|^\s*Page\s+\d+\s*$'            # page numbers
-    , re.I
-)
-
-# Lines that are clearly junk-content pages (skip whole page if majority match)
-JUNK_PAGE_SIGNALS = re.compile(
+JUNK_PAGE_RE = re.compile(
     r'Acknowledgment|acknowledgement|www\.|\.asp|\.html|'
-    r'KNOW YOUR ADMISSION|REGISTRATION DETAILS|Indira Gandhi National Open University'
-    r'|enrollment\s*no|enrolment\s*no|programme\s*code|study\s*centre',
+    r'KNOW YOUR ADMISSION|REGISTRATION DETAILS|'
+    r'enrollment\s*no|enrolment\s*no|programme\s*code|'
+    r'study\s*centre|Indira Gandhi National Open University|'
+    r'Student Identity Card|Enrolment Number',
     re.I
 )
 
+NOISE_LINE_RE = re.compile(
+    r'^\s*$'
+    r'|!\[.*?\]\(.*?\)'          # markdown images
+    r'|https?://\S+'             # URLs
+    r'|^\s*[-_=]{3,}\s*$'       # horizontal rules
+    r'|^\s*Page\s+\d+\s*$'      # bare page numbers
+    r'|Teacher\'s\s+Signature'   # notebook footer
+    r'|^\s*\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\s*$',  # bare dates
+    re.I
+)
 
-def _score_line(line: str) -> int:
-    """Return boundary score for a line. 0 = not a boundary."""
-    if NOISE_RE.search(line):
-        return 0
-    stripped = line.strip()
-    if len(stripped) < 3:
-        return 0
-    total = 0
-    for pat, score in BOUNDARY_PATTERNS:
-        if pat.search(stripped):
-            total += score
-    return total
-
-
-def _is_junk_page(page_text: str) -> bool:
-    """True if page is clearly admin/cover/web content with no answers."""
-    lines = [l for l in page_text.split('\n') if l.strip()]
+def _is_junk_page(text: str) -> bool:
+    lines = [l for l in text.split('\n') if l.strip()]
     if not lines:
         return True
-    junk_hits = sum(1 for l in lines if JUNK_PAGE_SIGNALS.search(l))
-    return junk_hits / max(len(lines), 1) > 0.3
+    hits = sum(1 for l in lines if JUNK_PAGE_RE.search(l))
+    return hits / max(len(lines), 1) > 0.25
 
+def _is_noise(line: str) -> bool:
+    return bool(NOISE_LINE_RE.search(line))
+
+
+# ── arrow marker detection ────────────────────────────────────────────────────
+#
+# Matches lines where the answer marker appears at the START.
+# Handles: →  Ans→  AB→  A→  AB-  Ans-  Ans:  A.B→  उत्तर→  उत्तर-
+# Also handles inline: "Q.1 Ans→ ..." on same line
+
+ARROW_START_RE = re.compile(
+    r'^\s*'
+    r'(?:'
+    r'(?:Ans(?:wer)?|AB?|A\.?B?|उत्तर|जवाब)'  # optional prefix word
+    r'\s*'
+    r')?'
+    r'(?:→|->|—>|⇒|-{1,2}|:)'                 # arrow/dash/colon
+    r'\s*\S',                                    # something after
+    re.I | re.UNICODE
+)
+
+# Inline: question label + answer marker on same line
+# e.g.  "Q.1 Ans→ भाषा..."   or   "9-7. Ab- वाणिज्य..."
+INLINE_ANS_RE = re.compile(
+    r'(?:Ans(?:wer)?|AB?|उत्तर|जवाब)\s*(?:→|->|—>|-{1,2}|:)\s*\S',
+    re.I | re.UNICODE
+)
+
+def _is_arrow_anchor(line: str) -> bool:
+    """True if this line starts an answer block."""
+    s = line.strip()
+    if ARROW_START_RE.match(s):
+        return True
+    # standalone → arrow at start (common in handwritten OCR)
+    if re.match(r'^→\s*\S', s):
+        return True
+    # ⇒ or => at start
+    if re.match(r'^(?:⇒|=>)\s*\S', s):
+        return True
+    return False
+
+def _split_inline(line: str):
+    """
+    If line has both Q-label AND answer marker inline,
+    split into (question_part, answer_part).
+    Returns (None, None) if not inline.
+    """
+    m = INLINE_ANS_RE.search(line)
+    if not m:
+        return None, None
+    q_part  = line[:m.start()].strip()
+    ans_part = line[m.start():].strip()
+    return q_part, ans_part
+
+
+# ── question label detection ──────────────────────────────────────────────────
+
+Q_LABEL_RE = re.compile(
+    r'^\s*'
+    r'(?:'
+    r'Q\.?\s*[-\.]?\s*\d[\d\.]*'        # Q.1  Q-1  Q. 3  Q.9-
+    r'|(?:Ques(?:tion)?\.?\s*)?\d{1,2}[\.\)]\s+[^\d\s]'  # 1. text  2) text
+    r'|\(\s*[a-zA-Z\u0900-\u097F]{1,3}\s*\)\s+\S'        # (a) (क) sub-Qs
+    r'|[a-zA-Z]{1,3}\)\s+[A-Z\u0900-\u097F]'             # a) b) c)
+    r'|\d{1,2}[-\.]\d{1,2}\.?\s'                          # 9-7.  9-8
+    r'|\d{2,3}\.\s*Q'                                      # 95. Q
+    r')',
+    re.I | re.UNICODE
+)
+
+def _is_q_label(line: str) -> bool:
+    return bool(Q_LABEL_RE.match(line.strip()))
+
+
+# ── flatten pages ─────────────────────────────────────────────────────────────
 
 def flatten_pages(pages: list, log=None) -> list:
-    """
-    Returns list of {"line": str, "page_number": int}.
-    Skips junk pages and noise lines.
-    """
+    """Returns list of {"line": str, "page_number": int}, junk filtered."""
     result = []
-    skipped_pages = []
+    skipped = []
     for p in pages:
         if _is_junk_page(p["raw_text"]):
-            skipped_pages.append(p["page_number"])
+            skipped.append(p["page_number"])
             continue
         for line in p["raw_text"].split("\n"):
-            if not NOISE_RE.search(line) and line.strip():
+            if not _is_noise(line) and line.strip():
                 result.append({"line": line, "page_number": p["page_number"]})
-
-    if log and skipped_pages:
-        log(f"Skipped junk/admin pages: {skipped_pages}")
+    if log and skipped:
+        log(f"Skipped junk/admin pages: {skipped}")
     return result
 
 
-def find_boundaries(flat_lines: list, threshold: int) -> list:
-    """Return indices into flat_lines where a new Q/section starts."""
-    boundaries = []
-    for i, row in enumerate(flat_lines):
-        if _score_line(row["line"]) >= threshold:
-            boundaries.append(i)
-    return boundaries
+# ── PASS 1: Arrow-anchor extraction ──────────────────────────────────────────
 
-
-def slice_qa(flat_lines: list, boundaries: list) -> list:
+def extract_by_arrows(flat_lines: list, log=None) -> list:
     """
-    Slice raw lines between boundaries into Q&A pairs.
-    The line AT the boundary = question label / first line of question.
-    Everything after until next boundary = answer body.
-    Raw text — zero modification.
+    Core extraction strategy.
+    Finds arrow markers → backtracks for question → collects answer body.
     """
-    pairs = []
     n = len(flat_lines)
-    for i, b_idx in enumerate(boundaries):
-        next_idx = boundaries[i + 1] if i + 1 < len(boundaries) else n
+    anchors = []   # list of {"q_lines": [...], "ans_start": int}
 
-        block = [flat_lines[j]["line"] for j in range(b_idx, next_idx)]
-        if not block:
+    i = 0
+    while i < n:
+        line = flat_lines[i]["line"]
+
+        # Check for inline Q+Ans on same line
+        q_part, ans_part = _split_inline(line)
+        if q_part and ans_part:
+            anchors.append({
+                "q_lines":  [q_part],
+                "ans_start": i,
+                "ans_inline": ans_part
+            })
+            i += 1
             continue
 
-        # First line = question header
-        # Rest = answer (may include sub-labels, all kept verbatim)
-        question = block[0].strip()
-        answer   = "\n".join(l for l in block[1:] if l.strip()).strip()
+        if _is_arrow_anchor(line):
+            # Backtrack up to 8 lines to gather question lines
+            q_lines = []
+            look_back = min(8, i)
+            # Collect lines above that look like question content
+            # Stop if we hit a previous anchor or a non-question block
+            for j in range(i - 1, max(i - look_back - 1, -1), -1):
+                prev = flat_lines[j]["line"].strip()
+                if _is_arrow_anchor(prev):
+                    break  # don't steal from previous answer
+                # Stop at clearly unrelated content (long prose lines
+                # that don't look like a question label or question text)
+                if (len(prev) > 200
+                        and not _is_q_label(prev)
+                        and not prev.endswith('?')):
+                    break
+                q_lines.insert(0, prev)
 
-        pairs.append({"question": question, "answer": answer})
+            anchors.append({
+                "q_lines":  q_lines,
+                "ans_start": i,
+                "ans_inline": None
+            })
+        i += 1
+
+    if not anchors:
+        return []
+
+    pairs = []
+    for k, anchor in enumerate(anchors):
+        # Answer body = from ans_start to next anchor's ans_start
+        ans_end = (anchors[k + 1]["ans_start"]
+                   if k + 1 < len(anchors)
+                   else n)
+
+        if anchor["ans_inline"]:
+            # Inline: answer starts mid-line
+            body_lines = [anchor["ans_inline"]]
+            body_lines += [flat_lines[j]["line"].strip()
+                           for j in range(anchor["ans_start"] + 1, ans_end)
+                           if flat_lines[j]["line"].strip()]
+        else:
+            body_lines = [flat_lines[j]["line"].strip()
+                          for j in range(anchor["ans_start"], ans_end)
+                          if flat_lines[j]["line"].strip()]
+
+        question = " ".join(anchor["q_lines"]).strip()
+        answer   = " ".join(body_lines).strip()
+
+        if question or answer:
+            pairs.append({"question": question, "answer": answer})
+
     return pairs
 
 
-# =========================================================
-# MAIN EXTRACTION — structure-agnostic, no LLM
-# =========================================================
+# ── PASS 2: Question-label boundaries ────────────────────────────────────────
+
+def extract_by_labels(flat_lines: list) -> list:
+    boundaries = [i for i, row in enumerate(flat_lines)
+                  if _is_q_label(row["line"])]
+    if not boundaries:
+        return []
+
+    pairs = []
+    n = len(flat_lines)
+    for k, b in enumerate(boundaries):
+        end = boundaries[k + 1] if k + 1 < len(boundaries) else n
+        block = [flat_lines[j]["line"].strip()
+                 for j in range(b, end)
+                 if flat_lines[j]["line"].strip()]
+        if block:
+            pairs.append({
+                "question": block[0],
+                "answer":   " ".join(block[1:]).strip()
+            })
+    return pairs
+
+
+# ── PASS 3: Paragraph blocks ─────────────────────────────────────────────────
+
+def extract_by_paragraphs(flat_lines: list) -> list:
+    pairs  = []
+    block  = []
+    raw    = [row["line"] for row in flat_lines]
+
+    for line in raw:
+        if line.strip():
+            block.append(line.strip())
+        else:
+            if block:
+                pairs.append({
+                    "question": block[0],
+                    "answer":   " ".join(block[1:]).strip()
+                })
+                block = []
+    if block:
+        pairs.append({
+            "question": block[0],
+            "answer":   " ".join(block[1:]).strip()
+        })
+    return pairs
+
+
+# ── MAIN EXTRACTION ───────────────────────────────────────────────────────────
 
 def extract_qa(pages: list, status_callback=None) -> list:
-    """
-    Multi-pass boundary detection.
-    Pass 1: high confidence (score ≥ 8)  — numbered questions
-    Pass 2: medium confidence (score ≥ 5) — lettered sub-qs, headings
-    Pass 3: low confidence (score ≥ 3)   — anything structural
-    Pass 4: fallback — split on blank-line paragraphs
-    Pass 5: whole document as one block
-    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -367,46 +477,31 @@ def extract_qa(pages: list, status_callback=None) -> list:
     log(f"Usable lines after filtering: {len(flat_lines)}")
 
     if not flat_lines:
-        log("No usable text found in document.")
+        log("No usable text found.")
         return []
 
-    # ── Pass 1: strict ───────────────────────────────────────────────────────
-    for threshold, label in [(8, "strict"), (5, "medium"), (3, "loose")]:
-        boundaries = find_boundaries(flat_lines, threshold)
-        log(f"Pass ({label}, threshold={threshold}): {len(boundaries)} boundaries")
-        if len(boundaries) >= 1:
-            pairs = slice_qa(flat_lines, boundaries)
-            log(f"Extracted {len(pairs)} Q-A pair(s) [{label}]")
-            return pairs
-
-    # ── Pass 4: paragraph split (blank-line separated blocks) ────────────────
-    log("Pass (paragraph): splitting on blank lines...")
-    pairs = []
-    current_block = []
-    for row in flat_lines:
-        if row["line"].strip():
-            current_block.append(row["line"])
-        else:
-            if current_block:
-                pairs.append({
-                    "question": current_block[0].strip(),
-                    "answer":   "\n".join(current_block[1:]).strip()
-                })
-                current_block = []
-    if current_block:
-        pairs.append({
-            "question": current_block[0].strip(),
-            "answer":   "\n".join(current_block[1:]).strip()
-        })
-
+    # Pass 1 — arrow anchors (primary strategy)
+    pairs = extract_by_arrows(flat_lines, log)
+    log(f"Pass 1 (arrow anchors): {len(pairs)} pair(s)")
     if pairs:
-        log(f"Extracted {len(pairs)} paragraph block(s)")
         return pairs
 
-    # ── Pass 5: entire document as one block ─────────────────────────────────
-    log("Pass (fallback): returning entire document as single block")
-    full_text = "\n".join(row["line"] for row in flat_lines)
-    return [{"question": "Full document", "answer": full_text}]
+    # Pass 2 — question label boundaries
+    pairs = extract_by_labels(flat_lines)
+    log(f"Pass 2 (Q-label boundaries): {len(pairs)} pair(s)")
+    if pairs:
+        return pairs
+
+    # Pass 3 — paragraph blocks
+    pairs = extract_by_paragraphs(flat_lines)
+    log(f"Pass 3 (paragraph blocks): {len(pairs)} pair(s)")
+    if pairs:
+        return pairs
+
+    # Pass 4 — whole document
+    log("Pass 4 (fallback): returning full document as one block")
+    full = " ".join(row["line"] for row in flat_lines)
+    return [{"question": "Full document", "answer": full}]
 
 
 # =========================================================
@@ -435,7 +530,7 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    log("Extracting Q&A (no LLM, structure-agnostic)...")
+    log("Extracting Q&A (arrow-anchor strategy, no LLM)...")
     qa_pairs = extract_qa(pages, status_callback)
 
     log(f"Pipeline complete — {len(qa_pairs)} Q-A pair(s)")
