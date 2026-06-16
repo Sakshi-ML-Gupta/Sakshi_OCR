@@ -142,115 +142,122 @@ def build_line_index(pages: list) -> list:
 
 
 # =========================================================
-# GROQ — find question start lines only
-# Groq ONLY returns line numbers — never touches content
-# Works for any language, any format, any structure
+# FIND Q-A BOUNDARIES — pure regex, zero LLM
+# Works for English and Hindi assignment formats
+#
+# Strategy:
+#   Scan every line for QUESTION markers and ANSWER markers
+#   Question marker = line that starts a new question block
+#   Answer marker   = line that starts the student response
+#
+# Returns list of {question_start_line, answer_start_line}
 # =========================================================
+
+# Lines that mark the START of a question block
+Q_BOUNDARY_PATTERNS = [
+    r'^Q[\.\-\s]*\d',                        # Q.1 Q-4 Q. 3 Q.2-
+    r'^(?:प्र|प्रो|प्रश्न)[\.\.\s]*\d?',   # प्र. 2  प्रो.
+    r'^\d{1,2}[\-\.]\d{1,2}[\-\.\s]',   # 9-7.  9-8
+    r'^[१-९][०-९]*[\-\.]',                   # Hindi numerals २०.
+    r'^(?:AR|AB|A\s*B)\s*[→\-\:]',         # AR→  A B -
+    r'^\d{2,3}\.\s*Q[\s\.]',              # 95. Q
+    r'^(?:Section|SECTION|Part|PART)\s+[A-Z\d]', # Section A
+    r'^\(?[ivxIVX]+[\.)\s]',                # (i) (ii) i. ii.
+]
+
+# Lines that mark the START of an answer (student response)
+ANS_BOUNDARY_PATTERNS = [
+    r'^उत्तर\s*[\-\:\→\s]',               # उत्तर - उत्तर:
+    r'^(?:Ans|Ans\.?)\s*[\-\:\→]',        # Ans- Ans:
+    r'^A\.?\s*\d*\s*[\-\:\→]',          # A- A.15- A1:
+    r'^(?:AR|AB)\s*[→\-\:]',                # AR→ AB-
+]
+
+# Lines to ignore entirely (question paper reprints, noise)
+SKIP_PATTERNS = [
+    r'^##',                                     # markdown headers
+    r'^Teacher\'s Signature',                  # footer
+    r'^PAGE NO',                                # footer
+    r'^DATE',                                   # footer
+    r'^Neal? Kamal',                            # student name footer
+    r'^Neel',                                   # student name footer
+]
+
+
+def is_q_boundary(line: str) -> bool:
+    line = line.strip()
+    line = re.sub(r'^\s*[-*#+]\s+', '', line)   # strip markdown bullets
+    for p in Q_BOUNDARY_PATTERNS:
+        if re.match(p, line):
+            return True
+    return False
+
+
+def is_ans_boundary(line: str) -> bool:
+    line = line.strip()
+    for p in ANS_BOUNDARY_PATTERNS:
+        if re.match(p, line):
+            return True
+    return False
+
+
+def is_skip_line(line: str) -> bool:
+    line = line.strip()
+    for p in SKIP_PATTERNS:
+        if re.match(p, line, re.IGNORECASE):
+            return True
+    return False
+
 
 def find_boundaries_with_groq(line_index: list, status_callback=None) -> list:
     """
-    Sends numbered lines to Groq.
-    Groq returns ONLY the line numbers where each question starts.
-    No content extraction — just positions.
-    Returns list of {question_id, start_line, answer_start_line}
+    Pure regex boundary detection — no LLM, no hallucination.
+    Scans all lines for question and answer markers.
+    Returns list of {question_start_line, answer_start_line}
     """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    groq = get_groq_client()
+    log(f"Scanning {len(line_index)} lines for Q-A boundaries...")
 
-    # Send lines in chunks to stay under token limits
-    # Each chunk: up to 400 lines (~6000 tokens)
-    CHUNK_SIZE = 400
+    boundaries    = []
+    current_q     = None
+    current_q_line = None
 
-    all_boundaries = []
+    for entry in line_index:
+        i    = entry["line_number"]
+        line = entry["text"]
 
-    total_chunks = (len(line_index) + CHUNK_SIZE - 1) // CHUNK_SIZE
-
-    for chunk_idx in range(total_chunks):
-        start = chunk_idx * CHUNK_SIZE
-        end   = min(start + CHUNK_SIZE, len(line_index))
-
-        chunk_lines = line_index[start:end]
-
-        numbered = "\n".join(
-            f"[L{entry['line_number']}] {entry['text']}"
-            for entry in chunk_lines
-        )
-
-        log(f"Groq scanning lines {start}-{end} (chunk {chunk_idx+1}/{total_chunks})...")
-
-        prompt = f"""You are scanning a document to find where questions and answers begin.
-
-The document may be in ANY language (English, Hindi, etc.) and ANY format.
-Each line is prefixed with its line number like [L42].
-
-Your job:
-1. Find every QUESTION in this chunk
-2. Find where the ANSWER to each question starts (first line of student's response)
-
-A "question" is any prompt the student is expected to answer:
-- Numbered: "1.", "Q.1", "Q-4", "9-7."
-- Section headers followed by a question
-- Any instruction like "Examine...", "Explain...", "Write...", "बताइए", "समझाइए" etc.
-
-Return ONLY this JSON — no explanation, no markdown:
-{{
-  "boundaries": [
-    {{
-      "question_id": "<label like Q1, Q.2, 9-7, i, ii — from the document>",
-      "question_start_line": <integer>,
-      "answer_start_line": <integer or null if answer not in this chunk>
-    }}
-  ]
-}}
-
-If no questions found in this chunk, return: {{"boundaries": []}}
-
-NUMBERED LINES:
-{numbered}"""
-
-        try:
-            resp = groq.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You find line numbers only. Return valid JSON only. Never modify or quote document content."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0,
-                max_tokens=1024,
-                response_format={"type": "json_object"}
-            )
-
-            raw  = resp.choices[0].message.content.strip()
-            data = json.loads(raw)
-            chunk_boundaries = data.get("boundaries", [])
-            all_boundaries.extend(chunk_boundaries)
-            log(f"  Found {len(chunk_boundaries)} question(s) in this chunk")
-
-        except Exception as e:
-            log(f"  Groq error on chunk {chunk_idx+1}: {e}")
+        if is_skip_line(line):
             continue
 
-    # Sort by question start line
-    all_boundaries.sort(key=lambda b: b.get("question_start_line", 0))
+        if is_q_boundary(line):
+            # Save previous block if exists
+            if current_q is not None and current_q.get("answer_start_line") is None:
+                # No explicit answer marker found — treat next line as answer start
+                current_q["answer_start_line"] = current_q["question_start_line"] + 1
+            if current_q is not None:
+                boundaries.append(current_q)
 
-    # Deduplicate — same line may appear in overlapping chunks
-    seen = set()
-    unique = []
-    for b in all_boundaries:
-        key = b.get("question_start_line")
-        if key not in seen:
-            seen.add(key)
-            unique.append(b)
+            current_q = {
+                "question_start_line": i,
+                "answer_start_line":   None
+            }
 
-    log(f"Total questions found: {len(unique)}")
-    return unique
+        elif is_ans_boundary(line) and current_q is not None:
+            if current_q["answer_start_line"] is None:
+                current_q["answer_start_line"] = i
+
+    # Don't forget the last block
+    if current_q is not None:
+        if current_q["answer_start_line"] is None:
+            current_q["answer_start_line"] = current_q["question_start_line"] + 1
+        boundaries.append(current_q)
+
+    log(f"Found {len(boundaries)} Q-A blocks")
+    return boundaries
 
 
 # =========================================================
