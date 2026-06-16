@@ -8,8 +8,9 @@ import httpx
 from pathlib import Path
 from mistralai import Mistral
 
+
 # =========================================================
-# API KEY
+# API KEYS
 # =========================================================
 
 def get_api_key(name):
@@ -23,7 +24,7 @@ def get_api_key(name):
 
 
 # =========================================================
-# PREPROCESS PDF
+# PREPROCESS PDF  (rasterise → clean OCR)
 # =========================================================
 
 def preprocess_pdf(file_bytes, dpi=250):
@@ -42,7 +43,7 @@ def preprocess_pdf(file_bytes, dpi=250):
 
 
 # =========================================================
-# OCR
+# OCR  (Mistral)
 # =========================================================
 
 def run_ocr(file_content: bytes, file_name: str, status_callback=None):
@@ -151,7 +152,6 @@ def process_reference(file_input, status_callback=None):
         file_bytes = file_input.read()
 
     api_key = get_api_key("MISTRAL_API_KEY")
-
     src_doc     = fitz.open(stream=file_bytes, filetype="pdf")
     total_pages = len(src_doc)
     src_doc.close()
@@ -192,387 +192,271 @@ def process_reference(file_input, status_callback=None):
 
 
 # =========================================================
-# DETECT DOCUMENT TYPE
+# FLATTEN PAGES → indexed lines
 #
-# Type A — question paper separate from answer sheets:
-#   Pages 1-N  : printed question paper
-#   Pages N+1+ : handwritten answer sheets with TOPIC/DATE
-#
-# Type B — integrated format (IGNOU, university assignments):
-#   All answers in one continuous document
-#   Each answer starts with Q.N / Q-N / Ans / number label
-#   No TOPIC/DATE markers
+# Build a single list of all lines across all pages,
+# keeping track of which page each line came from.
+# All Q&A slicing is done on this flat list so the
+# raw OCR text is NEVER modified.
 # =========================================================
 
-def detect_document_type(pages: list) -> str:
-    """Returns 'split' or 'integrated'"""
-    for page in pages:
-        if re.search(r'\bTOPIC\b', page["raw_text"]) and \
-           re.search(r'\bDATE\b', page["raw_text"]):
-            return "split"
-    return "integrated"
-
-
-# =========================================================
-# SPLIT TYPE — question paper separate from answer sheets
-# =========================================================
-
-def find_answer_start_page(pages: list) -> int:
-    for i, page in enumerate(pages):
-        text = page["raw_text"]
-        if re.search(r'\bTOPIC\b', text) and re.search(r'\bDATE\b', text):
-            return i
-    return len(pages) // 2
-
-
-def extract_questions_from_pages(pages: list, end_idx: int) -> list:
-    LABEL_PATTERNS = [
-        r'^\(?[ivxIVX]+[\.\)]\s+\S',
-        r'^\d+[\.\)]\s+\S',
-        r'^Q\.?\s*\d+[\.\):\s]',
-    ]
-    questions = []
-    for page in pages[:end_idx]:
-        for line in page["raw_text"].split("\n"):
-            stripped = line.strip()
-            if len(stripped) < 20:
-                continue
-            for pat in LABEL_PATTERNS:
-                if re.match(pat, stripped):
-                    questions.append(stripped)
-                    break
-
-    seen = set()
-    unique = []
-    for q in questions:
-        key = re.sub(r'\s+', ' ', q.lower().strip())
-        if key not in seen:
-            seen.add(key)
-            unique.append(q)
-    return unique
-
-
-# =========================================================
-# INTEGRATED TYPE — Q&A in same document
-#
-# Strategy:
-#   Scan all lines for lines that START with a question label
-#   The label line itself becomes the question boundary
-#   Everything between two boundaries = answer of the first
-#
-# Question label patterns found in Hindi IGNOU assignments:
-#   Q.1, Q.2, Q. 3, Q-4, Q. 9-      -> Q then dot/dash/space then digit
-#   9-7., 9-8, 86., 95.              -> digit(s)-digit(s) or digit(s).
-#   Ans-, A B:-, AB-3, A.15-         -> Answer markers (these follow questions)
-# =========================================================
-
-# Patterns that mark the START of a new question+answer block
-Q_BOUNDARY_PATTERNS = [
-    r'^Q[\.\-\s]+\d',              # Q.1  Q-4  Q. 3  Q. 9-
-    r'^\d{1,2}[\.\-]\d{1,2}[\.\-\s]',  # 9-7.  9-8  86.
-    r'^\d{2,3}\.\s*Q[\s\.]',       # 95. Q  86. Q
-    r'^\d{1,2}\.\s+(?!\d)',        # 86. संघ  (number. then non-digit content)
-]
-
-# Patterns that mark an ANSWER block start (used to split Q from A within a block)
-ANS_MARKER_PATTERNS = [
-    r'^(?:Ans|AB|A\.?\d*|A\s*B)\s*[\.\-\:\→]',   # Ans- AB:- A.15- A B:-
-    r'^(?:उत्तर|जवाब)\s*[\.\-\:]',                # Hindi answer markers
-]
-
-def is_question_boundary(line: str) -> bool:
-    line = line.strip()
-    line = re.sub(r'^\s*[-*#]+\s*', '', line)  # strip markdown
-    for pat in Q_BOUNDARY_PATTERNS:
-        if re.match(pat, line, re.IGNORECASE):
-            return True
-    return False
-
-
-def is_ans_marker(line: str) -> bool:
-    line = line.strip()
-    for pat in ANS_MARKER_PATTERNS:
-        if re.match(pat, line, re.IGNORECASE):
-            return True
-    return False
-
-
-def extract_question_label(line: str) -> str:
-    """Extract just the Q number label from a boundary line."""
-    line = line.strip()
-    # Q.1, Q-4, Q. 3 etc
-    m = re.match(r'^(Q[\.\-\s]*\d+[\.\-]?\d*)', line, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    # 9-7, 9-8, 86 etc
-    m = re.match(r'^(\d+[\.\-]\d+|\d{2,3})', line)
-    if m:
-        return m.group(1).strip()
-    return line[:30]
-
-
-def process_integrated(pages: list, question_pages: list, status_callback=None) -> list:
+def flatten_pages(pages: list) -> list:
     """
-    For integrated format where questions and answers are in the same document.
-    Skips the question-paper pages (they contain only the printed questions).
-    Scans answer pages for Q boundary lines, slices text between them.
-    Returns list of {question, answer}
+    Returns list of {"line": str, "page_number": int}
+    Skips lines that are pure noise (URLs, image tags, blank).
+    """
+    NOISE = re.compile(
+        r'^\s*$'                          # blank
+        r'|!\[.*?\]\(.*?\)'               # markdown images
+        r'|https?://\S+'                  # bare URLs
+        r'|^\s*[-_=]{3,}\s*$'            # horizontal rules
+    )
+    result = []
+    for p in pages:
+        for line in p["raw_text"].split("\n"):
+            if not NOISE.search(line):
+                result.append({"line": line, "page_number": p["page_number"]})
+    return result
+
+
+# =========================================================
+# LLM BOUNDARY DETECTION
+#
+# Claude sees the text but ONLY returns line numbers.
+# Raw OCR text is sliced from the flat list — never rewritten.
+# =========================================================
+
+BOUNDARY_SYSTEM_PROMPT = """You are a document structure analyser.
+
+You receive OCR text from a student assignment. Each line is prefixed with its
+line number like:
+  [42] Q.1 What is photosynthesis?
+  [43] Ans- Photosynthesis is the process...
+
+Your job: find where each question+answer block STARTS.
+Return ONLY a JSON array of objects, no explanation, no markdown fences.
+
+Each object:
+{
+  "question_number": "Q.1",          // label as it appears, or "?" if unlabelled
+  "question_start_line": 42,         // line number where the question text begins
+  "answer_start_line": 43            // line number where the student answer begins
+                                     // (null if no answer found)
+}
+
+Rules:
+- Ignore cover pages, URLs, headers, footers, admin info, enrollment numbers,
+  dates, watermarks, admit cards, web screenshots — skip those entirely.
+- A question label can be Q.1 / Q-2 / Q. 3 / 1. / (i) / (a) / no label at all.
+- An answer starts at: Ans / Ans- / AB- / A. / उत्तर / or just the line after
+  the question if there is no explicit marker.
+- If question and answer are on the same line, set answer_start_line = question_start_line.
+- If a block has no answer written by the student, set answer_start_line to null.
+- Do NOT rewrite, correct, or paraphrase any text. Only report line numbers.
+- Return [] if no questions found.
+"""
+
+def _call_claude_boundaries(numbered_text: str, anthropic_api_key: str) -> list:
+    """
+    Send numbered OCR text to Claude; get back boundary line numbers only.
+    Returns list of {question_number, question_start_line, answer_start_line}.
+    """
+    resp = httpx.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": anthropic_api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 2048,
+            "system": BOUNDARY_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": numbered_text}]
+        },
+        timeout=120,
+    )
+
+    if resp.status_code != 200:
+        raise Exception(f"Claude API error {resp.status_code}: {resp.text[:300]}")
+
+    raw = resp.json()["content"][0]["text"].strip()
+    # Strip any accidental markdown fences
+    raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+    raw = re.sub(r'\s*```\s*$', '', raw, flags=re.MULTILINE).strip()
+
+    try:
+        result = json.loads(raw)
+        return result if isinstance(result, list) else []
+    except json.JSONDecodeError:
+        m = re.search(r'\[.*\]', raw, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+        return []
+
+
+def _boundaries_from_chunk(
+    flat_lines: list,
+    start_idx: int,
+    end_idx: int,
+    anthropic_api_key: str,
+    offset: int
+) -> list:
+    """
+    Build numbered text for a slice of flat_lines, call Claude,
+    return boundaries with line indices adjusted to global flat_lines space.
+    offset = start_idx (so Claude's local line numbers → global indices).
+    """
+    numbered = "\n".join(
+        f"[{offset + i}] {flat_lines[start_idx + i]['line']}"
+        for i in range(end_idx - start_idx)
+    )
+    raw_boundaries = _call_claude_boundaries(numbered, anthropic_api_key)
+
+    # Validate & clamp line numbers
+    result = []
+    for b in raw_boundaries:
+        qsl = b.get("question_start_line")
+        asl = b.get("answer_start_line")
+        if qsl is None:
+            continue
+        # Already in global space because we used offset+i above
+        result.append({
+            "question_number": b.get("question_number", "?"),
+            "question_start_line": int(qsl),
+            "answer_start_line": int(asl) if asl is not None else None,
+        })
+    return result
+
+
+# =========================================================
+# SLICE RAW TEXT  (no LLM involvement)
+# =========================================================
+
+def _slice_qa(flat_lines: list, boundaries: list) -> list:
+    """
+    Given boundary line indices into flat_lines, slice raw text directly.
+    The LLM never touches answer content — only found boundaries.
+    """
+    qa_pairs = []
+    n = len(flat_lines)
+
+    for i, b in enumerate(boundaries):
+        qsl = b["question_start_line"]
+        asl = b.get("answer_start_line")
+
+        # Next question starts where the next boundary begins
+        next_start = (
+            boundaries[i + 1]["question_start_line"]
+            if i + 1 < len(boundaries)
+            else n
+        )
+
+        # Clamp indices
+        qsl = max(0, min(qsl, n - 1))
+        next_start = max(qsl + 1, min(next_start, n))
+
+        if asl is not None:
+            asl = max(qsl, min(asl, next_start))
+            q_lines = flat_lines[qsl:asl]
+            a_lines = flat_lines[asl:next_start]
+        else:
+            q_lines = flat_lines[qsl:qsl + 1]
+            a_lines = flat_lines[qsl + 1:next_start]
+
+        question_text = " ".join(row["line"] for row in q_lines).strip()
+        answer_text   = " ".join(row["line"] for row in a_lines).strip()
+
+        qa_pairs.append({
+            "question": question_text,
+            "answer":   answer_text,
+        })
+
+    return qa_pairs
+
+
+# =========================================================
+# MAIN EXTRACTION ENTRY POINT
+# =========================================================
+
+CHUNK_LINES = 300   # lines per Claude call (safe for token limits)
+
+def extract_qa_with_llm(pages: list, status_callback=None) -> list:
+    """
+    Structure-agnostic Q&A extraction.
+
+    1. Flatten all pages to a single indexed line list.
+    2. Send chunks of ~300 lines to Claude → get BOUNDARY LINE NUMBERS only.
+    3. Slice raw OCR text at those boundaries — text is never rewritten.
+    4. Merge & de-duplicate across chunks.
     """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    # Skip question paper pages — only process answer pages
-    answer_page_nums = set(range(len(pages))) - set(question_pages)
-    answer_pages = [pages[i] for i in sorted(answer_page_nums)]
-
-    # Flatten all answer lines with page tracking
-    all_lines = []
-    for page in answer_pages:
-        for line in page["raw_text"].split("\n"):
-            all_lines.append(line)
-
-    log(f"Scanning {len(all_lines)} lines for question boundaries...")
-
-    # Find boundary positions
-    boundaries = []
-    for i, line in enumerate(all_lines):
-        if is_question_boundary(line.strip()):
-            label = extract_question_label(line.strip())
-            boundaries.append({"line_index": i, "label": label, "raw_line": line.strip()})
-
-    log(f"Found {len(boundaries)} question boundaries: {[b['label'] for b in boundaries]}")
-
-    if not boundaries:
+    anthropic_api_key = get_api_key("ANTHROPIC_API_KEY")
+    if not anthropic_api_key:
         raise Exception(
-            "No question boundaries found in answer pages.\n"
-            f"First 10 answer lines:\n" + "\n".join(all_lines[:10])
+            "ANTHROPIC_API_KEY not set. Add it to your Streamlit secrets "
+            "(.streamlit/secrets.toml) as:\nANTHROPIC_API_KEY = 'sk-ant-...'"
         )
 
-    # Slice text between boundaries
-    qa_pairs = []
+    flat_lines = flatten_pages(pages)
+    total      = len(flat_lines)
+    log(f"Flattened to {total} lines across {len(pages)} pages")
 
-    for i, b in enumerate(boundaries):
-        start = b["line_index"]
-        end   = boundaries[i + 1]["line_index"] if i + 1 < len(boundaries) else len(all_lines)
+    if total == 0:
+        log("No usable text found.")
+        return []
 
-        block_lines = all_lines[start:end]
+    # Process in chunks
+    all_boundaries = []
+    chunk_start    = 0
 
-        # Within the block, split into question part and answer part
-        # Question = lines before the first Ans marker
-        # Answer   = lines from Ans marker onwards
-        q_lines   = []
-        ans_lines = []
-        ans_started = False
+    while chunk_start < total:
+        chunk_end = min(chunk_start + CHUNK_LINES, total)
+        log(f"  Analysing lines {chunk_start}–{chunk_end} ({chunk_end-chunk_start} lines)...")
 
-        for line in block_lines:
-            stripped = line.strip()
-            if not ans_started and is_ans_marker(stripped):
-                ans_started = True
-            if ans_started:
-                ans_lines.append(stripped)
-            else:
-                q_lines.append(stripped)
-
-        # If no explicit Ans marker found, use the boundary line as question
-        # and everything after it as answer
-        if not ans_started:
-            q_lines   = [block_lines[0].strip()] if block_lines else []
-            ans_lines = [l.strip() for l in block_lines[1:]]
-
-        question_text = " ".join(q for q in q_lines if q).strip()
-        answer_text   = " ".join(a for a in ans_lines if a).strip()
-
-        qa_pairs.append({
-            "question": question_text,
-            "answer":   answer_text
-        })
-
-    return qa_pairs
-
-
-# =========================================================
-# SPLIT TYPE HELPERS (unchanged from before)
-# =========================================================
-
-def normalize(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r'[^\w\s]', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-
-def similarity(a: str, b: str) -> float:
-    wa = set(normalize(a).split())
-    wb = set(normalize(b).split())
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / max(len(wa), len(wb))
-
-
-def strip_leading_label(text: str) -> str:
-    text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text.strip(), flags=re.IGNORECASE)
-    text = re.sub(r'^(?:Q\.?\s*)?\d+[.)]\s*', '', text.strip(), flags=re.IGNORECASE)
-    return text.strip()
-
-
-def strip_markdown(line: str) -> str:
-    return re.sub(r'^\s*[-*+]\s+', '', line)
-
-
-def is_noise_line(line: str) -> bool:
-    patterns = [
-        r'^\s*TOPIC\s*$', r'^\s*DATE\s*$',
-        r'TOPIC\s*_+', r'DATE\s*_+',
-        r'^\s*\d+\s*$', r'^\s*[-_]+\s*$',
-    ]
-    for p in patterns:
-        if re.search(p, line, re.IGNORECASE):
-            return True
-    return False
-
-
-def is_quote_question(question: str) -> bool:
-    return bool(re.match(r'^\(?[ivxIVX]+[.)]\s', question.strip()))
-
-
-STOPWORDS = {
-    'the','a','an','is','are','was','were','of','in','to','and','that',
-    'this','it','he','she','they','i','we','you','at','or','but','not',
-    'with','for','on','from','by','as','be','his','her','its','their'
-}
-
-LABEL_RE = re.compile(
-    r"^\s*(?:(?:Q\.?\s*)?\d+[.)]\s*)?"
-    r"(?:\(?\w+[.)]\s|\"|\d+[.)]\s)"
-)
-
-
-def find_question_boundaries_in_answers(answer_lines, questions,
-                                         similarity_threshold=0.35, window=5):
-    boundaries = []
-    used_questions = set()
-    used_line_indices = set()
-
-    for i in range(len(answer_lines)):
-        line_i = strip_markdown(answer_lines[i].strip())
-        if not LABEL_RE.match(line_i):
-            continue
-
-        for w in range(1, window + 1):
-            if i + w > len(answer_lines):
-                break
-            combined = " ".join(
-                strip_markdown(answer_lines[i + k].strip())
-                for k in range(w) if answer_lines[i + k].strip()
+        try:
+            boundaries = _boundaries_from_chunk(
+                flat_lines, chunk_start, chunk_end,
+                anthropic_api_key, offset=chunk_start
             )
-            if len(combined) < 10:
-                continue
-            combined_clean = strip_leading_label(combined)
+            log(f"    → {len(boundaries)} boundary/ies found")
+            all_boundaries.extend(boundaries)
+        except Exception as e:
+            log(f"    ⚠ Chunk failed: {e}")
 
-            best_score = 0
-            best_q = None
-            for q in questions:
-                if q in used_questions:
-                    continue
-                s1 = similarity(combined, q)
-                s2 = similarity(combined_clean, strip_leading_label(q))
-                combined_words = normalize(combined_clean).split()
-                q_words = normalize(strip_leading_label(q)).split()
-                body_c = " ".join(combined_words[1:]) if len(combined_words) > 1 else ""
-                body_q = " ".join(q_words[1:]) if len(q_words) > 1 else ""
-                s3 = similarity(body_c, body_q) if body_c and body_q else 0
-                score = max(s1, s2, s3)
-                if score > best_score:
-                    best_score = score
-                    best_q = q
+        chunk_start = chunk_end
 
-            if best_q and best_score >= similarity_threshold:
-                if i not in used_line_indices:
-                    boundaries.append({"question": best_q, "line_index": i})
-                    used_questions.add(best_q)
-                    used_line_indices.add(i)
-                break
+    if not all_boundaries:
+        log("⚠ No Q&A boundaries detected in any chunk.")
+        # Fallback: return entire text as one block
+        full_text = " ".join(row["line"] for row in flat_lines).strip()
+        return [{
+            "question": "Document content (no structured Q&A detected)",
+            "answer":   full_text
+        }]
 
-    boundaries.sort(key=lambda b: b["line_index"])
-    return boundaries
+    # Sort by question_start_line, de-duplicate
+    all_boundaries.sort(key=lambda b: b["question_start_line"])
+    seen_lines = set()
+    deduped = []
+    for b in all_boundaries:
+        key = b["question_start_line"]
+        if key not in seen_lines:
+            seen_lines.add(key)
+            deduped.append(b)
 
+    log(f"Total unique boundaries: {len(deduped)}")
 
-def find_answer_start_offset(answer_lines, boundary_idx, question):
-    if not is_quote_question(question):
-        return 1
-    q_words = set(normalize(question).split()) - STOPWORDS
-    offset = 1
-    max_skip = min(8, len(answer_lines) - boundary_idx - 1)
-    for k in range(1, max_skip + 1):
-        idx = boundary_idx + k
-        if idx >= len(answer_lines):
-            break
-        line = answer_lines[idx].strip()
-        if not line or is_noise_line(line):
-            offset = k + 1
-            continue
-        line_words = set(normalize(line).split()) - STOPWORDS
-        if not line_words:
-            offset = k + 1
-            continue
-        overlap = len(line_words & q_words) / max(len(line_words), 1)
-        if overlap >= 0.55:
-            offset = k + 1
-        else:
-            break
-    return offset
-
-
-def slice_raw_answers(answer_lines, boundaries):
-    qa_pairs = []
-    for i, b in enumerate(boundaries):
-        skip    = find_answer_start_offset(answer_lines, b["line_index"], b["question"])
-        a_start = b["line_index"] + skip
-        a_end   = boundaries[i + 1]["line_index"] if i + 1 < len(boundaries) else len(answer_lines)
-        raw_lines = [answer_lines[j] for j in range(a_start, a_end)
-                     if not is_noise_line(answer_lines[j])]
-        qa_pairs.append({
-            "question": b["question"],
-            "answer": " ".join(raw_lines).strip()
-        })
+    qa_pairs = _slice_qa(flat_lines, deduped)
+    log(f"Done — {len(qa_pairs)} Q-A pair(s) extracted")
     return qa_pairs
-
-
-# =========================================================
-# DETECT QUESTION PAPER PAGES
-# Page 1 is usually cover page, page 2 is question paper
-# Answer pages start where Q.N labels begin
-# =========================================================
-
-def find_question_paper_pages(pages: list) -> list:
-    """
-    Returns list of page indices (0-based) that are question paper pages.
-    These pages contain only printed questions, no student answers.
-    Heuristic: question paper pages have question lists but no Ans/AB markers.
-    """
-    q_paper_pages = []
-    for i, page in enumerate(pages):
-        text = page["raw_text"]
-        has_printed_questions = bool(
-            re.search(r'^\s*\d+[\.\)]\s+.{20,}', text, re.MULTILINE)
-        )
-        has_student_answers = bool(
-            re.search(r'(?:^|\n)\s*(?:Ans|AB|A\.?\d*)\s*[\.\-\:\→]', text, re.IGNORECASE)
-        ) or bool(
-            re.search(r'(?:^|\n)\s*Q[\.\-\s]*\d+', text, re.IGNORECASE)
-        )
-        # If page has printed question list but student hasn't written on it
-        if has_printed_questions and not has_student_answers:
-            q_paper_pages.append(i)
-
-    # Always include page index 0 (cover) and 1 (question paper) as non-answer
-    for idx in [0, 1]:
-        if idx not in q_paper_pages and idx < len(pages):
-            q_paper_pages.append(idx)
-
-    return sorted(set(q_paper_pages))
 
 
 # =========================================================
@@ -601,48 +485,8 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    # Detect document type
-    doc_type = detect_document_type(pages)
-    log(f"Document type detected: {doc_type}")
+    log("Extracting Q&A pairs (boundary detection via LLM, slicing from raw OCR)...")
+    qa_pairs = extract_qa_with_llm(pages, status_callback)
 
-    if doc_type == "split":
-        # Original flow — question paper separate from answer sheets
-        log("Split format: finding answer start page...")
-        answer_start = find_answer_start_page(pages)
-        log(f"Question pages: 1-{answer_start} | Answer pages: {answer_start+1}-{len(pages)}")
-
-        questions = extract_questions_from_pages(pages, answer_start)
-        log(f"Found {len(questions)} questions")
-
-        if not questions:
-            raise Exception("No questions found in question pages.\n"
-                            f"Preview:\n{pages[0]['raw_text'][:400]}")
-
-        answer_lines = []
-        for page in pages[answer_start:]:
-            for line in page["raw_text"].split("\n"):
-                answer_lines.append(line)
-
-        boundaries = find_question_boundaries_in_answers(answer_lines, questions)
-        log(f"Matched {len(boundaries)} boundaries")
-
-        for q in questions:
-            if q not in {b["question"] for b in boundaries}:
-                log(f"WARNING: No boundary found for: {q[:80]}")
-
-        if not boundaries:
-            raise Exception("Could not match any questions in answer pages.\n"
-                            f"Questions: {questions}")
-
-        qa_pairs = slice_raw_answers(answer_lines, boundaries)
-
-    else:
-        # Integrated format — Q&A in same document (IGNOU style)
-        log("Integrated format: scanning for Q.N boundaries...")
-        question_paper_pages = find_question_paper_pages(pages)
-        log(f"Skipping pages (question paper/cover): {[p+1 for p in question_paper_pages]}")
-
-        qa_pairs = process_integrated(pages, question_paper_pages, status_callback)
-
-    log(f"Done — {len(qa_pairs)} Q-A pairs")
+    log(f"Pipeline complete — {len(qa_pairs)} Q-A pair(s)")
     return ocr_json, qa_pairs
