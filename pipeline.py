@@ -322,11 +322,16 @@ def find_question_boundaries_by_similarity(
     """
     Scans answer lines for restated questions matching official questions.
     Uses sliding window to join multi-line question restatements.
-    Returns boundaries sorted by line position, one per question (best match).
+
+    Two correctness guarantees:
+    1. Tracks how many lines (`span`) the matched question text occupies,
+       so the answer slice can start AFTER the full question text, not
+       just one line after the first matched line.
+    2. Enforces that boundaries appear in the SAME ORDER as the official
+       questions list — prevents a later question's text incidentally
+       scoring high on an earlier line and jumping out of order.
     """
-    used_questions     = set()
-    used_line_indices  = set()
-    candidates         = []   # collect all candidate matches, pick best per question later
+    candidates = []
 
     for i in range(len(answer_lines)):
         line_i = answer_lines[i].strip()
@@ -356,6 +361,7 @@ def find_question_boundaries_by_similarity(
                     candidates.append({
                         "question":   q,
                         "line_index": i,
+                        "span":       w,     # how many lines the question text occupies
                         "score":      score
                     })
 
@@ -366,29 +372,36 @@ def find_question_boundaries_by_similarity(
         if q not in best_per_question or c["score"] > best_per_question[q]["score"]:
             best_per_question[q] = c
 
-    boundaries = list(best_per_question.values())
-    boundaries.sort(key=lambda b: b["line_index"])
-
-    # Remove boundaries that collide on the same line index (keep highest score)
+    # Enforce document order matches official question order:
+    # walk through questions in their official order, only accept
+    # a candidate if its line_index is AFTER the previous accepted one
     final = []
-    seen_lines = set()
-    for b in boundaries:
-        if b["line_index"] not in seen_lines:
-            final.append(b)
-            seen_lines.add(b["line_index"])
+    last_line_index = -1
 
-    final.sort(key=lambda b: b["line_index"])
+    for q in questions:
+        c = best_per_question.get(q)
+        if c is None:
+            continue
+        if c["line_index"] <= last_line_index:
+            # This match would go backwards — likely a false positive
+            # (e.g. shared vocabulary with an earlier question's content)
+            continue
+        final.append(c)
+        last_line_index = c["line_index"]
+
     return final
 
 
 def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
     """
-    For each boundary, answer = raw lines from boundary+1 to next boundary.
+    For each boundary, answer = raw lines starting AFTER the full matched
+    question span (boundary["span"] lines), up to the next boundary.
     Pure text slicing, zero LLM.
     """
     qa_pairs = []
     for i, b in enumerate(boundaries):
-        a_start = b["line_index"] + 1
+        span    = b.get("span", 1)
+        a_start = b["line_index"] + span
         a_end   = boundaries[i + 1]["line_index"] if i + 1 < len(boundaries) else len(answer_lines)
 
         raw = [
