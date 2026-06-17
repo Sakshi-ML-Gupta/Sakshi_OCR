@@ -113,7 +113,7 @@ def build_ocr_json(pages: list) -> dict:
 
 
 # =========================================================
-# REFERENCE BOOK — page by page, base64 inline
+# REFERENCE BOOK OCR
 # =========================================================
 
 def ocr_page_base64(page_b64: str, api_key: str) -> str:
@@ -191,74 +191,216 @@ def process_reference(file_input, status_callback=None):
 
 
 # =========================================================
-# DETECT QUESTION PAPER PAGE
-# The page that contains the printed list of questions
-# Identified by having numbered questions >= 5 items
+# QUESTION PAPER DETECTION
 # =========================================================
 
 def find_question_paper_page(pages: list) -> int:
     """
-    Returns index (0-based) of the page that is the question paper.
-    Looks for a page with 5+ numbered question lines.
+    Returns index (0-based) of the page that is the printed question
+    paper. Looks for the page with the most numbered/lettered label
+    lines AND short per-label content (a list, not prose answers).
     """
-    Q_LINE = re.compile(r'^\s*\d+[\.\)]\s+.{20,}')
-
-    best_idx   = -1
-    best_count = 0
-
+    best_idx, best_count = -1, 0
     for i, page in enumerate(pages):
         count = sum(
             1 for line in page["raw_text"].split("\n")
-            if Q_LINE.match(line.strip())
+            if TOP_LEVEL_RE.match(line.strip())
         )
         if count > best_count:
             best_count = count
-            best_idx   = i
-
+            best_idx = i
     return best_idx if best_count >= 3 else -1
 
 
 # =========================================================
-# EXTRACT OFFICIAL QUESTIONS FROM QUESTION PAPER PAGE
-# Returns list of question strings in order
+# OFFICIAL QUESTION EXTRACTION — WITH SUB-PARTS
+#
+# Produces a FLAT list of question units in document order, where
+# each unit knows its own label/text AND, if it's a sub-part, which
+# parent question it belongs to. This is the key structural fix:
+# sub-parts (a/b/c, i/ii/iii, क/ख/ग/घ) are extracted as independent
+# question units, not swallowed into their parent's answer blob.
+#
+# Each unit: {"label": str, "text": str, "level": "top"|"sub",
+#             "parent_label": str|None}
 # =========================================================
+
+TOP_LEVEL_RE = re.compile(r'^\s*(\d{1,2})[\.\)]\s+(.+)')
+
+SUB_PART_PATTERNS = [
+    re.compile(r'^\s*\(([a-zA-Z])\)\s*(.+)'),                 # (a) (b) (i) (ii)
+    re.compile(r'^\s*([a-zA-Z])\)\s*(.+)'),                    # a) b) i) ii) without parens
+    re.compile(r'^\s*\(([\u0915-\u0939])\)\s*(.+)'),           # (क) (ख) (ग) (घ)
+]
+
+# Lines that are SECTION/INSTRUCTION headers, not real questions.
+# These describe a *group* of questions ("Answer the following
+# questions in about 800 words each") rather than asking one
+# specific thing — they should never become a Q&A pair of their own.
+INSTRUCTION_ONLY_RE = re.compile(
+    r'^(?:answer the following|write short notes on the following|'
+    r'निम्नलिखित (?:पर|के) |सभी प्रश्न|note\s*[:.]|section\b|भाग[\-\s]?\d|'
+    r'part\s*[-\s]?\w)',
+    re.I
+)
+
+SKIP_LINE_RE = re.compile(r'^#+\s|^भाग|^PART|^\s*$|^Section\b', re.I)
+
+
+def _is_instruction_only(text: str) -> bool:
+    """
+    True if this looks like a section/group instruction rather than a
+    question with its own distinct answer — e.g. "Answer the following
+    questions in about 800 words each" (no specific content asked),
+    as opposed to "Discuss the major themes in the play Dr. Faustus"
+    (a specific, answerable prompt) even though both start similarly.
+    """
+    stripped = text.strip()
+    # If the line is ONLY the instructional phrase with no further
+    # specific content (short, generic, ends right after marks/word
+    # count), treat as instruction. If it's long / contains a specific
+    # question after a colon, treat as real.
+    if not INSTRUCTION_ONLY_RE.match(stripped):
+        return False
+    # Real questions that happen to start with "Answer the following"
+    # but then specify content are longer / contain "?" or a colon
+    # followed by substantial text. Pure instructions are short and
+    # end in word-count / marks notation.
+    word_count = len(stripped.split())
+    return word_count <= 18
+
 
 def extract_official_questions(page_text: str) -> list:
     """
-    Extracts numbered questions from the question paper page.
-    Handles multi-line questions by joining continuation lines.
+    Walks the printed question-paper page and produces a flat,
+    ordered list of question units, correctly capturing sub-parts
+    as independent entries tied to their parent.
+
+    Handles:
+      - top-level numbered questions: "1. text", "2. text"
+      - lettered/roman sub-parts following a top-level question:
+        "a) text", "(b) text", "(i) text"
+      - Devanagari lettered sub-parts: "(क) text"
+      - multi-line continuations (text wraps to next line before the
+        next label appears)
+      - section instruction lines that should NOT become their own
+        Q&A pair (e.g. "Answer the following questions in about 800
+        words each.") — these are dropped, and their *contained*
+        sub-items (the actual numbered questions that follow) become
+        the real top-level units for that section
+      - duplicate numbering across sections (e.g. Section A's "1.,
+        2., 3." vs Section C's own "1., 2., 3.") by tracking section
+        boundaries via instruction lines and re-keying duplicate
+        labels with a section-aware suffix so they never collide
     """
-    lines     = page_text.split("\n")
-    questions = []
-    current   = None
+    lines = page_text.split("\n")
 
-    # Matches: "1. text", "2. text", etc.
-    Q_START = re.compile(r'^\s*(\d+)[\.\)]\s+(.+)')
-    # Section headers to skip
-    SKIP    = re.compile(r'^#+\s|^भाग|^PART|^\s*$')
+    units = []
+    current_top = None        # currently open top-level unit (dict) or None
+    pending_parent_label = None  # label that subsequent sub-parts (a,b,c) should attach to,
+                                   # even if the parent line itself was instruction-only
+                                   # and never became its own unit
+    section_counter = 0        # increments every time we see an instruction line
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or SKIP.match(stripped):
-            if current:
-                questions.append(current.strip())
-                current = None
+    def flush_top():
+        if current_top is not None:
+            current_top["text"] = current_top["text"].strip()
+            units.append(current_top)
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if SKIP_LINE_RE.match(stripped) and not TOP_LEVEL_RE.match(stripped):
             continue
 
-        m = Q_START.match(stripped)
-        if m:
-            if current:
-                questions.append(current.strip())
-            current = stripped
-        elif current:
-            # continuation of previous question
-            current += " " + stripped
+        # --- Top-level numbered line? ---
+        m_top = TOP_LEVEL_RE.match(stripped)
+        if m_top:
+            num, rest = m_top.group(1), m_top.group(2)
+            label = f"S{section_counter}-{num}" if section_counter else num
 
-    if current:
-        questions.append(current.strip())
+            if _is_instruction_only(rest):
+                # This is a section header like "Answer the following
+                # questions in about 800 words each." Close out any
+                # open unit, bump the section counter so subsequent
+                # "1./2./3." labels get a unique section-aware key,
+                # and do NOT create a Q&A pair for this line itself —
+                # but DO remember its label so sub-parts that follow
+                # (a) b) c)) can still attach to it.
+                flush_top()
+                current_top = None
+                pending_parent_label = label
+                section_counter += 1
+                continue
 
-    return questions
+            # Real top-level question. Close the previous one first.
+            flush_top()
+            current_top = {
+                "label": label,
+                "display_label": f"{num}.",
+                "text": rest,
+                "level": "top",
+                "parent_label": None,
+            }
+            pending_parent_label = label
+            continue
 
+        # --- Sub-part line (a) b) (क) etc — attaches to whichever
+        # parent label is currently pending (whether or not that
+        # parent became its own answerable unit). ---
+        matched_sub = None
+        for pat in SUB_PART_PATTERNS:
+            m = pat.match(stripped)
+            if m:
+                matched_sub = m
+                break
+
+        if matched_sub and pending_parent_label is not None:
+            letter, rest = matched_sub.group(1), matched_sub.group(2)
+
+            # First sub-part under this parent: the parent itself
+            # stops accumulating free text (it's now just an umbrella),
+            # so flush/clear current_top if it matches this parent.
+            if current_top is not None and current_top["label"] == pending_parent_label:
+                flush_top()
+                current_top = None
+
+            units.append({
+                "label": f"{pending_parent_label}{letter})",
+                "display_label": f"{letter})",
+                "text": rest,
+                "level": "sub",
+                "parent_label": pending_parent_label,
+            })
+            continue
+
+        # --- Continuation line: append to whichever unit is open ---
+        if current_top is not None:
+            current_top["text"] += " " + stripped
+        elif units:
+            units[-1]["text"] += " " + stripped
+        # else: stray line before any question started — ignore
+
+    flush_top()
+
+    # Build final question text list. If a top-level question has
+    # sub-parts, it has no independent answer of its own — only its
+    # sub-parts are answerable questions. We mark this by NOT including
+    # bare top-level questions that were immediately consumed into subs
+    # (they were never appended above since we set current_top=None and
+    # didn't flush them as a standalone unit — flush_top() found
+    # current_top None and added nothing extra, so they're naturally
+    # excluded). Units list now contains exactly the answerable items.
+
+    return [{"label": u["label"], "display_label": u["display_label"],
+             "text": u["text"].strip(), "level": u["level"],
+             "parent_label": u["parent_label"]} for u in units]
+
+
+# =========================================================
+# NOISE FILTERING FOR ANSWER PAGES
+# =========================================================
 
 NOISE_RE = re.compile(
     r'(?:Teacher\'?s?\s*Signature'
@@ -271,6 +413,11 @@ NOISE_RE = re.compile(
     r'|Need?\s*Komal'
     r'|Nod\s*Komal'
     r'|TAKMA\s*SINAN'
+    r'|Experiment\s*Name'
+    r'|KLA(?:SS|ES|SE)?(?:NOTE|ENOTE|ENSTE|ENCTE|SCHOTE)?'
+    r'|KLEBENOTE|KILKEENOTE|KIASSNOTE|KIASENOTE|KIRENNOTE'
+    r'|!\[img[\-\d]*\.jpeg?\]\([^)]*\)'
+    r'|^\s*\*{1,3}\s*$'
     r'|^\s*\d{1,3}\s*$)',
     re.IGNORECASE
 )
@@ -281,10 +428,8 @@ def is_noise(line: str) -> bool:
 
 
 # =========================================================
-# FIND QUESTION BOUNDARIES IN ANSWER PAGES — similarity based
-# Works for Hindi, English, any language
-# Matches student-written question restatements against the
-# official question paper text using word-overlap similarity
+# SIMILARITY MATCHING — find where each question is restated/
+# answered in the handwritten pages
 # =========================================================
 
 def normalize(text: str) -> str:
@@ -303,39 +448,33 @@ def similarity(a: str, b: str) -> float:
 
 
 def strip_leading_label(text: str) -> str:
-    """Strip leading numbering like '1.', 'Q1.', 'प्र.2', '20.' etc."""
     text = text.strip()
     text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text, flags=re.IGNORECASE)
     text = re.sub(r'^(?:उत्तर)\s*[\-\:\s]*', '', text)
     text = re.sub(r'^(?:प्र|प्रो|प्रश्न)[\.\s]*\d*[\.\s]*', '', text)
     text = re.sub(r'^[१-९०][०-९]*[\.\-\s]*', '', text)
     text = re.sub(r'^(?:Q\.?\s*)?\d+[.)]\s*', '', text)
+    text = re.sub(r'^\(?[a-zA-Z\u0915-\u0939]\)\s*', '', text)
     return text.strip()
 
 
 def find_question_boundaries_by_similarity(
     answer_lines: list,
-    questions: list,
-    similarity_threshold: float = 0.30,
+    question_units: list,
+    similarity_threshold: float = 0.28,
     window: int = 4
 ) -> list:
     """
-    Scans answer lines for restated questions matching official questions.
-    Uses sliding window to join multi-line question restatements.
-
-    Two correctness guarantees:
-    1. Tracks how many lines (`span`) the matched question text occupies,
-       so the answer slice can start AFTER the full question text, not
-       just one line after the first matched line.
-    2. Enforces that boundaries appear in the SAME ORDER as the official
-       questions list — prevents a later question's text incidentally
-       scoring high on an earlier line and jumping out of order.
+    Scans answer lines for restated questions matching official
+    question units (top-level AND sub-parts treated identically —
+    each is just a "question" to match against). Sub-parts use a
+    lower window since they're typically short labels like "a) Renaissance".
     """
     candidates = []
 
     for i in range(len(answer_lines)):
         line_i = answer_lines[i].strip()
-        if len(line_i) < 8:
+        if len(line_i) < 3:
             continue
 
         for w in range(1, window + 1):
@@ -346,45 +485,58 @@ def find_question_boundaries_by_similarity(
                 answer_lines[i + k].strip()
                 for k in range(w) if answer_lines[i + k].strip()
             )
-            if len(combined) < 10:
+            if len(combined) < 6:
                 continue
 
             combined_clean = strip_leading_label(combined)
 
-            for q in questions:
-                q_clean = strip_leading_label(q)
-                s1 = similarity(combined, q)
+            for unit in question_units:
+                q_text = unit["text"]
+                q_clean = strip_leading_label(q_text)
+
+                s1 = similarity(combined, q_text)
                 s2 = similarity(combined_clean, q_clean)
-                score = max(s1, s2)
+
+                # Sub-part labels are often very short (e.g. "Renaissance",
+                # "Amoretti") — boost exact-label-line matches.
+                s3 = 0.0
+                if unit["level"] == "sub":
+                    label_only = unit["display_label"].rstrip(")")
+                    # does the answer line literally start with this
+                    # sub label's first content word?
+                    first_word = q_clean.split()[0] if q_clean.split() else ""
+                    if first_word and first_word.lower() in normalize(combined).split():
+                        s3 = 0.5
+
+                score = max(s1, s2, s3)
 
                 if score >= similarity_threshold:
                     candidates.append({
-                        "question":   q,
+                        "question": unit["text"],
+                        "label": unit["label"],
+                        "display_label": unit["display_label"],
+                        "level": unit["level"],
+                        "parent_label": unit["parent_label"],
                         "line_index": i,
-                        "span":       w,     # how many lines the question text occupies
-                        "score":      score
+                        "span": w,
+                        "score": score
                     })
 
-    # For each question, keep only its BEST scoring candidate
-    best_per_question = {}
+    # Best candidate per question unit (by label, since text might repeat)
+    best_per_label = {}
     for c in candidates:
-        q = c["question"]
-        if q not in best_per_question or c["score"] > best_per_question[q]["score"]:
-            best_per_question[q] = c
+        key = c["label"]
+        if key not in best_per_label or c["score"] > best_per_label[key]["score"]:
+            best_per_label[key] = c
 
-    # Enforce document order matches official question order:
-    # walk through questions in their official order, only accept
-    # a candidate if its line_index is AFTER the previous accepted one
+    # Enforce document order matches official question order
     final = []
     last_line_index = -1
-
-    for q in questions:
-        c = best_per_question.get(q)
+    for unit in question_units:
+        c = best_per_label.get(unit["label"])
         if c is None:
             continue
         if c["line_index"] <= last_line_index:
-            # This match would go backwards — likely a false positive
-            # (e.g. shared vocabulary with an earlier question's content)
             continue
         final.append(c)
         last_line_index = c["line_index"]
@@ -394,9 +546,8 @@ def find_question_boundaries_by_similarity(
 
 def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
     """
-    For each boundary, answer = raw lines starting AFTER the full matched
-    question span (boundary["span"] lines), up to the next boundary.
-    Pure text slicing, zero LLM.
+    For each boundary, answer = raw lines starting AFTER the matched
+    question span, up to the next boundary. Pure text slicing.
     """
     qa_pairs = []
     for i, b in enumerate(boundaries):
@@ -410,7 +561,7 @@ def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> lis
         ]
 
         qa_pairs.append({
-            "question": b["question"],
+            "question": f"{b['display_label']} {b['question']}".strip(),
             "answer":   " ".join(raw).strip()
         })
 
@@ -434,25 +585,23 @@ def process_pdf(file_input, status_callback=None):
         file_bytes = file_input.read()
         file_name  = getattr(file_input, "name", "document.pdf")
 
-    # Step 1: Preprocess
     log("Preprocessing PDF...")
     processed = preprocess_pdf(file_bytes)
 
-    # Step 2: OCR
     pages = run_ocr(processed, file_name, status_callback)
 
-    # Step 3: Build OCR JSON
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    # Step 4: Find question paper page
     qp_idx = find_question_paper_page(pages)
     log(f"Question paper detected on page: {qp_idx + 1 if qp_idx >= 0 else 'not found'}")
 
     if qp_idx >= 0:
         official_questions = extract_official_questions(pages[qp_idx]["raw_text"])
-        log(f"Official questions extracted: {len(official_questions)}")
+        log(f"Official question units extracted (incl. sub-parts): {len(official_questions)}")
+        for u in official_questions:
+            log(f"  [{u['level']}] {u['display_label']} {u['text'][:60]}")
     else:
         official_questions = []
         log("No question paper page found")
@@ -463,11 +612,9 @@ def process_pdf(file_input, status_callback=None):
             f"Preview of detected page:\n{pages[max(qp_idx,0)]['raw_text'][:500]}"
         )
 
-    # Step 5: Get answer pages (everything after question paper)
     answer_start = qp_idx + 1 if qp_idx >= 0 else 0
     answer_pages = pages[answer_start:]
 
-    # Step 6: Flatten answer page lines
     answer_lines = []
     for page in answer_pages:
         for line in page["raw_text"].split("\n"):
@@ -476,24 +623,22 @@ def process_pdf(file_input, status_callback=None):
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
-    # Step 7: Similarity-based matching — works for any language/format
-    log("Matching questions via similarity (works for Hindi/English/any format)...")
+    log("Matching questions via similarity (top-level + sub-parts)...")
     boundaries = find_question_boundaries_by_similarity(answer_lines, official_questions)
-    log(f"Matched {len(boundaries)} of {len(official_questions)} questions")
+    log(f"Matched {len(boundaries)} of {len(official_questions)} question units")
 
-    matched_qs = {b["question"] for b in boundaries}
-    for q in official_questions:
-        if q not in matched_qs:
-            log(f"WARNING: No match found for: {q[:60]}")
+    matched_labels = {b["label"] for b in boundaries}
+    for u in official_questions:
+        if u["label"] not in matched_labels:
+            log(f"WARNING: No match found for [{u['level']}] {u['display_label']} {u['text'][:60]}")
 
     if not boundaries:
         raise Exception(
             "Could not match any questions in answer pages.\n"
-            f"Official questions: {official_questions}\n"
+            f"Official questions: {[u['text'] for u in official_questions]}\n"
             f"First 10 answer lines: {answer_lines[:10]}"
         )
 
-    # Step 8: Slice raw answers — zero LLM, pure text slicing
     log("Slicing raw answers...")
     qa_pairs = slice_raw_answers_by_boundaries(answer_lines, boundaries)
 
