@@ -8,6 +8,7 @@ import httpx
 from pathlib import Path
 from mistralai import Mistral
 
+
 # =========================================================
 # API KEY
 # =========================================================
@@ -113,7 +114,7 @@ def build_ocr_json(pages: list) -> dict:
 
 
 # =========================================================
-# REFERENCE BOOK — page by page, base64 inline
+# REFERENCE BOOK OCR
 # =========================================================
 
 def ocr_page_base64(page_b64: str, api_key: str) -> str:
@@ -150,7 +151,8 @@ def process_reference(file_input, status_callback=None):
     else:
         file_bytes = file_input.read()
 
-    api_key     = get_api_key("MISTRAL_API_KEY")
+    api_key = get_api_key("MISTRAL_API_KEY")
+
     src_doc     = fitz.open(stream=file_bytes, filetype="pdf")
     total_pages = len(src_doc)
     src_doc.close()
@@ -191,299 +193,269 @@ def process_reference(file_input, status_callback=None):
 
 
 # =========================================================
-# DETECT QUESTION PAPER PAGE
-# The page that contains the printed list of questions
-# Identified by having numbered questions >= 5 items
+# UNIVERSAL Q&A EXTRACTOR  v3
+# No LLM. No fixed structure assumptions.
+#
+# KEY INSIGHT (from real samples across two very different
+# IGNOU course formats):
+#
+#   The thing that reliably marks a NEW question is the
+#   QUESTION LABEL itself — Q.1, Q-2, 1., (a), (i), etc.
+#   The "Ans/AB/A.15-" marker is NOT reliable: OCR reads the
+#   same handwritten word as "Ans-", "A B:-", "AB-3", "A.15-",
+#   "AIS-7", "A13-3" etc. depending on handwriting noise.
+#
+#   So: a new Q&A block starts at a question-label line.
+#   Everything until the next question-label line — INCLUDING
+#   any "Ans-" noise word — is the answer (we just don't try
+#   to parse the Ans-marker separately; we keep it as-is,
+#   since stripping it raw-text-style without modification
+#   is safest).
+#
+#   We ALSO strip page furniture that repeats on every page
+#   and pollutes the text: "Experiment Name :", "Page No. N",
+#   "Teacher's Signature & Date :", lone page numbers injected
+#   mid-paragraph by the OCR (e.g. "8 9", "14 15").
 # =========================================================
 
-def find_question_paper_page(pages: list) -> int:
+# ---- noise that should be removed before boundary detection ----
+NOISE_LINE_RE = re.compile(
+    r'^\s*$'                                  # blank
+    r'|!\[.*?\]\(.*?\)'                       # markdown images
+    r'|https?://\S+'                          # URLs
+    r'|^\s*[-_=]{3,}\s*$'                     # horizontal rules
+    r'|^\s*Experiment\s*Name\s*:?\s*$'        # repeating page furniture
+    r'|^\s*Page\s*No\.?\s*\d*\s*$'
+    r"|^\s*Teacher'?s\s*Signature\s*&?\s*Date\s*:?.*$"
+    r'|^\s*\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}[,\s]*\d{0,2}:?\d{0,2}\s*$'  # bare dates/timestamps
+    , re.I
+)
+
+# Lines that are entirely admin/cover/web junk — used for whole-page skip
+JUNK_PAGE_SIGNALS = re.compile(
+    r'Acknowledgment|acknowledgement|www\.|\.asp|\.html|'
+    r'KNOW YOUR ADMISSION|REGISTRATION DETAILS|Indira Gandhi National Open University|'
+    r'enrollment\s*no|enrolment\s*no|programme\s*code|study\s*centre|'
+    r'Student Identity Card|IGNOU - Student|RC Code|Father\'?s Name'
+    , re.I
+)
+
+# Mid-text injected page numbers like "8 9" or "14 15" standing alone
+# (printed page numbers OCR'd between handwritten lines)
+INLINE_PAGENUM_RE = re.compile(r'^\s*\d{1,3}(?:\s+\d{1,3}){0,2}\s*$')
+
+
+# ---- question-label boundary patterns, highest confidence first ----
+# Each: (regex, score). A line is a candidate boundary if total score
+# across all matching patterns >= threshold used in that pass.
+QUESTION_LABEL_PATTERNS = [
+    # Q.1 / Q-1 / Q 1 / Q.1. / Ques.1 / Question 1 / Q.1- (with optional trailing dash)
+    (re.compile(r'^\s*Q(?:ues(?:tion)?)?[\.\-\s]*\d+\s*[\.\)\-:]?', re.I), 10),
+
+    # 1. text / 1) text  — digit + dot/paren + space + non-digit start
+    (re.compile(r'^\s*\d{1,3}[\.\)]\s+[^\d\s]'), 8),
+
+    # (a) (b) (i) (ii) (iv) — lettered/roman sub-question, parens
+    (re.compile(r'^\s*\([a-zA-Z]{1,4}\)\s*\S'), 8),
+
+    # a) b) i) ii) — without parens, followed by capital or Devanagari
+    (re.compile(r'^\s*[a-zA-Z]{1,3}\)\s*[A-Z\u0900-\u097F]'), 6),
+
+    # 9-7. / 9-8 / 86. / 95. — IGNOU-style cross-numbered question refs
+    (re.compile(r'^\s*\d{1,2}[\.\-]\d{1,2}\b'), 6),
+]
+
+# Words that strongly indicate an answer-label noise token sitting at
+# the START of a line right after a real question boundary — these are
+# NOT boundaries themselves (too unreliable across OCR variants), but
+# recognising them helps us avoid double-counting them as new questions.
+ANSWER_NOISE_RE = re.compile(
+    r'^\s*(?:Ans|A\s*B|A\d{0,2}|AIS|AR)[\.\-\:\s\d]{0,6}[\-\:→]?\s*$', re.I
+)
+
+
+def _score_line(line: str) -> int:
+    stripped = line.strip()
+    if len(stripped) < 2:
+        return 0
+    total = 0
+    for pat, score in QUESTION_LABEL_PATTERNS:
+        if pat.match(stripped):
+            total += score
+    return total
+
+
+def _is_junk_page(page_text: str) -> bool:
+    lines = [l for l in page_text.split('\n') if l.strip()]
+    if not lines:
+        return True
+    junk_hits = sum(1 for l in lines if JUNK_PAGE_SIGNALS.search(l))
+    return junk_hits / max(len(lines), 1) > 0.3
+
+
+# A printed question paper looks like: several lines that ALL score as
+# question-label boundaries, with very little non-label prose between
+# them (each "question" is 1-3 lines, no real answer content).
+# A genuine answer page has long stretches of prose between boundaries.
+QUESTION_PAPER_HINTS = re.compile(
+    r'Answer the following|Max\.?\s*Marks|Course Code|Assignment\b.*Session|'
+    r'सभी प्रश्न अनिवार्य|कुल अंक|पाठ्यक्रम कोड|सत्रीय कार्य कोड',
+    re.I
+)
+
+
+def _is_question_paper_page(page_text: str) -> bool:
     """
-    Returns index (0-based) of the page that is the question paper.
-    Looks for a page with 5+ numbered question lines.
+    True if this page is the printed question paper (not a student's
+    answer). Strong signal: explicit question-paper phrasing. Weaker
+    heuristic: MULTIPLE question labels on the page where NONE of them
+    is followed by a real prose answer (every gap between labels is
+    short — just the prompt text + mark allocation, no actual answer
+    content). A single short answer page must NOT trigger this.
     """
-    Q_LINE = re.compile(r'^\s*\d+[\.\)]\s+.{20,}')
+    if QUESTION_PAPER_HINTS.search(page_text):
+        return True
 
-    best_idx   = -1
-    best_count = 0
+    lines = [l.strip() for l in page_text.split('\n') if l.strip()]
+    if len(lines) < 4:
+        return False
 
-    for i, page in enumerate(pages):
-        count = sum(
-            1 for line in page["raw_text"].split("\n")
-            if Q_LINE.match(line.strip())
-        )
-        if count > best_count:
-            best_count = count
-            best_idx   = i
+    label_idxs = [i for i, l in enumerate(lines) if _score_line(l) >= 6]
+    if len(label_idxs) < 3:
+        # Too few labels to confidently call this a question list;
+        # could just be a normal answer page with 1-2 sub-questions.
+        return False
 
-    return best_idx if best_count >= 3 else -1
+    # Check the gap after each label (until the next label or end).
+    # If EVERY gap is short (<= 2 lines / <=25 words), this page has
+    # no real answers — it's a question list.
+    max_gap_words = 0
+    for k, idx in enumerate(label_idxs):
+        next_idx = label_idxs[k + 1] if k + 1 < len(label_idxs) else len(lines)
+        gap_lines = lines[idx:next_idx]
+        gap_words = sum(len(l.split()) for l in gap_lines)
+        max_gap_words = max(max_gap_words, gap_words)
+
+    # If the longest gap is still short, no prose answer exists anywhere
+    # on this page -> it's a printed question list.
+    return max_gap_words < 30
 
 
-# =========================================================
-# EXTRACT OFFICIAL QUESTIONS FROM QUESTION PAPER PAGE
-# Returns list of question strings in order
-# =========================================================
-
-def extract_official_questions(page_text: str) -> list:
+def flatten_pages(pages: list, log=None) -> list:
     """
-    Extracts numbered questions from the question paper page.
-    Handles multi-line questions by joining continuation lines.
+    Returns list of {"line": str, "page_number": int}.
+    Skips junk pages, printed question-paper pages, and noise/furniture
+    lines. Bare inline page numbers are dropped too (OCR artefacts).
     """
-    lines     = page_text.split("\n")
-    questions = []
-    current   = None
-
-    # Matches: "1. text", "2. text", etc.
-    Q_START = re.compile(r'^\s*(\d+)[\.\)]\s+(.+)')
-    # Section headers to skip
-    SKIP    = re.compile(r'^#+\s|^भाग|^PART|^\s*$')
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or SKIP.match(stripped):
-            if current:
-                questions.append(current.strip())
-                current = None
+    result = []
+    skipped_junk = []
+    skipped_qp   = []
+    for p in pages:
+        if _is_junk_page(p["raw_text"]):
+            skipped_junk.append(p["page_number"])
             continue
+        if _is_question_paper_page(p["raw_text"]):
+            skipped_qp.append(p["page_number"])
+            continue
+        for line in p["raw_text"].split("\n"):
+            if NOISE_LINE_RE.search(line):
+                continue
+            if INLINE_PAGENUM_RE.match(line.strip()):
+                continue
+            if line.strip():
+                result.append({"line": line, "page_number": p["page_number"]})
 
-        m = Q_START.match(stripped)
-        if m:
-            if current:
-                questions.append(current.strip())
-            current = stripped
-        elif current:
-            # continuation of previous question
-            current += " " + stripped
-
-    if current:
-        questions.append(current.strip())
-
-    return questions
-
-
-# =========================================================
-# FIND ANSWER BLOCKS IN ANSWER PAGES
-#
-# Two strategies tried in order:
-#
-# Strategy A — उत्तर / Ans marker based:
-#   Scan all answer page lines for "उत्तर", "Ans-", "उत्तर:"
-#   Each marker = start of a new answer block
-#   Text from marker to next marker = answer
-#
-# Strategy B — TOPIC/DATE split (English answer sheets):
-#   If strategy A finds nothing, fall back to the original
-#   question-paper-split approach
-# =========================================================
-
-# Answer start markers
-ANS_RE = re.compile(
-    r'^(?:'
-    r'उत्तर\s*[\-\:\s]'        # उत्तर - / उत्तर:
-    r'|Ans\.?\s*[\-\:\→]'       # Ans- / Ans:
-    r'|Answer\s*[\-\:\→]'       # Answer:
-    r')'
-)
-
-# Lines to skip (headers/footers)
-NOISE_RE = re.compile(
-    r'(?:Teacher\'?s?\s*Signature'
-    r'|PAGE\s*NO'
-    r'|^\s*DATE'
-    r'|Neel?\s*Kamal'
-    r'|Neal?\s*Kamal'
-    r'|TAKMA\s*SINAN'
-    r'|Facebook\'?s?\s*Signature'
-    r'|Tancher\'?s?\s*Signature)',
-    re.IGNORECASE
-)
-
-def is_noise(line: str) -> bool:
-    return bool(NOISE_RE.search(line))
+    if log:
+        if skipped_junk:
+            log(f"Skipped junk/admin pages: {skipped_junk}")
+        if skipped_qp:
+            log(f"Skipped printed question-paper pages: {skipped_qp}")
+    return result
 
 
-def extract_answers_by_uttar(answer_lines: list, status_callback=None) -> list:
+def find_boundaries(flat_lines: list, threshold: int) -> list:
+    """Indices into flat_lines that look like the start of a new question."""
+    boundaries = []
+    for i, row in enumerate(flat_lines):
+        if _score_line(row["line"]) >= threshold:
+            boundaries.append(i)
+    return boundaries
+
+
+def slice_qa(flat_lines: list, boundaries: list) -> list:
     """
-    Finds उत्तर / Ans markers in the answer lines.
-    Returns list of raw answer strings in order found.
+    Slice raw lines between boundaries.
+    First line of the block = question.
+    Everything else (including any Ans-/AB- style noise token, kept
+    verbatim) = answer. Zero text modification — pure slicing.
+    """
+    pairs = []
+    n = len(flat_lines)
+    for i, b_idx in enumerate(boundaries):
+        next_idx = boundaries[i + 1] if i + 1 < len(boundaries) else n
+        block = [flat_lines[j]["line"] for j in range(b_idx, next_idx)]
+        if not block:
+            continue
+        question = block[0].strip()
+        answer   = "\n".join(l for l in block[1:] if l.strip()).strip()
+        pairs.append({"question": question, "answer": answer})
+    return pairs
+
+
+def extract_qa(pages: list, status_callback=None) -> list:
+    """
+    Multi-pass, structure-agnostic boundary detection.
+    Pass thresholds loosen progressively; first pass producing
+    >=1 boundary wins. Falls back to paragraph-split, then whole-doc.
     """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    # Find positions of all उत्तर markers
-    positions = []
-    for i, line in enumerate(answer_lines):
-        if ANS_RE.match(line.strip()):
-            positions.append(i)
+    flat_lines = flatten_pages(pages, log)
+    log(f"Usable lines after filtering: {len(flat_lines)}")
 
-    log(f"Found {len(positions)} उत्तर/Ans markers")
-
-    if not positions:
+    if not flat_lines:
+        log("No usable text found in document.")
         return []
 
-    answers = []
-    for idx, pos in enumerate(positions):
-        end = positions[idx + 1] if idx + 1 < len(positions) else len(answer_lines)
+    for threshold, label in [(6, "structural")]:
+        boundaries = find_boundaries(flat_lines, threshold)
+        log(f"Pass ({label}, threshold={threshold}): {len(boundaries)} boundaries")
+        if len(boundaries) >= 1:
+            pairs = slice_qa(flat_lines, boundaries)
+            log(f"Extracted {len(pairs)} Q-A pair(s) [{label}]")
+            return pairs
 
-        # Include the उत्तर line itself (it has answer content after the marker)
-        raw_lines = []
-        for j in range(pos, end):
-            line = answer_lines[j]
-            if is_noise(line):
-                continue
-            raw_lines.append(line.strip())
-
-        answer_text = " ".join(l for l in raw_lines if l).strip()
-
-        # Strip the "उत्तर -" / "Ans-" prefix from the first line
-        answer_text = ANS_RE.sub("", answer_text, count=1).strip()
-        answer_text = re.sub(r'^[\-\:\→\s]+', '', answer_text).strip()
-
-        answers.append(answer_text)
-
-    return answers
-
-
-# =========================================================
-# SPLIT FORMAT — TOPIC/DATE answer sheets (English format)
-# =========================================================
-
-def find_answer_start_page(pages: list) -> int:
-    for i, page in enumerate(pages):
-        text = page["raw_text"]
-        if re.search(r'\bTOPIC\b', text) and re.search(r'\bDATE\b', text):
-            return i
-    return -1
-
-
-def normalize(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r'[^\w\s]', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-
-def similarity(a: str, b: str) -> float:
-    wa = set(normalize(a).split())
-    wb = set(normalize(b).split())
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / max(len(wa), len(wb))
-
-
-def strip_leading_label(text: str) -> str:
-    text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text.strip(), flags=re.IGNORECASE)
-    text = re.sub(r'^(?:Q\.?\s*)?\d+[.)]\s*', '', text.strip(), flags=re.IGNORECASE)
-    return text.strip()
-
-
-def strip_markdown(line: str) -> str:
-    return re.sub(r'^\s*[-*+]\s+', '', line)
-
-
-STOPWORDS = {
-    'the','a','an','is','are','was','were','of','in','to','and','that',
-    'this','it','he','she','they','i','we','you','at','or','but','not',
-    'with','for','on','from','by','as','be','his','her','its','their'
-}
-
-LABEL_RE = re.compile(
-    r"^\s*(?:(?:Q\.?\s*)?\d+[.)]\s*)?"
-    r"(?:\(?\w+[.)]\s|\"|\d+[.)]\s)"
-)
-
-
-def find_question_boundaries_in_answers(answer_lines, questions,
-                                         similarity_threshold=0.35, window=5):
-    boundaries = []
-    used_questions = set()
-    used_line_indices = set()
-
-    for i in range(len(answer_lines)):
-        line_i = strip_markdown(answer_lines[i].strip())
-        if not LABEL_RE.match(line_i):
-            continue
-
-        for w in range(1, window + 1):
-            if i + w > len(answer_lines):
-                break
-            combined = " ".join(
-                strip_markdown(answer_lines[i + k].strip())
-                for k in range(w) if answer_lines[i + k].strip()
-            )
-            if len(combined) < 10:
-                continue
-            combined_clean = strip_leading_label(combined)
-
-            best_score = 0
-            best_q = None
-            for q in questions:
-                if q in used_questions:
-                    continue
-                s1 = similarity(combined, q)
-                s2 = similarity(combined_clean, strip_leading_label(q))
-                cw = normalize(combined_clean).split()
-                qw = normalize(strip_leading_label(q)).split()
-                bc = " ".join(cw[1:]) if len(cw) > 1 else ""
-                bq = " ".join(qw[1:]) if len(qw) > 1 else ""
-                s3 = similarity(bc, bq) if bc and bq else 0
-                score = max(s1, s2, s3)
-                if score > best_score:
-                    best_score = score
-                    best_q = q
-
-            if best_q and best_score >= similarity_threshold:
-                if i not in used_line_indices:
-                    boundaries.append({"question": best_q, "line_index": i})
-                    used_questions.add(best_q)
-                    used_line_indices.add(i)
-                break
-
-    boundaries.sort(key=lambda b: b["line_index"])
-    return boundaries
-
-
-def is_quote_question(question: str) -> bool:
-    return bool(re.match(r'^\(?[ivxIVX]+[.)]\s', question.strip()))
-
-
-def find_answer_start_offset(answer_lines, boundary_idx, question):
-    if not is_quote_question(question):
-        return 1
-    q_words = set(normalize(question).split()) - STOPWORDS
-    offset = 1
-    for k in range(1, min(8, len(answer_lines) - boundary_idx - 1) + 1):
-        idx = boundary_idx + k
-        if idx >= len(answer_lines):
-            break
-        line = answer_lines[idx].strip()
-        if not line:
-            offset = k + 1
-            continue
-        line_words = set(normalize(line).split()) - STOPWORDS
-        if not line_words:
-            offset = k + 1
-            continue
-        if len(line_words & q_words) / max(len(line_words), 1) >= 0.55:
-            offset = k + 1
+    # ── Fallback: paragraph split (blank-line separated blocks) ──────────
+    log("Pass (paragraph): splitting on blank lines...")
+    pairs = []
+    current_block = []
+    for row in flat_lines:
+        if row["line"].strip():
+            current_block.append(row["line"])
         else:
-            break
-    return offset
-
-
-def slice_raw_answers(answer_lines, boundaries):
-    qa_pairs = []
-    for i, b in enumerate(boundaries):
-        skip    = find_answer_start_offset(answer_lines, b["line_index"], b["question"])
-        a_start = b["line_index"] + skip
-        a_end   = boundaries[i + 1]["line_index"] if i + 1 < len(boundaries) else len(answer_lines)
-        raw     = [answer_lines[j] for j in range(a_start, a_end) if answer_lines[j].strip()]
-        qa_pairs.append({
-            "question": b["question"],
-            "answer":   " ".join(raw).strip()
+            if current_block:
+                pairs.append({
+                    "question": current_block[0].strip(),
+                    "answer":   "\n".join(current_block[1:]).strip()
+                })
+                current_block = []
+    if current_block:
+        pairs.append({
+            "question": current_block[0].strip(),
+            "answer":   "\n".join(current_block[1:]).strip()
         })
-    return qa_pairs
+
+    if pairs:
+        log(f"Extracted {len(pairs)} paragraph block(s)")
+        return pairs
+
+    # ── Last resort: entire document as one block ────────────────────────
+    log("Pass (fallback): returning entire document as single block")
+    full_text = "\n".join(row["line"] for row in flat_lines)
+    return [{"question": "Full document", "answer": full_text}]
 
 
 # =========================================================
@@ -503,82 +475,17 @@ def process_pdf(file_input, status_callback=None):
         file_bytes = file_input.read()
         file_name  = getattr(file_input, "name", "document.pdf")
 
-    # Step 1: Preprocess
     log("Preprocessing PDF...")
     processed = preprocess_pdf(file_bytes)
 
-    # Step 2: OCR
     pages = run_ocr(processed, file_name, status_callback)
 
-    # Step 3: Build OCR JSON
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    # Step 4: Find question paper page
-    qp_idx = find_question_paper_page(pages)
-    log(f"Question paper detected on page: {qp_idx + 1 if qp_idx >= 0 else 'not found'}")
+    log("Extracting Q&A (no LLM, structure-agnostic)...")
+    qa_pairs = extract_qa(pages, status_callback)
 
-    if qp_idx >= 0:
-        official_questions = extract_official_questions(pages[qp_idx]["raw_text"])
-        log(f"Official questions extracted: {len(official_questions)}")
-    else:
-        official_questions = []
-        log("No question paper page found — will use answer markers only")
-
-    # Step 5: Get answer pages (everything after question paper)
-    answer_start = qp_idx + 1 if qp_idx >= 0 else 0
-    answer_pages = pages[answer_start:]
-
-    # Step 6: Flatten answer page lines
-    answer_lines = []
-    for page in answer_pages:
-        for line in page["raw_text"].split("\n"):
-            answer_lines.append(line)
-
-    # Step 7A: Try उत्तर/Ans marker based extraction first
-    log("Trying उत्तर/Ans marker extraction...")
-    raw_answers = extract_answers_by_uttar(answer_lines, status_callback)
-
-    if raw_answers:
-        log(f"Found {len(raw_answers)} answer blocks via markers")
-        qa_pairs = []
-        for idx, answer in enumerate(raw_answers):
-            if idx < len(official_questions):
-                question = official_questions[idx]
-            else:
-                question = f"Q{idx + 1}"
-            qa_pairs.append({
-                "question": question,
-                "answer":   answer
-            })
-        log(f"Done — {len(qa_pairs)} Q-A pairs")
-        return ocr_json, qa_pairs
-
-    # Step 7B: Fall back to TOPIC/DATE split format (English answer sheets)
-    log("No उत्तर markers found — trying TOPIC/DATE split format...")
-    split_idx = find_answer_start_page(pages)
-
-    if split_idx >= 0 and official_questions:
-        log(f"Split format: answer sheets start at page {split_idx + 1}")
-        split_lines = []
-        for page in pages[split_idx:]:
-            for line in page["raw_text"].split("\n"):
-                split_lines.append(line)
-
-        boundaries = find_question_boundaries_in_answers(split_lines, official_questions)
-        log(f"Matched {len(boundaries)} boundaries")
-
-        if boundaries:
-            qa_pairs = slice_raw_answers(split_lines, boundaries)
-            log(f"Done — {len(qa_pairs)} Q-A pairs")
-            return ocr_json, qa_pairs
-
-    # Step 7C: Last resort — return OCR text as single block with official questions
-    log("WARNING: Could not detect Q-A structure. Returning raw OCR blocks.")
-    full_text = " ".join(answer_lines)
-    qa_pairs = [{"question": q, "answer": ""} for q in official_questions] if official_questions \
-               else [{"question": "Full Document", "answer": full_text}]
-
-    log(f"Done — {len(qa_pairs)} Q-A pairs")
+    log(f"Pipeline complete — {len(qa_pairs)} Q-A pair(s)")
     return ocr_json, qa_pairs
