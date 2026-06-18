@@ -1,594 +1,343 @@
-import os
 import io
-import re
 import json
-import fitz
-import base64
-import httpx
+import os
+import re
 from pathlib import Path
-from mistralai import Mistral
 
-# =========================================================
-# API KEY
-# =========================================================
+import httpx
 
-def get_api_key(name):
-    try:
-        import streamlit as st
-        return st.secrets[name]
-    except Exception:
-        from dotenv import load_dotenv
-        load_dotenv()
-        return os.getenv(name)
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv():
+        return False
 
-
-# =========================================================
-# PREPROCESS PDF
-# =========================================================
-
-def preprocess_pdf(file_bytes, dpi=250):
-    src_doc = fitz.open(stream=file_bytes, filetype="pdf")
-    out_doc = fitz.open()
-    for page in src_doc:
-        pix = page.get_pixmap(dpi=dpi)
-        new_page = out_doc.new_page(width=pix.width, height=pix.height)
-        new_page.insert_image(new_page.rect, pixmap=pix)
-    buf = io.BytesIO()
-    out_doc.save(buf)
-    src_doc.close()
-    out_doc.close()
-    buf.seek(0)
-    return buf.read()
+try:
+    from pdf2image import convert_from_path
+except ImportError:
+    convert_from_path = None
 
 
-# =========================================================
-# OCR
-# =========================================================
+load_dotenv()
 
-def run_ocr(file_content: bytes, file_name: str, status_callback=None):
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
+CHANDRA_OCR_URL = os.getenv("CHANDRA_OCR_URL")
+CHANDRA_API_KEY = os.getenv("CHANDRA_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-    api_key = get_api_key("MISTRAL_API_KEY")
-    client  = Mistral(api_key=api_key)
-
-    log("Uploading to Mistral OCR...")
-    uploaded = client.files.upload(
-        file={"file_name": file_name, "content": file_content},
-        purpose="ocr"
-    )
-    signed = client.files.get_signed_url(file_id=uploaded.id, expiry=1)
-    log("Running OCR...")
-
-    resp = httpx.post(
-        "https://api.mistral.ai/v1/ocr",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "mistral-ocr-latest",
-            "document": {
-                "type": "document_url",
-                "document_url": signed.url
-            },
-            "include_image_base64": False
-        },
-        timeout=180
-    )
-
-    if resp.status_code != 200:
-        raise Exception(f"OCR error {resp.status_code}: {resp.text}")
-
-    try:
-        client.files.delete(file_id=uploaded.id)
-    except Exception:
-        pass
-
-    pages = []
-    for page in resp.json().get("pages", []):
-        pages.append({
-            "page_number": page.get("index", 0) + 1,
-            "raw_text":    page.get("markdown", "")
-        })
-
-    log(f"OCR done — {len(pages)} pages")
-    return pages
-
-
-# =========================================================
-# BUILD OCR JSON
-# =========================================================
-
-def build_ocr_json(pages: list) -> dict:
-    return {
-        "total_pages": len(pages),
-        "pages": [
-            {"page_number": p["page_number"], "text": p["raw_text"]}
-            for p in pages
-        ]
-    }
-
-
-# =========================================================
-# REFERENCE BOOK — page by page, base64 inline
-# =========================================================
-
-def ocr_page_base64(page_b64: str, api_key: str) -> str:
-    resp = httpx.post(
-        "https://api.mistral.ai/v1/ocr",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "mistral-ocr-latest",
-            "document": {
-                "type": "document_url",
-                "document_url": f"data:application/pdf;base64,{page_b64}"
-            },
-            "include_image_base64": False
-        },
-        timeout=120
-    )
-    if resp.status_code == 200:
-        ocr_pages = resp.json().get("pages", [])
-        return ocr_pages[0].get("markdown", "") if ocr_pages else ""
-    raise Exception(f"OCR error {resp.status_code}: {resp.text[:200]}")
-
-
-def process_reference(file_input, status_callback=None):
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
-
-    if isinstance(file_input, (str, Path)):
-        file_bytes = Path(file_input).read_bytes()
-    else:
-        file_bytes = file_input.read()
-
-    api_key     = get_api_key("MISTRAL_API_KEY")
-    src_doc     = fitz.open(stream=file_bytes, filetype="pdf")
-    total_pages = len(src_doc)
-    src_doc.close()
-
-    log(f"Reference book: {total_pages} page(s)")
-    pages_output = []
-
-    for page_num in range(total_pages):
-        log(f"Page {page_num + 1} of {total_pages}...")
-        try:
-            src_doc  = fitz.open(stream=file_bytes, filetype="pdf")
-            one_page = fitz.open()
-            one_page.insert_pdf(src_doc, from_page=page_num, to_page=page_num)
-            src_doc.close()
-
-            pix      = one_page[0].get_pixmap(dpi=200)
-            out_doc  = fitz.open()
-            new_page = out_doc.new_page(width=pix.width, height=pix.height)
-            new_page.insert_image(new_page.rect, pixmap=pix)
-
-            buf      = io.BytesIO()
-            out_doc.save(buf)
-            page_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-            one_page.close()
-            out_doc.close()
-            buf.close()
-
-            text = ocr_page_base64(page_b64, api_key)
-        except Exception as e:
-            log(f"  Page {page_num + 1} failed: {e}")
-            text = ""
-
-        pages_output.append({"page_number": page_num + 1, "raw_text": text})
-
-    log(f"Reference OCR complete — {total_pages} pages")
-    return build_ocr_json(pages_output)
-
-
-# =========================================================
-# DETECT QUESTION PAPER PAGE
-# The page that contains the printed list of questions
-# Identified by having numbered questions >= 5 items
-# =========================================================
-
-def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
-    """
-    Returns list of page indices (0-based) that look like question paper
-    pages — i.e. pages dominated by printed numbered/lettered questions
-    rather than handwritten answers.
-
-    Unlike picking a single "best" page, this scans every page, since
-    question papers can span multiple pages or be split into sections
-    (Part 1 / Part 2 / Part 3, or a parent question like "Q.9 Write notes
-    on:" followed by lettered sub-parts a)/b)/c)/d) or क)/ख)/ग)/घ) that
-    may land on their own page).
-
-    A page counts as a question-paper page if it has at least
-    `min_questions` lines matching EITHER a numbered question pattern
-    OR a lettered sub-part pattern, AND does not contain answer-marker
-    text (Ans-, उत्तर, A.15- etc) — answer pages sometimes contain
-    numbered sub-points which would otherwise be miscounted as questions.
-    """
-    Q_LINE_NUM   = re.compile(r'^\s*\d+[\.\)]\s+.{15,}')
-    Q_LINE_LATIN = re.compile(r'^\s*[a-d]\)\s+.{5,}', re.IGNORECASE)
-    Q_LINE_DEVA  = re.compile(r'^\s*[क-घ]\)\s+.{5,}')
-    ANSWER_MARKER = re.compile(
-        r'(?:उत्तर\s*[\-\:]|Ans\.?\s*[\-\:]|A\.\d|A\d+\s*[\-\:])',
-        re.IGNORECASE
-    )
-
-    candidate_pages = []
-
-    for i, page in enumerate(pages):
-        text  = page["raw_text"]
-        lines = text.split("\n")
-
-        q_count = sum(
-            1 for line in lines
-            if Q_LINE_NUM.match(line.strip())
-            or Q_LINE_LATIN.match(line.strip())
-            or Q_LINE_DEVA.match(line.strip())
-        )
-
-        has_answer_marker = bool(ANSWER_MARKER.search(text))
-
-        if q_count >= min_questions and not has_answer_marker:
-            candidate_pages.append(i)
-
-    return candidate_pages
-
-
-# =========================================================
-# EXTRACT OFFICIAL QUESTIONS — scans across MULTIPLE pages
-# Also captures lettered sub-questions (क/ख/ग/घ, a/b/c/d)
-# that appear as a standalone list after a parent question
-# like "Q.9 निम्नलिखित पर टिप्पणी लिखिए" on a DIFFERENT page
-# than where the sub-options are printed.
-# =========================================================
-
-def extract_official_questions_multi_page(pages: list, qp_page_indices: list) -> list:
-    """
-    Extracts numbered questions across all detected question-paper pages,
-    in page order. Handles:
-    - Standard numbered questions: "1. text"
-    - Multi-line questions (continuation lines joined)
-    - Lettered sub-parts within a question: a) b) c) / क) ख) ग) घ)
-    - Sub-parts that appear on a later page than their parent question
-      (common when "Q.9 Write notes on:" is followed by a), b), c), d)
-      printed on the next page)
-    """
-    all_questions = []
-    pending_parent = None   # holds a parent question awaiting sub-parts from next page
-
-    Q_START   = re.compile(r'^\s*(\d+)[\.\)]\s+(.+)')
-    SUB_LATIN = re.compile(r'^\s*([a-d])\)\s*(.+)', re.IGNORECASE)
-    SUB_DEVA  = re.compile(r'^\s*([क-घ])\)\s*(.+)')
-    SKIP      = re.compile(r'^#+\s|^भाग|^PART|^\s*$')
-
-    for page_idx in qp_page_indices:
-        lines   = pages[page_idx]["raw_text"].split("\n")
-        current = None
-
-        for line in lines:
-            stripped = line.strip()
-
-            if not stripped or SKIP.match(stripped):
-                if current:
-                    all_questions.append({"text": current.strip(), "parent": None})
-                    current = None
-                continue
-
-            # Lettered sub-part (Latin a-d or Devanagari क-घ)
-            sub_m = SUB_LATIN.match(stripped) or SUB_DEVA.match(stripped)
-            if sub_m:
-                if current:
-                    all_questions.append({"text": current.strip(), "parent": None})
-                    current = None
-                label = sub_m.group(1)
-                body  = sub_m.group(2)
-                parent_text = pending_parent if pending_parent else ""
-                combined = f"{parent_text} {label}) {body}".strip()
-                all_questions.append({"text": combined, "parent": pending_parent})
-                continue
-
-            m = Q_START.match(stripped)
-            if m:
-                if current:
-                    all_questions.append({"text": current.strip(), "parent": None})
-                current = stripped
-                # Track this as a potential parent for sub-parts on a later page
-                # (e.g. ends with "टिप्पणी लिखिए" / "following" / colon)
-                if re.search(r'(?:लिखिए|following|:)\s*$', stripped, re.IGNORECASE):
-                    pending_parent = stripped
-                else:
-                    pending_parent = None
-                continue
-
-            if current:
-                current += " " + stripped
-
-        if current:
-            all_questions.append({"text": current.strip(), "parent": None})
-
-    # Now split any question that has 2+ inline sub-parts (a)/b)/c) on one line block)
-    final_questions = []
-    SUBPART_RE = re.compile(r'(?:^|\s)([a-zक-घ])\)\s', re.UNICODE)
-
-    for q in all_questions:
-        text = q["text"]
-        matches = list(SUBPART_RE.finditer(text))
-
-        if len(matches) >= 2:
-            preamble = text[:matches[0].start()].strip()
-            for idx, m in enumerate(matches):
-                start = m.start(1)
-                end   = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-                part_text = text[start:end].strip()
-                full_q = f"{preamble} {part_text}".strip() if preamble else part_text
-                final_questions.append(full_q)
-        else:
-            final_questions.append(text)
-
-    # Deduplicate while preserving order
-    seen = set()
-    unique = []
-    for q in final_questions:
-        key = re.sub(r'\s+', ' ', q.lower().strip())
-        if key not in seen:
-            seen.add(key)
-            unique.append(q)
-
-    return unique
-
+OUTPUT_OCR_DIR = Path("outputs/ocr_json")
+OUTPUT_FINAL_DIR = Path("outputs/final_json")
 
 NOISE_RE = re.compile(
-    r'(?:Teacher\'?s?\s*Signature'
-    r'|Tancher\'?s?\s*Signature'
-    r'|Facebook\'?s?\s*Signature'
-    r'|PAGE\s*NO'
-    r'|^\s*DATE\b'
-    r'|Neel?\s*Kamal'
-    r'|Neal?\s*Kamal'
-    r'|Need?\s*Komal'
-    r'|Nod\s*Komal'
-    r'|TAKMA\s*SINAN'
-    r'|^\s*\d{1,3}\s*$)',
-    re.IGNORECASE
+    r"(?:^TOPIC\s*$|^DATE\s*$|^PAGE\s*NO|Teacher'?s?\s*Signature|^\d{1,3}$)",
+    re.IGNORECASE,
 )
 
 
-def is_noise(line: str) -> bool:
-    return bool(NOISE_RE.search(line))
+def require_env(name: str, value: str | None) -> str:
+    if not value:
+        raise RuntimeError(f"Missing {name}. Add it to .env before running the pipeline.")
+    return value
 
 
-# =========================================================
-# FIND QUESTION BOUNDARIES IN ANSWER PAGES — similarity based
-# Works for Hindi, English, any language
-# Matches student-written question restatements against the
-# official question paper text using word-overlap similarity
-# =========================================================
+def preprocess_pdf(file_path: str, dpi: int = 300) -> bytes:
+    print(f"Preprocessing {file_path}...")
+    if convert_from_path is None:
+        print("pdf2image is not installed, using original PDF.")
+        return Path(file_path).read_bytes()
 
-def normalize(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r'[^\w\s]', ' ', text, flags=re.UNICODE)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+    try:
+        images = convert_from_path(file_path, dpi=dpi)
+        if images:
+            pdf_bytes = io.BytesIO()
+            images[0].save(pdf_bytes, format="PDF", save_all=True, append_images=images[1:])
+            pdf_bytes.seek(0)
+            print("Converted to image-based PDF")
+            return pdf_bytes.read()
+    except Exception as e:
+        print(f"Preprocessing failed, using original PDF: {e}")
 
-
-def similarity(a: str, b: str) -> float:
-    wa = set(normalize(a).split())
-    wb = set(normalize(b).split())
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / max(len(wa), len(wb))
+    return Path(file_path).read_bytes()
 
 
-def strip_leading_label(text: str) -> str:
-    """Strip leading numbering like '1.', 'Q1.', 'प्र.2', '20.', 'a)' etc."""
-    text = text.strip()
-    text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^(?:उत्तर)\s*[\-\:\s]*', '', text)
-    text = re.sub(r'^(?:प्र|प्रो|प्रश्न)[\.\s]*\d*[\.\s]*', '', text)
-    text = re.sub(r'^[१-९०][०-९]*[\.\-\s]*', '', text)
-    text = re.sub(r'^(?:Q\.?\s*)?\d+[.)]\s*', '', text)
-    text = re.sub(r'^[a-z]\)\s*', '', text, flags=re.IGNORECASE)
-    return text.strip()
+def extract_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(extract_text(item) for item in value)
+    if isinstance(value, dict):
+        for key in ("text", "markdown", "raw_text", "content", "value"):
+            if key in value:
+                text = extract_text(value[key])
+                if text.strip():
+                    return text
+        return "\n".join(extract_text(item) for item in value.values())
+    return str(value)
 
 
-def find_question_boundaries_by_similarity(
-    answer_lines: list,
-    questions: list,
-    similarity_threshold: float = 0.30,
-    window: int = 4
-) -> list:
-    """
-    Scans answer lines for restated questions matching official questions.
-    Uses sliding window to join multi-line question restatements.
+def parse_chandra_response(payload) -> list[dict]:
+    if isinstance(payload, dict):
+        for key in ("pages", "data", "result", "results", "documents"):
+            if key in payload:
+                return parse_chandra_response(payload[key])
+        text = extract_text(payload)
+        return [{"page_number": 1, "text": clean_ocr_lines(text)}] if text.strip() else []
 
-    Correctness guarantees:
-    1. Tracks how many lines (`span`) the matched question text occupies,
-       so the answer slice can start AFTER the full question text.
-    2. Enforces that boundaries appear in the SAME ORDER as the official
-       questions list. If a question's best-scoring candidate would break
-       order (e.g. a false-positive shares vocabulary with an earlier
-       question), the NEXT best-scoring candidate for that same question
-       is tried, and so on, rather than dropping the question entirely.
-    """
-    candidates_by_question = {}   # question -> list of candidates, sorted by score desc
+    if isinstance(payload, list):
+        pages = []
+        for index, item in enumerate(payload, start=1):
+            text = extract_text(item)
+            page_number = item.get("page_number") or item.get("page") or index if isinstance(item, dict) else index
+            pages.append({"page_number": int(page_number), "text": clean_ocr_lines(text)})
+        return pages
 
-    for i in range(len(answer_lines)):
-        line_i = answer_lines[i].strip()
-        if len(line_i) < 8:
+    text = extract_text(payload)
+    return [{"page_number": 1, "text": clean_ocr_lines(text)}] if text.strip() else []
+
+
+def clean_ocr_lines(text: str) -> list[str]:
+    lines = []
+    seen_on_page = set()
+    for raw_line in text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line or NOISE_RE.search(line):
+            continue
+        if line not in seen_on_page:
+            seen_on_page.add(line)
+            lines.append(line)
+    return lines
+
+
+def run_ocr(file_content: bytes, file_name: str) -> dict:
+    url = require_env("CHANDRA_OCR_URL", CHANDRA_OCR_URL)
+    api_key = require_env("CHANDRA_API_KEY", CHANDRA_API_KEY)
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    files = {"file": (file_name, file_content, "application/pdf")}
+    data = {"output_format": "json"}
+
+    print("Running Chandra OCR...")
+    with httpx.Client(timeout=300) as client:
+        response = client.post(url, headers=headers, files=files, data=data)
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Chandra OCR error {response.status_code}: {response.text[:500]}")
+
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        payload = response.text
+
+    pages = parse_chandra_response(payload)
+    if not pages:
+        raise RuntimeError("Chandra OCR returned no readable pages.")
+
+    return {"total_pages": len(pages), "pages": pages}
+
+
+def groq_json(system_prompt: str, user_payload: dict, temperature: float = 0.0) -> dict:
+    api_key = require_env("GROQ_API_KEY", GROQ_API_KEY)
+    body = {
+        "model": GROQ_MODEL,
+        "temperature": temperature,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    with httpx.Client(timeout=180) as client:
+        response = client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=body)
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Groq error {response.status_code}: {response.text[:500]}")
+
+    content = response.json()["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+
+def pages_for_prompt(pages: list[dict]) -> list[dict]:
+    return [
+        {
+            "page_number": page["page_number"],
+            "text": "\n".join(page["text"]),
+        }
+        for page in pages
+    ]
+
+
+def extract_official_questions_with_groq(pages: list[dict]) -> list[dict]:
+    system_prompt = """
+You extract the printed question paper from OCR pages for exam revaluation.
+Return only JSON with key "questions".
+Each question must have:
+- question_id: stable exam id like Q1, Q1.a, Q1.i, A1(i), B2. Preserve section labels if printed.
+- question: exact printed question text, cleaned only for obvious OCR line breaks.
+- page_number.
+Rules:
+- Follow the question paper order.
+- If a parent question has sub-questions, create one row per sub-question.
+- Do not include student answers as questions.
+- Do not invent missing questions.
+"""
+    payload = groq_json(system_prompt, {"pages": pages_for_prompt(pages)})
+    questions = payload.get("questions", [])
+    if not questions:
+        raise RuntimeError("Groq could not identify official questions from the OCR text.")
+    return normalize_questions(questions)
+
+
+def normalize_questions(questions: list[dict]) -> list[dict]:
+    normalized = []
+    seen = set()
+
+    for index, question in enumerate(questions, start=1):
+        qid = str(question.get("question_id") or question.get("id") or f"Q{index}").strip()
+        qtext = re.sub(r"\s+", " ", str(question.get("question") or question.get("text") or "")).strip()
+        if not qid or not qtext:
             continue
 
-        for w in range(1, window + 1):
-            if i + w > len(answer_lines):
-                break
+        key = qid.lower()
+        if key in seen:
+            suffix = 2
+            while f"{key}.{suffix}" in seen:
+                suffix += 1
+            qid = f"{qid}.{suffix}"
+            key = qid.lower()
 
-            combined = " ".join(
-                answer_lines[i + k].strip()
-                for k in range(w) if answer_lines[i + k].strip()
-            )
-            if len(combined) < 10:
+        seen.add(key)
+        normalized.append(
+            {
+                "question_id": qid,
+                "question": qtext,
+                "page_number": question.get("page_number"),
+            }
+        )
+
+    if not normalized:
+        raise RuntimeError("Groq returned questions, but none had usable IDs and text.")
+
+    return normalized
+
+
+def flatten_answer_lines(pages: list[dict], question_page_numbers: set[int]) -> list[dict]:
+    lines = []
+    line_id = 1
+    answer_pages = [page for page in pages if page["page_number"] not in question_page_numbers]
+    if not answer_pages:
+        answer_pages = pages
+
+    for page in answer_pages:
+        for text in page["text"]:
+            clean = re.sub(r"\s+", " ", text).strip()
+            if not clean or NOISE_RE.search(clean):
                 continue
-
-            combined_clean = strip_leading_label(combined)
-
-            for q in questions:
-                q_clean = strip_leading_label(q)
-                s1 = similarity(combined, q)
-                s2 = similarity(combined_clean, q_clean)
-                score = max(s1, s2)
-
-                if score >= similarity_threshold:
-                    candidates_by_question.setdefault(q, []).append({
-                        "question":   q,
-                        "line_index": i,
-                        "span":       w,
-                        "score":      score
-                    })
-
-    # Sort each question's candidates by score, descending
-    for q in candidates_by_question:
-        candidates_by_question[q].sort(key=lambda c: -c["score"])
-
-    # Walk questions in official order. For each, try candidates from
-    # highest score downward, accepting the first one that comes after
-    # the previously accepted boundary's line_index.
-    final = []
-    last_line_index = -1
-
-    for q in questions:
-        cands = candidates_by_question.get(q, [])
-        chosen = None
-        for c in cands:
-            if c["line_index"] > last_line_index:
-                chosen = c
-                break
-        if chosen is not None:
-            final.append(chosen)
-            last_line_index = chosen["line_index"]
-
-    return final
+            lines.append({"line_id": line_id, "page_number": page["page_number"], "text": clean})
+            line_id += 1
+    return lines
 
 
-def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
-    """
-    For each boundary, answer = raw lines starting AFTER the full matched
-    question span (boundary["span"] lines), up to the next boundary.
-    Pure text slicing, zero LLM.
-    """
+def map_answer_spans_with_groq(questions: list[dict], answer_lines: list[dict]) -> list[dict]:
+    system_prompt = """
+You map handwritten/student answers to official exam questions.
+Return only JSON with key "answer_spans".
+Each span must have:
+- question_id: exactly one of the provided question IDs.
+- start_line: first OCR line of that answer, not the printed question paper.
+- end_line: last OCR line of that answer.
+- confidence: number from 0 to 1.
+- notes: short reason.
+Rules:
+- Use the official question order as the backbone.
+- If the student writes sub-question labels like Q1.a, 1(a), A1(i), map to that exact provided ID.
+- If an answer starts with a copied question, start_line may be that copied-question line.
+- Do not create spans for unanswered questions.
+- Do not overlap spans.
+- Prefer raw line positions over rewriting text.
+"""
+    payload = groq_json(
+        system_prompt,
+        {
+            "official_questions": questions,
+            "answer_lines": answer_lines,
+        },
+    )
+    return payload.get("answer_spans", [])
+
+
+def slice_answers(questions: list[dict], answer_lines: list[dict], spans: list[dict]) -> list[dict]:
+    line_by_id = {line["line_id"]: line for line in answer_lines}
+    question_by_id = {q["question_id"]: q for q in questions}
     qa_pairs = []
-    for i, b in enumerate(boundaries):
-        span    = b.get("span", 1)
-        a_start = b["line_index"] + span
-        a_end   = boundaries[i + 1]["line_index"] if i + 1 < len(boundaries) else len(answer_lines)
 
-        raw = [
-            answer_lines[j] for j in range(a_start, a_end)
-            if answer_lines[j].strip() and not is_noise(answer_lines[j])
+    for span in sorted(spans, key=lambda item: item.get("start_line", 10**9)):
+        qid = span.get("question_id")
+        if qid not in question_by_id:
+            continue
+
+        start = int(span.get("start_line", 0))
+        end = int(span.get("end_line", 0))
+        if start <= 0 or end < start:
+            continue
+
+        raw_lines = [
+            line_by_id[line_id]["text"]
+            for line_id in range(start, end + 1)
+            if line_id in line_by_id
         ]
+        answer = re.sub(r"\s+", " ", " ".join(raw_lines)).strip()
+        if not answer:
+            continue
 
-        qa_pairs.append({
-            "question": b["question"],
-            "answer":   " ".join(raw).strip()
-        })
+        qa_pairs.append(
+            {
+                "question_id": qid,
+                "question": question_by_id[qid]["question"],
+                "answer": answer,
+                "mapping_confidence": span.get("confidence"),
+            }
+        )
 
     return qa_pairs
 
 
-# =========================================================
-# COMPLETE PIPELINE
-# =========================================================
+def build_final_json(qa_pairs: list[dict]) -> dict:
+    return {"total_qa_pairs": len(qa_pairs), "qa_pairs": qa_pairs}
 
-def process_pdf(file_input, status_callback=None):
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
 
-    if isinstance(file_input, (str, Path)):
-        file_bytes = Path(file_input).read_bytes()
-        file_name  = Path(file_input).name
-    else:
-        file_bytes = file_input.read()
-        file_name  = getattr(file_input, "name", "document.pdf")
+def process_pdf(pdf_path):
+    pdf_file = Path(pdf_path)
+    if not pdf_file.exists():
+        raise RuntimeError("PDF not found")
 
-    # Step 1: Preprocess
-    log("Preprocessing PDF...")
-    processed = preprocess_pdf(file_bytes)
+    OUTPUT_OCR_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_FINAL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Step 2: OCR
-    pages = run_ocr(processed, file_name, status_callback)
+    pdf_bytes = preprocess_pdf(str(pdf_file))
+    ocr_json = run_ocr(pdf_bytes, pdf_file.name)
 
-    # Step 3: Build OCR JSON
-    log("Building OCR JSON...")
-    ocr_json = build_ocr_json(pages)
-    log(f"Total pages: {ocr_json['total_pages']}")
+    ocr_output_path = OUTPUT_OCR_DIR / f"{pdf_file.stem}_ocr.json"
+    with open(ocr_output_path, "w", encoding="utf-8") as f:
+        json.dump(ocr_json, f, ensure_ascii=False, indent=4)
 
-    # Step 4: Scan ALL pages for question-paper-like pages
-    # (handles question papers split across multiple pages/sections,
-    #  rather than assuming a single page holds everything)
-    qp_page_indices = find_question_paper_pages(pages)
-    log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
+    pages = ocr_json["pages"]
+    questions = extract_official_questions_with_groq(pages)
+    question_page_numbers = {
+        int(q["page_number"])
+        for q in questions
+        if str(q.get("page_number") or "").isdigit()
+    }
+    answer_lines = flatten_answer_lines(pages, question_page_numbers)
+    spans = map_answer_spans_with_groq(questions, answer_lines)
+    qa_pairs = slice_answers(questions, answer_lines, spans)
 
-    if not qp_page_indices:
-        raise Exception(
-            "Could not detect any question paper pages in this document.\n"
-            "This usually means the document has a different layout than expected — "
-            "no page was found with multiple numbered question lines.\n"
-            f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
-        )
+    final_json = build_final_json(qa_pairs)
+    final_output_path = OUTPUT_FINAL_DIR / f"{pdf_file.stem}_final.json"
+    with open(final_output_path, "w", encoding="utf-8") as f:
+        json.dump(final_json, f, ensure_ascii=False, indent=4)
 
-    official_questions = extract_official_questions_multi_page(pages, qp_page_indices)
-    log(f"Official questions extracted: {len(official_questions)}")
-
-    if not official_questions:
-        raise Exception(
-            "Question paper pages were found, but no questions could be parsed from them.\n"
-            f"Detected pages: {[p+1 for p in qp_page_indices]}"
-        )
-
-    # Step 5: Answer pages = every page NOT identified as a question paper page
-    answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
-    answer_pages = [pages[i] for i in answer_page_indices]
-
-    log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
-
-    # Step 6: Flatten answer page lines
-    answer_lines = []
-    for page in answer_pages:
-        for line in page["raw_text"].split("\n"):
-            if not is_noise(line):
-                answer_lines.append(line)
-
-    log(f"Flattened {len(answer_lines)} answer lines")
-
-    # Step 7: Similarity-based matching — works for any language/format
-    log("Matching questions via similarity (works for Hindi/English/any format)...")
-    boundaries = find_question_boundaries_by_similarity(answer_lines, official_questions)
-    log(f"Matched {len(boundaries)} of {len(official_questions)} questions")
-
-    matched_qs = {b["question"] for b in boundaries}
-    for q in official_questions:
-        if q not in matched_qs:
-            log(f"WARNING: No match found for: {q[:60]}")
-
-    if not boundaries:
-        raise Exception(
-            "Could not match any questions in answer pages.\n"
-            f"Official questions: {official_questions}\n"
-            f"First 10 answer lines: {answer_lines[:10]}"
-        )
-
-    # Step 8: Slice raw answers — zero LLM, pure text slicing
-    log("Slicing raw answers...")
-    qa_pairs = slice_raw_answers_by_boundaries(answer_lines, boundaries)
-
-    log(f"Done — {len(qa_pairs)} Q-A pairs")
-    return ocr_json, qa_pairs
+    return str(final_output_path)
