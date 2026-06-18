@@ -3,6 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -38,6 +39,16 @@ def require_env(name: str, value: str | None) -> str:
     if not value:
         raise RuntimeError(f"Missing {name}. Add it to .env before running the pipeline.")
     return value
+
+
+def require_url(name: str, value: str | None) -> str:
+    url = require_env(name, value).strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError(f"{name} must be a full URL, for example https://api.example.com/ocr.")
+    if "example" in parsed.netloc or "your-" in url:
+        raise RuntimeError(f"{name} is still a placeholder. Replace it with your real Chandra OCR endpoint.")
+    return url
 
 
 def preprocess_pdf(file_path: str, dpi: int = 300) -> bytes:
@@ -111,7 +122,7 @@ def clean_ocr_lines(text: str) -> list[str]:
 
 
 def run_ocr(file_content: bytes, file_name: str) -> dict:
-    url = require_env("CHANDRA_OCR_URL", CHANDRA_OCR_URL)
+    url = require_url("CHANDRA_OCR_URL", CHANDRA_OCR_URL)
     api_key = require_env("CHANDRA_API_KEY", CHANDRA_API_KEY)
 
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -119,8 +130,14 @@ def run_ocr(file_content: bytes, file_name: str) -> dict:
     data = {"output_format": "json"}
 
     print("Running Chandra OCR...")
-    with httpx.Client(timeout=300) as client:
-        response = client.post(url, headers=headers, files=files, data=data)
+    try:
+        with httpx.Client(timeout=300) as client:
+            response = client.post(url, headers=headers, files=files, data=data)
+    except httpx.RequestError as e:
+        raise RuntimeError(
+            "Could not reach Chandra OCR. Check CHANDRA_OCR_URL in .env; "
+            f"the configured host could not be contacted. Details: {e}"
+        ) from e
 
     if response.status_code >= 400:
         raise RuntimeError(f"Chandra OCR error {response.status_code}: {response.text[:500]}")
@@ -150,8 +167,14 @@ def groq_json(system_prompt: str, user_payload: dict, temperature: float = 0.0) 
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    with httpx.Client(timeout=180) as client:
-        response = client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=body)
+    try:
+        with httpx.Client(timeout=180) as client:
+            response = client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=body)
+    except httpx.RequestError as e:
+        raise RuntimeError(
+            "Could not reach Groq. Check your internet connection and GROQ_API_KEY. "
+            f"Details: {e}"
+        ) from e
 
     if response.status_code >= 400:
         raise RuntimeError(f"Groq error {response.status_code}: {response.text[:500]}")
