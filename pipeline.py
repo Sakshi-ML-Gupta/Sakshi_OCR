@@ -196,92 +196,154 @@ def process_reference(file_input, status_callback=None):
 # Identified by having numbered questions >= 5 items
 # =========================================================
 
-def find_question_paper_page(pages: list) -> int:
+def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
     """
-    Returns index (0-based) of the page that is the question paper.
-    Looks for a page with 5+ numbered question lines.
-    """
-    Q_LINE = re.compile(r'^\s*\d+[\.\)]\s+.{20,}')
+    Returns list of page indices (0-based) that look like question paper
+    pages — i.e. pages dominated by printed numbered/lettered questions
+    rather than handwritten answers.
 
-    best_idx   = -1
-    best_count = 0
+    Unlike picking a single "best" page, this scans every page, since
+    question papers can span multiple pages or be split into sections
+    (Part 1 / Part 2 / Part 3, or a parent question like "Q.9 Write notes
+    on:" followed by lettered sub-parts a)/b)/c)/d) or क)/ख)/ग)/घ) that
+    may land on their own page).
+
+    A page counts as a question-paper page if it has at least
+    `min_questions` lines matching EITHER a numbered question pattern
+    OR a lettered sub-part pattern, AND does not contain answer-marker
+    text (Ans-, उत्तर, A.15- etc) — answer pages sometimes contain
+    numbered sub-points which would otherwise be miscounted as questions.
+    """
+    Q_LINE_NUM   = re.compile(r'^\s*\d+[\.\)]\s+.{15,}')
+    Q_LINE_LATIN = re.compile(r'^\s*[a-d]\)\s+.{5,}', re.IGNORECASE)
+    Q_LINE_DEVA  = re.compile(r'^\s*[क-घ]\)\s+.{5,}')
+    ANSWER_MARKER = re.compile(
+        r'(?:उत्तर\s*[\-\:]|Ans\.?\s*[\-\:]|A\.\d|A\d+\s*[\-\:])',
+        re.IGNORECASE
+    )
+
+    candidate_pages = []
 
     for i, page in enumerate(pages):
-        count = sum(
-            1 for line in page["raw_text"].split("\n")
-            if Q_LINE.match(line.strip())
+        text  = page["raw_text"]
+        lines = text.split("\n")
+
+        q_count = sum(
+            1 for line in lines
+            if Q_LINE_NUM.match(line.strip())
+            or Q_LINE_LATIN.match(line.strip())
+            or Q_LINE_DEVA.match(line.strip())
         )
-        if count > best_count:
-            best_count = count
-            best_idx   = i
 
-    return best_idx if best_count >= 3 else -1
+        has_answer_marker = bool(ANSWER_MARKER.search(text))
+
+        if q_count >= min_questions and not has_answer_marker:
+            candidate_pages.append(i)
+
+    return candidate_pages
 
 
 # =========================================================
-# EXTRACT OFFICIAL QUESTIONS FROM QUESTION PAPER PAGE
-# Returns list of question strings in order
+# EXTRACT OFFICIAL QUESTIONS — scans across MULTIPLE pages
+# Also captures lettered sub-questions (क/ख/ग/घ, a/b/c/d)
+# that appear as a standalone list after a parent question
+# like "Q.9 निम्नलिखित पर टिप्पणी लिखिए" on a DIFFERENT page
+# than where the sub-options are printed.
 # =========================================================
 
-def extract_official_questions(page_text: str) -> list:
+def extract_official_questions_multi_page(pages: list, qp_page_indices: list) -> list:
     """
-    Extracts numbered questions from the question paper page.
-    Handles multi-line questions by joining continuation lines.
-    Splits questions containing sub-parts like a) b) c) into separate
-    question entries, since each sub-part typically has its own answer.
+    Extracts numbered questions across all detected question-paper pages,
+    in page order. Handles:
+    - Standard numbered questions: "1. text"
+    - Multi-line questions (continuation lines joined)
+    - Lettered sub-parts within a question: a) b) c) / क) ख) ग) घ)
+    - Sub-parts that appear on a later page than their parent question
+      (common when "Q.9 Write notes on:" is followed by a), b), c), d)
+      printed on the next page)
     """
-    lines     = page_text.split("\n")
-    questions = []
-    current   = None
+    all_questions = []
+    pending_parent = None   # holds a parent question awaiting sub-parts from next page
 
-    # Matches: "1. text", "2. text", etc.
-    Q_START = re.compile(r'^\s*(\d+)[\.\)]\s+(.+)')
-    # Section headers to skip
-    SKIP    = re.compile(r'^#+\s|^भाग|^PART|^\s*$')
+    Q_START   = re.compile(r'^\s*(\d+)[\.\)]\s+(.+)')
+    SUB_LATIN = re.compile(r'^\s*([a-d])\)\s*(.+)', re.IGNORECASE)
+    SUB_DEVA  = re.compile(r'^\s*([क-घ])\)\s*(.+)')
+    SKIP      = re.compile(r'^#+\s|^भाग|^PART|^\s*$')
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or SKIP.match(stripped):
+    for page_idx in qp_page_indices:
+        lines   = pages[page_idx]["raw_text"].split("\n")
+        current = None
+
+        for line in lines:
+            stripped = line.strip()
+
+            if not stripped or SKIP.match(stripped):
+                if current:
+                    all_questions.append({"text": current.strip(), "parent": None})
+                    current = None
+                continue
+
+            # Lettered sub-part (Latin a-d or Devanagari क-घ)
+            sub_m = SUB_LATIN.match(stripped) or SUB_DEVA.match(stripped)
+            if sub_m:
+                if current:
+                    all_questions.append({"text": current.strip(), "parent": None})
+                    current = None
+                label = sub_m.group(1)
+                body  = sub_m.group(2)
+                parent_text = pending_parent if pending_parent else ""
+                combined = f"{parent_text} {label}) {body}".strip()
+                all_questions.append({"text": combined, "parent": pending_parent})
+                continue
+
+            m = Q_START.match(stripped)
+            if m:
+                if current:
+                    all_questions.append({"text": current.strip(), "parent": None})
+                current = stripped
+                # Track this as a potential parent for sub-parts on a later page
+                # (e.g. ends with "टिप्पणी लिखिए" / "following" / colon)
+                if re.search(r'(?:लिखिए|following|:)\s*$', stripped, re.IGNORECASE):
+                    pending_parent = stripped
+                else:
+                    pending_parent = None
+                continue
+
             if current:
-                questions.append(current.strip())
-                current = None
-            continue
+                current += " " + stripped
 
-        m = Q_START.match(stripped)
-        if m:
-            if current:
-                questions.append(current.strip())
-            current = stripped
-        elif current:
-            # continuation of previous question
-            current += " " + stripped
+        if current:
+            all_questions.append({"text": current.strip(), "parent": None})
 
-    if current:
-        questions.append(current.strip())
-
-    # Split questions containing lettered sub-parts: a) ... b) ... c) ...
+    # Now split any question that has 2+ inline sub-parts (a)/b)/c) on one line block)
     final_questions = []
-    SUBPART_RE = re.compile(r'(?:^|\s)([a-z])\)\s')
+    SUBPART_RE = re.compile(r'(?:^|\s)([a-zक-घ])\)\s', re.UNICODE)
 
-    for q in questions:
-        matches = list(SUBPART_RE.finditer(q))
+    for q in all_questions:
+        text = q["text"]
+        matches = list(SUBPART_RE.finditer(text))
 
         if len(matches) >= 2:
-            # Has 2+ sub-parts — split into separate questions
-            # Preamble = text before the first sub-part marker
-            preamble = q[:matches[0].start()].strip()
-
+            preamble = text[:matches[0].start()].strip()
             for idx, m in enumerate(matches):
-                start = m.start(1)  # position of the letter itself
-                end   = matches[idx + 1].start() if idx + 1 < len(matches) else len(q)
-                part_text = q[start:end].strip()
-                # part_text looks like "a) Renaissance" — keep preamble for context
+                start = m.start(1)
+                end   = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+                part_text = text[start:end].strip()
                 full_q = f"{preamble} {part_text}".strip() if preamble else part_text
                 final_questions.append(full_q)
         else:
-            final_questions.append(q)
+            final_questions.append(text)
 
-    return final_questions
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for q in final_questions:
+        key = re.sub(r'\s+', ' ', q.lower().strip())
+        if key not in seen:
+            seen.add(key)
+            unique.append(q)
+
+    return unique
 
 
 NOISE_RE = re.compile(
@@ -469,26 +531,34 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    # Step 4: Find question paper page
-    qp_idx = find_question_paper_page(pages)
-    log(f"Question paper detected on page: {qp_idx + 1 if qp_idx >= 0 else 'not found'}")
+    # Step 4: Scan ALL pages for question-paper-like pages
+    # (handles question papers split across multiple pages/sections,
+    #  rather than assuming a single page holds everything)
+    qp_page_indices = find_question_paper_pages(pages)
+    log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
 
-    if qp_idx >= 0:
-        official_questions = extract_official_questions(pages[qp_idx]["raw_text"])
-        log(f"Official questions extracted: {len(official_questions)}")
-    else:
-        official_questions = []
-        log("No question paper page found")
+    if not qp_page_indices:
+        raise Exception(
+            "Could not detect any question paper pages in this document.\n"
+            "This usually means the document has a different layout than expected — "
+            "no page was found with multiple numbered question lines.\n"
+            f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
+        )
+
+    official_questions = extract_official_questions_multi_page(pages, qp_page_indices)
+    log(f"Official questions extracted: {len(official_questions)}")
 
     if not official_questions:
         raise Exception(
-            "Could not extract official questions from the question paper page.\n"
-            f"Preview of detected page:\n{pages[max(qp_idx,0)]['raw_text'][:500]}"
+            "Question paper pages were found, but no questions could be parsed from them.\n"
+            f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
 
-    # Step 5: Get answer pages (everything after question paper)
-    answer_start = qp_idx + 1 if qp_idx >= 0 else 0
-    answer_pages = pages[answer_start:]
+    # Step 5: Answer pages = every page NOT identified as a question paper page
+    answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
+    answer_pages = [pages[i] for i in answer_page_indices]
+
+    log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
 
     # Step 6: Flatten answer page lines
     answer_lines = []
