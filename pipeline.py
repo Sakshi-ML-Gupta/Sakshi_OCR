@@ -113,7 +113,7 @@ def build_ocr_json(pages: list) -> dict:
 
 
 # =========================================================
-# REFERENCE BOOK OCR
+# REFERENCE BOOK — page by page, base64 inline
 # =========================================================
 
 def ocr_page_base64(page_b64: str, api_key: str) -> str:
@@ -191,203 +191,98 @@ def process_reference(file_input, status_callback=None):
 
 
 # =========================================================
-# LINE RECOVERY  ***CRITICAL FIX***
-#
-# Mistral OCR markdown does NOT reliably emit "\n" between logical
-# lines/paragraphs within a page's text. Instead, paragraph breaks
-# are represented as runs of 2+ whitespace characters. A naive
-# `text.split("\n")` therefore collapses an entire page into ONE
-# string, which silently breaks every line-based regex in the
-# pipeline (question detection, sub-part detection, noise filtering)
-# without raising any error — this was the root cause of multiple
-# previous bugs that looked like "matching" problems but were
-# actually "there were no lines to match against" problems.
-#
-# This function reconstructs logical lines from raw OCR text:
-#   1. Normalise actual "\n" characters to the same separator.
-#   2. Split on runs of 2+ whitespace (paragraph/markdown breaks).
-#   3. Within each resulting chunk, further split immediately before
-#      any INLINE sub-part label (a) b) (i) (क) etc.) or inline
-#      top-level "N. " that appears after other text on the same
-#      chunk — these are real new logical lines that got fused
-#      together because they weren't separated by 2+ whitespace in
-#      the source (common when OCR reads a sequence of short labels
-#      as one flowing line, e.g. "a) Renaissance b) Amoretti").
+# DETECT QUESTION PAPER PAGE
+# The page that contains the printed list of questions
+# Identified by having numbered questions >= 5 items
 # =========================================================
-
-_PARA_SPLIT_RE     = re.compile(r'\s{2,}')
-_INLINE_SUBPART_RE = re.compile(r'(?<=\S)\s+(?=\(?[a-zA-Z]\)\s)')
-_INLINE_SUBPART_DEVA_RE = re.compile(r'(?<=\S)\s+(?=\([\u0915-\u0939]\)\s)')
-_INLINE_TOPLEVEL_RE = re.compile(r'(?<=\S)\s+(?=\d{1,2}\.\s+[A-Z\u0900-\u097F"\'])')
-
-
-def recover_lines(raw_text: str) -> list:
-    """Returns a list of logical lines reconstructed from raw OCR text."""
-    if not raw_text:
-        return []
-
-    normalised = raw_text.replace("\r\n", "\n").replace("\r", "\n")
-    chunks = []
-    for part in normalised.split("\n"):
-        chunks.extend(_PARA_SPLIT_RE.split(part))
-
-    lines = []
-    for chunk in chunks:
-        if not chunk.strip():
-            continue
-        pieces = _INLINE_SUBPART_RE.split(chunk)
-        for piece in pieces:
-            sub_pieces = _INLINE_SUBPART_DEVA_RE.split(piece)
-            for sp in sub_pieces:
-                final_pieces = _INLINE_TOPLEVEL_RE.split(sp)
-                lines.extend(p.strip() for p in final_pieces if p.strip())
-
-    return lines
-
-
-# =========================================================
-# QUESTION PAPER DETECTION
-# =========================================================
-
-TOP_LEVEL_RE = re.compile(r'^\s*(\d{1,2})[\.\)]\s+(.+)')
-
 
 def find_question_paper_page(pages: list) -> int:
     """
-    Returns index (0-based) of the page that is the printed question
-    paper. Looks for the page (after line recovery) with the most
-    top-level numbered label lines.
+    Returns index (0-based) of the page that is the question paper.
+    Looks for a page with 5+ numbered question lines.
     """
-    best_idx, best_count = -1, 0
+    Q_LINE = re.compile(r'^\s*\d+[\.\)]\s+.{20,}')
+
+    best_idx   = -1
+    best_count = 0
+
     for i, page in enumerate(pages):
-        lines = recover_lines(page["raw_text"])
-        count = sum(1 for line in lines if TOP_LEVEL_RE.match(line))
+        count = sum(
+            1 for line in page["raw_text"].split("\n")
+            if Q_LINE.match(line.strip())
+        )
         if count > best_count:
             best_count = count
-            best_idx = i
+            best_idx   = i
+
     return best_idx if best_count >= 3 else -1
 
 
 # =========================================================
-# OFFICIAL QUESTION EXTRACTION — WITH SUB-PARTS
+# EXTRACT OFFICIAL QUESTIONS FROM QUESTION PAPER PAGE
+# Returns list of question strings in order
 # =========================================================
-
-SUB_PART_PATTERNS = [
-    re.compile(r'^\s*\(([a-zA-Z])\)\s*(.+)'),                 # (a) (b) (i) (ii)
-    re.compile(r'^\s*([a-zA-Z])\)\s*(.+)'),                    # a) b) i) ii)
-    re.compile(r'^\s*\(([\u0915-\u0939])\)\s*(.+)'),           # (क) (ख) (ग) (घ)
-]
-
-INSTRUCTION_ONLY_RE = re.compile(
-    r'^(?:answer the following|write short notes on the following|'
-    r'निम्नलिखित (?:पर|के) |सभी प्रश्न|note\s*[:.]|section\b|भाग[\-\s]?\d|'
-    r'part\s*[-\s]?\w)',
-    re.I
-)
-
-SKIP_LINE_RE = re.compile(
-    r'^#+\s*$|^#+\s*(?:section|भाग|part)\b|^भाग|^PART|^\s*$|^Section\b|'
-    r'^Max\.?\s*Marks|^Course Code|^\S+ ALL SOLVED|^openeducation',
-    re.I
-)
-
-
-def _is_instruction_only(text: str) -> bool:
-    stripped = text.strip()
-    if not INSTRUCTION_ONLY_RE.match(stripped):
-        return False
-    word_count = len(stripped.split())
-    return word_count <= 18
-
 
 def extract_official_questions(page_text: str) -> list:
     """
-    Walks the printed question-paper page (after line recovery) and
-    produces a flat, ordered list of question units, correctly
-    capturing sub-parts as independent entries tied to their parent,
-    and excluding pure section/instruction lines from becoming their
-    own (unanswerable) Q&A pair.
+    Extracts numbered questions from the question paper page.
+    Handles multi-line questions by joining continuation lines.
+    Splits questions containing sub-parts like a) b) c) into separate
+    question entries, since each sub-part typically has its own answer.
     """
-    lines = recover_lines(page_text)
+    lines     = page_text.split("\n")
+    questions = []
+    current   = None
 
-    units = []
-    current_top = None
-    pending_parent_label = None
-    section_counter = 0
+    # Matches: "1. text", "2. text", etc.
+    Q_START = re.compile(r'^\s*(\d+)[\.\)]\s+(.+)')
+    # Section headers to skip
+    SKIP    = re.compile(r'^#+\s|^भाग|^PART|^\s*$')
 
-    def flush_top():
-        if current_top is not None:
-            current_top["text"] = current_top["text"].strip()
-            units.append(current_top)
-
-    for stripped in lines:
-        if not stripped:
-            continue
-        if SKIP_LINE_RE.match(stripped) and not TOP_LEVEL_RE.match(stripped):
-            continue
-
-        m_top = TOP_LEVEL_RE.match(stripped)
-        if m_top:
-            num, rest = m_top.group(1), m_top.group(2)
-            label = f"S{section_counter}-{num}" if section_counter else num
-
-            if _is_instruction_only(rest):
-                flush_top()
-                current_top = None
-                pending_parent_label = label
-                section_counter += 1
-                continue
-
-            flush_top()
-            current_top = {
-                "label": label,
-                "display_label": f"{num}.",
-                "text": rest,
-                "level": "top",
-                "parent_label": None,
-            }
-            pending_parent_label = label
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or SKIP.match(stripped):
+            if current:
+                questions.append(current.strip())
+                current = None
             continue
 
-        matched_sub = None
-        for pat in SUB_PART_PATTERNS:
-            m = pat.match(stripped)
-            if m:
-                matched_sub = m
-                break
+        m = Q_START.match(stripped)
+        if m:
+            if current:
+                questions.append(current.strip())
+            current = stripped
+        elif current:
+            # continuation of previous question
+            current += " " + stripped
 
-        if matched_sub and pending_parent_label is not None:
-            letter, rest = matched_sub.group(1), matched_sub.group(2)
+    if current:
+        questions.append(current.strip())
 
-            if current_top is not None and current_top["label"] == pending_parent_label:
-                flush_top()
-                current_top = None
+    # Split questions containing lettered sub-parts: a) ... b) ... c) ...
+    final_questions = []
+    SUBPART_RE = re.compile(r'(?:^|\s)([a-z])\)\s')
 
-            units.append({
-                "label": f"{pending_parent_label}{letter})",
-                "display_label": f"{letter})",
-                "text": rest,
-                "level": "sub",
-                "parent_label": pending_parent_label,
-            })
-            continue
+    for q in questions:
+        matches = list(SUBPART_RE.finditer(q))
 
-        # Continuation line: append to whichever unit is open
-        if current_top is not None:
-            current_top["text"] += " " + stripped
-        elif units:
-            units[-1]["text"] += " " + stripped
+        if len(matches) >= 2:
+            # Has 2+ sub-parts — split into separate questions
+            # Preamble = text before the first sub-part marker
+            preamble = q[:matches[0].start()].strip()
 
-    flush_top()
+            for idx, m in enumerate(matches):
+                start = m.start(1)  # position of the letter itself
+                end   = matches[idx + 1].start() if idx + 1 < len(matches) else len(q)
+                part_text = q[start:end].strip()
+                # part_text looks like "a) Renaissance" — keep preamble for context
+                full_q = f"{preamble} {part_text}".strip() if preamble else part_text
+                final_questions.append(full_q)
+        else:
+            final_questions.append(q)
 
-    return [{"label": u["label"], "display_label": u["display_label"],
-             "text": u["text"].strip(), "level": u["level"],
-             "parent_label": u["parent_label"]} for u in units]
+    return final_questions
 
-
-# =========================================================
-# NOISE FILTERING FOR ANSWER LINES
-# =========================================================
 
 NOISE_RE = re.compile(
     r'(?:Teacher\'?s?\s*Signature'
@@ -400,18 +295,7 @@ NOISE_RE = re.compile(
     r'|Need?\s*Komal'
     r'|Nod\s*Komal'
     r'|TAKMA\s*SINAN'
-    r'|Experiment\s*Name'
-    r'|KLA(?:SS|ES|SE)?(?:NOTE|ENOTE|ENSTE|ENCTE|SCHOTE)?'
-    r'|KLEBENOTE|KILKEENOTE|KIASSNOTE|KIASENOTE|KIRENNOTE'
-    r'|!\[img[\-\d]*\.jpeg?\]\([^)]*\)'
-    r'|^\s*\*{1,3}\s*$'
-    r'|^\s*\d{1,3}\s*$'
-    r'|^ALL SOLVED ASSIGNMENT'
-    r'|openeducation\.co\.in'
-    r'|^Acknowledgment$'
-    r'|^Enrolment Number'
-    r'|^RC Code'
-    r'|isms\.ignou\.ac\.in)',
+    r'|^\s*\d{1,3}\s*$)',
     re.IGNORECASE
 )
 
@@ -420,58 +304,16 @@ def is_noise(line: str) -> bool:
     return bool(NOISE_RE.search(line))
 
 
-def _is_junk_page(page_text: str) -> bool:
-    """
-    Whole-page junk: covers, admit cards, web admin screenshots,
-    acknowledgments — pages with no real Q&A content at all.
-    """
-    JUNK_SIGNALS = re.compile(
-        r'Acknowledgment|acknowledgement|isms\.ignou|'
-        r'KNOW YOUR ADMISSION|REGISTRATION DETAILS|'
-        r'Student Identity Card|RC Code|Father\'?s Name|'
-        r'ENROLMENT NUMBER\s*:|PROGRAMME (?:TITLE|CODE)\s*:|'
-        r'sincere gratitude',
-        re.I
-    )
-    lines = recover_lines(page_text)
-    if not lines:
-        return True
-    hits = sum(1 for l in lines if JUNK_SIGNALS.search(l))
-    return hits / max(len(lines), 1) > 0.25
-
-
 # =========================================================
-# SIMILARITY MATCHING
+# FIND QUESTION BOUNDARIES IN ANSWER PAGES — similarity based
+# Works for Hindi, English, any language
+# Matches student-written question restatements against the
+# official question paper text using word-overlap similarity
 # =========================================================
 
 def normalize(text: str) -> str:
-    """
-    Normalise text for word-overlap similarity matching.
-
-    CRITICAL FIX: Python's `\\w` (even with re.UNICODE) does NOT
-    include Devanagari combining marks — matras (ा ि ी ु ू ृ े ै ो ौ)
-    and the virama/halant (्) all fail `\\w`. The original regex
-    `[^\\w\\s]` therefore replaced every matra with a space, shattering
-    Hindi words into their individual base consonants (e.g.
-    "वैज्ञानिक" became "व ज ञ न क" — five fragments instead of one
-    word). This silently destroyed similarity matching for ANY Hindi
-    text, which is why Hindi document Q&A boundary detection was
-    unreliable. We explicitly whitelist the Devanagari combining mark
-    ranges alongside \\w so whole words survive intact.
-    """
     text = text.lower()
-    # \w (word chars) + \s (whitespace) + Devanagari combining marks:
-    #   U+0900-0903: candrabindu, anusvara, visarga (nasalisation/aspiration signs)
-    #   U+093A-094F: dependent vowel signs (matras) + virama/halant + nukta
-    #   U+0951-0957: stress/accent marks + extra vowel signs
-    #   U+0962-0963: vocalic l/ll vowel signs
-    # Deliberately EXCLUDES U+0964 (danda) and U+0965 (double danda) —
-    # these are Devanagari sentence-ending punctuation and should
-    # still be treated as separators, same as a Latin period.
-    text = re.sub(
-        r'[^\w\s\u0900-\u0903\u093A-\u094F\u0951-\u0957\u0962\u0963]',
-        ' ', text, flags=re.UNICODE
-    )
+    text = re.sub(r'[^\w\s]', ' ', text, flags=re.UNICODE)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
@@ -484,151 +326,42 @@ def similarity(a: str, b: str) -> float:
     return len(wa & wb) / max(len(wa), len(wb))
 
 
-def _char_trigrams(word: str) -> set:
-    word = f"  {word}  "
-    return {word[i:i+3] for i in range(len(word) - 2)}
-
-
-def fuzzy_word_similarity(a: str, b: str) -> float:
-    """
-    Character-trigram overlap between two short strings — used ONLY
-    as a matching signal to LOCATE where a question is answered, never
-    to alter any text. Handles OCR misspellings of proper nouns (e.g.
-    question says "Amoretti", student's OCR'd handwriting reads
-    "Amosetti") where plain word-overlap similarity scores 0 because
-    no word is spelled identically.
-    """
-    ta, tb = _char_trigrams(a.lower()), _char_trigrams(b.lower())
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / max(len(ta), len(tb))
-
-
 def strip_leading_label(text: str) -> str:
+    """Strip leading numbering like '1.', 'Q1.', 'प्र.2', '20.', 'a)' etc."""
     text = text.strip()
     text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text, flags=re.IGNORECASE)
     text = re.sub(r'^(?:उत्तर)\s*[\-\:\s]*', '', text)
     text = re.sub(r'^(?:प्र|प्रो|प्रश्न)[\.\s]*\d*[\.\s]*', '', text)
     text = re.sub(r'^[१-९०][०-९]*[\.\-\s]*', '', text)
     text = re.sub(r'^(?:Q\.?\s*)?\d+[.)]\s*', '', text)
-    text = re.sub(r'^\(?[a-zA-Z\u0915-\u0939]\)\s*', '', text)
+    text = re.sub(r'^[a-z]\)\s*', '', text, flags=re.IGNORECASE)
     return text.strip()
-
-
-# A line that's just the question being restated (e.g. the student
-# rewrote "(a) Renaissance" or "(b) Amoretti =" before actually
-# answering) — short, label-prefixed, little independent content.
-# We use this both to prefer non-echo boundary matches and to skip
-# leading echo lines so an answer slice begins at the real prose.
-def _is_echo_line(line: str, max_words: int = 5) -> bool:
-    """
-    True if this line looks like a BARE restatement of a question
-    label/title with no real content attached — e.g. "(a) Renaissance"
-    or "b) Amoretti =" — as opposed to "(a) Renaissance: It was in
-    Italy that..." where a colon/dash introduces actual answer prose
-    on the same line. The presence of a colon followed by more than a
-    couple words means this is NOT a bare echo, even if otherwise short.
-    """
-    stripped = line.strip()
-
-    # If there's a colon/dash separator followed by substantial text,
-    # this line already contains real content — never treat as echo.
-    m = re.search(r'[:\-]\s*(\S.*)$', stripped)
-    if m and len(m.group(1).split()) >= 3:
-        return False
-
-    word_count = len(stripped.split())
-    if word_count > max_words:
-        return False
-    starts_with_label = bool(
-        re.match(r'^\s*\(?[a-zA-Z0-9\u0915-\u0939]{1,3}[\.\)]', stripped)
-    )
-    return starts_with_label
-
-
-# Markers that explicitly signal "this is where the answer begins"
-# when found right after a repeated sub-part letter — e.g. the
-# question is restated as (a)(b)(c), then answered later as a
-# SEPARATE (a)=>...(b)=>...(c)=>... block. Detecting these markers
-# lets us prefer the true answer occurrence over the bare restatement.
-ANSWER_MARKER_AFTER_LABEL_RE = re.compile(
-    r'^\s*\(?[a-zA-Z\u0915-\u0939]\)?\s*[\.\)]?\s*(?:⇒|=>|:-|Ans(?:wer)?\s*[\-:]|Reference\s*:|उत्तर\s*[\-:]|→)',
-    re.I
-)
-
-
-def _has_answer_marker(line: str) -> bool:
-    return bool(ANSWER_MARKER_AFTER_LABEL_RE.match(line.strip()))
-
-
-def _find_group_anchor_line(answer_lines: list, parent_label: str, sibling_units: list) -> int:
-    """
-    For a group of sub-parts sharing the same parent (e.g. 1a, 1b),
-    find the line index where this group's question block is restated
-    (the cluster of bare "(a)", "(b)" labels, or the first sub-part's
-    high-confidence text match). Returns -1 if not found.
-    Used to scope answer-marker matching to AFTER this point, so
-    letter labels reused by a different section's question never
-    collide with this group's answers.
-    """
-    best_line = -1
-    for unit in sibling_units:
-        if unit["parent_label"] != parent_label:
-            continue
-        q_clean = strip_leading_label(unit["text"])
-        q_words = q_clean.split()
-        if not q_words:
-            continue
-        for i, line in enumerate(answer_lines):
-            s = similarity(line, unit["text"])
-            if s >= 0.4:
-                if best_line == -1 or i < best_line:
-                    best_line = i
-                break
-    return best_line
 
 
 def find_question_boundaries_by_similarity(
     answer_lines: list,
-    question_units: list,
-    similarity_threshold: float = 0.28,
+    questions: list,
+    similarity_threshold: float = 0.30,
     window: int = 4
 ) -> list:
-    candidates = []
+    """
+    Scans answer lines for restated questions matching official questions.
+    Uses sliding window to join multi-line question restatements.
 
-    # Precompute, for each parent group, the line range where its
-    # question block is restated and (presumably) answered — used to
-    # scope answer-marker (s4) matching so reused letter labels
-    # (a)/(b)/(c) across different sections never collide.
-    parent_labels_in_order = []
-    seen_pl = set()
-    for u in question_units:
-        if u["parent_label"] and u["parent_label"] not in seen_pl:
-            parent_labels_in_order.append(u["parent_label"])
-            seen_pl.add(u["parent_label"])
-
-    raw_anchor = {
-        pl: _find_group_anchor_line(answer_lines, pl, question_units)
-        for pl in parent_labels_in_order
-    }
-    # Bound each group's window to end where the NEXT group (in
-    # question-paper order) begins, so a letter match deep inside a
-    # later section's answers never gets credited to an earlier
-    # group's same-letter sub-part.
-    group_window = {}
-    for idx, pl in enumerate(parent_labels_in_order):
-        start = raw_anchor.get(pl, -1)
-        next_starts = [
-            raw_anchor[parent_labels_in_order[j]]
-            for j in range(idx + 1, len(parent_labels_in_order))
-            if raw_anchor.get(parent_labels_in_order[j], -1) != -1
-        ]
-        end = min(next_starts) if next_starts else len(answer_lines)
-        group_window[pl] = (start, end)
+    Correctness guarantees:
+    1. Tracks how many lines (`span`) the matched question text occupies,
+       so the answer slice can start AFTER the full question text.
+    2. Enforces that boundaries appear in the SAME ORDER as the official
+       questions list. If a question's best-scoring candidate would break
+       order (e.g. a false-positive shares vocabulary with an earlier
+       question), the NEXT best-scoring candidate for that same question
+       is tried, and so on, rather than dropping the question entirely.
+    """
+    candidates_by_question = {}   # question -> list of candidates, sorted by score desc
 
     for i in range(len(answer_lines)):
         line_i = answer_lines[i].strip()
-        if len(line_i) < 3:
+        if len(line_i) < 8:
             continue
 
         for w in range(1, window + 1):
@@ -639,151 +372,60 @@ def find_question_boundaries_by_similarity(
                 answer_lines[i + k].strip()
                 for k in range(w) if answer_lines[i + k].strip()
             )
-            if len(combined) < 6:
+            if len(combined) < 10:
                 continue
 
             combined_clean = strip_leading_label(combined)
 
-            for unit in question_units:
-                q_text = unit["text"]
-                q_clean = strip_leading_label(q_text)
-
-                s1 = similarity(combined, q_text)
+            for q in questions:
+                q_clean = strip_leading_label(q)
+                s1 = similarity(combined, q)
                 s2 = similarity(combined_clean, q_clean)
-
-                s3 = 0.0
-                s3_anchor = False
-                if unit["level"] == "sub":
-                    first_word = q_clean.split()[0] if q_clean.split() else ""
-                    first_line_norm = normalize(answer_lines[i].strip()).split()
-                    if first_word and first_word.lower() in first_line_norm:
-                        s3 = 0.5
-                        s3_anchor = True
-                    elif first_word and len(first_word) >= 5:
-                        # Fuzzy fallback for OCR-misspelled proper nouns
-                        # (e.g. question "Amoretti" vs OCR "Amosetti").
-                        # Only applied to longer words to avoid noisy
-                        # false positives on short common words.
-                        best_fuzzy = max(
-                            (fuzzy_word_similarity(first_word, w) for w in first_line_norm),
-                            default=0.0
-                        )
-                        if best_fuzzy >= 0.6:
-                            s3 = 0.45
-                            s3_anchor = True
-
-                s4 = 0.0
-                if unit["level"] == "sub" and _has_answer_marker(answer_lines[i]):
-                    m_label = re.match(
-                        r'^\s*\(?([a-zA-Z\u0915-\u0939])\)?', answer_lines[i].strip()
-                    )
-                    unit_letter = unit["display_label"].rstrip(") ").lstrip("(")
-                    win_start, win_end = group_window.get(unit["parent_label"], (-1, -1))
-                    if (m_label and m_label.group(1).lower() == unit_letter.lower()
-                            and win_start != -1 and win_start <= i < win_end):
-                        s4 = 0.6
-
-                score = max(s1, s2, s3, s4)
-                winning_signal = "s1_s2"
-                if score > 0 and score == s4:
-                    winning_signal = "s4"
-                elif score > 0 and score == s3:
-                    winning_signal = "s3"
-
-                # When s3 or s4 (single-line anchors) produce the
-                # winning score, the answer slice should start AT
-                # this line — it likely contains both the label/
-                # marker and the start of real prose (e.g. "(a)
-                # Renaissance: It was in Italy..." or "(a) ⇒
-                # Reference: The given lines are...") — not after it.
-                effective_span = w
-                if winning_signal == "s4":
-                    effective_span = 0
-                elif winning_signal == "s3" and s3_anchor:
-                    effective_span = 0
+                score = max(s1, s2)
 
                 if score >= similarity_threshold:
-                    candidates.append({
-                        "question": unit["text"],
-                        "label": unit["label"],
-                        "display_label": unit["display_label"],
-                        "level": unit["level"],
-                        "parent_label": unit["parent_label"],
+                    candidates_by_question.setdefault(q, []).append({
+                        "question":   q,
                         "line_index": i,
-                        "span": effective_span,
-                        "score": score,
-                        "via": winning_signal,
+                        "span":       w,
+                        "score":      score
                     })
 
-    # Non-echo candidates (real content) always beat echo candidates
-    # (bare label restatement) for the same question label, regardless
-    # of score — a perfect-score match on a bare "(a) Renaissance"
-    # label is less useful than an 0.85-score match on the line that
-    # actually starts the real answer. Only fall back to an echo
-    # candidate if NO non-echo candidate exists for that label (e.g.
-    # OCR garbled the proper noun so badly the real-answer line never
-    # scored high enough to become a candidate at all).
-    def _candidate_rank(c):
-        line_text = answer_lines[c["line_index"]] if c["line_index"] < len(answer_lines) else ""
-        is_echo = _is_echo_line(line_text)
-        return (1 if is_echo else 0, -round(c["score"], 2))
+    # Sort each question's candidates by score, descending
+    for q in candidates_by_question:
+        candidates_by_question[q].sort(key=lambda c: -c["score"])
 
-    best_per_label = {}
-    for c in candidates:
-        key = c["label"]
-        if key not in best_per_label or _candidate_rank(c) < _candidate_rank(best_per_label[key]):
-            best_per_label[key] = c
-
-    # Second pass: for any unit where the winning candidate is itself
-    # a restatement of the question (very high s1/s2 word-overlap,
-    # occurring at/near its group's anchor line) AND a genuine
-    # answer-marker (s4) candidate exists for the same unit further
-    # along, prefer the s4 candidate — restating the quote is not
-    # the same as answering it.
-    s4_candidates_by_label = {}
-    for c in candidates:
-        if c.get("via") == "s4":
-            key = c["label"]
-            if key not in s4_candidates_by_label or c["score"] > s4_candidates_by_label[key]["score"]:
-                s4_candidates_by_label[key] = c
-
-    for label, s4_cand in s4_candidates_by_label.items():
-        current = best_per_label.get(label)
-        if current is None:
-            best_per_label[label] = s4_cand
-            continue
-        if current.get("via") != "s4":
-            # Current winner came from raw word-overlap (likely the
-            # bare restatement). Swap to the s4 (explicit answer
-            # marker) candidate, which is structurally more reliable
-            # for this "restated-then-answered-separately" pattern.
-            best_per_label[label] = s4_cand
-
+    # Walk questions in official order. For each, try candidates from
+    # highest score downward, accepting the first one that comes after
+    # the previously accepted boundary's line_index.
     final = []
     last_line_index = -1
-    for unit in question_units:
-        c = best_per_label.get(unit["label"])
-        if c is None:
-            continue
-        if c["line_index"] <= last_line_index:
-            continue
-        final.append(c)
-        last_line_index = c["line_index"]
+
+    for q in questions:
+        cands = candidates_by_question.get(q, [])
+        chosen = None
+        for c in cands:
+            if c["line_index"] > last_line_index:
+                chosen = c
+                break
+        if chosen is not None:
+            final.append(chosen)
+            last_line_index = chosen["line_index"]
 
     return final
 
 
 def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
+    """
+    For each boundary, answer = raw lines starting AFTER the full matched
+    question span (boundary["span"] lines), up to the next boundary.
+    Pure text slicing, zero LLM.
+    """
     qa_pairs = []
     for i, b in enumerate(boundaries):
         span    = b.get("span", 1)
         a_start = b["line_index"] + span
         a_end   = boundaries[i + 1]["line_index"] if i + 1 < len(boundaries) else len(answer_lines)
-
-        # Skip leading echo lines (restated question labels) so the
-        # answer starts at the real prose, not a repeated question.
-        while a_start < a_end and _is_echo_line(answer_lines[a_start]):
-            a_start += 1
 
         raw = [
             answer_lines[j] for j in range(a_start, a_end)
@@ -791,7 +433,7 @@ def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> lis
         ]
 
         qa_pairs.append({
-            "question": f"{b['display_label']} {b['question']}".strip(),
+            "question": b["question"],
             "answer":   " ".join(raw).strip()
         })
 
@@ -815,23 +457,25 @@ def process_pdf(file_input, status_callback=None):
         file_bytes = file_input.read()
         file_name  = getattr(file_input, "name", "document.pdf")
 
+    # Step 1: Preprocess
     log("Preprocessing PDF...")
     processed = preprocess_pdf(file_bytes)
 
+    # Step 2: OCR
     pages = run_ocr(processed, file_name, status_callback)
 
+    # Step 3: Build OCR JSON
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
+    # Step 4: Find question paper page
     qp_idx = find_question_paper_page(pages)
     log(f"Question paper detected on page: {qp_idx + 1 if qp_idx >= 0 else 'not found'}")
 
     if qp_idx >= 0:
         official_questions = extract_official_questions(pages[qp_idx]["raw_text"])
-        log(f"Official question units extracted (incl. sub-parts): {len(official_questions)}")
-        for u in official_questions:
-            log(f"  [{u['level']}] {u['display_label']} {u['text'][:60]}")
+        log(f"Official questions extracted: {len(official_questions)}")
     else:
         official_questions = []
         log("No question paper page found")
@@ -842,36 +486,37 @@ def process_pdf(file_input, status_callback=None):
             f"Preview of detected page:\n{pages[max(qp_idx,0)]['raw_text'][:500]}"
         )
 
+    # Step 5: Get answer pages (everything after question paper)
     answer_start = qp_idx + 1 if qp_idx >= 0 else 0
     answer_pages = pages[answer_start:]
 
+    # Step 6: Flatten answer page lines
     answer_lines = []
     for page in answer_pages:
-        if _is_junk_page(page["raw_text"]):
-            log(f"  Skipping junk page {page['page_number']}")
-            continue
-        for line in recover_lines(page["raw_text"]):
+        for line in page["raw_text"].split("\n"):
             if not is_noise(line):
                 answer_lines.append(line)
 
-    log(f"Flattened {len(answer_lines)} answer lines (after line recovery)")
+    log(f"Flattened {len(answer_lines)} answer lines")
 
-    log("Matching questions via similarity (top-level + sub-parts)...")
+    # Step 7: Similarity-based matching — works for any language/format
+    log("Matching questions via similarity (works for Hindi/English/any format)...")
     boundaries = find_question_boundaries_by_similarity(answer_lines, official_questions)
-    log(f"Matched {len(boundaries)} of {len(official_questions)} question units")
+    log(f"Matched {len(boundaries)} of {len(official_questions)} questions")
 
-    matched_labels = {b["label"] for b in boundaries}
-    for u in official_questions:
-        if u["label"] not in matched_labels:
-            log(f"WARNING: No match found for [{u['level']}] {u['display_label']} {u['text'][:60]}")
+    matched_qs = {b["question"] for b in boundaries}
+    for q in official_questions:
+        if q not in matched_qs:
+            log(f"WARNING: No match found for: {q[:60]}")
 
     if not boundaries:
         raise Exception(
             "Could not match any questions in answer pages.\n"
-            f"Official questions: {[u['text'] for u in official_questions]}\n"
+            f"Official questions: {official_questions}\n"
             f"First 10 answer lines: {answer_lines[:10]}"
         )
 
+    # Step 8: Slice raw answers — zero LLM, pure text slicing
     log("Slicing raw answers...")
     qa_pairs = slice_raw_answers_by_boundaries(answer_lines, boundaries)
 
