@@ -5,3 +5,5 @@ pymupdf
 pillow
 numpy
 surya-ocr
+torch
+torchvision
