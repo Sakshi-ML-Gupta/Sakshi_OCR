@@ -1,8 +1,4 @@
 streamlit
+pymupdf
 python-dotenv
 httpx
-pymupdf
-pillow
-numpy
-paddleocr
-paddlepaddle
