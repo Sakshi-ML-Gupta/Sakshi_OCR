@@ -216,35 +216,79 @@ def process_reference(file_input, status_callback=None):
 
 # =========================================================
 # DETECT QUESTION PAPER PAGE
-# The page that contains the printed list of questions
-# Identified by having numbered questions >= 5 items
+# The page that contains the printed list of questions.
+# 
+# FIXED: Previous version matched ANY line starting with "digit." 
+# or "digit)" + 15 chars. This falsely matched IGNOU ID card terms 
+# (e.g., "1. This card should be produced...") and handwritten answer 
+# pages where students restate questions before answering.
+#
+# NEW LOGIC: Uses a strict scoring system based on EXCLUSIVE exam-
+# paper structural signals (marks allocation, Section headers, 
+# Course Codes). Explicitly blocks ID cards, registration pages, 
+# and handwritten answer pages via fingerprinting.
 # =========================================================
 
-def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
-    """
-    Returns list of page indices (0-based) that look like question paper
-    pages — i.e. pages dominated by printed numbered/lettered questions
-    rather than handwritten answers.
+# Hard negative fingerprints for non-question pages
+NEGATIVE_FINGERPRINTS = re.compile(
+    r'(?:'
+    r'identity\s*card|id\s*card'                         # ID cards
+    r'|this\s+card\s+should\s+be\s+produced'              # IGNOU ID T&C
+    r'|student\s+name|father\s+name|enrolment\s+no'       # Registration forms
+    r'|programme\s*code|reg\.\s*no|study\s+centre'        # Reg headers
+    r'|signature\s+of\s+the\s+student'                    # Sign fields
+    r'|date\s+of\s+issue|valid\s+upto'                    # Card validity
+    r')',
+    re.IGNORECASE
+)
 
-    Unlike picking a single "best" page, this scans every page, since
-    question papers can span multiple pages or be split into sections
-    (Part 1 / Part 2 / Part 3, or a parent question like "Q.9 Write notes
-    on:" followed by lettered sub-parts a)/b)/c)/d) or क)/ख)/ग)/घ) that
-    may land on their own page).
+# Hard negatives for handwritten answer pages
+ANSWER_PAGE_FINGERPRINTS = re.compile(
+    r'(?:'
+    r'उत्तर\s*[\-\:]|Ans\.?\s*[\-\:]|A\.\d|A\d+\s*[\-\:]' # Answer markers
+    r'|\bAns\b\s*$'                                        # Lone "Ans"
+    r')',
+    re.IGNORECASE
+)
 
-    A page counts as a question-paper page if it has at least
-    `min_questions` lines matching EITHER a numbered question pattern
-    OR a lettered sub-part pattern, AND does not contain answer-marker
-    text (Ans-, उत्तर, A.15- etc) — answer pages sometimes contain
-    numbered sub-points which would otherwise be miscounted as questions.
+# STRONG POSITIVE SIGNALS (Only ever appear on official printed question papers)
+STRONG_EXAM_SIGNALS = [
+    # Marks allocation patterns (e.g., "10", "5X4=20", "2X10=20")
+    re.compile(r'\b\d+\s*[xX×]\s*\d+\s*=\s*\d+\b'),
+    re.compile(r'(?:\(|\[|\s)\d{2}\s*(?:\)|\]|\s|$)'),      # Standalone 2-digit marks like "(10)" or " 20 "
+    
+    # Section / Part headers
+    re.compile(r'\bSECTION\s*[\-–]?\s*[A-D]\b', re.IGNORECASE),
+    re.compile(r'\bPART\s*[\-–]?\s*[A-D]\b', re.IGNORECASE),
+    re.compile(r'\bखंड\s*[\-–]?\s*[अ-ज]\b'),               # Hindi sections
+    
+    # Course / Paper codes (e.g., "BCS-051", "EHI-03", "MTE-12")
+    re.compile(r'\b[A-Z]{2,4}\s*[-–]\s*\d{2,4}\b'),
+    
+    # Time / Marks headers (e.g., "Time: 3 Hours", "Maximum Marks: 100")
+    re.compile(r'(?:Time|Duration|समय)\s*[:\-]?\s*\d+\s*(?:Hours|Hrs|मिनट|घंटे)', re.IGNORECASE),
+    re.compile(r'(?:Maximum\s*Marks|कुल\s*अंक)\s*[:\-]?\s*\d+', re.IGNORECASE),
+    
+    # Instructional verbs grouped together (highly indicative of printed QP)
+    re.compile(r'(?:attempt|explain|define|describe|discuss|write\s+notes|compare|analyze|evaluate|illustrate)', re.IGNORECASE),
+]
+
+def find_question_paper_pages(pages: list, min_questions: int = 2, min_score: int = 3) -> list:
     """
-    Q_LINE_NUM   = re.compile(r'^\s*\d+[\.\)]\s+.{15,}')
-    Q_LINE_LATIN = re.compile(r'^\s*[a-d]\)\s+.{5,}', re.IGNORECASE)
-    Q_LINE_DEVA  = re.compile(r'^\s*[क-घ]\)\s+.{5,}')
-    ANSWER_MARKER = re.compile(
-        r'(?:उत्तर\s*[\-\:]|Ans\.?\s*[\-\:]|A\.\d|A\d+\s*[\-\:])',
-        re.IGNORECASE
-    )
+    Returns list of page indices (0-based) that are official question paper pages.
+    
+    Scoring Rules:
+    - +1 for each distinct STRONG_EXAM_SIGNAL found on the page
+    - +1 for having >= min_questions lines matching a strict question pattern
+      (Requires NO answer markers on the same line to prevent counting student restatements)
+    - Automatic FAIL (-infinity) if NEGATIVE_FINGERPRINTS are detected
+    - Automatic FAIL if ANSWER_PAGE_FINGERPRINTS are detected
+    - Page must score >= min_score (default 3) to be classified as a QP page.
+    """
+    # Stricter question line pattern (must be >= 20 chars to avoid matching short list items)
+    Q_LINE_NUM   = re.compile(r'^\s*\d+[\.\)]\s+.{20,}')
+    Q_LINE_LATIN = re.compile(r'^\s*[a-d]\)\s+.{8,}', re.IGNORECASE)
+    Q_LINE_DEVA  = re.compile(r'^\s*[क-घ]\)\s+.{8,}')
 
     candidate_pages = []
 
@@ -252,16 +296,38 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
         text  = page["raw_text"]
         lines = text.split("\n")
 
-        q_count = sum(
-            1 for line in lines
-            if Q_LINE_NUM.match(line.strip())
-            or Q_LINE_LATIN.match(line.strip())
-            or Q_LINE_DEVA.match(line.strip())
-        )
+        # HARD NEGATIVE 1: ID Card / Registration Page Fingerprint
+        if NEGATIVE_FINGERPRINTS.search(text):
+            continue
 
-        has_answer_marker = bool(ANSWER_MARKER.search(text))
+        # HARD NEGATIVE 2: Handwritten Answer Page Fingerprint
+        if ANSWER_PAGE_FINGERPRINTS.search(text):
+            continue
 
-        if q_count >= min_questions and not has_answer_marker:
+        score = 0
+
+        # POSITIVE SIGNAL 1: Strong structural exam markers
+        for signal_re in STRONG_EXAM_SIGNALS:
+            if signal_re.search(text):
+                score += 1
+
+        # POSITIVE SIGNAL 2: High density of numbered/lettered questions
+        # We explicitly check that the line itself doesn't look like an answer restatement
+        q_count = 0
+        for line in lines:
+            stripped = line.strip()
+            is_q = (Q_LINE_NUM.match(stripped) 
+                    or Q_LINE_LATIN.match(stripped) 
+                    or Q_LINE_DEVA.match(stripped))
+            if is_q:
+                # Extra safety: ignore if line has handwritten answer restatement markers
+                if not re.match(r'^(?:Ans|उत्तर|A\.)', stripped, re.IGNORECASE):
+                    q_count += 1
+                    
+        if q_count >= min_questions:
+            score += 1
+
+        if score >= min_score:
             candidate_pages.append(i)
 
     return candidate_pages
@@ -271,7 +337,7 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
 # EXTRACT OFFICIAL QUESTIONS — scans across MULTIPLE pages
 # Also captures lettered sub-questions (क/ख/ग/घ, a/b/c/d)
 # that appear as a standalone list after a parent question
-# like "Q.9 निम्नलिखित पर टिप्पणी लिखिए" on a DIFFERENT page
+# like "Q.9 Write notes on:" on a DIFFERENT page
 # than where the sub-options are printed.
 # =========================================================
 
@@ -564,7 +630,7 @@ def process_pdf(file_input, status_callback=None):
         raise Exception(
             "Could not detect any question paper pages in this document.\n"
             "This usually means the document has a different layout than expected — "
-            "no page was found with multiple numbered question lines.\n"
+            "no page was found with strong exam structural signals (Marks, Sections, Course Codes).\n"
             f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
         )
 
