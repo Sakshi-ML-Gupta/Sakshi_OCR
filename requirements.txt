@@ -4,6 +4,5 @@ httpx
 pymupdf
 pillow
 numpy
-surya-ocr
-torch
-torchvision
+paddleocr
+paddlepaddle
