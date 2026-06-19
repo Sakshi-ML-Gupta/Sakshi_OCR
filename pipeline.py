@@ -15,19 +15,14 @@ except Exception:
 
 try:
     from dotenv import load_dotenv
-except ImportError:
+except Exception:
     def load_dotenv():
         return False
 
 try:
     import fitz
-except ImportError:
+except Exception:
     fitz = None
-
-try:
-    from paddleocr import PaddleOCR
-except ImportError:
-    PaddleOCR = None
 
 
 load_dotenv()
@@ -43,7 +38,6 @@ NOISE_RE = re.compile(
 
 def get_config(name, default=None):
     value = os.getenv(name)
-
     if value:
         return value
 
@@ -60,21 +54,17 @@ def get_config(name, default=None):
 OCR_PROVIDER = get_config("OCR_PROVIDER", "surya").strip().lower()
 GEMINI_API_KEY = get_config("GEMINI_API_KEY")
 GEMINI_MODEL = get_config("GEMINI_MODEL", "gemini-3.5-flash")
-
 PADDLEOCR_LANG = get_config("PADDLEOCR_LANG", "hi")
 SURYA_LANGS = [
-    item.strip()
-    for item in get_config(
-        "SURYA_LANGS",
-        "en,hi,bn,ta,te,gu,kn,ml,mr,pa,or",
-    ).split(",")
-    if item.strip()
+    x.strip()
+    for x in get_config("SURYA_LANGS", "en,hi,bn,ta,te,gu,kn,ml,mr,pa,or").split(",")
+    if x.strip()
 ]
 
 
 def require_config(name, value):
     if not value:
-        raise RuntimeError(f"Missing {name}. Add it to Streamlit secrets or .env.")
+        raise RuntimeError(f"Missing {name}. Add it to Streamlit secrets.")
     return value.strip()
 
 
@@ -84,10 +74,8 @@ def clean_ocr_lines(text):
 
     for raw_line in str(text).splitlines():
         line = re.sub(r"\s+", " ", raw_line).strip()
-
         if not line or NOISE_RE.search(line):
             continue
-
         if line not in seen:
             seen.add(line)
             lines.append(line)
@@ -95,9 +83,9 @@ def clean_ocr_lines(text):
     return lines
 
 
-def pdf_to_images(pdf_bytes, dpi=220):
+def pdf_to_images(pdf_bytes, dpi=200):
     if fitz is None:
-        raise RuntimeError("PyMuPDF missing. Add pymupdf to requirements.txt.")
+        raise RuntimeError("PyMuPDF is missing. Add pymupdf to requirements.txt.")
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     zoom = dpi / 72
@@ -116,7 +104,7 @@ def pdf_to_images(pdf_bytes, dpi=220):
     return images
 
 
-def extract_text_from_any_ocr_result(result):
+def extract_text_from_any_result(result):
     lines = []
 
     def walk(value):
@@ -135,7 +123,7 @@ def extract_text_from_any_ocr_result(result):
 
             for key in ("rec_texts", "texts"):
                 if key in value and isinstance(value[key], list):
-                    lines.extend(str(item) for item in value[key] if str(item).strip())
+                    lines.extend(str(x) for x in value[key] if str(x).strip())
 
             for child in value.values():
                 walk(child)
@@ -173,52 +161,24 @@ def extract_text_from_any_ocr_result(result):
     return clean_ocr_lines("\n".join(lines))
 
 
-def run_paddle_ocr(pdf_bytes):
-    if PaddleOCR is None:
-        raise RuntimeError(
-            "PaddleOCR missing. Add paddleocr and paddlepaddle to requirements.txt."
-        )
-
-    print(f"Loading PaddleOCR lang={PADDLEOCR_LANG}...")
-    ocr = PaddleOCR(use_angle_cls=True, lang=PADDLEOCR_LANG, show_log=False)
-
-    pages = []
-
-    for page_number, image in pdf_to_images(pdf_bytes):
-        print(f"OCR page {page_number} with PaddleOCR...")
-        result = ocr.ocr(np.array(image), cls=True)
-        lines = extract_text_from_any_ocr_result(result)
-
-        pages.append({
-            "page_number": page_number,
-            "text": lines,
-        })
-
-    return {
-        "total_pages": len(pages),
-        "pages": pages,
-    }
-
-
 def run_surya_ocr(pdf_bytes):
     try:
         from surya.detection import DetectionPredictor
         from surya.ocr import run_ocr
         from surya.recognition import RecognitionPredictor
-    except ImportError as e:
-        raise RuntimeError("Surya OCR missing. Add surya-ocr to requirements.txt.") from e
-
-    print(f"Loading Surya OCR langs={','.join(SURYA_LANGS)}...")
+    except Exception as e:
+        raise RuntimeError(
+            "Surya OCR could not load. Make sure requirements.txt contains surya-ocr."
+        ) from e
 
     images_with_numbers = pdf_to_images(pdf_bytes)
-    page_numbers = [item[0] for item in images_with_numbers]
-    images = [item[1] for item in images_with_numbers]
+    page_numbers = [x[0] for x in images_with_numbers]
+    images = [x[1] for x in images_with_numbers]
 
     recognition_predictor = RecognitionPredictor()
     detection_predictor = DetectionPredictor()
     lang_lists = [SURYA_LANGS for _ in images]
 
-    print("Running Surya OCR...")
     predictions = run_ocr(
         images,
         lang_lists,
@@ -229,11 +189,35 @@ def run_surya_ocr(pdf_bytes):
     pages = []
 
     for page_number, prediction in zip(page_numbers, predictions):
-        lines = extract_text_from_any_ocr_result(prediction)
+        pages.append({
+            "page_number": page_number,
+            "text": extract_text_from_any_result(prediction),
+        })
+
+    return {
+        "total_pages": len(pages),
+        "pages": pages,
+    }
+
+
+def run_paddle_ocr(pdf_bytes):
+    try:
+        from paddleocr import PaddleOCR
+    except Exception as e:
+        raise RuntimeError(
+            "PaddleOCR could not load on this host. Use OCR_PROVIDER=surya instead."
+        ) from e
+
+    ocr = PaddleOCR(use_angle_cls=True, lang=PADDLEOCR_LANG, show_log=False)
+
+    pages = []
+
+    for page_number, image in pdf_to_images(pdf_bytes):
+        result = ocr.ocr(np.array(image), cls=True)
 
         pages.append({
             "page_number": page_number,
-            "text": lines,
+            "text": extract_text_from_any_result(result),
         })
 
     return {
@@ -286,13 +270,7 @@ Return valid JSON only. No markdown. No explanation.
     )
 
     body = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ],
+        "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0,
             "response_mime_type": "application/json",
@@ -301,11 +279,7 @@ Return valid JSON only. No markdown. No explanation.
 
     try:
         with httpx.Client(timeout=240) as client:
-            response = client.post(
-                url,
-                params={"key": api_key},
-                json=body,
-            )
+            response = client.post(url, params={"key": api_key}, json=body)
     except httpx.RequestError as e:
         raise RuntimeError(f"Could not reach Gemini. Details: {e}") from e
 
@@ -336,18 +310,9 @@ def normalize_questions(questions):
     normalized = []
     seen = set()
 
-    for index, question in enumerate(questions, start=1):
-        qid = str(
-            question.get("question_id")
-            or question.get("id")
-            or f"Q{index}"
-        ).strip()
-
-        qtext = re.sub(
-            r"\s+",
-            " ",
-            str(question.get("question") or question.get("text") or ""),
-        ).strip()
+    for index, q in enumerate(questions, start=1):
+        qid = str(q.get("question_id") or q.get("id") or f"Q{index}").strip()
+        qtext = re.sub(r"\s+", " ", str(q.get("question") or q.get("text") or "")).strip()
 
         if not qid or not qtext:
             continue
@@ -366,7 +331,7 @@ def normalize_questions(questions):
         normalized.append({
             "question_id": qid,
             "question": qtext,
-            "page_number": question.get("page_number"),
+            "page_number": q.get("page_number"),
         })
 
     if not normalized:
@@ -399,11 +364,7 @@ Rules:
 - Do not invent missing questions.
 """
 
-    payload = gemini_json(
-        system_prompt,
-        {"pages": pages_for_prompt(pages)},
-    )
-
+    payload = gemini_json(system_prompt, {"pages": pages_for_prompt(pages)})
     return normalize_questions(payload.get("questions", []))
 
 
@@ -476,15 +437,8 @@ Rules:
 
 
 def slice_answers(questions, answer_lines, spans):
-    line_by_id = {
-        line["line_id"]: line
-        for line in answer_lines
-    }
-
-    question_by_id = {
-        q["question_id"]: q
-        for q in questions
-    }
+    line_by_id = {line["line_id"]: line for line in answer_lines}
+    question_by_id = {q["question_id"]: q for q in questions}
 
     qa_pairs = []
     used_question_ids = set()
@@ -505,9 +459,9 @@ def slice_answers(questions, answer_lines, spans):
             continue
 
         raw_lines = [
-            line_by_id[line_id]["text"]
-            for line_id in range(start, end + 1)
-            if line_id in line_by_id
+            line_by_id[i]["text"]
+            for i in range(start, end + 1)
+            if i in line_by_id
         ]
 
         answer = re.sub(r"\s+", " ", " ".join(raw_lines)).strip()
@@ -527,13 +481,6 @@ def slice_answers(questions, answer_lines, spans):
     return qa_pairs
 
 
-def build_final_json(qa_pairs):
-    return {
-        "total_qa_pairs": len(qa_pairs),
-        "qa_pairs": qa_pairs,
-    }
-
-
 def process_pdf(pdf_path):
     pdf_file = Path(pdf_path)
 
@@ -544,7 +491,6 @@ def process_pdf(pdf_path):
     OUTPUT_FINAL_DIR.mkdir(parents=True, exist_ok=True)
 
     pdf_bytes = pdf_file.read_bytes()
-
     ocr_json = run_ocr(pdf_bytes)
 
     ocr_output_path = OUTPUT_OCR_DIR / f"{pdf_file.stem}_ocr.json"
@@ -562,23 +508,14 @@ def process_pdf(pdf_path):
         if str(q.get("page_number") or "").isdigit()
     }
 
-    answer_lines = flatten_answer_lines(
-        pages,
-        question_page_numbers,
-    )
+    answer_lines = flatten_answer_lines(pages, question_page_numbers)
+    spans = map_answer_spans_with_llm(questions, answer_lines)
+    qa_pairs = slice_answers(questions, answer_lines, spans)
 
-    spans = map_answer_spans_with_llm(
-        questions,
-        answer_lines,
-    )
-
-    qa_pairs = slice_answers(
-        questions,
-        answer_lines,
-        spans,
-    )
-
-    final_json = build_final_json(qa_pairs)
+    final_json = {
+        "total_qa_pairs": len(qa_pairs),
+        "qa_pairs": qa_pairs,
+    }
 
     final_output_path = OUTPUT_FINAL_DIR / f"{pdf_file.stem}_final.json"
 
