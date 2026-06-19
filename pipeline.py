@@ -1,11 +1,12 @@
-import base64
+import io
 import json
 import os
 import re
 from pathlib import Path
-from urllib.parse import urlparse
 
 import httpx
+import numpy as np
+from PIL import Image
 
 try:
     from dotenv import load_dotenv
@@ -18,18 +19,23 @@ try:
 except ImportError:
     fitz = None
 
+try:
+    from paddleocr import PaddleOCR
+except ImportError:
+    PaddleOCR = None
+
 
 load_dotenv()
 
-OCR_PROVIDER = os.getenv("OCR_PROVIDER", "groq_vision").strip().lower()
-CHANDRA_OCR_URL = os.getenv("CHANDRA_OCR_URL")
-CHANDRA_API_KEY = os.getenv("CHANDRA_API_KEY")
+OCR_PROVIDER = os.getenv("OCR_PROVIDER", "surya").strip().lower()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "llama-3.3-70b-versatile")
-GROQ_VISION_MODEL = os.getenv(
-    "GROQ_VISION_MODEL",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-)
+PADDLEOCR_LANG = os.getenv("PADDLEOCR_LANG", "hi")
+SURYA_LANGS = [
+    item.strip()
+    for item in os.getenv("SURYA_LANGS", "en,hi,bn,ta,te,gu,kn,ml,mr,pa,or").split(",")
+    if item.strip()
+]
 
 OUTPUT_OCR_DIR = Path("outputs/ocr_json")
 OUTPUT_FINAL_DIR = Path("outputs/final_json")
@@ -40,25 +46,15 @@ NOISE_RE = re.compile(
 )
 
 
-def require_env(name: str, value: str | None) -> str:
+def require_env(name, value):
     if not value:
-        raise RuntimeError(f"Missing {name}. Add it to .env before running the pipeline.")
+        raise RuntimeError(f"Missing {name}. Add it to .env.")
     return value.strip()
 
 
-def require_url(name: str, value: str | None) -> str:
-    url = require_env(name, value)
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise RuntimeError(f"{name} must be a full URL.")
-    if "example" in parsed.netloc or "your-" in url:
-        raise RuntimeError(f"{name} is still a placeholder.")
-    return url
-
-
-def clean_ocr_lines(text: str) -> list[str]:
+def clean_ocr_lines(text):
     lines = []
-    seen_on_page = set()
+    seen = set()
 
     for raw_line in str(text).splitlines():
         line = re.sub(r"\s+", " ", raw_line).strip()
@@ -66,90 +62,192 @@ def clean_ocr_lines(text: str) -> list[str]:
         if not line or NOISE_RE.search(line):
             continue
 
-        if line not in seen_on_page:
-            seen_on_page.add(line)
+        if line not in seen:
+            seen.add(line)
             lines.append(line)
 
     return lines
 
 
-def extract_text(value) -> str:
-    if value is None:
-        return ""
+def pdf_to_images(pdf_bytes, dpi=220):
+    if fitz is None:
+        raise RuntimeError("PyMuPDF missing. Install it with: pip install pymupdf")
 
-    if isinstance(value, str):
-        return value
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    zoom = dpi / 72
+    matrix = fitz.Matrix(zoom, zoom)
 
-    if isinstance(value, list):
-        return "\n".join(extract_text(item) for item in value)
+    images = []
 
-    if isinstance(value, dict):
-        for key in ("text", "markdown", "raw_text", "content", "value"):
-            if key in value:
-                text = extract_text(value[key])
-                if text.strip():
-                    return text
+    try:
+        for page_number, page in enumerate(doc, start=1):
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            images.append((page_number, image))
+    finally:
+        doc.close()
 
-        return "\n".join(extract_text(item) for item in value.values())
-
-    return str(value)
-
-
-def parse_ocr_response(payload) -> list[dict]:
-    if isinstance(payload, dict):
-        for key in ("pages", "data", "result", "results", "documents"):
-            if key in payload:
-                return parse_ocr_response(payload[key])
-
-        text = extract_text(payload)
-        return [{"page_number": 1, "text": clean_ocr_lines(text)}] if text.strip() else []
-
-    if isinstance(payload, list):
-        pages = []
-
-        for index, item in enumerate(payload, start=1):
-            text = extract_text(item)
-            page_number = (
-                item.get("page_number") or item.get("page") or index
-                if isinstance(item, dict)
-                else index
-            )
-
-            pages.append({
-                "page_number": int(page_number),
-                "text": clean_ocr_lines(text),
-            })
-
-        return pages
-
-    text = extract_text(payload)
-    return [{"page_number": 1, "text": clean_ocr_lines(text)}] if text.strip() else []
+    return images
 
 
-def groq_chat(
-    messages: list[dict],
-    model: str,
-    response_format: dict | None = None,
-    timeout: int = 180,
-) -> dict:
-    api_key = require_env("GROQ_API_KEY", GROQ_API_KEY)
+def extract_text_from_any_ocr_result(result):
+    lines = []
 
-    body = {
-        "model": model,
-        "temperature": 0,
-        "messages": messages,
+    def walk(value):
+        if value is None:
+            return
+
+        if isinstance(value, str):
+            if value.strip():
+                lines.append(value)
+            return
+
+        if isinstance(value, dict):
+            for key in ("text", "rec_text", "label"):
+                if key in value and str(value[key]).strip():
+                    lines.append(str(value[key]))
+
+            for key in ("rec_texts", "texts"):
+                if key in value and isinstance(value[key], list):
+                    lines.extend(str(item) for item in value[key] if str(item).strip())
+
+            for child in value.values():
+                walk(child)
+            return
+
+        if hasattr(value, "text") and str(value.text).strip():
+            lines.append(str(value.text))
+
+        if hasattr(value, "text_lines"):
+            walk(value.text_lines)
+
+        if hasattr(value, "dict"):
+            try:
+                walk(value.dict())
+            except Exception:
+                pass
+
+        if isinstance(value, tuple):
+            if len(value) >= 2 and isinstance(value[1], (int, float)):
+                lines.append(str(value[0]))
+            else:
+                for child in value:
+                    walk(child)
+            return
+
+        if isinstance(value, list):
+            if len(value) >= 2 and isinstance(value[1], tuple):
+                lines.append(str(value[1][0]))
+                return
+
+            for child in value:
+                walk(child)
+
+    walk(result)
+    return clean_ocr_lines("\n".join(lines))
+
+
+def run_paddle_ocr(pdf_bytes):
+    if PaddleOCR is None:
+        raise RuntimeError("PaddleOCR missing. Install: pip install paddleocr paddlepaddle")
+
+    print(f"Loading PaddleOCR lang={PADDLEOCR_LANG}...")
+    ocr = PaddleOCR(use_angle_cls=True, lang=PADDLEOCR_LANG, show_log=False)
+
+    pages = []
+
+    for page_number, image in pdf_to_images(pdf_bytes):
+        print(f"OCR page {page_number} with PaddleOCR...")
+        result = ocr.ocr(np.array(image), cls=True)
+        lines = extract_text_from_any_ocr_result(result)
+
+        pages.append({
+            "page_number": page_number,
+            "text": lines,
+        })
+
+    return {
+        "total_pages": len(pages),
+        "pages": pages,
     }
 
-    if response_format:
-        body["response_format"] = response_format
+
+def run_surya_ocr(pdf_bytes):
+    try:
+        from surya.detection import DetectionPredictor
+        from surya.ocr import run_ocr
+        from surya.recognition import RecognitionPredictor
+    except ImportError as e:
+        raise RuntimeError("Surya OCR missing. Install: pip install surya-ocr") from e
+
+    print(f"Loading Surya OCR langs={','.join(SURYA_LANGS)}...")
+
+    images_with_numbers = pdf_to_images(pdf_bytes)
+    page_numbers = [item[0] for item in images_with_numbers]
+    images = [item[1] for item in images_with_numbers]
+
+    recognition_predictor = RecognitionPredictor()
+    detection_predictor = DetectionPredictor()
+
+    lang_lists = [SURYA_LANGS for _ in images]
+
+    print("Running Surya OCR...")
+    predictions = run_ocr(
+        images,
+        lang_lists,
+        recognition_predictor,
+        detection_predictor,
+    )
+
+    pages = []
+
+    for page_number, prediction in zip(page_numbers, predictions):
+        lines = extract_text_from_any_ocr_result(prediction)
+
+        pages.append({
+            "page_number": page_number,
+            "text": lines,
+        })
+
+    return {
+        "total_pages": len(pages),
+        "pages": pages,
+    }
+
+
+def run_ocr(pdf_bytes):
+    if OCR_PROVIDER == "surya":
+        return run_surya_ocr(pdf_bytes)
+
+    if OCR_PROVIDER == "paddle":
+        return run_paddle_ocr(pdf_bytes)
+
+    raise RuntimeError("OCR_PROVIDER must be either surya or paddle.")
+
+
+def groq_json(system_prompt, user_payload):
+    api_key = require_env("GROQ_API_KEY", GROQ_API_KEY)
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
+    body = {
+        "model": GROQ_TEXT_MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(user_payload, ensure_ascii=False),
+            },
+        ],
+    }
+
     try:
-        with httpx.Client(timeout=timeout) as client:
+        with httpx.Client(timeout=180) as client:
             response = client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers=headers,
@@ -161,153 +259,11 @@ def groq_chat(
     if response.status_code >= 400:
         raise RuntimeError(f"Groq error {response.status_code}: {response.text[:700]}")
 
-    return response.json()
-
-
-def groq_json(system_prompt: str, user_payload: dict, model: str = GROQ_TEXT_MODEL) -> dict:
-    response = groq_chat(
-        model=model,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-        ],
-    )
-
-    content = response["choices"][0]["message"]["content"]
+    content = response.json()["choices"][0]["message"]["content"]
     return json.loads(content)
 
 
-def pdf_pages_to_png_base64(pdf_bytes: bytes, dpi: int = 220) -> list[dict]:
-    if fitz is None:
-        raise RuntimeError("PyMuPDF is required. Install it with: pip install pymupdf")
-
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    zoom = dpi / 72
-    matrix = fitz.Matrix(zoom, zoom)
-
-    pages = []
-
-    try:
-        for index, page in enumerate(doc, start=1):
-            pix = page.get_pixmap(matrix=matrix, alpha=False)
-            png_bytes = pix.tobytes("png")
-
-            pages.append({
-                "page_number": index,
-                "image_b64": base64.b64encode(png_bytes).decode("ascii"),
-            })
-    finally:
-        doc.close()
-
-    return pages
-
-
-def ocr_page_with_groq(page_number: int, image_b64: str) -> list[str]:
-    prompt = """
-You are doing OCR for exam revaluation.
-Transcribe the page exactly enough for question-answer mapping.
-Keep the natural line breaks.
-Do not summarize.
-Do not correct the student's meaning.
-Return only JSON: {"text": "line1\\nline2\\n..."}.
-"""
-
-    response = groq_chat(
-        model=GROQ_VISION_MODEL,
-        response_format={"type": "json_object"},
-        timeout=240,
-        messages=[
-            {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": f"OCR page {page_number}."},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{image_b64}"
-                        },
-                    },
-                ],
-            },
-        ],
-    )
-
-    content = response["choices"][0]["message"]["content"]
-    payload = json.loads(content)
-
-    return clean_ocr_lines(payload.get("text", ""))
-
-
-def run_groq_vision_ocr(file_content: bytes) -> dict:
-    image_pages = pdf_pages_to_png_base64(file_content)
-    pages = []
-
-    for page in image_pages:
-        print(f"OCR page {page['page_number']} with Groq vision...")
-        lines = ocr_page_with_groq(page["page_number"], page["image_b64"])
-
-        pages.append({
-            "page_number": page["page_number"],
-            "text": lines,
-        })
-
-    return {
-        "total_pages": len(pages),
-        "pages": pages,
-    }
-
-
-def run_chandra_ocr(file_content: bytes, file_name: str) -> dict:
-    url = require_url("CHANDRA_OCR_URL", CHANDRA_OCR_URL)
-    api_key = require_env("CHANDRA_API_KEY", CHANDRA_API_KEY)
-
-    headers = {"Authorization": f"Bearer {api_key}"}
-    files = {"file": (file_name, file_content, "application/pdf")}
-    data = {"output_format": "json"}
-
-    print("Running Chandra OCR...")
-
-    try:
-        with httpx.Client(timeout=300) as client:
-            response = client.post(url, headers=headers, files=files, data=data)
-    except httpx.RequestError as e:
-        raise RuntimeError(
-            "Could not reach Chandra OCR. If you do not have a real Chandra endpoint, "
-            "set OCR_PROVIDER=groq_vision in .env. Details: " + str(e)
-        ) from e
-
-    if response.status_code >= 400:
-        raise RuntimeError(f"Chandra OCR error {response.status_code}: {response.text[:700]}")
-
-    try:
-        payload = response.json()
-    except json.JSONDecodeError:
-        payload = response.text
-
-    pages = parse_ocr_response(payload)
-
-    if not pages:
-        raise RuntimeError("OCR returned no readable pages.")
-
-    return {
-        "total_pages": len(pages),
-        "pages": pages,
-    }
-
-
-def run_ocr(file_content: bytes, file_name: str) -> dict:
-    if OCR_PROVIDER == "chandra":
-        return run_chandra_ocr(file_content, file_name)
-
-    if OCR_PROVIDER == "groq_vision":
-        return run_groq_vision_ocr(file_content)
-
-    raise RuntimeError("OCR_PROVIDER must be either groq_vision or chandra.")
-
-
-def pages_for_prompt(pages: list[dict]) -> list[dict]:
+def pages_for_prompt(pages):
     return [
         {
             "page_number": page["page_number"],
@@ -317,7 +273,7 @@ def pages_for_prompt(pages: list[dict]) -> list[dict]:
     ]
 
 
-def normalize_questions(questions: list[dict]) -> list[dict]:
+def normalize_questions(questions):
     normalized = []
     seen = set()
 
@@ -355,39 +311,40 @@ def normalize_questions(questions: list[dict]) -> list[dict]:
         })
 
     if not normalized:
-        raise RuntimeError("Groq returned questions, but none had usable IDs and text.")
+        raise RuntimeError("No usable questions extracted.")
 
     return normalized
 
 
-def extract_official_questions_with_groq(pages: list[dict]) -> list[dict]:
+def extract_official_questions_with_groq(pages):
     system_prompt = """
-You extract the printed question paper from OCR pages for exam revaluation.
-Return only JSON with key "questions".
-Each question must have:
-- question_id: stable exam id like Q1, Q1.a, Q1.i, A1(i), B2. Preserve section labels if printed.
-- question: exact printed question text, cleaned only for obvious OCR line breaks.
-- page_number.
+You extract the printed question paper from OCR text for exam revaluation.
+
+Return only JSON:
+{
+  "questions": [
+    {
+      "question_id": "Q1",
+      "question": "question text",
+      "page_number": 1
+    }
+  ]
+}
+
 Rules:
-- Follow the question paper order.
+- Follow the question paper order exactly.
 - If a parent question has sub-questions, create one row per sub-question.
-- Do not include student answers as questions.
+- Use IDs like Q1, Q1.a, Q1.b, Q2.i, A1(i), B2 depending on the paper.
+- Preserve section labels if printed, such as A1(i), B2, Section-C.Q3.
+- Do not include student answers as official questions.
 - Do not invent missing questions.
 """
 
     payload = groq_json(system_prompt, {"pages": pages_for_prompt(pages)})
-    questions = payload.get("questions", [])
-
-    if not questions:
-        raise RuntimeError("Groq could not identify official questions from the OCR text.")
-
-    return normalize_questions(questions)
+    return normalize_questions(payload.get("questions", []))
 
 
-def flatten_answer_lines(
-    pages: list[dict],
-    question_page_numbers: set[int],
-) -> list[dict]:
+def flatten_answer_lines(pages, question_page_numbers):
     lines = []
     line_id = 1
 
@@ -417,26 +374,32 @@ def flatten_answer_lines(
     return lines
 
 
-def map_answer_spans_with_groq(
-    questions: list[dict],
-    answer_lines: list[dict],
-) -> list[dict]:
+def map_answer_spans_with_groq(questions, answer_lines):
     system_prompt = """
-You map handwritten/student answers to official exam questions.
-Return only JSON with key "answer_spans".
-Each span must have:
-- question_id: exactly one of the provided question IDs.
-- start_line: first OCR line of that answer, not the printed question paper.
-- end_line: last OCR line of that answer.
-- confidence: number from 0 to 1.
-- notes: short reason.
+You map student answer OCR lines to official exam questions.
+
+Return only JSON:
+{
+  "answer_spans": [
+    {
+      "question_id": "Q1.a",
+      "start_line": 1,
+      "end_line": 25,
+      "confidence": 0.92,
+      "notes": "short reason"
+    }
+  ]
+}
+
 Rules:
-- Use the official question order as the backbone.
-- If the student writes sub-question labels like Q1.a, 1(a), A1(i), map to that exact provided ID.
-- If an answer starts with a copied question, start_line may be that copied-question line.
+- question_id must exactly match one official question_id.
+- Use official question order as the backbone.
+- Map sub-questions separately.
+- If the student writes labels like Q1.a, 1(a), A1(i), match that exact official question.
+- If the student copied the question before the answer, include that copied-question line in the span.
 - Do not create spans for unanswered questions.
 - Do not overlap spans.
-- Prefer raw line positions over rewriting text.
+- Prefer line positions. Do not rewrite the answer.
 """
 
     payload = groq_json(
@@ -450,11 +413,7 @@ Rules:
     return payload.get("answer_spans", [])
 
 
-def slice_answers(
-    questions: list[dict],
-    answer_lines: list[dict],
-    spans: list[dict],
-) -> list[dict]:
+def slice_answers(questions, answer_lines, spans):
     line_by_id = {
         line["line_id"]: line
         for line in answer_lines
@@ -467,10 +426,15 @@ def slice_answers(
 
     qa_pairs = []
 
+    used_question_ids = set()
+
     for span in sorted(spans, key=lambda item: item.get("start_line", 10**9)):
         qid = span.get("question_id")
 
         if qid not in question_by_id:
+            continue
+
+        if qid in used_question_ids:
             continue
 
         start = int(span.get("start_line", 0))
@@ -485,11 +449,7 @@ def slice_answers(
             if line_id in line_by_id
         ]
 
-        answer = re.sub(
-            r"\s+",
-            " ",
-            " ".join(raw_lines),
-        ).strip()
+        answer = re.sub(r"\s+", " ", " ".join(raw_lines)).strip()
 
         if not answer:
             continue
@@ -501,10 +461,12 @@ def slice_answers(
             "mapping_confidence": span.get("confidence"),
         })
 
+        used_question_ids.add(qid)
+
     return qa_pairs
 
 
-def build_final_json(qa_pairs: list[dict]) -> dict:
+def build_final_json(qa_pairs):
     return {
         "total_qa_pairs": len(qa_pairs),
         "qa_pairs": qa_pairs,
@@ -522,7 +484,7 @@ def process_pdf(pdf_path):
 
     pdf_bytes = pdf_file.read_bytes()
 
-    ocr_json = run_ocr(pdf_bytes, pdf_file.name)
+    ocr_json = run_ocr(pdf_bytes)
 
     ocr_output_path = OUTPUT_OCR_DIR / f"{pdf_file.stem}_ocr.json"
 
