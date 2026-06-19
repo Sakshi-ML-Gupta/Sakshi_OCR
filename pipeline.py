@@ -167,9 +167,10 @@ def run_surya_ocr(pdf_bytes):
         from surya.ocr import run_ocr
         from surya.recognition import RecognitionPredictor
     except Exception as e:
-        raise RuntimeError(
-            "Surya OCR could not load. Make sure requirements.txt contains surya-ocr."
-        ) from e
+        print("REAL SURYA ERROR:")
+        print(type(e).__name__)
+        print(str(e))
+        raise
 
     images_with_numbers = pdf_to_images(pdf_bytes)
     page_numbers = [x[0] for x in images_with_numbers]
