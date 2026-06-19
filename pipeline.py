@@ -28,8 +28,11 @@ except ImportError:
 load_dotenv()
 
 OCR_PROVIDER = os.getenv("OCR_PROVIDER", "surya").strip().lower()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "llama-3.3-70b-versatile")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+
 PADDLEOCR_LANG = os.getenv("PADDLEOCR_LANG", "hi")
 SURYA_LANGS = [
     item.strip()
@@ -44,12 +47,6 @@ NOISE_RE = re.compile(
     r"(?:^TOPIC\s*$|^DATE\s*$|^PAGE\s*NO|Teacher'?s?\s*Signature|^\d{1,3}$)",
     re.IGNORECASE,
 )
-
-
-def require_env(name, value):
-    if not value:
-        raise RuntimeError(f"Missing {name}. Add it to .env.")
-    return value.strip()
 
 
 def clean_ocr_lines(text):
@@ -188,7 +185,6 @@ def run_surya_ocr(pdf_bytes):
 
     recognition_predictor = RecognitionPredictor()
     detection_predictor = DetectionPredictor()
-
     lang_lists = [SURYA_LANGS for _ in images]
 
     print("Running Surya OCR...")
@@ -225,42 +221,59 @@ def run_ocr(pdf_bytes):
     raise RuntimeError("OCR_PROVIDER must be either surya or paddle.")
 
 
-def groq_json(system_prompt, user_payload):
-    api_key = require_env("GROQ_API_KEY", GROQ_API_KEY)
+def extract_json_object(text):
+    text = text.strip()
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+
+    if not match:
+        raise RuntimeError(f"LLM did not return JSON. Response was: {text[:500]}")
+
+    return json.loads(match.group(0))
+
+
+def ollama_json(system_prompt, user_payload):
+    if LLM_PROVIDER != "ollama":
+        raise RuntimeError("Only LLM_PROVIDER=ollama is configured in this script.")
+
+    prompt = f"""
+{system_prompt}
+
+Input JSON:
+{json.dumps(user_payload, ensure_ascii=False)}
+
+Return valid JSON only. No markdown. No explanation.
+"""
 
     body = {
-        "model": GROQ_TEXT_MODEL,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": json.dumps(user_payload, ensure_ascii=False),
-            },
-        ],
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {
+            "temperature": 0,
+        },
     }
 
     try:
-        with httpx.Client(timeout=180) as client:
-            response = client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers=headers,
-                json=body,
-            )
+        with httpx.Client(timeout=600) as client:
+            response = client.post(f"{OLLAMA_URL}/api/generate", json=body)
     except httpx.RequestError as e:
-        raise RuntimeError(f"Could not reach Groq. Details: {e}") from e
+        raise RuntimeError(
+            "Could not reach Ollama. Start Ollama and run: "
+            f"ollama pull {OLLAMA_MODEL}. Details: {e}"
+        ) from e
 
     if response.status_code >= 400:
-        raise RuntimeError(f"Groq error {response.status_code}: {response.text[:700]}")
+        raise RuntimeError(f"Ollama error {response.status_code}: {response.text[:700]}")
 
-    content = response.json()["choices"][0]["message"]["content"]
-    return json.loads(content)
+    data = response.json()
+    return extract_json_object(data.get("response", ""))
 
 
 def pages_for_prompt(pages):
@@ -316,7 +329,7 @@ def normalize_questions(questions):
     return normalized
 
 
-def extract_official_questions_with_groq(pages):
+def extract_official_questions_with_llm(pages):
     system_prompt = """
 You extract the printed question paper from OCR text for exam revaluation.
 
@@ -340,7 +353,7 @@ Rules:
 - Do not invent missing questions.
 """
 
-    payload = groq_json(system_prompt, {"pages": pages_for_prompt(pages)})
+    payload = ollama_json(system_prompt, {"pages": pages_for_prompt(pages)})
     return normalize_questions(payload.get("questions", []))
 
 
@@ -374,7 +387,7 @@ def flatten_answer_lines(pages, question_page_numbers):
     return lines
 
 
-def map_answer_spans_with_groq(questions, answer_lines):
+def map_answer_spans_with_llm(questions, answer_lines):
     system_prompt = """
 You map student answer OCR lines to official exam questions.
 
@@ -402,7 +415,7 @@ Rules:
 - Prefer line positions. Do not rewrite the answer.
 """
 
-    payload = groq_json(
+    payload = ollama_json(
         system_prompt,
         {
             "official_questions": questions,
@@ -425,7 +438,6 @@ def slice_answers(questions, answer_lines, spans):
     }
 
     qa_pairs = []
-
     used_question_ids = set()
 
     for span in sorted(spans, key=lambda item: item.get("start_line", 10**9)):
@@ -493,7 +505,7 @@ def process_pdf(pdf_path):
 
     pages = ocr_json["pages"]
 
-    questions = extract_official_questions_with_groq(pages)
+    questions = extract_official_questions_with_llm(pages)
 
     question_page_numbers = {
         int(q["page_number"])
@@ -506,7 +518,7 @@ def process_pdf(pdf_path):
         question_page_numbers,
     )
 
-    spans = map_answer_spans_with_groq(
+    spans = map_answer_spans_with_llm(
         questions,
         answer_lines,
     )
