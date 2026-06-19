@@ -9,6 +9,11 @@ import numpy as np
 from PIL import Image
 
 try:
+    import streamlit as st
+except Exception:
+    st = None
+
+try:
     from dotenv import load_dotenv
 except ImportError:
     def load_dotenv():
@@ -27,95 +32,6 @@ except ImportError:
 
 load_dotenv()
 
-OCR_PROVIDER = os.getenv("OCR_PROVIDER", "surya").strip().lower()
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
-
-
-def require_env(name, value):
-    if not value:
-        raise RuntimeError(f"Missing {name}. Add it to Streamlit secrets or .env.")
-    return value.strip()
-
-
-def extract_json_object(text):
-    text = text.strip()
-
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-
-    if not match:
-        raise RuntimeError(f"LLM did not return JSON. Response was: {text[:500]}")
-
-    return json.loads(match.group(0))
-
-
-def gemini_json(system_prompt, user_payload):
-    api_key = require_env("GEMINI_API_KEY", GEMINI_API_KEY)
-
-    prompt = f"""
-{system_prompt}
-
-Input JSON:
-{json.dumps(user_payload, ensure_ascii=False)}
-
-Return valid JSON only. No markdown. No explanation.
-"""
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{GEMINI_MODEL}:generateContent"
-    )
-
-    body = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0,
-            "response_mime_type": "application/json",
-        },
-    }
-
-    try:
-        with httpx.Client(timeout=180) as client:
-            response = client.post(
-                url,
-                params={"key": api_key},
-                json=body,
-            )
-    except httpx.RequestError as e:
-        raise RuntimeError(f"Could not reach Gemini. Details: {e}") from e
-
-    if response.status_code >= 400:
-        raise RuntimeError(f"Gemini error {response.status_code}: {response.text[:700]}")
-
-    data = response.json()
-
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        raise RuntimeError(f"Unexpected Gemini response: {data}") from e
-
-    return extract_json_object(text)
-    
-PADDLEOCR_LANG = os.getenv("PADDLEOCR_LANG", "hi")
-SURYA_LANGS = [
-    item.strip()
-    for item in os.getenv("SURYA_LANGS", "en,hi,bn,ta,te,gu,kn,ml,mr,pa,or").split(",")
-    if item.strip()
-]
-
 OUTPUT_OCR_DIR = Path("outputs/ocr_json")
 OUTPUT_FINAL_DIR = Path("outputs/final_json")
 
@@ -123,6 +39,43 @@ NOISE_RE = re.compile(
     r"(?:^TOPIC\s*$|^DATE\s*$|^PAGE\s*NO|Teacher'?s?\s*Signature|^\d{1,3}$)",
     re.IGNORECASE,
 )
+
+
+def get_config(name, default=None):
+    value = os.getenv(name)
+
+    if value:
+        return value
+
+    if st is not None:
+        try:
+            if name in st.secrets:
+                return str(st.secrets[name])
+        except Exception:
+            pass
+
+    return default
+
+
+OCR_PROVIDER = get_config("OCR_PROVIDER", "surya").strip().lower()
+GEMINI_API_KEY = get_config("GEMINI_API_KEY")
+GEMINI_MODEL = get_config("GEMINI_MODEL", "gemini-3.5-flash")
+
+PADDLEOCR_LANG = get_config("PADDLEOCR_LANG", "hi")
+SURYA_LANGS = [
+    item.strip()
+    for item in get_config(
+        "SURYA_LANGS",
+        "en,hi,bn,ta,te,gu,kn,ml,mr,pa,or",
+    ).split(",")
+    if item.strip()
+]
+
+
+def require_config(name, value):
+    if not value:
+        raise RuntimeError(f"Missing {name}. Add it to Streamlit secrets or .env.")
+    return value.strip()
 
 
 def clean_ocr_lines(text):
@@ -144,7 +97,7 @@ def clean_ocr_lines(text):
 
 def pdf_to_images(pdf_bytes, dpi=220):
     if fitz is None:
-        raise RuntimeError("PyMuPDF missing. Install it with: pip install pymupdf")
+        raise RuntimeError("PyMuPDF missing. Add pymupdf to requirements.txt.")
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     zoom = dpi / 72
@@ -222,7 +175,9 @@ def extract_text_from_any_ocr_result(result):
 
 def run_paddle_ocr(pdf_bytes):
     if PaddleOCR is None:
-        raise RuntimeError("PaddleOCR missing. Install: pip install paddleocr paddlepaddle")
+        raise RuntimeError(
+            "PaddleOCR missing. Add paddleocr and paddlepaddle to requirements.txt."
+        )
 
     print(f"Loading PaddleOCR lang={PADDLEOCR_LANG}...")
     ocr = PaddleOCR(use_angle_cls=True, lang=PADDLEOCR_LANG, show_log=False)
@@ -251,7 +206,7 @@ def run_surya_ocr(pdf_bytes):
         from surya.ocr import run_ocr
         from surya.recognition import RecognitionPredictor
     except ImportError as e:
-        raise RuntimeError("Surya OCR missing. Install: pip install surya-ocr") from e
+        raise RuntimeError("Surya OCR missing. Add surya-ocr to requirements.txt.") from e
 
     print(f"Loading Surya OCR langs={','.join(SURYA_LANGS)}...")
 
@@ -298,7 +253,7 @@ def run_ocr(pdf_bytes):
 
 
 def extract_json_object(text):
-    text = text.strip()
+    text = str(text).strip()
 
     try:
         return json.loads(text)
@@ -308,14 +263,13 @@ def extract_json_object(text):
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
 
     if not match:
-        raise RuntimeError(f"LLM did not return JSON. Response was: {text[:500]}")
+        raise RuntimeError(f"Gemini did not return JSON. Response was: {text[:500]}")
 
     return json.loads(match.group(0))
 
 
-def ollama_json(system_prompt, user_payload):
-    if LLM_PROVIDER != "ollama":
-        raise RuntimeError("Only LLM_PROVIDER=ollama is configured in this script.")
+def gemini_json(system_prompt, user_payload):
+    api_key = require_config("GEMINI_API_KEY", GEMINI_API_KEY)
 
     prompt = f"""
 {system_prompt}
@@ -326,30 +280,46 @@ Input JSON:
 Return valid JSON only. No markdown. No explanation.
 """
 
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        f"models/{GEMINI_MODEL}:generateContent"
+    )
+
     body = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "options": {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
             "temperature": 0,
+            "response_mime_type": "application/json",
         },
     }
 
     try:
-        with httpx.Client(timeout=600) as client:
-            response = client.post(f"{OLLAMA_URL}/api/generate", json=body)
+        with httpx.Client(timeout=240) as client:
+            response = client.post(
+                url,
+                params={"key": api_key},
+                json=body,
+            )
     except httpx.RequestError as e:
-        raise RuntimeError(
-            "Could not reach Ollama. Start Ollama and run: "
-            f"ollama pull {OLLAMA_MODEL}. Details: {e}"
-        ) from e
+        raise RuntimeError(f"Could not reach Gemini. Details: {e}") from e
 
     if response.status_code >= 400:
-        raise RuntimeError(f"Ollama error {response.status_code}: {response.text[:700]}")
+        raise RuntimeError(f"Gemini error {response.status_code}: {response.text[:700]}")
 
     data = response.json()
-    return extract_json_object(data.get("response", ""))
+
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        raise RuntimeError(f"Unexpected Gemini response: {data}") from e
+
+    return extract_json_object(text)
 
 
 def pages_for_prompt(pages):
@@ -429,45 +399,13 @@ Rules:
 - Do not invent missing questions.
 """
 
-    payload = gemini_json(system_prompt, {"pages": pages_for_prompt(pages)})
-    return normalize_questions(payload.get("questions", []))
-
-
-def map_answer_spans_with_llm(questions, answer_lines):
-    system_prompt = """
-You map student answer OCR lines to official exam questions.
-
-Return only JSON:
-{
-  "answer_spans": [
-    {
-      "question_id": "Q1.a",
-      "start_line": 1,
-      "end_line": 25,
-      "confidence": 0.92,
-      "notes": "short reason"
-    }
-  ]
-}
-
-Rules:
-- question_id must exactly match one official question_id.
-- Use official question order as the backbone.
-- Map sub-questions separately.
-- Do not create spans for unanswered questions.
-- Do not overlap spans.
-- Prefer line positions. Do not rewrite the answer.
-"""
-
     payload = gemini_json(
         system_prompt,
-        {
-            "official_questions": questions,
-            "answer_lines": answer_lines,
-        },
+        {"pages": pages_for_prompt(pages)},
     )
 
-    return payload.get("answer_spans", [])
+    return normalize_questions(payload.get("questions", []))
+
 
 def flatten_answer_lines(pages, question_page_numbers):
     lines = []
@@ -499,7 +437,42 @@ def flatten_answer_lines(pages, question_page_numbers):
     return lines
 
 
+def map_answer_spans_with_llm(questions, answer_lines):
+    system_prompt = """
+You map student answer OCR lines to official exam questions.
 
+Return only JSON:
+{
+  "answer_spans": [
+    {
+      "question_id": "Q1.a",
+      "start_line": 1,
+      "end_line": 25,
+      "confidence": 0.92,
+      "notes": "short reason"
+    }
+  ]
+}
+
+Rules:
+- question_id must exactly match one official question_id.
+- Use official question order as the backbone.
+- Map sub-questions separately.
+- If the student writes labels like Q1.a, 1(a), A1(i), match that exact official question.
+- Do not create spans for unanswered questions.
+- Do not overlap spans.
+- Prefer line positions. Do not rewrite the answer.
+"""
+
+    payload = gemini_json(
+        system_prompt,
+        {
+            "official_questions": questions,
+            "answer_lines": answer_lines,
+        },
+    )
+
+    return payload.get("answer_spans", [])
 
 
 def slice_answers(questions, answer_lines, spans):
