@@ -3,6 +3,7 @@ python-dotenv
 httpx
 pymupdf
 pillow
+numpy
 paddleocr
 paddlepaddle
 surya-ocr
