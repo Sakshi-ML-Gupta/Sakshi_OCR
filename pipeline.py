@@ -90,9 +90,19 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
     if not api_key:
         raise Exception("DATALAB_API_KEY not found in secrets or environment")
 
+    # Guard against oversized uploads — fail with a clear message
+    # instead of a cryptic Cloudflare 413 HTML page.
+    size_mb = len(file_content) / (1024 * 1024)
+    MAX_MB  = 45   # conservative margin under typical Cloudflare limits
+    if size_mb > MAX_MB:
+        raise Exception(
+            f"File is {size_mb:.1f}MB, which exceeds the {MAX_MB}MB upload limit. "
+            f"Try compressing the PDF or splitting it into smaller files before uploading."
+        )
+
     headers = {"X-API-Key": api_key}
 
-    log("Submitting document to Datalab (Chandra OCR)...")
+    log(f"Submitting document to Datalab (Chandra OCR)... ({size_mb:.1f}MB)")
 
     resp = httpx.post(
         f"{DATALAB_BASE_URL}/api/v1/convert",
@@ -533,14 +543,13 @@ def process_pdf(file_input, status_callback=None):
         file_bytes = file_input.read()
         file_name  = getattr(file_input, "name", "document.pdf")
 
-    # Step 1: Preprocess
-    log("Preprocessing PDF...")
-    processed = preprocess_pdf(file_bytes)
+    # Step 1: OCR — send the original PDF directly.
+    # Datalab/Chandra handles native PDFs natively; rasterizing to
+    # images first (as Mistral required) only inflates file size and
+    # can trigger 413 Payload Too Large on upload.
+    pages = run_ocr(file_bytes, file_name, status_callback)
 
-    # Step 2: OCR
-    pages = run_ocr(processed, file_name, status_callback)
-
-    # Step 3: Build OCR JSON
+    # Step 2: Build OCR JSON
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
