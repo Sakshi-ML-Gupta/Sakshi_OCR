@@ -53,7 +53,7 @@ def get_config(name, default=None):
 
 OCR_PROVIDER = get_config("OCR_PROVIDER", "surya").strip().lower()
 GEMINI_API_KEY = get_config("GEMINI_API_KEY")
-GEMINI_MODEL = get_config("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL = get_config("GEMINI_MODEL", "gemini-2.5-flash")
 PADDLEOCR_LANG = get_config("PADDLEOCR_LANG", "hi")
 SURYA_LANGS = [
     x.strip()
@@ -368,19 +368,11 @@ Rules:
     return normalize_questions(payload.get("questions", []))
 
 
-def flatten_answer_lines(pages, question_page_numbers):
+def flatten_answer_lines(pages):
     lines = []
     line_id = 1
 
-    answer_pages = [
-        page for page in pages
-        if page["page_number"] not in question_page_numbers
-    ]
-
-    if not answer_pages:
-        answer_pages = pages
-
-    for page in answer_pages:
+    for page in pages:
         for text in page["text"]:
             clean = re.sub(r"\s+", " ", text).strip()
 
@@ -400,29 +392,27 @@ def flatten_answer_lines(pages, question_page_numbers):
 
 def map_answer_spans_with_llm(questions, answer_lines):
     system_prompt = """
-You map student answer OCR lines to official exam questions.
+You are a boundary detection engine.
 
-Return only JSON:
-{
-  "answer_spans": [
-    {
-      "question_id": "Q1.a",
-      "start_line": 1,
-      "end_line": 25,
-      "confidence": 0.92,
-      "notes": "short reason"
-    }
-  ]
-}
+DO NOT:
+- rewrite text
+- fix spelling
+- fix grammar
+- summarize
+- paraphrase
+- infer missing words
+- enhance answers
 
-Rules:
-- question_id must exactly match one official question_id.
-- Use official question order as the backbone.
-- Map sub-questions separately.
-- If the student writes labels like Q1.a, 1(a), A1(i), match that exact official question.
-- Do not create spans for unanswered questions.
-- Do not overlap spans.
-- Prefer line positions. Do not rewrite the answer.
+Your job is ONLY to return:
+
+question_id
+start_line
+end_line
+confidence
+
+The answer text will be extracted later by software.
+
+Return JSON only.
 """
 
     payload = gemini_json(
@@ -473,6 +463,7 @@ def slice_answers(questions, answer_lines, spans):
             "question_id": qid,
             "question": question_by_id[qid]["question"],
             "answer": answer,
+            "answer_lines": raw_lines,
             "mapping_confidence": span.get("confidence"),
         })
 
@@ -508,7 +499,7 @@ def process_pdf(pdf_path):
         if str(q.get("page_number") or "").isdigit()
     }
 
-    answer_lines = flatten_answer_lines(pages, question_page_numbers)
+    answer_lines = flatten_answer_lines(pages)
     spans = map_answer_spans_with_llm(questions, answer_lines)
     qa_pairs = slice_answers(questions, answer_lines, spans)
 
