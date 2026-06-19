@@ -30,9 +30,85 @@ load_dotenv()
 OCR_PROVIDER = os.getenv("OCR_PROVIDER", "surya").strip().lower()
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
+
+def require_env(name, value):
+    if not value:
+        raise RuntimeError(f"Missing {name}. Add it to Streamlit secrets or .env.")
+    return value.strip()
+
+
+def extract_json_object(text):
+    text = text.strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+
+    if not match:
+        raise RuntimeError(f"LLM did not return JSON. Response was: {text[:500]}")
+
+    return json.loads(match.group(0))
+
+
+def gemini_json(system_prompt, user_payload):
+    api_key = require_env("GEMINI_API_KEY", GEMINI_API_KEY)
+
+    prompt = f"""
+{system_prompt}
+
+Input JSON:
+{json.dumps(user_payload, ensure_ascii=False)}
+
+Return valid JSON only. No markdown. No explanation.
+"""
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        f"models/{GEMINI_MODEL}:generateContent"
+    )
+
+    body = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0,
+            "response_mime_type": "application/json",
+        },
+    }
+
+    try:
+        with httpx.Client(timeout=180) as client:
+            response = client.post(
+                url,
+                params={"key": api_key},
+                json=body,
+            )
+    except httpx.RequestError as e:
+        raise RuntimeError(f"Could not reach Gemini. Details: {e}") from e
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Gemini error {response.status_code}: {response.text[:700]}")
+
+    data = response.json()
+
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        raise RuntimeError(f"Unexpected Gemini response: {data}") from e
+
+    return extract_json_object(text)
+    
 PADDLEOCR_LANG = os.getenv("PADDLEOCR_LANG", "hi")
 SURYA_LANGS = [
     item.strip()
@@ -348,14 +424,50 @@ Rules:
 - Follow the question paper order exactly.
 - If a parent question has sub-questions, create one row per sub-question.
 - Use IDs like Q1, Q1.a, Q1.b, Q2.i, A1(i), B2 depending on the paper.
-- Preserve section labels if printed, such as A1(i), B2, Section-C.Q3.
+- Preserve section labels if printed.
 - Do not include student answers as official questions.
 - Do not invent missing questions.
 """
 
-    payload = ollama_json(system_prompt, {"pages": pages_for_prompt(pages)})
+    payload = gemini_json(system_prompt, {"pages": pages_for_prompt(pages)})
     return normalize_questions(payload.get("questions", []))
 
+
+def map_answer_spans_with_llm(questions, answer_lines):
+    system_prompt = """
+You map student answer OCR lines to official exam questions.
+
+Return only JSON:
+{
+  "answer_spans": [
+    {
+      "question_id": "Q1.a",
+      "start_line": 1,
+      "end_line": 25,
+      "confidence": 0.92,
+      "notes": "short reason"
+    }
+  ]
+}
+
+Rules:
+- question_id must exactly match one official question_id.
+- Use official question order as the backbone.
+- Map sub-questions separately.
+- Do not create spans for unanswered questions.
+- Do not overlap spans.
+- Prefer line positions. Do not rewrite the answer.
+"""
+
+    payload = gemini_json(
+        system_prompt,
+        {
+            "official_questions": questions,
+            "answer_lines": answer_lines,
+        },
+    )
+
+    return payload.get("answer_spans", [])
 
 def flatten_answer_lines(pages, question_page_numbers):
     lines = []
@@ -387,43 +499,7 @@ def flatten_answer_lines(pages, question_page_numbers):
     return lines
 
 
-def map_answer_spans_with_llm(questions, answer_lines):
-    system_prompt = """
-You map student answer OCR lines to official exam questions.
 
-Return only JSON:
-{
-  "answer_spans": [
-    {
-      "question_id": "Q1.a",
-      "start_line": 1,
-      "end_line": 25,
-      "confidence": 0.92,
-      "notes": "short reason"
-    }
-  ]
-}
-
-Rules:
-- question_id must exactly match one official question_id.
-- Use official question order as the backbone.
-- Map sub-questions separately.
-- If the student writes labels like Q1.a, 1(a), A1(i), match that exact official question.
-- If the student copied the question before the answer, include that copied-question line in the span.
-- Do not create spans for unanswered questions.
-- Do not overlap spans.
-- Prefer line positions. Do not rewrite the answer.
-"""
-
-    payload = ollama_json(
-        system_prompt,
-        {
-            "official_questions": questions,
-            "answer_lines": answer_lines,
-        },
-    )
-
-    return payload.get("answer_spans", [])
 
 
 def slice_answers(questions, answer_lines, spans):
