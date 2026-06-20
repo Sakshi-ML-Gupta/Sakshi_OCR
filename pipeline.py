@@ -25,20 +25,27 @@ def get_api_key(name):
 # INPUT NORMALIZATION
 #
 # FIX: "expected str, bytes or os.PathLike object, not tuple"
-# happened because process_pdf()/process_reference() assumed
-# file_input was always either a str/Path OR a file-like object
-# with .read(). In practice it can also arrive as:
-#   - a (filename, bytes) tuple
-#   - a (filename, bytes, content_type) tuple  (e.g. from
-#     Streamlit's file_uploader when multiple values are unpacked,
-#     or from code that passes requests/httpx-style file tuples)
-# Path(file_input) or file_input.read() then blows up with this
-# exact TypeError. This helper accepts ALL of those shapes safely.
+# is raised by Python's own os.fspath()/open() when given a tuple
+# instead of a path. The most common real-world cause is calling
+# code that does something like:
+#
+#     process_pdf(open(uploaded_file))
+#     for f in zip(names, files): process_pdf(f)   # f is a tuple!
+#
+# i.e. the tuple is built BEFORE this module ever sees it, or a
+# tuple slips into a spot expecting a bare filename/path string.
+# This module can't fix bugs in the caller, but it CAN make sure
+# every file_name / file_input value it touches is fully normalized
+# to a plain str/bytes the moment it enters this module, so a stray
+# tuple anywhere downstream (Path(...), open(...), httpx files=...)
+# can never reach a raw os.fspath()-style call unguarded.
 # =========================================================
 
 def _normalize_file_input(file_input, default_name="document.pdf"):
     """
-    Returns (file_bytes, file_name) regardless of whether file_input is:
+    Returns (file_bytes, file_name) -- file_bytes is always `bytes`,
+    file_name is always a plain `str`. Regardless of whether
+    file_input is:
     - a str or Path to a file on disk
     - a file-like object with .read() (e.g. Streamlit UploadedFile, open file)
     - a (filename, bytes) tuple
@@ -56,7 +63,7 @@ def _normalize_file_input(file_input, default_name="document.pdf"):
             raise TypeError(
                 f"Expected bytes as second tuple element, got {type(data).__name__}"
             )
-        return bytes(data), str(name) if name else default_name
+        return bytes(data), _coerce_name(name, default_name)
 
     # Raw bytes
     if isinstance(file_input, (bytes, bytearray)):
@@ -76,16 +83,40 @@ def _normalize_file_input(file_input, default_name="document.pdf"):
                 f"Open the file in binary mode ('rb')."
             )
         name = getattr(file_input, "name", default_name)
-        # Streamlit/Werkzeug uploads sometimes give a full path as .name —
-        # keep just the basename for cleanliness.
-        name = Path(name).name if name else default_name
-        return bytes(data), name
+        return bytes(data), _coerce_name(name, default_name)
 
     raise TypeError(
         f"Unsupported file_input type: {type(file_input).__name__}. "
         f"Expected str, Path, bytes, a file-like object with .read(), "
-        f"or a (filename, bytes) tuple."
+        f"or a (filename, bytes) tuple. If you're seeing "
+        f"\"expected str, bytes or os.PathLike object, not tuple\", "
+        f"check the code that CALLS process_pdf()/process_reference() -- "
+        f"a tuple is being passed somewhere a plain path/filename or "
+        f"file object was expected (e.g. open(some_tuple) or "
+        f"process_pdf(open(uploaded_file)) instead of "
+        f"process_pdf(uploaded_file))."
     )
+
+
+def _coerce_name(name, default_name="document.pdf"):
+    """
+    Guarantees a plain, safe basename string. Defends against:
+    - name being a Path object           -> str(Path) then basename
+    - name being a tuple/list (malformed upstream data) -> default_name
+    - name being None / empty            -> default_name
+    """
+    if isinstance(name, (tuple, list)):
+        # A tuple/list ended up where a filename was expected -- this is
+        # exactly the shape that causes the os.fspath() tuple TypeError
+        # if it were ever passed to open()/Path() downstream. Never let
+        # it propagate; fall back to a safe default instead.
+        return default_name
+    if not name:
+        return default_name
+    try:
+        return Path(str(name)).name or default_name
+    except Exception:
+        return default_name
 
 
 # =========================================================
@@ -108,7 +139,7 @@ def preprocess_pdf(file_bytes, dpi=250):
 
 
 # =========================================================
-# OCR — Datalab (Chandra model) via /convert endpoint
+# OCR -- Datalab (Chandra model) via /convert endpoint
 #
 # Datalab's /convert is async: submit -> poll request_check_url
 # until status == "complete". paginate=True returns markdown with
@@ -118,15 +149,10 @@ def preprocess_pdf(file_bytes, dpi=250):
 
 DATALAB_BASE_URL = "https://www.datalab.to"
 
-# FIX: Datalab's actual paginated output uses a marker of the form
+# Datalab's actual paginated output uses a marker of the form
 #   {N}------------------------------------------------
 # i.e. the (0-based) page number in curly braces, immediately
-# followed by a run of 3+ dashes — NOT "----- Page N -----" as the
-# old code assumed. That mismatch caused _split_paginated_markdown
-# to never match anything and silently return the WHOLE document as
-# a single "page 1", which is why downstream detection saw the cover/
-# registration page text blended with everything else and rejected
-# the whole document as having "no question paper pages".
+# followed by a run of 3+ dashes.
 PAGE_BREAK_RE = re.compile(
     r'\n?\{(\d+)\}-{3,}\n?'
 )
@@ -153,7 +179,6 @@ def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> li
             parts.append(markdown[start:m.start()].strip())
             start = m.end()
         parts.append(markdown[start:].strip())
-        # Drop empty fragments (e.g. nothing before the very first marker)
         parts = [p for p in parts if p]
         if parts:
             return parts
@@ -164,7 +189,7 @@ def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> li
     if len(parts) > 1:
         return [p.strip() for p in parts]
 
-    # Fallback 2: no recognizable page markers at all — single block
+    # Fallback 2: no recognizable page markers at all -- single block
     return [markdown.strip()]
 
 
@@ -174,11 +199,23 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         if status_callback:
             status_callback(msg)
 
+    # Defensive re-guard: even though callers should already pass a
+    # clean str, this is the exact boundary where file_name flows into
+    # httpx's files={...} tuple below. If anything upstream ever slips
+    # a non-str through, coerce it here rather than let httpx/urllib
+    # hit a raw tuple deep inside multipart encoding.
+    file_name = _coerce_name(file_name, default_name="document.pdf")
+
+    if not isinstance(file_content, (bytes, bytearray)):
+        raise TypeError(
+            f"run_ocr() expected file_content as bytes, got {type(file_content).__name__}"
+        )
+
     api_key = get_api_key("DATALAB_API_KEY")
     if not api_key:
         raise Exception("DATALAB_API_KEY not found in secrets or environment")
 
-    # Guard against oversized uploads — fail with a clear message
+    # Guard against oversized uploads -- fail with a clear message
     # instead of a cryptic Cloudflare 413 HTML page.
     size_mb = len(file_content) / (1024 * 1024)
     MAX_MB  = 45   # conservative margin under typical Cloudflare limits
@@ -198,7 +235,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         files={"file": (file_name, file_content, "application/pdf")},
         data={
             "output_format": "markdown",
-            "mode": "accurate",     # highest accuracy — best for handwriting
+            "mode": "accurate",     # highest accuracy -- best for handwriting
             "paginate": "true"      # keep page boundaries in the output
         },
         timeout=120
@@ -213,9 +250,9 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         raise Exception(f"Datalab submit failed: {data.get('error')}")
 
     check_url = data["request_check_url"]
-    log("Document submitted — polling for OCR result...")
+    log("Document submitted -- polling for OCR result...")
 
-    # ── Poll until complete ─────────────────────────────────
+    # -- Poll until complete --------------------------------
     max_polls = 150          # ~150 * 2s = 5 minutes max wait
     poll_interval = 2
 
@@ -230,7 +267,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         status = result.get("status")
 
         if status == "complete":
-            log("OCR complete — parsing pages...")
+            log("OCR complete -- parsing pages...")
             break
 
         if status == "failed" or result.get("error"):
@@ -261,7 +298,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
             "raw_text":    text
         })
 
-    log(f"OCR done — {len(pages)} page(s) extracted")
+    log(f"OCR done -- {len(pages)} page(s) extracted")
     return pages
 
 
@@ -280,7 +317,7 @@ def build_ocr_json(pages: list) -> dict:
 
 
 # =========================================================
-# REFERENCE BOOK OCR — Datalab handles full multi-page PDFs
+# REFERENCE BOOK OCR -- Datalab handles full multi-page PDFs
 # natively, so no manual page-splitting is needed here.
 # =========================================================
 
@@ -293,7 +330,7 @@ def process_reference(file_input, status_callback=None):
     file_bytes, file_name = _normalize_file_input(file_input, default_name="reference.pdf")
 
     pages = run_ocr(file_bytes, file_name, status_callback)
-    log(f"Reference OCR complete — {len(pages)} page(s)")
+    log(f"Reference OCR complete -- {len(pages)} page(s)")
     return build_ocr_json(pages)
 
 
@@ -306,25 +343,7 @@ def process_reference(file_input, status_callback=None):
 def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
     """
     Returns list of page indices (0-based) that look like GENUINE exam
-    question paper pages — as opposed to:
-    - ID card / registration / admin pages (numbered instructions,
-      terms and conditions)
-    - Handwritten answer pages where the student restates the question
-      number before writing their answer
-
-    Strategy: a real question paper page must satisfy ALL of:
-    1. Has 2+ lines matching a question-start pattern (numbered or lettered)
-    2. Has at least one STRONG exam-paper signal:
-       - mark allocation pattern like "10", "X2=10", "3X20=60", "5X2"
-       - a SECTION/PART header (SECTION-A, भाग-1, PART B)
-       - explicit instruction phrase ("answer all questions",
-         "सभी प्रश्न अनिवार्य", "TMA", "assignment code", course code pattern)
-    3. Does NOT contain admin/ID-card signals (enrolment number, IGNOU
-       student identity, regional centre, "produced on demand", QR code
-       instructions) — these are registration pages, not exam papers
-    4. Does NOT contain handwritten-answer signals (उत्तर, Ans-, Teacher's
-       Signature, PAGE NO/DATE handwritten template, A.15- style answer
-       labels)
+    question paper pages.
     """
     Q_LINE_NUM   = re.compile(r'^\s*\d+[\.\)]\s+.{15,}')
     Q_LINE_LATIN = re.compile(r'^\s*[a-d]\)\s+.{5,}', re.IGNORECASE)
@@ -359,7 +378,7 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
     )
 
     candidate_pages = []
-    weak_pages = []   # pages with question-like lines but no strong signal — possible continuations
+    weak_pages = []
 
     for i, page in enumerate(pages):
         text  = page["raw_text"]
@@ -376,10 +395,10 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
             continue
 
         if ADMIN_PAGE_MARKERS.search(text):
-            continue   # ID card / registration page — never a question paper
+            continue
 
         if ANSWER_PAGE_MARKERS.search(text):
-            continue   # student's handwritten answer page
+            continue
 
         has_strong_signal = bool(
             MARK_ALLOCATION.search(text)
@@ -390,14 +409,8 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
         if has_strong_signal:
             candidate_pages.append(i)
         else:
-            # No strong signal on its own — could be a continuation page
-            # (e.g. a parent question's lettered sub-parts spilling onto
-            # the next page). Only counts if adjacent to a confirmed page.
             weak_pages.append(i)
 
-    # Promote weak pages that are immediately adjacent to a confirmed
-    # question-paper page (continuation of the same question paper),
-    # rather than requiring every single page to repeat the strong signal.
     confirmed_set = set(candidate_pages)
     for i in weak_pages:
         if (i - 1) in confirmed_set or (i + 1) in confirmed_set:
@@ -408,26 +421,12 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
 
 
 # =========================================================
-# EXTRACT OFFICIAL QUESTIONS — scans across MULTIPLE pages
-# Also captures lettered sub-questions (क/ख/ग/घ, a/b/c/d)
-# that appear as a standalone list after a parent question
-# like "Q.9 निम्नलिखित पर टिप्पणी लिखिए" on a DIFFERENT page
-# than where the sub-options are printed.
+# EXTRACT OFFICIAL QUESTIONS -- scans across MULTIPLE pages
 # =========================================================
 
 def extract_official_questions_multi_page(pages: list, qp_page_indices: list) -> list:
-    """
-    Extracts numbered questions across all detected question-paper pages,
-    in page order. Handles:
-    - Standard numbered questions: "1. text"
-    - Multi-line questions (continuation lines joined)
-    - Lettered sub-parts within a question: a) b) c) / क) ख) ग) घ)
-    - Sub-parts that appear on a later page than their parent question
-      (common when "Q.9 Write notes on:" is followed by a), b), c), d)
-      printed on the next page)
-    """
     all_questions = []
-    pending_parent = None   # holds a parent question awaiting sub-parts from next page
+    pending_parent = None
 
     Q_START   = re.compile(r'^\s*(\d+)[\.\)]\s+(.+)')
     SUB_LATIN = re.compile(r'^\s*\(?([a-d])\)\s*(.+)', re.IGNORECASE)
@@ -447,7 +446,6 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
                     current = None
                 continue
 
-            # Lettered sub-part (Latin a-d or Devanagari क-घ)
             sub_m = SUB_LATIN.match(stripped) or SUB_DEVA.match(stripped)
             if sub_m:
                 if current:
@@ -465,8 +463,6 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
                 if current:
                     all_questions.append({"text": current.strip(), "parent": None})
                 current = stripped
-                # Track this as a potential parent for sub-parts on a later page
-                # (e.g. ends with "टिप्पणी लिखिए" / "following" / colon)
                 if re.search(r'(?:लिखिए|following|:)\s*$', stripped, re.IGNORECASE):
                     pending_parent = stripped
                 else:
@@ -479,7 +475,6 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
         if current:
             all_questions.append({"text": current.strip(), "parent": None})
 
-    # Now split any question that has 2+ inline sub-parts (a)/b)/c) on one line block)
     final_questions = []
     SUBPART_RE = re.compile(r'(?:^|\s)\(?([a-zक-घ])\)\s', re.UNICODE)
 
@@ -498,7 +493,6 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
         else:
             final_questions.append(text)
 
-    # Deduplicate while preserving order
     seen = set()
     unique = []
     for q in final_questions:
@@ -531,10 +525,7 @@ def is_noise(line: str) -> bool:
 
 
 # =========================================================
-# FIND QUESTION BOUNDARIES IN ANSWER PAGES — similarity based
-# Works for Hindi, English, any language
-# Matches student-written question restatements against the
-# official question paper text using word-overlap similarity
+# FIND QUESTION BOUNDARIES IN ANSWER PAGES -- similarity based
 # =========================================================
 
 def normalize(text: str) -> str:
@@ -571,20 +562,7 @@ def find_question_boundaries_by_similarity(
     similarity_threshold: float = 0.30,
     window: int = 4
 ) -> list:
-    """
-    Scans answer lines for restated questions matching official questions.
-    Uses sliding window to join multi-line question restatements.
-
-    Correctness guarantees:
-    1. Tracks how many lines (`span`) the matched question text occupies,
-       so the answer slice can start AFTER the full question text.
-    2. Enforces that boundaries appear in the SAME ORDER as the official
-       questions list. If a question's best-scoring candidate would break
-       order (e.g. a false-positive shares vocabulary with an earlier
-       question), the NEXT best-scoring candidate for that same question
-       is tried, and so on, rather than dropping the question entirely.
-    """
-    candidates_by_question = {}   # question -> list of candidates, sorted by score desc
+    candidates_by_question = {}
 
     for i in range(len(answer_lines)):
         line_i = answer_lines[i].strip()
@@ -618,13 +596,9 @@ def find_question_boundaries_by_similarity(
                         "score":      score
                     })
 
-    # Sort each question's candidates by score, descending
     for q in candidates_by_question:
         candidates_by_question[q].sort(key=lambda c: -c["score"])
 
-    # Walk questions in official order. For each, try candidates from
-    # highest score downward, accepting the first one that comes after
-    # the previously accepted boundary's line_index.
     final = []
     last_line_index = -1
 
@@ -643,11 +617,6 @@ def find_question_boundaries_by_similarity(
 
 
 def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
-    """
-    For each boundary, answer = raw lines starting AFTER the full matched
-    question span (boundary["span"] lines), up to the next boundary.
-    Pure text slicing, zero LLM.
-    """
     qa_pairs = []
     for i, b in enumerate(boundaries):
         span    = b.get("span", 1)
@@ -679,27 +648,19 @@ def process_pdf(file_input, status_callback=None):
 
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
 
-    # Step 1: OCR — send the original PDF directly.
-    # Datalab/Chandra handles native PDFs natively; rasterizing to
-    # images first (as Mistral required) only inflates file size and
-    # can trigger 413 Payload Too Large on upload.
     pages = run_ocr(file_bytes, file_name, status_callback)
 
-    # Step 2: Build OCR JSON
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    # Step 4: Scan ALL pages for question-paper-like pages
-    # (handles question papers split across multiple pages/sections,
-    #  rather than assuming a single page holds everything)
     qp_page_indices = find_question_paper_pages(pages)
     log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
 
     if not qp_page_indices:
         raise Exception(
             "Could not detect any question paper pages in this document.\n"
-            "This usually means the document has a different layout than expected — "
+            "This usually means the document has a different layout than expected -- "
             "no page was found with multiple numbered question lines.\n"
             f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
         )
@@ -713,13 +674,11 @@ def process_pdf(file_input, status_callback=None):
             f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
 
-    # Step 5: Answer pages = every page NOT identified as a question paper page
     answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
     answer_pages = [pages[i] for i in answer_page_indices]
 
     log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
 
-    # Step 6: Flatten answer page lines
     answer_lines = []
     for page in answer_pages:
         for line in page["raw_text"].split("\n"):
@@ -728,7 +687,6 @@ def process_pdf(file_input, status_callback=None):
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
-    # Step 7: Similarity-based matching — works for any language/format
     log("Matching questions via similarity (works for Hindi/English/any format)...")
     boundaries = find_question_boundaries_by_similarity(answer_lines, official_questions)
     log(f"Matched {len(boundaries)} of {len(official_questions)} questions")
@@ -745,9 +703,8 @@ def process_pdf(file_input, status_callback=None):
             f"First 10 answer lines: {answer_lines[:10]}"
         )
 
-    # Step 8: Slice raw answers — zero LLM, pure text slicing
     log("Slicing raw answers...")
     qa_pairs = slice_raw_answers_by_boundaries(answer_lines, boundaries)
 
-    log(f"Done — {len(qa_pairs)} Q-A pairs")
+    log(f"Done -- {len(qa_pairs)} Q-A pairs")
     return ocr_json, qa_pairs
