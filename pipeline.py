@@ -8,7 +8,7 @@ import httpx
 from pathlib import Path
 
 # =========================================================
-# API KEY
+# API KEYS
 # =========================================================
 
 def get_api_key(name):
@@ -19,6 +19,60 @@ def get_api_key(name):
         from dotenv import load_dotenv
         load_dotenv()
         return os.getenv(name)
+
+
+# =========================================================
+# INPUT NORMALIZATION
+# Accepts str/Path, bytes, file-like objects, or (filename, bytes)
+# / (filename, bytes, content_type) tuples without crashing.
+# =========================================================
+
+def _normalize_file_input(file_input, default_name="document.pdf"):
+    if isinstance(file_input, tuple):
+        if len(file_input) < 2:
+            raise ValueError(
+                f"Tuple file_input must have at least (filename, bytes), got {len(file_input)} items"
+            )
+        name, data = file_input[0], file_input[1]
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError(
+                f"Expected bytes as second tuple element, got {type(data).__name__}"
+            )
+        return bytes(data), _coerce_name(name, default_name)
+
+    if isinstance(file_input, (bytes, bytearray)):
+        return bytes(file_input), default_name
+
+    if isinstance(file_input, (str, Path)):
+        p = Path(file_input)
+        return p.read_bytes(), p.name
+
+    if hasattr(file_input, "read"):
+        data = file_input.read()
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError(
+                f"file_input.read() returned {type(data).__name__}, expected bytes. "
+                f"Open the file in binary mode ('rb')."
+            )
+        name = getattr(file_input, "name", default_name)
+        return bytes(data), _coerce_name(name, default_name)
+
+    raise TypeError(
+        f"Unsupported file_input type: {type(file_input).__name__}. "
+        f"Expected str, Path, bytes, a file-like object with .read(), "
+        f"or a (filename, bytes) tuple."
+    )
+
+
+def _coerce_name(name, default_name="document.pdf"):
+    if isinstance(name, (tuple, list)):
+        return default_name
+    if not name:
+        return default_name
+    try:
+        return Path(str(name)).name or default_name
+    except Exception:
+        return default_name
 
 
 # =========================================================
@@ -41,42 +95,64 @@ def preprocess_pdf(file_bytes, dpi=250):
 
 
 # =========================================================
-# OCR — Datalab (Chandra model) via /convert endpoint
-#
-# Datalab's /convert is async: submit -> poll request_check_url
-# until status == "complete". paginate=True returns markdown with
-# page-break markers so we can split back into per-page text,
-# matching the page-based structure the rest of the pipeline needs.
+# OCR -- Datalab (Chandra model) via /convert endpoint
 # =========================================================
 
 DATALAB_BASE_URL = "https://www.datalab.to"
 
-# Marker for page breaks when paginate=True
-# Datalab inserts a horizontal rule with the page number between pages.
-PAGE_BREAK_RE = re.compile(
-    r'\n?-{3,}\s*\n+\s*\{(\d+)\}-{3,}\s*\n?|\n?\{(\d+)\}-{3,}\s*\n?',
-)
+PAGE_BREAK_PATTERNS = [
+    re.compile(r'\n?\{(\d+)\}-{3,}\n?'),                            # {0}------------------
+    re.compile(r'\n?-{2,}\{(\d+)\}-{2,}\n?'),                       # ---{0}---
+    re.compile(r'\n-{3,}\s*Page\s*\d+\s*-{3,}\n', re.IGNORECASE),   # ----- Page 1 -----
+    re.compile(r'\n\s*\[PAGE\s*(\d+)\]\s*\n', re.IGNORECASE),       # [PAGE 1]
+    re.compile(r'\n\s*<!--\s*page\s*(\d+)\s*-->\s*\n', re.IGNORECASE),  # <!-- page 1 -->
+]
 
 
-def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> list:
+def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=print) -> list:
     """
-    Datalab paginated markdown separates pages with a horizontal rule
-    containing the page number, e.g.:
-        page 1 content
-        ------- Page 1 -------
-        page 2 content
-    Exact format can vary slightly by version, so we fall back to a
-    generic split on form-feed / page-marker patterns, and if no
-    markers are found at all, return the whole text as one page.
+    Tries every known Datalab page-break marker shape. Prefers whichever
+    pattern's result matches Datalab's own page_count hint, otherwise
+    takes the pattern producing the most pages.
     """
-    # Try splitting on common Datalab page break patterns
-    generic_break = re.compile(r'\n-{3,}\s*Page\s*\d+\s*-{3,}\n', re.IGNORECASE)
+    best_parts = None
 
-    parts = generic_break.split(markdown)
-    if len(parts) > 1:
-        return [p.strip() for p in parts]
+    for pattern in PAGE_BREAK_PATTERNS:
+        matches = list(pattern.finditer(markdown))
+        if not matches:
+            continue
 
-    # Fallback: no recognizable page breaks — return as single block
+        parts = []
+        start = 0
+        for m in matches:
+            parts.append(markdown[start:m.start()].strip())
+            start = m.end()
+        parts.append(markdown[start:].strip())
+        parts = [p for p in parts if p]
+
+        if len(parts) <= 1:
+            continue
+
+        if page_count_hint and len(parts) == page_count_hint:
+            return parts
+
+        if best_parts is None or len(parts) > len(best_parts):
+            best_parts = parts
+
+    if best_parts:
+        return best_parts
+
+    if '\f' in markdown:
+        parts = [p.strip() for p in markdown.split('\f') if p.strip()]
+        if len(parts) > 1:
+            return parts
+
+    log(
+        f"WARNING: No page-break marker recognized in Datalab output "
+        f"(length={len(markdown)} chars, page_count_hint={page_count_hint}). "
+        f"Treating entire document as a single page. "
+        f"First 200 chars: {markdown[:200]!r}"
+    )
     return [markdown.strip()]
 
 
@@ -86,14 +162,19 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         if status_callback:
             status_callback(msg)
 
+    file_name = _coerce_name(file_name, default_name="document.pdf")
+
+    if not isinstance(file_content, (bytes, bytearray)):
+        raise TypeError(
+            f"run_ocr() expected file_content as bytes, got {type(file_content).__name__}"
+        )
+
     api_key = get_api_key("DATALAB_API_KEY")
     if not api_key:
         raise Exception("DATALAB_API_KEY not found in secrets or environment")
 
-    # Guard against oversized uploads — fail with a clear message
-    # instead of a cryptic Cloudflare 413 HTML page.
     size_mb = len(file_content) / (1024 * 1024)
-    MAX_MB  = 45   # conservative margin under typical Cloudflare limits
+    MAX_MB  = 45
     if size_mb > MAX_MB:
         raise Exception(
             f"File is {size_mb:.1f}MB, which exceeds the {MAX_MB}MB upload limit. "
@@ -110,8 +191,8 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         files={"file": (file_name, file_content, "application/pdf")},
         data={
             "output_format": "markdown",
-            "mode": "accurate",     # highest accuracy — best for handwriting
-            "paginate": "true"      # keep page boundaries in the output
+            "mode": "accurate",
+            "paginate": "true"
         },
         timeout=120
     )
@@ -125,10 +206,9 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         raise Exception(f"Datalab submit failed: {data.get('error')}")
 
     check_url = data["request_check_url"]
-    log("Document submitted — polling for OCR result...")
+    log("Document submitted -- polling for OCR result...")
 
-    # ── Poll until complete ─────────────────────────────────
-    max_polls = 150          # ~150 * 2s = 5 minutes max wait
+    max_polls = 150
     poll_interval = 2
 
     result = None
@@ -142,7 +222,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         status = result.get("status")
 
         if status == "complete":
-            log("OCR complete — parsing pages...")
+            log("OCR complete -- parsing pages...")
             break
 
         if status == "failed" or result.get("error"):
@@ -164,7 +244,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         raise Exception("Datalab returned empty markdown output")
 
     page_count_hint = result.get("page_count")
-    page_texts = _split_paginated_markdown(markdown, page_count_hint)
+    page_texts = _split_paginated_markdown(markdown, page_count_hint, log=log)
 
     pages = []
     for idx, text in enumerate(page_texts):
@@ -173,7 +253,15 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
             "raw_text":    text
         })
 
-    log(f"OCR done — {len(pages)} page(s) extracted")
+    log(f"OCR done -- {len(pages)} page(s) extracted")
+
+    if len(pages) == 1 and size_mb > 1.0:
+        log(
+            f"WARNING: Only 1 page extracted from a {size_mb:.1f}MB file. "
+            f"This usually means the page-break marker format was not recognized. "
+            f"Markdown length: {len(markdown)} chars."
+        )
+
     return pages
 
 
@@ -192,8 +280,7 @@ def build_ocr_json(pages: list) -> dict:
 
 
 # =========================================================
-# REFERENCE BOOK OCR — Datalab handles full multi-page PDFs
-# natively, so no manual page-splitting is needed here.
+# REFERENCE BOOK OCR
 # =========================================================
 
 def process_reference(file_input, status_callback=None):
@@ -202,229 +289,177 @@ def process_reference(file_input, status_callback=None):
         if status_callback:
             status_callback(msg)
 
-    if isinstance(file_input, (str, Path)):
-        file_bytes = Path(file_input).read_bytes()
-        file_name  = Path(file_input).name
-    else:
-        file_bytes = file_input.read()
-        file_name  = getattr(file_input, "name", "reference.pdf")
+    file_bytes, file_name = _normalize_file_input(file_input, default_name="reference.pdf")
 
     pages = run_ocr(file_bytes, file_name, status_callback)
-    log(f"Reference OCR complete — {len(pages)} page(s)")
+    log(f"Reference OCR complete -- {len(pages)} page(s)")
     return build_ocr_json(pages)
 
 
 # =========================================================
-# DETECT QUESTION PAPER PAGE
-# The page that contains the printed list of questions
-# Identified by having numbered questions >= 5 items
+# LLM-BASED QUESTION PAPER / QUESTION DETECTION (Groq)
+#
+# WHY: layout-driven regex heuristics (numbered-line counting, mark-
+# allocation patterns, admin/answer keyword blocklists) break every
+# time a new document uses a slightly different layout -- e.g. a
+# student's own answer that happens to contain a numbered explanatory
+# list gets misclassified as a question paper page, while real
+# question papers with unusual formatting get missed. None of this
+# scales across many different real-world PDF layouts.
+#
+# FIX: send the OCR'd page text to an LLM (via Groq) and let it use
+# actual reading comprehension to tell question-paper pages apart from
+# answer pages, and to extract the clean list of real questions. This
+# generalizes across layouts without per-document regex tuning. The
+# downstream answer-matching (similarity-based slicing) is UNCHANGED --
+# only page/question identification moves to the LLM.
 # =========================================================
 
-def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
+GROQ_MODEL = "openai/gpt-oss-120b"  # current Groq-hosted model, good
+                                     # general reasoning, large context
+
+QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet (e.g. IGNOU-style, India). The booklet mixes pages of different kinds, in no guaranteed order:
+
+1. ADMINISTRATIVE/COVER pages: enrolment number, programme code, learner name, registration details, regional centre info. NEVER question paper pages.
+2. QUESTION PAPER pages: the official printed list of numbered exam questions the student must answer. These read as instructions/prompts DIRECTED AT the student (e.g. "Discuss X", "Explain Y with examples", "Write notes on the following:"). Mark allocations may appear (e.g. "10", "20").
+3. ANSWER pages: the student's own (handwritten, OCR'd) answers. These are typically long, restate or reference a question briefly then write an extended response, and may themselves contain numbered or bulleted sub-points as part of the student's OWN explanation (e.g. a student listing several numbered points as part of one answer's content). These numbered sub-points inside a long answer are NOT separate exam questions, even though superficially they look similar (number, period, text) -- they are part of the answer to ONE question.
+
+Your task: read all pages and return ONLY valid JSON (no markdown fences, no commentary, no explanation) in exactly this shape:
+
+{
+  "question_paper_pages": [<list of integer page_number values that are genuine question-paper pages>],
+  "questions": [<ordered list of the exact text of each real numbered exam question, copied exactly as printed on the question paper pages>]
+}
+
+Critical rules for telling question-paper pages apart from answer pages that happen to contain numbered content:
+- A genuine question paper question is a PROMPT directed at the student ("explain", "discuss", "describe", "write notes on", "compare", a question mark, etc.) -- it asks the student to DO something.
+- A numbered point inside a long answer is typically a STATEMENT or FACT that is part of an explanation the student is giving -- it does not ask the reader to do anything; it's content, not an instruction.
+- If a page's numbered items closely follow words like "उत्तर" (answer), "Ans", "Ans-", or come after a long paragraph of explanatory prose in the same block, that page is almost certainly an ANSWER page, not a question paper page -- exclude it from question_paper_pages even if it has multiple numbered lines.
+- A real question paper is usually self-contained and concise per question (a question, maybe a mark allocation) -- not a long flowing essay with numbered sub-points woven into running prose.
+- When genuinely uncertain whether a page is a question paper page, prefer NOT including it as one, and prefer NOT extracting its numbered items as separate questions.
+- Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate.
+- Output ONLY the JSON object described above. No prose before or after it. No markdown code fences."""
+
+
+def _build_qp_user_prompt(pages: list) -> str:
+    blocks = []
+    for p in pages:
+        blocks.append(f"--- PAGE {p['page_number']} ---\n{p['raw_text']}")
+    return "Here are the OCR'd pages of the document:\n\n" + "\n\n".join(blocks)
+
+
+def _parse_qp_llm_response(content: str) -> tuple:
     """
-    Returns list of page indices (0-based) that look like GENUINE exam
-    question paper pages — as opposed to:
-    - ID card / registration / admin pages (numbered instructions,
-      terms and conditions)
-    - Handwritten answer pages where the student restates the question
-      number before writing their answer
-
-    Strategy: a real question paper page must satisfy ALL of:
-    1. Has 2+ lines matching a question-start pattern (numbered or lettered)
-    2. Has at least one STRONG exam-paper signal:
-       - mark allocation pattern like "10", "X2=10", "3X20=60", "5X2"
-       - a SECTION/PART header (SECTION-A, भाग-1, PART B)
-       - explicit instruction phrase ("answer all questions",
-         "सभी प्रश्न अनिवार्य", "TMA", "assignment code", course code pattern)
-    3. Does NOT contain admin/ID-card signals (enrolment number, IGNOU
-       student identity, regional centre, "produced on demand", QR code
-       instructions) — these are registration pages, not exam papers
-    4. Does NOT contain handwritten-answer signals (उत्तर, Ans-, Teacher's
-       Signature, PAGE NO/DATE handwritten template, A.15- style answer
-       labels)
+    Parses the LLM's JSON response into (question_paper_pages, questions).
+    Tolerates markdown code fences even though the prompt forbids them,
+    since models occasionally add them anyway.
     """
-    Q_LINE_NUM   = re.compile(r'^\s*\d+[\.\)]\s+.{15,}')
-    Q_LINE_LATIN = re.compile(r'^\s*[a-d]\)\s+.{5,}', re.IGNORECASE)
-    Q_LINE_DEVA  = re.compile(r'^\s*[क-घ]\)\s+.{5,}')
+    content = content.strip()
 
-    MARK_ALLOCATION = re.compile(
-        r'(?:\d+\s*[xX]\s*\d+\s*=?\s*\d*|\b\d{1,3}\s*$|\(\s*\d+\s*\))',
-    )
-    SECTION_HEADER = re.compile(
-        r'(?:SECTION\s*[-–]?\s*[A-Z]|PART\s*[-–]?\s*\d|भाग\s*[-–]?\s*\d|भाग\s*[-–]?\s*[१-९])',
-        re.IGNORECASE
-    )
-    EXAM_INSTRUCTION = re.compile(
-        r'(?:answer\s+all\s+questions|all\s+questions\s+are\s+compulsory'
-        r'|सभी\s*प्रश्न\s*अनिवार्य|assignment\s*code|TMA\b|कुल\s*अंक'
-        r'|words?\s+each|शब्दों\s*में)',
-        re.IGNORECASE
-    )
+    if content.startswith("```"):
+        # Strip leading ```json / ``` and trailing ```
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
 
-    ADMIN_PAGE_MARKERS = re.compile(
-        r'(?:enrolment\s*number|enrollment\s*no|student\s*identity\s*card'
-        r'|regional\s*cent[er]+|study\s*cent[er]+|produced\s+on\s+demand'
-        r'|qr\s*code|registration\s*details|admission\s*status'
-        r'|father.?s\s*name|programme\s*registered|IGNOU\s*-\s*Student)',
-        re.IGNORECASE
-    )
-
-    ANSWER_PAGE_MARKERS = re.compile(
-        r'(?:उत्तर\s*[\-\:]|Ans\.?\s*[\-\:]|A\.\d|A\d+\s*[\-\:]'
-        r'|Teacher.?s\s*Signature|PAGE\s*NO[\.\:]?\s*\d*\s*DATE)',
-        re.IGNORECASE
-    )
-
-    candidate_pages = []
-    weak_pages = []   # pages with question-like lines but no strong signal — possible continuations
-
-    for i, page in enumerate(pages):
-        text  = page["raw_text"]
-        lines = text.split("\n")
-
-        q_count = sum(
-            1 for line in lines
-            if Q_LINE_NUM.match(line.strip())
-            or Q_LINE_LATIN.match(line.strip())
-            or Q_LINE_DEVA.match(line.strip())
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"LLM did not return valid JSON: {e}\nRaw content (first 500 chars): {content[:500]!r}"
         )
 
-        if q_count < min_questions:
-            continue
+    if not isinstance(data, dict):
+        raise ValueError(f"LLM response must be a JSON object, got: {type(data).__name__}")
 
-        if ADMIN_PAGE_MARKERS.search(text):
-            continue   # ID card / registration page — never a question paper
-
-        if ANSWER_PAGE_MARKERS.search(text):
-            continue   # student's handwritten answer page
-
-        has_strong_signal = bool(
-            MARK_ALLOCATION.search(text)
-            or SECTION_HEADER.search(text)
-            or EXAM_INSTRUCTION.search(text)
+    if "question_paper_pages" not in data or "questions" not in data:
+        raise ValueError(
+            f"LLM response missing required keys. Got keys: {list(data.keys())}"
         )
 
-        if has_strong_signal:
-            candidate_pages.append(i)
-        else:
-            # No strong signal on its own — could be a continuation page
-            # (e.g. a parent question's lettered sub-parts spilling onto
-            # the next page). Only counts if adjacent to a confirmed page.
-            weak_pages.append(i)
+    qp_pages = data["question_paper_pages"]
+    questions = data["questions"]
 
-    # Promote weak pages that are immediately adjacent to a confirmed
-    # question-paper page (continuation of the same question paper),
-    # rather than requiring every single page to repeat the strong signal.
-    confirmed_set = set(candidate_pages)
-    for i in weak_pages:
-        if (i - 1) in confirmed_set or (i + 1) in confirmed_set:
-            candidate_pages.append(i)
-            confirmed_set.add(i)
+    if not isinstance(qp_pages, list):
+        raise ValueError(f"question_paper_pages must be a list, got: {type(qp_pages).__name__}")
+    qp_pages = [int(x) for x in qp_pages]  # tolerate "3" as well as 3
 
-    return sorted(candidate_pages)
+    if not isinstance(questions, list):
+        raise ValueError(f"questions must be a list, got: {type(questions).__name__}")
+    questions = [str(x).strip() for x in questions if str(x).strip()]
+
+    return qp_pages, questions
 
 
-# =========================================================
-# EXTRACT OFFICIAL QUESTIONS — scans across MULTIPLE pages
-# Also captures lettered sub-questions (क/ख/ग/घ, a/b/c/d)
-# that appear as a standalone list after a parent question
-# like "Q.9 निम्नलिखित पर टिप्पणी लिखिए" on a DIFFERENT page
-# than where the sub-options are printed.
-# =========================================================
-
-def extract_official_questions_multi_page(pages: list, qp_page_indices: list) -> list:
+def identify_questions_with_llm(pages: list, status_callback=None, max_retries: int = 2) -> tuple:
     """
-    Extracts numbered questions across all detected question-paper pages,
-    in page order. Handles:
-    - Standard numbered questions: "1. text"
-    - Multi-line questions (continuation lines joined)
-    - Lettered sub-parts within a question: a) b) c) / क) ख) ग) घ)
-    - Sub-parts that appear on a later page than their parent question
-      (common when "Q.9 Write notes on:" is followed by a), b), c), d)
-      printed on the next page)
+    Calls Groq to identify which pages are genuine question-paper pages
+    and to extract the clean list of real exam questions.
+
+    Returns (qp_page_indices_0based, questions) -- 0-based page indices
+    to match the indexing convention used by the rest of this pipeline
+    (pages list is 0-indexed even though "page_number" is 1-indexed).
+
+    Retries on malformed JSON output up to max_retries times before
+    raising, since occasional non-conforming output is the main
+    failure mode of LLM-based structured extraction.
     """
-    all_questions = []
-    pending_parent = None   # holds a parent question awaiting sub-parts from next page
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
 
-    Q_START   = re.compile(r'^\s*(\d+)[\.\)]\s+(.+)')
-    SUB_LATIN = re.compile(r'^\s*\(?([a-d])\)\s*(.+)', re.IGNORECASE)
-    SUB_DEVA  = re.compile(r'^\s*\(?([क-घ])\)\s*(.+)')
-    SKIP      = re.compile(r'^#+\s|^भाग|^PART|^\s*$')
+    from groq import Groq
 
-    for page_idx in qp_page_indices:
-        lines   = pages[page_idx]["raw_text"].split("\n")
-        current = None
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
+        raise Exception("GROQ_API_KEY not found in secrets or environment")
 
-        for line in lines:
-            stripped = line.strip()
+    client = Groq(api_key=api_key)
+    user_prompt = _build_qp_user_prompt(pages)
 
-            if not stripped or SKIP.match(stripped):
-                if current:
-                    all_questions.append({"text": current.strip(), "parent": None})
-                    current = None
-                continue
+    last_error = None
+    for attempt in range(1, max_retries + 2):  # at least 1 try, then retries
+        log(f"Asking LLM to identify question paper pages (attempt {attempt})...")
+        try:
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": QP_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            content = response.choices[0].message.content
+            qp_pages_1based, questions = _parse_qp_llm_response(content)
 
-            # Lettered sub-part (Latin a-d or Devanagari क-घ)
-            sub_m = SUB_LATIN.match(stripped) or SUB_DEVA.match(stripped)
-            if sub_m:
-                if current:
-                    all_questions.append({"text": current.strip(), "parent": None})
-                    current = None
-                label = sub_m.group(1)
-                body  = sub_m.group(2)
-                parent_text = pending_parent if pending_parent else ""
-                combined = f"{parent_text} {label}) {body}".strip()
-                all_questions.append({"text": combined, "parent": pending_parent})
-                continue
+            # Convert 1-based page_number values to 0-based indices used
+            # internally by the rest of the pipeline (pages list index).
+            valid_page_numbers = {p["page_number"] for p in pages}
+            qp_page_indices_0based = sorted({
+                pn - 1 for pn in qp_pages_1based if pn in valid_page_numbers
+            })
 
-            m = Q_START.match(stripped)
-            if m:
-                if current:
-                    all_questions.append({"text": current.strip(), "parent": None})
-                current = stripped
-                # Track this as a potential parent for sub-parts on a later page
-                # (e.g. ends with "टिप्पणी लिखिए" / "following" / colon)
-                if re.search(r'(?:लिखिए|following|:)\s*$', stripped, re.IGNORECASE):
-                    pending_parent = stripped
-                else:
-                    pending_parent = None
-                continue
+            invalid = [pn for pn in qp_pages_1based if pn not in valid_page_numbers]
+            if invalid:
+                log(f"WARNING: LLM returned out-of-range page numbers, ignoring: {invalid}")
 
-            if current:
-                current += " " + stripped
+            log(
+                f"LLM identified {len(qp_page_indices_0based)} question paper page(s) "
+                f"and {len(questions)} question(s)"
+            )
+            return qp_page_indices_0based, questions
 
-        if current:
-            all_questions.append({"text": current.strip(), "parent": None})
+        except Exception as e:
+            last_error = e
+            log(f"LLM call/parse attempt {attempt} failed: {e}")
+            time.sleep(1)
 
-    # Now split any question that has 2+ inline sub-parts (a)/b)/c) on one line block)
-    final_questions = []
-    SUBPART_RE = re.compile(r'(?:^|\s)\(?([a-zक-घ])\)\s', re.UNICODE)
-
-    for q in all_questions:
-        text = q["text"]
-        matches = list(SUBPART_RE.finditer(text))
-
-        if len(matches) >= 2:
-            preamble = text[:matches[0].start()].strip()
-            for idx, m in enumerate(matches):
-                start = m.start(1)
-                end   = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-                part_text = text[start:end].strip()
-                full_q = f"{preamble} {part_text}".strip() if preamble else part_text
-                final_questions.append(full_q)
-        else:
-            final_questions.append(text)
-
-    # Deduplicate while preserving order
-    seen = set()
-    unique = []
-    for q in final_questions:
-        key = re.sub(r'\s+', ' ', q.lower().strip())
-        if key not in seen:
-            seen.add(key)
-            unique.append(q)
-
-    return unique
+    raise Exception(
+        f"LLM-based question identification failed after {max_retries + 1} attempts. "
+        f"Last error: {last_error}"
+    )
 
 
 NOISE_RE = re.compile(
@@ -448,10 +483,9 @@ def is_noise(line: str) -> bool:
 
 
 # =========================================================
-# FIND QUESTION BOUNDARIES IN ANSWER PAGES — similarity based
-# Works for Hindi, English, any language
-# Matches student-written question restatements against the
-# official question paper text using word-overlap similarity
+# FIND QUESTION BOUNDARIES IN ANSWER PAGES -- similarity based
+# UNCHANGED from prior version, per your instruction to keep
+# existing answer-matching logic as-is.
 # =========================================================
 
 def normalize(text: str) -> str:
@@ -470,7 +504,6 @@ def similarity(a: str, b: str) -> float:
 
 
 def strip_leading_label(text: str) -> str:
-    """Strip leading numbering like '1.', 'Q1.', 'प्र.2', '20.', 'a)', '(a)', 'क)', '(क)' etc."""
     text = text.strip()
     text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text, flags=re.IGNORECASE)
     text = re.sub(r'^(?:उत्तर)\s*[\-\:\s]*', '', text)
@@ -488,20 +521,7 @@ def find_question_boundaries_by_similarity(
     similarity_threshold: float = 0.30,
     window: int = 4
 ) -> list:
-    """
-    Scans answer lines for restated questions matching official questions.
-    Uses sliding window to join multi-line question restatements.
-
-    Correctness guarantees:
-    1. Tracks how many lines (`span`) the matched question text occupies,
-       so the answer slice can start AFTER the full question text.
-    2. Enforces that boundaries appear in the SAME ORDER as the official
-       questions list. If a question's best-scoring candidate would break
-       order (e.g. a false-positive shares vocabulary with an earlier
-       question), the NEXT best-scoring candidate for that same question
-       is tried, and so on, rather than dropping the question entirely.
-    """
-    candidates_by_question = {}   # question -> list of candidates, sorted by score desc
+    candidates_by_question = {}
 
     for i in range(len(answer_lines)):
         line_i = answer_lines[i].strip()
@@ -535,13 +555,9 @@ def find_question_boundaries_by_similarity(
                         "score":      score
                     })
 
-    # Sort each question's candidates by score, descending
     for q in candidates_by_question:
         candidates_by_question[q].sort(key=lambda c: -c["score"])
 
-    # Walk questions in official order. For each, try candidates from
-    # highest score downward, accepting the first one that comes after
-    # the previously accepted boundary's line_index.
     final = []
     last_line_index = -1
 
@@ -560,11 +576,6 @@ def find_question_boundaries_by_similarity(
 
 
 def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
-    """
-    For each boundary, answer = raw lines starting AFTER the full matched
-    question span (boundary["span"] lines), up to the next boundary.
-    Pure text slicing, zero LLM.
-    """
     qa_pairs = []
     for i, b in enumerate(boundaries):
         span    = b.get("span", 1)
@@ -588,296 +599,47 @@ def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> lis
 # COMPLETE PIPELINE
 # =========================================================
 
-# =========================================================
-# GROQ-BASED Q&A LINE DETECTION
-#
-# Groq's ONLY job: read numbered lines and report which line
-# numbers correspond to question starts and answer starts.
-# It NEVER outputs question text or answer text — only integers.
-# This makes it layout-agnostic (works on any PDF format) while
-# remaining hallucination-safe, because every line number it
-# returns is validated against the real document before use:
-#   - must be a real, in-range line index
-#   - must be in increasing order
-#   - the line at that index must actually look like the kind
-#     of content claimed (a question line / a non-empty line)
-# If validation fails for too many entries, or Groq is unavailable,
-# the caller falls back to the regex/similarity pipeline.
-# =========================================================
-
-def get_groq_client():
-    from groq import Groq
-    key = get_api_key("GROQ_API_KEY")
-    if not key:
-        raise Exception("GROQ_API_KEY not found")
-    return Groq(api_key=key)
-
-
-def build_numbered_line_dump(pages: list) -> list:
-    """
-    Flattens the whole document into a single list of lines,
-    each tagged with its global line number and source page number.
-    This numbering is what gets shown to Groq and is the same
-    numbering used afterward for validation and slicing.
-    """
-    line_index = []
-    for page in pages:
-        for line in page["raw_text"].split("\n"):
-            line_index.append({
-                "line_number": len(line_index),
-                "page_number": page["page_number"],
-                "text": line
-            })
-    return line_index
-
-
-def ask_groq_for_qa_lines(line_index: list, status_callback=None, chunk_size: int = 350):
-    """
-    Sends the numbered line dump to Groq in chunks (to stay under
-    token limits) and asks ONLY for line numbers — never content.
-    Returns a list of {question_id, question_start_line, answer_start_line}.
-    Raises on any API/parsing failure so the caller can fall back.
-    """
+def process_pdf(file_input, status_callback=None):
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    groq = get_groq_client()
-    total = len(line_index)
-    all_results = []
+    file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
 
-    num_chunks = (total + chunk_size - 1) // chunk_size
+    pages = run_ocr(file_bytes, file_name, status_callback)
 
-    for ci in range(num_chunks):
-        start = ci * chunk_size
-        end   = min(start + chunk_size, total)
-        chunk = line_index[start:end]
+    log("Building OCR JSON...")
+    ocr_json = build_ocr_json(pages)
+    log(f"Total pages: {ocr_json['total_pages']}")
 
-        numbered_text = "\n".join(
-            f"[L{e['line_number']}] {e['text']}" for e in chunk
-        )
+    # LLM-based identification replaces the old regex heuristics for
+    # BOTH "which pages are question paper pages" AND "what are the
+    # real questions" -- this is the part that varies wildly across
+    # different PDF layouts and was the source of repeated breakage.
+    qp_page_indices, official_questions = identify_questions_with_llm(pages, status_callback)
 
-        log(f"Groq scanning lines {start}-{end} (chunk {ci+1}/{num_chunks})...")
-
-        prompt = f"""You are scanning OCR text from a scanned exam answer booklet.
-The document may be in ANY language (Hindi, English, mixed) and the
-layout varies between documents — do not assume a fixed structure.
-
-Each line below is tagged with its line number like [L42].
-
-Find every QUESTION and the START of its ANSWER in this chunk.
-A question is a numbered/lettered exam prompt the student must answer
-(e.g. "1.", "Q.1", "क)", "(a)", "9.", roman numerals, etc — in any
-language). The answer is the student's handwritten response that
-follows, often after a marker like "Ans-", "उत्तर-", "A.1-", or with
-no marker at all (answer just starts on the next line).
-
-Return ONLY this JSON, nothing else:
-{{
-  "items": [
-    {{
-      "question_id": "<a short label for this question, e.g. Q1, Q9-a>",
-      "question_start_line": <integer line number where the question starts>,
-      "answer_start_line": <integer line number where the answer starts, or null if not found in this chunk>
-    }}
-  ]
-}}
-
-If no questions are found in this chunk, return {{"items": []}}.
-Do NOT include question text or answer text in your response — line numbers only.
-
-NUMBERED LINES:
-{numbered_text}"""
-
-        resp = groq.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You identify line numbers only. Never output document content. Return valid JSON only."
-                },
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
-            max_tokens=1500,
-            response_format={"type": "json_object"}
-        )
-
-        raw = resp.choices[0].message.content.strip()
-        data = json.loads(raw)
-        items = data.get("items", [])
-        log(f"  Chunk {ci+1}: Groq reported {len(items)} item(s)")
-        all_results.extend(items)
-
-    return all_results
-
-
-def validate_and_clean_groq_items(raw_items: list, line_index: list, status_callback=None) -> list:
-    """
-    Validates every Groq-reported item against the real document.
-    Drops anything that:
-    - has an out-of-range line number
-    - has a question_start_line >= answer_start_line (nonsensical)
-    - points to an empty/too-short line for the question start
-    - duplicates a question_start_line already accepted
-    Also enforces overall increasing order of question_start_line,
-    dropping any item that goes backwards (same safeguard as the
-    regex pipeline's order enforcement).
-    """
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
-
-    total_lines = len(line_index)
-    cleaned = []
-    seen_start_lines = set()
-
-    # Sort by question_start_line first so order-enforcement is meaningful
-    raw_items_sorted = sorted(
-        [it for it in raw_items if isinstance(it.get("question_start_line"), int)],
-        key=lambda it: it["question_start_line"]
-    )
-
-    last_start = -1
-    for it in raw_items_sorted:
-        qsl = it.get("question_start_line")
-        asl = it.get("answer_start_line")
-
-        if qsl is None or not (0 <= qsl < total_lines):
-            continue
-        if qsl in seen_start_lines:
-            continue
-        if qsl <= last_start:
-            continue   # out of order — likely hallucinated, skip
-
-        q_line_text = line_index[qsl]["text"].strip()
-        if len(q_line_text) < 2:
-            continue   # points to a blank/near-empty line — not a real question
-
-        # Validate answer_start_line if provided
-        if asl is not None:
-            if not isinstance(asl, int) or not (0 <= asl < total_lines) or asl <= qsl:
-                asl = None   # invalid — will be treated as "not found", filled in later
-
-        cleaned.append({
-            "question_id":        it.get("question_id", f"Q{len(cleaned)+1}"),
-            "question_start_line": qsl,
-            "answer_start_line":   asl
-        })
-        seen_start_lines.add(qsl)
-        last_start = qsl
-
-    log(f"Validation: {len(cleaned)} of {len(raw_items)} Groq items passed checks")
-    return cleaned
-
-
-def slice_qa_from_line_items(line_index: list, items: list) -> list:
-    """
-    Pure text slicing — zero LLM. Given validated {question_start_line,
-    answer_start_line} pairs, slices the question and answer directly
-    from the raw OCR line index. If answer_start_line is missing for
-    an item, defaults to question_start_line + 1 (next line).
-    """
-    qa_pairs = []
-
-    for i, item in enumerate(items):
-        q_start = item["question_start_line"]
-        a_start = item["answer_start_line"]
-        if a_start is None:
-            a_start = q_start + 1
-
-        a_end = items[i + 1]["question_start_line"] if i + 1 < len(items) else len(line_index)
-
-        q_lines = [
-            line_index[j]["text"] for j in range(q_start, min(a_start, len(line_index)))
-            if line_index[j]["text"].strip()
-        ]
-        a_lines = [
-            line_index[j]["text"] for j in range(a_start, max(a_end, a_start))
-            if line_index[j]["text"].strip() and not is_noise(line_index[j]["text"])
-        ]
-
-        qa_pairs.append({
-            "question": " ".join(q_lines).strip(),
-            "answer":   " ".join(a_lines).strip()
-        })
-
-    return qa_pairs
-
-
-def try_groq_pipeline(pages: list, status_callback=None):
-    """
-    Attempts the Groq line-identification pipeline end to end.
-    Returns qa_pairs on success, or None if anything fails/looks
-    unreliable — signalling the caller to fall back to regex.
-    """
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
-
-    try:
-        line_index = build_numbered_line_dump(pages)
-        log(f"Built line index: {len(line_index)} total lines")
-
-        raw_items = ask_groq_for_qa_lines(line_index, status_callback)
-        if not raw_items:
-            log("Groq returned no items — falling back")
-            return None
-
-        cleaned = validate_and_clean_groq_items(raw_items, line_index, status_callback)
-        if len(cleaned) < 2:
-            log("Too few validated items from Groq — falling back")
-            return None
-
-        qa_pairs = slice_qa_from_line_items(line_index, cleaned)
-        non_empty = [p for p in qa_pairs if p["answer"].strip()]
-        if len(non_empty) < len(qa_pairs) * 0.5:
-            log("More than half the answers came out empty — falling back")
-            return None
-
-        log(f"Groq pipeline succeeded — {len(qa_pairs)} Q-A pairs")
-        return qa_pairs
-
-    except Exception as e:
-        log(f"Groq pipeline failed ({e}) — falling back to regex pipeline")
-        return None
-
-
-def run_regex_pipeline(pages: list, status_callback=None):
-    """
-    The original regex/similarity-based pipeline, used as a fallback
-    when the Groq pipeline is unavailable or produces unreliable results.
-    """
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
-
-    qp_page_indices = find_question_paper_pages(pages)
-    log(f"[fallback] Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
+    log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
+    log(f"Official questions extracted: {len(official_questions)}")
 
     if not qp_page_indices:
         raise Exception(
-            "Could not detect any question paper pages in this document, "
-            "and the Groq-based detection also failed.\n"
+            "The LLM could not identify any question paper pages in this document.\n"
             f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
         )
 
-    official_questions = extract_official_questions_multi_page(pages, qp_page_indices)
-    log(f"[fallback] Official questions extracted: {len(official_questions)}")
-
     if not official_questions:
         raise Exception(
-            "Question paper pages were found, but no questions could be parsed from them.\n"
+            "Question paper pages were identified, but no questions were extracted.\n"
             f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
 
+    # Answer pages = every page NOT identified as a question paper page.
+    # This logic is UNCHANGED -- only the source of qp_page_indices changed.
     answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
     answer_pages = [pages[i] for i in answer_page_indices]
-    log(f"[fallback] Answer pages: {[i+1 for i in answer_page_indices]}")
+
+    log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
 
     answer_lines = []
     for page in answer_pages:
@@ -885,57 +647,26 @@ def run_regex_pipeline(pages: list, status_callback=None):
             if not is_noise(line):
                 answer_lines.append(line)
 
-    log(f"[fallback] Flattened {len(answer_lines)} answer lines")
+    log(f"Flattened {len(answer_lines)} answer lines")
 
+    log("Matching questions via similarity (works for Hindi/English/any format)...")
     boundaries = find_question_boundaries_by_similarity(answer_lines, official_questions)
-    log(f"[fallback] Matched {len(boundaries)} of {len(official_questions)} questions")
+    log(f"Matched {len(boundaries)} of {len(official_questions)} questions")
 
     matched_qs = {b["question"] for b in boundaries}
     for q in official_questions:
         if q not in matched_qs:
-            log(f"[fallback] WARNING: No match found for: {q[:60]}")
+            log(f"WARNING: No match found for: {q[:60]}")
 
     if not boundaries:
         raise Exception(
-            "Could not match any questions in answer pages (fallback also failed).\n"
-            f"Official questions: {official_questions}"
+            "Could not match any questions in answer pages.\n"
+            f"Official questions: {official_questions}\n"
+            f"First 10 answer lines: {answer_lines[:10]}"
         )
 
+    log("Slicing raw answers...")
     qa_pairs = slice_raw_answers_by_boundaries(answer_lines, boundaries)
-    return qa_pairs
 
-
-def process_pdf(file_input, status_callback=None):
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
-
-    if isinstance(file_input, (str, Path)):
-        file_bytes = Path(file_input).read_bytes()
-        file_name  = Path(file_input).name
-    else:
-        file_bytes = file_input.read()
-        file_name  = getattr(file_input, "name", "document.pdf")
-
-    # Step 1: OCR — send the original PDF directly.
-    pages = run_ocr(file_bytes, file_name, status_callback)
-
-    # Step 2: Build OCR JSON
-    log("Building OCR JSON...")
-    ocr_json = build_ocr_json(pages)
-    log(f"Total pages: {ocr_json['total_pages']}")
-
-    # Step 3: Try Groq-based line identification first — layout-agnostic,
-    # works regardless of where the question paper appears in the PDF.
-    # Groq only ever returns line numbers; all text is sliced by Python
-    # from the raw OCR afterward, so answer content is never LLM-touched.
-    log("Attempting Groq-based question/answer line detection...")
-    qa_pairs = try_groq_pipeline(pages, status_callback)
-
-    if qa_pairs is None:
-        log("Falling back to regex/similarity pipeline...")
-        qa_pairs = run_regex_pipeline(pages, status_callback)
-
-    log(f"Done — {len(qa_pairs)} Q-A pairs")
+    log(f"Done -- {len(qa_pairs)} Q-A pairs")
     return ocr_json, qa_pairs
