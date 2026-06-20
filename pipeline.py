@@ -3,7 +3,6 @@ import io
 import re
 import json
 import time
-import fitz
 import httpx
 from pathlib import Path
 
@@ -28,15 +27,10 @@ def get_api_key(name):
 DATALAB_BASE_URL = "https://www.datalab.to"
 
 def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> list:
-    """
-    Robust multi-fallback approach to split Datalab's paginated markdown.
-    """
-    # Fallback 1: Standard explicit page text
     parts = re.split(r'\n-{3,}\s*Page\s*\d+\s*-{3,}\n', markdown, flags=re.IGNORECASE)
     if len(parts) > 1:
         return [p.strip() for p in parts if p.strip()]
 
-    # Fallback 2: Line-by-line scan for dash sequences ignoring embedded images
     lines = markdown.split('\n')
     split_indices = []
     
@@ -54,12 +48,10 @@ def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> li
         pages.append("\n".join(lines[start:]).strip())
         return [p for p in pages if p.strip()]
 
-    # Fallback 3: Form feed character
     if '\f' in markdown:
         parts = markdown.split('\f')
         return [p.strip() for p in parts if p.strip()]
 
-    # Fallback 4: Un-paginated text - split evenly by paragraphs if hint provided
     if total_pages_hint and total_pages_hint > 1:
         blocks = re.split(r'\n\s*\n', markdown)
         if len(blocks) > total_pages_hint:
@@ -74,11 +66,43 @@ def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> li
     return [markdown.strip()]
 
 
-def run_ocr(file_content: bytes, file_name: str, status_callback=None):
+def run_ocr(file_input, file_name: str = "document.pdf", status_callback=None):
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
+
+    # ---------------------------------------------------------
+    # CRITICAL FIX: Force exact `bytes` type from ANY input format
+    # Handles Streamlit tuples, BytesIO, file objects, raw bytes
+    # ---------------------------------------------------------
+    if isinstance(file_input, bytes):
+        file_content = file_input
+    elif isinstance(file_input, tuple):
+        # Streamlit st.file_uploader often passes a tuple
+        file_content = file_input[1] if len(file_input) > 1 else file_input[0]
+        if hasattr(file_content, 'read'):
+            file_content = file_content.read()
+        if not isinstance(file_content, bytes):
+            raise TypeError(f"Could not extract bytes from tuple: {type(file_content)}")
+    elif isinstance(file_input, io.BytesIO):
+        file_content = file_input.getvalue()
+    elif hasattr(file_input, 'read'):
+        file_content = file_input.read()
+        if isinstance(file_content, str):
+            file_content = file_content.encode('utf-8')
+    elif isinstance(file_input, str):
+        file_content = Path(file_input).read_bytes()
+        file_name = Path(file_input).name
+    elif isinstance(file_input, Path):
+        file_content = file_input.read_bytes()
+        file_name = file_input.name
+    else:
+        raise TypeError(f"Unsupported file input type: {type(file_input)}")
+
+    # Final absolute guarantee that httpx receives pure bytes
+    if not isinstance(file_content, bytes):
+        raise TypeError(f"Failed to convert input to bytes. Got: {type(file_content)}")
 
     api_key = get_api_key("DATALAB_API_KEY")
     if not api_key:
@@ -192,28 +216,24 @@ def process_reference(file_input, status_callback=None):
         if status_callback:
             status_callback(msg)
 
+    file_name = "reference.pdf"
     if isinstance(file_input, (str, Path)):
-        file_bytes = Path(file_input).read_bytes()
-        file_name  = Path(file_input).name
-    else:
-        file_bytes = file_input.read()
-        file_name  = getattr(file_input, "name", "reference.pdf")
+        file_name = Path(file_input).name
 
-    pages = run_ocr(file_bytes, file_name, status_callback)
+    pages = run_ocr(file_input, file_name, status_callback)
     log(f"Reference OCR complete — {len(pages)} page(s)")
     return build_ocr_json(pages)
 
 
 # =========================================================
 # DETECT QUESTION PAPER PAGE
-# Pure structural pattern matching. No layout assumptions.
 # =========================================================
 
 NEGATIVE_FINGERPRINTS = re.compile(
     r'(?:'
     r'identity\s*card|id\s*card'                         
     r'|this\s+card\s+should\s+be\s+produced'              
-    r'|student\s+name|father\s+name|enrolment\s+no'       
+    r'|student\s+name|father\s+name|enrolment\s*no'       
     r'|programme\s*code|reg\.\s*no|study\s+centre'        
     r'|signature\s*of\s+the\s+student'                    
     r'|date\s*of\s*issue|valid\s*upto'                    
@@ -507,14 +527,11 @@ def process_pdf(file_input, status_callback=None):
         if status_callback:
             status_callback(msg)
 
+    file_name = "document.pdf"
     if isinstance(file_input, (str, Path)):
-        file_bytes = Path(file_input).read_bytes()
-        file_name  = Path(file_input).name
-    else:
-        file_bytes = file_input.read()
-        file_name  = getattr(file_input, "name", "document.pdf")
+        file_name = Path(file_input).name
 
-    pages = run_ocr(file_bytes, file_name, status_callback)
+    pages = run_ocr(file_input, file_name, status_callback)
 
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
