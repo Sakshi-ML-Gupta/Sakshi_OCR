@@ -22,25 +22,6 @@ def get_api_key(name):
 
 
 # =========================================================
-# PREPROCESS PDF
-# =========================================================
-
-def preprocess_pdf(file_bytes, dpi=250):
-    src_doc = fitz.open(stream=file_bytes, filetype="pdf")
-    out_doc = fitz.open()
-    for page in src_doc:
-        pix = page.get_pixmap(dpi=dpi)
-        new_page = out_doc.new_page(width=pix.width, height=pix.height)
-        new_page.insert_image(new_page.rect, pixmap=pix)
-    buf = io.BytesIO()
-    out_doc.save(buf)
-    src_doc.close()
-    out_doc.close()
-    buf.seek(0)
-    return buf.read()
-
-
-# =========================================================
 # OCR — Datalab (Chandra model) via /convert endpoint
 # =========================================================
 
@@ -49,8 +30,6 @@ DATALAB_BASE_URL = "https://www.datalab.to"
 def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> list:
     """
     Robust multi-fallback approach to split Datalab's paginated markdown.
-    Datalab separates pages with lines of dashes, sometimes containing inline
-    image markdown tags for logos. We strip images and look for pure dash lines.
     """
     # Fallback 1: Standard explicit page text
     parts = re.split(r'\n-{3,}\s*Page\s*\d+\s*-{3,}\n', markdown, flags=re.IGNORECASE)
@@ -230,7 +209,6 @@ def process_reference(file_input, status_callback=None):
 # Pure structural pattern matching. No layout assumptions.
 # =========================================================
 
-# Hard negatives: ID cards, registration forms
 NEGATIVE_FINGERPRINTS = re.compile(
     r'(?:'
     r'identity\s*card|id\s*card'                         
@@ -238,12 +216,11 @@ NEGATIVE_FINGERPRINTS = re.compile(
     r'|student\s+name|father\s+name|enrolment\s+no'       
     r'|programme\s*code|reg\.\s*no|study\s+centre'        
     r'|signature\s*of\s+the\s+student'                    
-    r'|date\s*of\s+issue|valid\s*upto'                    
+    r'|date\s*of\s*issue|valid\s*upto'                    
     r')',
     re.IGNORECASE
 )
 
-# Hard negatives: Handwritten answer pages
 ANSWER_PAGE_FINGERPRINTS = re.compile(
     r'(?:'
     r'उत्तर\s*[\-\:]|Ans\.?\s*[\-\:]|A\.\d|A\d+\s*[\-\:]' 
@@ -252,21 +229,15 @@ ANSWER_PAGE_FINGERPRINTS = re.compile(
     re.IGNORECASE
 )
 
-# Strict structural patterns exclusive to printed exam papers
 STRONG_EXAM_SIGNALS = [
-    # Math marks allocation (e.g., "10", "5X4=20", "2X10=20")
     re.compile(r'\b\d+\s*[xX×]\s*\d+\s*=\s*\d+\b'),
     re.compile(r'(?:\(|\[|\s)\d{2}\s*(?:\)|\]|\s|$)'),      
-    # Section / Part headers
     re.compile(r'\bSECTION\s*[\-–]?\s*[A-D]\b', re.IGNORECASE),
     re.compile(r'\bPART\s*[\-–]?\s*[A-D]\b', re.IGNORECASE),
     re.compile(r'\bखंड\s*[\-–]?\s*[अ-ज]\b'),               
-    # Course / Paper codes (e.g., "BCS-051", "EHI-03")
     re.compile(r'\b[A-Z]{2,4}\s*[-–]\s*\d{2,4}\b'),
-    # Time / Marks headers
     re.compile(r'(?:Time|Duration|समय)\s*[:\-]?\s*\d+\s*(?:Hours|Hrs|मिनट|घंटे)', re.IGNORECASE),
     re.compile(r'(?:Maximum\s*Marks|कुल\s*अंक)\s*[:\-]?\s*\d+', re.IGNORECASE),
-    # Grouped instructional verbs
     re.compile(r'(?:attempt|explain|define|describe|discuss|write\s+notes|compare|analyze|evaluate|illustrate)', re.IGNORECASE),
 ]
 
