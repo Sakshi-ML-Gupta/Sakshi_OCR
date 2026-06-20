@@ -48,32 +48,21 @@ DATALAB_BASE_URL = "https://www.datalab.to"
 
 def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> list:
     """
-    Datalab paginated markdown separates pages with a horizontal rule.
-    The exact formatting varies and can include image captions like ![...] 
-    inside the break. We use a robust multi-fallback approach:
-    
-    1. Look for generic "------- Page X -------" text
-    2. Look for a sequence of dashes spanning a whole line (ignoring inline images)
-    3. Fallback: split by form-feed (\f) if it exists
-    4. Last resort: If total_pages_hint is provided and no breaks found, 
-       attempt an even structural split to salvage the document.
+    Robust multi-fallback approach to split Datalab's paginated markdown.
+    Datalab separates pages with lines of dashes, sometimes containing inline
+    image markdown tags for logos. We strip images and look for pure dash lines.
     """
-    
     # Fallback 1: Standard explicit page text
     parts = re.split(r'\n-{3,}\s*Page\s*\d+\s*-{3,}\n', markdown, flags=re.IGNORECASE)
     if len(parts) > 1:
         return [p.strip() for p in parts if p.strip()]
 
-    # Fallback 2: Datalab's raw separator is often just a long line of dashes. 
-    # We isolate lines that are PRIMARILY dashes to avoid splitting on legitimate 
-    # markdown separators inside the content (like --- under a header).
+    # Fallback 2: Line-by-line scan for dash sequences ignoring embedded images
     lines = markdown.split('\n')
     split_indices = []
     
     for i, line in enumerate(lines):
-        # Remove image tags that Datalab injects for logos/icons within the break
         clean_line = re.sub(r'!\[.*?\]\(.*?\)', '', line).strip()
-        # If what's left is mostly dashes (at least 3), it's a page break
         if len(clean_line) >= 3 and clean_line.replace('-', '').strip() == '':
             split_indices.append(i)
             
@@ -83,7 +72,7 @@ def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> li
         for idx in split_indices:
             pages.append("\n".join(lines[start:idx]).strip())
             start = idx + 1
-        pages.append("\n".join(lines[start:]).strip()) # Add the last page
+        pages.append("\n".join(lines[start:]).strip())
         return [p for p in pages if p.strip()]
 
     # Fallback 3: Form feed character
@@ -91,9 +80,7 @@ def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> li
         parts = markdown.split('\f')
         return [p.strip() for p in parts if p.strip()]
 
-    # Fallback 4: Datalab returned un-paginated text despite paginate=True.
-    # If we know the expected page count, split the text as evenly as possible 
-    # by double-newlines to prevent losing the whole document.
+    # Fallback 4: Un-paginated text - split evenly by paragraphs if hint provided
     if total_pages_hint and total_pages_hint > 1:
         blocks = re.split(r'\n\s*\n', markdown)
         if len(blocks) > total_pages_hint:
@@ -105,7 +92,6 @@ def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> li
                 pages.append("\n\n".join(blocks[start:end]).strip())
             return pages
 
-    # Absolute last resort
     return [markdown.strip()]
 
 
@@ -241,20 +227,23 @@ def process_reference(file_input, status_callback=None):
 
 # =========================================================
 # DETECT QUESTION PAPER PAGE
+# Pure structural pattern matching. No layout assumptions.
 # =========================================================
 
+# Hard negatives: ID cards, registration forms
 NEGATIVE_FINGERPRINTS = re.compile(
     r'(?:'
     r'identity\s*card|id\s*card'                         
     r'|this\s+card\s+should\s+be\s+produced'              
     r'|student\s+name|father\s+name|enrolment\s+no'       
     r'|programme\s*code|reg\.\s*no|study\s+centre'        
-    r'|signature\s+of\s+the\s+student'                    
-    r'|date\s+of\s+issue|valid\s+upto'                    
+    r'|signature\s*of\s+the\s+student'                    
+    r'|date\s*of\s+issue|valid\s*upto'                    
     r')',
     re.IGNORECASE
 )
 
+# Hard negatives: Handwritten answer pages
 ANSWER_PAGE_FINGERPRINTS = re.compile(
     r'(?:'
     r'उत्तर\s*[\-\:]|Ans\.?\s*[\-\:]|A\.\d|A\d+\s*[\-\:]' 
@@ -263,15 +252,21 @@ ANSWER_PAGE_FINGERPRINTS = re.compile(
     re.IGNORECASE
 )
 
+# Strict structural patterns exclusive to printed exam papers
 STRONG_EXAM_SIGNALS = [
+    # Math marks allocation (e.g., "10", "5X4=20", "2X10=20")
     re.compile(r'\b\d+\s*[xX×]\s*\d+\s*=\s*\d+\b'),
     re.compile(r'(?:\(|\[|\s)\d{2}\s*(?:\)|\]|\s|$)'),      
+    # Section / Part headers
     re.compile(r'\bSECTION\s*[\-–]?\s*[A-D]\b', re.IGNORECASE),
     re.compile(r'\bPART\s*[\-–]?\s*[A-D]\b', re.IGNORECASE),
     re.compile(r'\bखंड\s*[\-–]?\s*[अ-ज]\b'),               
+    # Course / Paper codes (e.g., "BCS-051", "EHI-03")
     re.compile(r'\b[A-Z]{2,4}\s*[-–]\s*\d{2,4}\b'),
+    # Time / Marks headers
     re.compile(r'(?:Time|Duration|समय)\s*[:\-]?\s*\d+\s*(?:Hours|Hrs|मिनट|घंटे)', re.IGNORECASE),
     re.compile(r'(?:Maximum\s*Marks|कुल\s*अंक)\s*[:\-]?\s*\d+', re.IGNORECASE),
+    # Grouped instructional verbs
     re.compile(r'(?:attempt|explain|define|describe|discuss|write\s+notes|compare|analyze|evaluate|illustrate)', re.IGNORECASE),
 ]
 
