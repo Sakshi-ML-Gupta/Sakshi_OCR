@@ -588,6 +588,323 @@ def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> lis
 # COMPLETE PIPELINE
 # =========================================================
 
+# =========================================================
+# GROQ-BASED Q&A LINE DETECTION
+#
+# Groq's ONLY job: read numbered lines and report which line
+# numbers correspond to question starts and answer starts.
+# It NEVER outputs question text or answer text — only integers.
+# This makes it layout-agnostic (works on any PDF format) while
+# remaining hallucination-safe, because every line number it
+# returns is validated against the real document before use:
+#   - must be a real, in-range line index
+#   - must be in increasing order
+#   - the line at that index must actually look like the kind
+#     of content claimed (a question line / a non-empty line)
+# If validation fails for too many entries, or Groq is unavailable,
+# the caller falls back to the regex/similarity pipeline.
+# =========================================================
+
+def get_groq_client():
+    from groq import Groq
+    key = get_api_key("GROQ_API_KEY")
+    if not key:
+        raise Exception("GROQ_API_KEY not found")
+    return Groq(api_key=key)
+
+
+def build_numbered_line_dump(pages: list) -> list:
+    """
+    Flattens the whole document into a single list of lines,
+    each tagged with its global line number and source page number.
+    This numbering is what gets shown to Groq and is the same
+    numbering used afterward for validation and slicing.
+    """
+    line_index = []
+    for page in pages:
+        for line in page["raw_text"].split("\n"):
+            line_index.append({
+                "line_number": len(line_index),
+                "page_number": page["page_number"],
+                "text": line
+            })
+    return line_index
+
+
+def ask_groq_for_qa_lines(line_index: list, status_callback=None, chunk_size: int = 350):
+    """
+    Sends the numbered line dump to Groq in chunks (to stay under
+    token limits) and asks ONLY for line numbers — never content.
+    Returns a list of {question_id, question_start_line, answer_start_line}.
+    Raises on any API/parsing failure so the caller can fall back.
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    groq = get_groq_client()
+    total = len(line_index)
+    all_results = []
+
+    num_chunks = (total + chunk_size - 1) // chunk_size
+
+    for ci in range(num_chunks):
+        start = ci * chunk_size
+        end   = min(start + chunk_size, total)
+        chunk = line_index[start:end]
+
+        numbered_text = "\n".join(
+            f"[L{e['line_number']}] {e['text']}" for e in chunk
+        )
+
+        log(f"Groq scanning lines {start}-{end} (chunk {ci+1}/{num_chunks})...")
+
+        prompt = f"""You are scanning OCR text from a scanned exam answer booklet.
+The document may be in ANY language (Hindi, English, mixed) and the
+layout varies between documents — do not assume a fixed structure.
+
+Each line below is tagged with its line number like [L42].
+
+Find every QUESTION and the START of its ANSWER in this chunk.
+A question is a numbered/lettered exam prompt the student must answer
+(e.g. "1.", "Q.1", "क)", "(a)", "9.", roman numerals, etc — in any
+language). The answer is the student's handwritten response that
+follows, often after a marker like "Ans-", "उत्तर-", "A.1-", or with
+no marker at all (answer just starts on the next line).
+
+Return ONLY this JSON, nothing else:
+{{
+  "items": [
+    {{
+      "question_id": "<a short label for this question, e.g. Q1, Q9-a>",
+      "question_start_line": <integer line number where the question starts>,
+      "answer_start_line": <integer line number where the answer starts, or null if not found in this chunk>
+    }}
+  ]
+}}
+
+If no questions are found in this chunk, return {{"items": []}}.
+Do NOT include question text or answer text in your response — line numbers only.
+
+NUMBERED LINES:
+{numbered_text}"""
+
+        resp = groq.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You identify line numbers only. Never output document content. Return valid JSON only."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+            max_tokens=1500,
+            response_format={"type": "json_object"}
+        )
+
+        raw = resp.choices[0].message.content.strip()
+        data = json.loads(raw)
+        items = data.get("items", [])
+        log(f"  Chunk {ci+1}: Groq reported {len(items)} item(s)")
+        all_results.extend(items)
+
+    return all_results
+
+
+def validate_and_clean_groq_items(raw_items: list, line_index: list, status_callback=None) -> list:
+    """
+    Validates every Groq-reported item against the real document.
+    Drops anything that:
+    - has an out-of-range line number
+    - has a question_start_line >= answer_start_line (nonsensical)
+    - points to an empty/too-short line for the question start
+    - duplicates a question_start_line already accepted
+    Also enforces overall increasing order of question_start_line,
+    dropping any item that goes backwards (same safeguard as the
+    regex pipeline's order enforcement).
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    total_lines = len(line_index)
+    cleaned = []
+    seen_start_lines = set()
+
+    # Sort by question_start_line first so order-enforcement is meaningful
+    raw_items_sorted = sorted(
+        [it for it in raw_items if isinstance(it.get("question_start_line"), int)],
+        key=lambda it: it["question_start_line"]
+    )
+
+    last_start = -1
+    for it in raw_items_sorted:
+        qsl = it.get("question_start_line")
+        asl = it.get("answer_start_line")
+
+        if qsl is None or not (0 <= qsl < total_lines):
+            continue
+        if qsl in seen_start_lines:
+            continue
+        if qsl <= last_start:
+            continue   # out of order — likely hallucinated, skip
+
+        q_line_text = line_index[qsl]["text"].strip()
+        if len(q_line_text) < 2:
+            continue   # points to a blank/near-empty line — not a real question
+
+        # Validate answer_start_line if provided
+        if asl is not None:
+            if not isinstance(asl, int) or not (0 <= asl < total_lines) or asl <= qsl:
+                asl = None   # invalid — will be treated as "not found", filled in later
+
+        cleaned.append({
+            "question_id":        it.get("question_id", f"Q{len(cleaned)+1}"),
+            "question_start_line": qsl,
+            "answer_start_line":   asl
+        })
+        seen_start_lines.add(qsl)
+        last_start = qsl
+
+    log(f"Validation: {len(cleaned)} of {len(raw_items)} Groq items passed checks")
+    return cleaned
+
+
+def slice_qa_from_line_items(line_index: list, items: list) -> list:
+    """
+    Pure text slicing — zero LLM. Given validated {question_start_line,
+    answer_start_line} pairs, slices the question and answer directly
+    from the raw OCR line index. If answer_start_line is missing for
+    an item, defaults to question_start_line + 1 (next line).
+    """
+    qa_pairs = []
+
+    for i, item in enumerate(items):
+        q_start = item["question_start_line"]
+        a_start = item["answer_start_line"]
+        if a_start is None:
+            a_start = q_start + 1
+
+        a_end = items[i + 1]["question_start_line"] if i + 1 < len(items) else len(line_index)
+
+        q_lines = [
+            line_index[j]["text"] for j in range(q_start, min(a_start, len(line_index)))
+            if line_index[j]["text"].strip()
+        ]
+        a_lines = [
+            line_index[j]["text"] for j in range(a_start, max(a_end, a_start))
+            if line_index[j]["text"].strip() and not is_noise(line_index[j]["text"])
+        ]
+
+        qa_pairs.append({
+            "question": " ".join(q_lines).strip(),
+            "answer":   " ".join(a_lines).strip()
+        })
+
+    return qa_pairs
+
+
+def try_groq_pipeline(pages: list, status_callback=None):
+    """
+    Attempts the Groq line-identification pipeline end to end.
+    Returns qa_pairs on success, or None if anything fails/looks
+    unreliable — signalling the caller to fall back to regex.
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    try:
+        line_index = build_numbered_line_dump(pages)
+        log(f"Built line index: {len(line_index)} total lines")
+
+        raw_items = ask_groq_for_qa_lines(line_index, status_callback)
+        if not raw_items:
+            log("Groq returned no items — falling back")
+            return None
+
+        cleaned = validate_and_clean_groq_items(raw_items, line_index, status_callback)
+        if len(cleaned) < 2:
+            log("Too few validated items from Groq — falling back")
+            return None
+
+        qa_pairs = slice_qa_from_line_items(line_index, cleaned)
+        non_empty = [p for p in qa_pairs if p["answer"].strip()]
+        if len(non_empty) < len(qa_pairs) * 0.5:
+            log("More than half the answers came out empty — falling back")
+            return None
+
+        log(f"Groq pipeline succeeded — {len(qa_pairs)} Q-A pairs")
+        return qa_pairs
+
+    except Exception as e:
+        log(f"Groq pipeline failed ({e}) — falling back to regex pipeline")
+        return None
+
+
+def run_regex_pipeline(pages: list, status_callback=None):
+    """
+    The original regex/similarity-based pipeline, used as a fallback
+    when the Groq pipeline is unavailable or produces unreliable results.
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    qp_page_indices = find_question_paper_pages(pages)
+    log(f"[fallback] Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
+
+    if not qp_page_indices:
+        raise Exception(
+            "Could not detect any question paper pages in this document, "
+            "and the Groq-based detection also failed.\n"
+            f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
+        )
+
+    official_questions = extract_official_questions_multi_page(pages, qp_page_indices)
+    log(f"[fallback] Official questions extracted: {len(official_questions)}")
+
+    if not official_questions:
+        raise Exception(
+            "Question paper pages were found, but no questions could be parsed from them.\n"
+            f"Detected pages: {[p+1 for p in qp_page_indices]}"
+        )
+
+    answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
+    answer_pages = [pages[i] for i in answer_page_indices]
+    log(f"[fallback] Answer pages: {[i+1 for i in answer_page_indices]}")
+
+    answer_lines = []
+    for page in answer_pages:
+        for line in page["raw_text"].split("\n"):
+            if not is_noise(line):
+                answer_lines.append(line)
+
+    log(f"[fallback] Flattened {len(answer_lines)} answer lines")
+
+    boundaries = find_question_boundaries_by_similarity(answer_lines, official_questions)
+    log(f"[fallback] Matched {len(boundaries)} of {len(official_questions)} questions")
+
+    matched_qs = {b["question"] for b in boundaries}
+    for q in official_questions:
+        if q not in matched_qs:
+            log(f"[fallback] WARNING: No match found for: {q[:60]}")
+
+    if not boundaries:
+        raise Exception(
+            "Could not match any questions in answer pages (fallback also failed).\n"
+            f"Official questions: {official_questions}"
+        )
+
+    qa_pairs = slice_raw_answers_by_boundaries(answer_lines, boundaries)
+    return qa_pairs
+
+
 def process_pdf(file_input, status_callback=None):
     def log(msg):
         print(msg)
@@ -602,9 +919,6 @@ def process_pdf(file_input, status_callback=None):
         file_name  = getattr(file_input, "name", "document.pdf")
 
     # Step 1: OCR — send the original PDF directly.
-    # Datalab/Chandra handles native PDFs natively; rasterizing to
-    # images first (as Mistral required) only inflates file size and
-    # can trigger 413 Payload Too Large on upload.
     pages = run_ocr(file_bytes, file_name, status_callback)
 
     # Step 2: Build OCR JSON
@@ -612,64 +926,16 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    # Step 4: Scan ALL pages for question-paper-like pages
-    # (handles question papers split across multiple pages/sections,
-    #  rather than assuming a single page holds everything)
-    qp_page_indices = find_question_paper_pages(pages)
-    log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
+    # Step 3: Try Groq-based line identification first — layout-agnostic,
+    # works regardless of where the question paper appears in the PDF.
+    # Groq only ever returns line numbers; all text is sliced by Python
+    # from the raw OCR afterward, so answer content is never LLM-touched.
+    log("Attempting Groq-based question/answer line detection...")
+    qa_pairs = try_groq_pipeline(pages, status_callback)
 
-    if not qp_page_indices:
-        raise Exception(
-            "Could not detect any question paper pages in this document.\n"
-            "This usually means the document has a different layout than expected — "
-            "no page was found with multiple numbered question lines.\n"
-            f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
-        )
-
-    official_questions = extract_official_questions_multi_page(pages, qp_page_indices)
-    log(f"Official questions extracted: {len(official_questions)}")
-
-    if not official_questions:
-        raise Exception(
-            "Question paper pages were found, but no questions could be parsed from them.\n"
-            f"Detected pages: {[p+1 for p in qp_page_indices]}"
-        )
-
-    # Step 5: Answer pages = every page NOT identified as a question paper page
-    answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
-    answer_pages = [pages[i] for i in answer_page_indices]
-
-    log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
-
-    # Step 6: Flatten answer page lines
-    answer_lines = []
-    for page in answer_pages:
-        for line in page["raw_text"].split("\n"):
-            if not is_noise(line):
-                answer_lines.append(line)
-
-    log(f"Flattened {len(answer_lines)} answer lines")
-
-    # Step 7: Similarity-based matching — works for any language/format
-    log("Matching questions via similarity (works for Hindi/English/any format)...")
-    boundaries = find_question_boundaries_by_similarity(answer_lines, official_questions)
-    log(f"Matched {len(boundaries)} of {len(official_questions)} questions")
-
-    matched_qs = {b["question"] for b in boundaries}
-    for q in official_questions:
-        if q not in matched_qs:
-            log(f"WARNING: No match found for: {q[:60]}")
-
-    if not boundaries:
-        raise Exception(
-            "Could not match any questions in answer pages.\n"
-            f"Official questions: {official_questions}\n"
-            f"First 10 answer lines: {answer_lines[:10]}"
-        )
-
-    # Step 8: Slice raw answers — zero LLM, pure text slicing
-    log("Slicing raw answers...")
-    qa_pairs = slice_raw_answers_by_boundaries(answer_lines, boundaries)
+    if qa_pairs is None:
+        log("Falling back to regex/similarity pipeline...")
+        qa_pairs = run_regex_pipeline(pages, status_callback)
 
     log(f"Done — {len(qa_pairs)} Q-A pairs")
     return ocr_json, qa_pairs
