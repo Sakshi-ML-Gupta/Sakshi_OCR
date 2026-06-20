@@ -23,36 +23,11 @@ def get_api_key(name):
 
 # =========================================================
 # INPUT NORMALIZATION
-#
-# FIX: "expected str, bytes or os.PathLike object, not tuple"
-# is raised by Python's own os.fspath()/open() when given a tuple
-# instead of a path. The most common real-world cause is calling
-# code that does something like:
-#
-#     process_pdf(open(uploaded_file))
-#     for f in zip(names, files): process_pdf(f)   # f is a tuple!
-#
-# i.e. the tuple is built BEFORE this module ever sees it, or a
-# tuple slips into a spot expecting a bare filename/path string.
-# This module can't fix bugs in the caller, but it CAN make sure
-# every file_name / file_input value it touches is fully normalized
-# to a plain str/bytes the moment it enters this module, so a stray
-# tuple anywhere downstream (Path(...), open(...), httpx files=...)
-# can never reach a raw os.fspath()-style call unguarded.
+# Accepts str/Path, bytes, file-like objects, or (filename, bytes)
+# / (filename, bytes, content_type) tuples without crashing.
 # =========================================================
 
 def _normalize_file_input(file_input, default_name="document.pdf"):
-    """
-    Returns (file_bytes, file_name) -- file_bytes is always `bytes`,
-    file_name is always a plain `str`. Regardless of whether
-    file_input is:
-    - a str or Path to a file on disk
-    - a file-like object with .read() (e.g. Streamlit UploadedFile, open file)
-    - a (filename, bytes) tuple
-    - a (filename, bytes, content_type) tuple
-    - raw bytes
-    """
-    # Tuple input: (filename, bytes) or (filename, bytes, content_type)
     if isinstance(file_input, tuple):
         if len(file_input) < 2:
             raise ValueError(
@@ -65,16 +40,13 @@ def _normalize_file_input(file_input, default_name="document.pdf"):
             )
         return bytes(data), _coerce_name(name, default_name)
 
-    # Raw bytes
     if isinstance(file_input, (bytes, bytearray)):
         return bytes(file_input), default_name
 
-    # str or Path on disk
     if isinstance(file_input, (str, Path)):
         p = Path(file_input)
         return p.read_bytes(), p.name
 
-    # File-like object (Streamlit UploadedFile, open(file, "rb"), io.BytesIO, etc.)
     if hasattr(file_input, "read"):
         data = file_input.read()
         if not isinstance(data, (bytes, bytearray)):
@@ -88,28 +60,12 @@ def _normalize_file_input(file_input, default_name="document.pdf"):
     raise TypeError(
         f"Unsupported file_input type: {type(file_input).__name__}. "
         f"Expected str, Path, bytes, a file-like object with .read(), "
-        f"or a (filename, bytes) tuple. If you're seeing "
-        f"\"expected str, bytes or os.PathLike object, not tuple\", "
-        f"check the code that CALLS process_pdf()/process_reference() -- "
-        f"a tuple is being passed somewhere a plain path/filename or "
-        f"file object was expected (e.g. open(some_tuple) or "
-        f"process_pdf(open(uploaded_file)) instead of "
-        f"process_pdf(uploaded_file))."
+        f"or a (filename, bytes) tuple."
     )
 
 
 def _coerce_name(name, default_name="document.pdf"):
-    """
-    Guarantees a plain, safe basename string. Defends against:
-    - name being a Path object           -> str(Path) then basename
-    - name being a tuple/list (malformed upstream data) -> default_name
-    - name being None / empty            -> default_name
-    """
     if isinstance(name, (tuple, list)):
-        # A tuple/list ended up where a filename was expected -- this is
-        # exactly the shape that causes the os.fspath() tuple TypeError
-        # if it were ever passed to open()/Path() downstream. Never let
-        # it propagate; fall back to a safe default instead.
         return default_name
     if not name:
         return default_name
@@ -140,39 +96,43 @@ def preprocess_pdf(file_bytes, dpi=250):
 
 # =========================================================
 # OCR -- Datalab (Chandra model) via /convert endpoint
-#
-# Datalab's /convert is async: submit -> poll request_check_url
-# until status == "complete". paginate=True returns markdown with
-# page-break markers so we can split back into per-page text,
-# matching the page-based structure the rest of the pipeline needs.
 # =========================================================
 
 DATALAB_BASE_URL = "https://www.datalab.to"
 
-# Datalab's actual paginated output uses a marker of the form
-#   {N}------------------------------------------------
-# i.e. the (0-based) page number in curly braces, immediately
-# followed by a run of 3+ dashes.
-PAGE_BREAK_RE = re.compile(
-    r'\n?\{(\d+)\}-{3,}\n?'
-)
+# FIX (round 3): a single page-break regex is too brittle -- different
+# documents have produced different marker shapes in practice (this is
+# why some real uploads above collapsed to "1 page" even though they
+# were clearly multi-page assignments). We now try several known marker
+# shapes and prefer whichever split result matches Datalab's own
+# page_count, if provided. We also log enough diagnostic info that if
+# a brand new marker shape appears, it's immediately visible in the
+# logs instead of silently collapsing to 1 page again.
+PAGE_BREAK_PATTERNS = [
+    re.compile(r'\n?\{(\d+)\}-{3,}\n?'),                            # {0}------------------
+    re.compile(r'\n?-{2,}\{(\d+)\}-{2,}\n?'),                       # ---{0}---
+    re.compile(r'\n-{3,}\s*Page\s*\d+\s*-{3,}\n', re.IGNORECASE),   # ----- Page 1 -----
+    re.compile(r'\n\s*\[PAGE\s*(\d+)\]\s*\n', re.IGNORECASE),       # [PAGE 1]
+    re.compile(r'\n\s*<!--\s*page\s*(\d+)\s*-->\s*\n', re.IGNORECASE),  # <!-- page 1 -->
+]
 
 
-def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> list:
+def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=print) -> list:
     """
-    Datalab paginated markdown separates pages with a marker like:
-        {0}------------------------------------------------
-        page 1 content
-        {1}------------------------------------------------
-        page 2 content
-    We split on PAGE_BREAK_RE (the real marker format). If that finds
-    no matches (e.g. a future Datalab version changes the format),
-    fall back to the old "----- Page N -----" style, and finally to
-    returning the whole text as a single page so the caller still
-    gets something usable instead of crashing.
+    Tries every known Datalab page-break marker shape. If multiple
+    patterns produce a valid split, prefers the one whose page count
+    matches Datalab's own page_count_hint (when available); otherwise
+    takes whichever pattern produced the most pages (more pages found
+    is generally more correct than fewer, since failing to split at
+    all is the known failure mode).
     """
-    matches = list(PAGE_BREAK_RE.finditer(markdown))
-    if matches:
+    best_parts = None
+
+    for pattern in PAGE_BREAK_PATTERNS:
+        matches = list(pattern.finditer(markdown))
+        if not matches:
+            continue
+
         parts = []
         start = 0
         for m in matches:
@@ -180,16 +140,33 @@ def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> li
             start = m.end()
         parts.append(markdown[start:].strip())
         parts = [p for p in parts if p]
-        if parts:
+
+        if len(parts) <= 1:
+            continue
+
+        if page_count_hint and len(parts) == page_count_hint:
             return parts
 
-    # Fallback 1: legacy "----- Page N -----" style
-    generic_break = re.compile(r'\n-{3,}\s*Page\s*\d+\s*-{3,}\n', re.IGNORECASE)
-    parts = generic_break.split(markdown)
-    if len(parts) > 1:
-        return [p.strip() for p in parts]
+        if best_parts is None or len(parts) > len(best_parts):
+            best_parts = parts
 
-    # Fallback 2: no recognizable page markers at all -- single block
+    if best_parts:
+        return best_parts
+
+    # Form-feed fallback
+    if '\f' in markdown:
+        parts = [p.strip() for p in markdown.split('\f') if p.strip()]
+        if len(parts) > 1:
+            return parts
+
+    # Nothing worked -- log diagnostics so the NEXT failure is fixable
+    # in one look instead of needing another round of guessing.
+    log(
+        f"WARNING: No page-break marker recognized in Datalab output "
+        f"(length={len(markdown)} chars, page_count_hint={page_count_hint}). "
+        f"Treating entire document as a single page. "
+        f"First 200 chars: {markdown[:200]!r}"
+    )
     return [markdown.strip()]
 
 
@@ -199,11 +176,6 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         if status_callback:
             status_callback(msg)
 
-    # Defensive re-guard: even though callers should already pass a
-    # clean str, this is the exact boundary where file_name flows into
-    # httpx's files={...} tuple below. If anything upstream ever slips
-    # a non-str through, coerce it here rather than let httpx/urllib
-    # hit a raw tuple deep inside multipart encoding.
     file_name = _coerce_name(file_name, default_name="document.pdf")
 
     if not isinstance(file_content, (bytes, bytearray)):
@@ -215,10 +187,8 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
     if not api_key:
         raise Exception("DATALAB_API_KEY not found in secrets or environment")
 
-    # Guard against oversized uploads -- fail with a clear message
-    # instead of a cryptic Cloudflare 413 HTML page.
     size_mb = len(file_content) / (1024 * 1024)
-    MAX_MB  = 45   # conservative margin under typical Cloudflare limits
+    MAX_MB  = 45
     if size_mb > MAX_MB:
         raise Exception(
             f"File is {size_mb:.1f}MB, which exceeds the {MAX_MB}MB upload limit. "
@@ -235,8 +205,8 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         files={"file": (file_name, file_content, "application/pdf")},
         data={
             "output_format": "markdown",
-            "mode": "accurate",     # highest accuracy -- best for handwriting
-            "paginate": "true"      # keep page boundaries in the output
+            "mode": "accurate",
+            "paginate": "true"
         },
         timeout=120
     )
@@ -252,8 +222,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
     check_url = data["request_check_url"]
     log("Document submitted -- polling for OCR result...")
 
-    # -- Poll until complete --------------------------------
-    max_polls = 150          # ~150 * 2s = 5 minutes max wait
+    max_polls = 150
     poll_interval = 2
 
     result = None
@@ -289,7 +258,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         raise Exception("Datalab returned empty markdown output")
 
     page_count_hint = result.get("page_count")
-    page_texts = _split_paginated_markdown(markdown, page_count_hint)
+    page_texts = _split_paginated_markdown(markdown, page_count_hint, log=log)
 
     pages = []
     for idx, text in enumerate(page_texts):
@@ -299,6 +268,17 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         })
 
     log(f"OCR done -- {len(pages)} page(s) extracted")
+
+    # Extra diagnostic: if we collapsed to 1 page on a sizeable file,
+    # warn loudly so it's obvious in logs that the split failed rather
+    # than the document genuinely being one page.
+    if len(pages) == 1 and size_mb > 1.0:
+        log(
+            f"WARNING: Only 1 page extracted from a {size_mb:.1f}MB file. "
+            f"This usually means the page-break marker format was not "
+            f"recognized. Markdown length: {len(markdown)} chars."
+        )
+
     return pages
 
 
@@ -317,8 +297,7 @@ def build_ocr_json(pages: list) -> dict:
 
 
 # =========================================================
-# REFERENCE BOOK OCR -- Datalab handles full multi-page PDFs
-# natively, so no manual page-splitting is needed here.
+# REFERENCE BOOK OCR
 # =========================================================
 
 def process_reference(file_input, status_callback=None):
@@ -336,16 +315,10 @@ def process_reference(file_input, status_callback=None):
 
 # =========================================================
 # DETECT QUESTION PAPER PAGE
-# The page that contains the printed list of questions
-# Identified by having numbered questions >= 5 items
 # =========================================================
 
 def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
-    """
-    Returns list of page indices (0-based) that look like GENUINE exam
-    question paper pages.
-    """
-    Q_LINE_NUM   = re.compile(r'^\s*\d+[\.\)]\s+.{15,}')
+    Q_LINE_NUM   = re.compile(r'^\s*[0-9]+[\.\)]\s+.{15,}')
     Q_LINE_LATIN = re.compile(r'^\s*[a-d]\)\s+.{5,}', re.IGNORECASE)
     Q_LINE_DEVA  = re.compile(r'^\s*[क-घ]\)\s+.{5,}')
 
@@ -421,14 +394,57 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
 
 
 # =========================================================
+# FIX (round 3): instruction-line filter
+#
+# Numbered lines that tell the student HOW to answer (word counts,
+# "answer the following questions", marks distribution instructions)
+# were being extracted as if they were real question content. They
+# can never be matched against an answer because students don't
+# restate instructions -- they restate the actual question. This
+# filter removes them from the official question list before matching
+# is ever attempted, so they stop showing up as permanent false
+# "no match found" warnings and stop occupying a "question slot" that
+# a real question should have filled.
+# =========================================================
+
+INSTRUCTION_LINE_RE = re.compile(
+    r'(?:answer\s+(?:the\s+)?(?:following|all)\s+questions'
+    r'|in\s+about\s+\d+\s+words'
+    r'|each\s+question\s+carries'
+    r'|attempt\s+any'
+    r'|all\s+questions\s+are\s+compulsory'
+    r'|सभी\s*प्रश्न\s*अनिवार्य'
+    r'|किसी\s*भी.*?उत्तर\s*दें'
+    r'|शब्दों\s*में\s*उत्तर)',
+    re.IGNORECASE
+)
+
+
+def is_instruction_line(text: str) -> bool:
+    """True if text is a meta-instruction about HOW to answer, not an
+    actual question to be answered."""
+    return bool(INSTRUCTION_LINE_RE.search(text))
+
+
+# =========================================================
 # EXTRACT OFFICIAL QUESTIONS -- scans across MULTIPLE pages
+#
+# FIX (round 3): Q_START is now restricted to ASCII digits [0-9]
+# only. Devanagari numerals (१,२,३...) were previously being matched
+# by \d (Unicode-aware by default), which caused numbered sub-headings
+# inside topic lists / long answers (e.g. "१. द्वंद्व समास") to be
+# extracted as if they were standalone exam questions. Real question
+# papers in this pipeline's domain (IGNOU-style assignments) number
+# questions with Western numerals even in Hindi-medium papers, so this
+# restriction removes a major source of phantom "questions" that could
+# never be matched to a real student answer.
 # =========================================================
 
 def extract_official_questions_multi_page(pages: list, qp_page_indices: list) -> list:
     all_questions = []
     pending_parent = None
 
-    Q_START   = re.compile(r'^\s*(\d+)[\.\)]\s+(.+)')
+    Q_START   = re.compile(r'^\s*([0-9]+)[\.\)]\s+(.+)')
     SUB_LATIN = re.compile(r'^\s*\(?([a-d])\)\s*(.+)', re.IGNORECASE)
     SUB_DEVA  = re.compile(r'^\s*\(?([क-घ])\)\s*(.+)')
     SKIP      = re.compile(r'^#+\s|^भाग|^PART|^\s*$')
@@ -476,11 +492,15 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
             all_questions.append({"text": current.strip(), "parent": None})
 
     final_questions = []
-    SUBPART_RE = re.compile(r'(?:^|\s)\(?([a-zक-घ])\)\s', re.UNICODE)
+    SUBPART_RE = re.compile(r'(?:^|\s)\(?([a-z])\)\s', re.UNICODE)
+    SUBPART_DEVA_RE = re.compile(r'(?:^|\s)\(?([क-घ])\)\s', re.UNICODE)
 
     for q in all_questions:
         text = q["text"]
-        matches = list(SUBPART_RE.finditer(text))
+        matches = sorted(
+            list(SUBPART_RE.finditer(text)) + list(SUBPART_DEVA_RE.finditer(text)),
+            key=lambda m: m.start()
+        )
 
         if len(matches) >= 2:
             preamble = text[:matches[0].start()].strip()
@@ -492,6 +512,10 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
                 final_questions.append(full_q)
         else:
             final_questions.append(text)
+
+    # FIX: drop instruction lines before dedup/return -- they are never
+    # real questions and can never be matched to a student answer.
+    final_questions = [q for q in final_questions if not is_instruction_line(q)]
 
     seen = set()
     unique = []
@@ -544,7 +568,6 @@ def similarity(a: str, b: str) -> float:
 
 
 def strip_leading_label(text: str) -> str:
-    """Strip leading numbering like '1.', 'Q1.', 'प्र.2', '20.', 'a)', '(a)', 'क)', '(क)' etc."""
     text = text.strip()
     text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text, flags=re.IGNORECASE)
     text = re.sub(r'^(?:उत्तर)\s*[\-\:\s]*', '', text)
@@ -660,8 +683,9 @@ def process_pdf(file_input, status_callback=None):
     if not qp_page_indices:
         raise Exception(
             "Could not detect any question paper pages in this document.\n"
-            "This usually means the document has a different layout than expected -- "
-            "no page was found with multiple numbered question lines.\n"
+            "This usually means the document has a different layout than expected, "
+            "OR the OCR output collapsed to fewer pages than expected (check the "
+            "logs above for a 'WARNING: No page-break marker recognized' message).\n"
             f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
         )
 
