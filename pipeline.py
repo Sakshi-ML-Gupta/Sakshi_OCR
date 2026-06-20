@@ -22,6 +22,73 @@ def get_api_key(name):
 
 
 # =========================================================
+# INPUT NORMALIZATION
+#
+# FIX: "expected str, bytes or os.PathLike object, not tuple"
+# happened because process_pdf()/process_reference() assumed
+# file_input was always either a str/Path OR a file-like object
+# with .read(). In practice it can also arrive as:
+#   - a (filename, bytes) tuple
+#   - a (filename, bytes, content_type) tuple  (e.g. from
+#     Streamlit's file_uploader when multiple values are unpacked,
+#     or from code that passes requests/httpx-style file tuples)
+# Path(file_input) or file_input.read() then blows up with this
+# exact TypeError. This helper accepts ALL of those shapes safely.
+# =========================================================
+
+def _normalize_file_input(file_input, default_name="document.pdf"):
+    """
+    Returns (file_bytes, file_name) regardless of whether file_input is:
+    - a str or Path to a file on disk
+    - a file-like object with .read() (e.g. Streamlit UploadedFile, open file)
+    - a (filename, bytes) tuple
+    - a (filename, bytes, content_type) tuple
+    - raw bytes
+    """
+    # Tuple input: (filename, bytes) or (filename, bytes, content_type)
+    if isinstance(file_input, tuple):
+        if len(file_input) < 2:
+            raise ValueError(
+                f"Tuple file_input must have at least (filename, bytes), got {len(file_input)} items"
+            )
+        name, data = file_input[0], file_input[1]
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError(
+                f"Expected bytes as second tuple element, got {type(data).__name__}"
+            )
+        return bytes(data), str(name) if name else default_name
+
+    # Raw bytes
+    if isinstance(file_input, (bytes, bytearray)):
+        return bytes(file_input), default_name
+
+    # str or Path on disk
+    if isinstance(file_input, (str, Path)):
+        p = Path(file_input)
+        return p.read_bytes(), p.name
+
+    # File-like object (Streamlit UploadedFile, open(file, "rb"), io.BytesIO, etc.)
+    if hasattr(file_input, "read"):
+        data = file_input.read()
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError(
+                f"file_input.read() returned {type(data).__name__}, expected bytes. "
+                f"Open the file in binary mode ('rb')."
+            )
+        name = getattr(file_input, "name", default_name)
+        # Streamlit/Werkzeug uploads sometimes give a full path as .name —
+        # keep just the basename for cleanliness.
+        name = Path(name).name if name else default_name
+        return bytes(data), name
+
+    raise TypeError(
+        f"Unsupported file_input type: {type(file_input).__name__}. "
+        f"Expected str, Path, bytes, a file-like object with .read(), "
+        f"or a (filename, bytes) tuple."
+    )
+
+
+# =========================================================
 # PREPROCESS PDF
 # =========================================================
 
@@ -223,12 +290,7 @@ def process_reference(file_input, status_callback=None):
         if status_callback:
             status_callback(msg)
 
-    if isinstance(file_input, (str, Path)):
-        file_bytes = Path(file_input).read_bytes()
-        file_name  = Path(file_input).name
-    else:
-        file_bytes = file_input.read()
-        file_name  = getattr(file_input, "name", "reference.pdf")
+    file_bytes, file_name = _normalize_file_input(file_input, default_name="reference.pdf")
 
     pages = run_ocr(file_bytes, file_name, status_callback)
     log(f"Reference OCR complete — {len(pages)} page(s)")
@@ -615,12 +677,7 @@ def process_pdf(file_input, status_callback=None):
         if status_callback:
             status_callback(msg)
 
-    if isinstance(file_input, (str, Path)):
-        file_bytes = Path(file_input).read_bytes()
-        file_name  = Path(file_input).name
-    else:
-        file_bytes = file_input.read()
-        file_name  = getattr(file_input, "name", "document.pdf")
+    file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
 
     # Step 1: OCR — send the original PDF directly.
     # Datalab/Chandra handles native PDFs natively; rasterizing to
