@@ -22,60 +22,6 @@ def get_api_key(name):
 
 
 # =========================================================
-# INPUT NORMALIZATION
-# Accepts str/Path, bytes, file-like objects, or (filename, bytes)
-# / (filename, bytes, content_type) tuples without crashing.
-# =========================================================
-
-def _normalize_file_input(file_input, default_name="document.pdf"):
-    if isinstance(file_input, tuple):
-        if len(file_input) < 2:
-            raise ValueError(
-                f"Tuple file_input must have at least (filename, bytes), got {len(file_input)} items"
-            )
-        name, data = file_input[0], file_input[1]
-        if not isinstance(data, (bytes, bytearray)):
-            raise TypeError(
-                f"Expected bytes as second tuple element, got {type(data).__name__}"
-            )
-        return bytes(data), _coerce_name(name, default_name)
-
-    if isinstance(file_input, (bytes, bytearray)):
-        return bytes(file_input), default_name
-
-    if isinstance(file_input, (str, Path)):
-        p = Path(file_input)
-        return p.read_bytes(), p.name
-
-    if hasattr(file_input, "read"):
-        data = file_input.read()
-        if not isinstance(data, (bytes, bytearray)):
-            raise TypeError(
-                f"file_input.read() returned {type(data).__name__}, expected bytes. "
-                f"Open the file in binary mode ('rb')."
-            )
-        name = getattr(file_input, "name", default_name)
-        return bytes(data), _coerce_name(name, default_name)
-
-    raise TypeError(
-        f"Unsupported file_input type: {type(file_input).__name__}. "
-        f"Expected str, Path, bytes, a file-like object with .read(), "
-        f"or a (filename, bytes) tuple."
-    )
-
-
-def _coerce_name(name, default_name="document.pdf"):
-    if isinstance(name, (tuple, list)):
-        return default_name
-    if not name:
-        return default_name
-    try:
-        return Path(str(name)).name or default_name
-    except Exception:
-        return default_name
-
-
-# =========================================================
 # PREPROCESS PDF
 # =========================================================
 
@@ -95,78 +41,42 @@ def preprocess_pdf(file_bytes, dpi=250):
 
 
 # =========================================================
-# OCR -- Datalab (Chandra model) via /convert endpoint
+# OCR — Datalab (Chandra model) via /convert endpoint
+#
+# Datalab's /convert is async: submit -> poll request_check_url
+# until status == "complete". paginate=True returns markdown with
+# page-break markers so we can split back into per-page text,
+# matching the page-based structure the rest of the pipeline needs.
 # =========================================================
 
 DATALAB_BASE_URL = "https://www.datalab.to"
 
-# FIX (round 3): a single page-break regex is too brittle -- different
-# documents have produced different marker shapes in practice (this is
-# why some real uploads above collapsed to "1 page" even though they
-# were clearly multi-page assignments). We now try several known marker
-# shapes and prefer whichever split result matches Datalab's own
-# page_count, if provided. We also log enough diagnostic info that if
-# a brand new marker shape appears, it's immediately visible in the
-# logs instead of silently collapsing to 1 page again.
-PAGE_BREAK_PATTERNS = [
-    re.compile(r'\n?\{(\d+)\}-{3,}\n?'),                            # {0}------------------
-    re.compile(r'\n?-{2,}\{(\d+)\}-{2,}\n?'),                       # ---{0}---
-    re.compile(r'\n-{3,}\s*Page\s*\d+\s*-{3,}\n', re.IGNORECASE),   # ----- Page 1 -----
-    re.compile(r'\n\s*\[PAGE\s*(\d+)\]\s*\n', re.IGNORECASE),       # [PAGE 1]
-    re.compile(r'\n\s*<!--\s*page\s*(\d+)\s*-->\s*\n', re.IGNORECASE),  # <!-- page 1 -->
-]
+# Marker for page breaks when paginate=True
+# Datalab inserts a horizontal rule with the page number between pages.
+PAGE_BREAK_RE = re.compile(
+    r'\n?-{3,}\s*\n+\s*\{(\d+)\}-{3,}\s*\n?|\n?\{(\d+)\}-{3,}\s*\n?',
+)
 
 
-def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=print) -> list:
+def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> list:
     """
-    Tries every known Datalab page-break marker shape. If multiple
-    patterns produce a valid split, prefers the one whose page count
-    matches Datalab's own page_count_hint (when available); otherwise
-    takes whichever pattern produced the most pages (more pages found
-    is generally more correct than fewer, since failing to split at
-    all is the known failure mode).
+    Datalab paginated markdown separates pages with a horizontal rule
+    containing the page number, e.g.:
+        page 1 content
+        ------- Page 1 -------
+        page 2 content
+    Exact format can vary slightly by version, so we fall back to a
+    generic split on form-feed / page-marker patterns, and if no
+    markers are found at all, return the whole text as one page.
     """
-    best_parts = None
+    # Try splitting on common Datalab page break patterns
+    generic_break = re.compile(r'\n-{3,}\s*Page\s*\d+\s*-{3,}\n', re.IGNORECASE)
 
-    for pattern in PAGE_BREAK_PATTERNS:
-        matches = list(pattern.finditer(markdown))
-        if not matches:
-            continue
+    parts = generic_break.split(markdown)
+    if len(parts) > 1:
+        return [p.strip() for p in parts]
 
-        parts = []
-        start = 0
-        for m in matches:
-            parts.append(markdown[start:m.start()].strip())
-            start = m.end()
-        parts.append(markdown[start:].strip())
-        parts = [p for p in parts if p]
-
-        if len(parts) <= 1:
-            continue
-
-        if page_count_hint and len(parts) == page_count_hint:
-            return parts
-
-        if best_parts is None or len(parts) > len(best_parts):
-            best_parts = parts
-
-    if best_parts:
-        return best_parts
-
-    # Form-feed fallback
-    if '\f' in markdown:
-        parts = [p.strip() for p in markdown.split('\f') if p.strip()]
-        if len(parts) > 1:
-            return parts
-
-    # Nothing worked -- log diagnostics so the NEXT failure is fixable
-    # in one look instead of needing another round of guessing.
-    log(
-        f"WARNING: No page-break marker recognized in Datalab output "
-        f"(length={len(markdown)} chars, page_count_hint={page_count_hint}). "
-        f"Treating entire document as a single page. "
-        f"First 200 chars: {markdown[:200]!r}"
-    )
+    # Fallback: no recognizable page breaks — return as single block
     return [markdown.strip()]
 
 
@@ -176,19 +86,14 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         if status_callback:
             status_callback(msg)
 
-    file_name = _coerce_name(file_name, default_name="document.pdf")
-
-    if not isinstance(file_content, (bytes, bytearray)):
-        raise TypeError(
-            f"run_ocr() expected file_content as bytes, got {type(file_content).__name__}"
-        )
-
     api_key = get_api_key("DATALAB_API_KEY")
     if not api_key:
         raise Exception("DATALAB_API_KEY not found in secrets or environment")
 
+    # Guard against oversized uploads — fail with a clear message
+    # instead of a cryptic Cloudflare 413 HTML page.
     size_mb = len(file_content) / (1024 * 1024)
-    MAX_MB  = 45
+    MAX_MB  = 45   # conservative margin under typical Cloudflare limits
     if size_mb > MAX_MB:
         raise Exception(
             f"File is {size_mb:.1f}MB, which exceeds the {MAX_MB}MB upload limit. "
@@ -205,8 +110,8 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         files={"file": (file_name, file_content, "application/pdf")},
         data={
             "output_format": "markdown",
-            "mode": "accurate",
-            "paginate": "true"
+            "mode": "accurate",     # highest accuracy — best for handwriting
+            "paginate": "true"      # keep page boundaries in the output
         },
         timeout=120
     )
@@ -220,9 +125,10 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         raise Exception(f"Datalab submit failed: {data.get('error')}")
 
     check_url = data["request_check_url"]
-    log("Document submitted -- polling for OCR result...")
+    log("Document submitted — polling for OCR result...")
 
-    max_polls = 150
+    # ── Poll until complete ─────────────────────────────────
+    max_polls = 150          # ~150 * 2s = 5 minutes max wait
     poll_interval = 2
 
     result = None
@@ -236,7 +142,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         status = result.get("status")
 
         if status == "complete":
-            log("OCR complete -- parsing pages...")
+            log("OCR complete — parsing pages...")
             break
 
         if status == "failed" or result.get("error"):
@@ -258,7 +164,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         raise Exception("Datalab returned empty markdown output")
 
     page_count_hint = result.get("page_count")
-    page_texts = _split_paginated_markdown(markdown, page_count_hint, log=log)
+    page_texts = _split_paginated_markdown(markdown, page_count_hint)
 
     pages = []
     for idx, text in enumerate(page_texts):
@@ -267,18 +173,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
             "raw_text":    text
         })
 
-    log(f"OCR done -- {len(pages)} page(s) extracted")
-
-    # Extra diagnostic: if we collapsed to 1 page on a sizeable file,
-    # warn loudly so it's obvious in logs that the split failed rather
-    # than the document genuinely being one page.
-    if len(pages) == 1 and size_mb > 1.0:
-        log(
-            f"WARNING: Only 1 page extracted from a {size_mb:.1f}MB file. "
-            f"This usually means the page-break marker format was not "
-            f"recognized. Markdown length: {len(markdown)} chars."
-        )
-
+    log(f"OCR done — {len(pages)} page(s) extracted")
     return pages
 
 
@@ -297,7 +192,8 @@ def build_ocr_json(pages: list) -> dict:
 
 
 # =========================================================
-# REFERENCE BOOK OCR
+# REFERENCE BOOK OCR — Datalab handles full multi-page PDFs
+# natively, so no manual page-splitting is needed here.
 # =========================================================
 
 def process_reference(file_input, status_callback=None):
@@ -306,19 +202,48 @@ def process_reference(file_input, status_callback=None):
         if status_callback:
             status_callback(msg)
 
-    file_bytes, file_name = _normalize_file_input(file_input, default_name="reference.pdf")
+    if isinstance(file_input, (str, Path)):
+        file_bytes = Path(file_input).read_bytes()
+        file_name  = Path(file_input).name
+    else:
+        file_bytes = file_input.read()
+        file_name  = getattr(file_input, "name", "reference.pdf")
 
     pages = run_ocr(file_bytes, file_name, status_callback)
-    log(f"Reference OCR complete -- {len(pages)} page(s)")
+    log(f"Reference OCR complete — {len(pages)} page(s)")
     return build_ocr_json(pages)
 
 
 # =========================================================
 # DETECT QUESTION PAPER PAGE
+# The page that contains the printed list of questions
+# Identified by having numbered questions >= 5 items
 # =========================================================
 
 def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
-    Q_LINE_NUM   = re.compile(r'^\s*[0-9]+[\.\)]\s+.{15,}')
+    """
+    Returns list of page indices (0-based) that look like GENUINE exam
+    question paper pages — as opposed to:
+    - ID card / registration / admin pages (numbered instructions,
+      terms and conditions)
+    - Handwritten answer pages where the student restates the question
+      number before writing their answer
+
+    Strategy: a real question paper page must satisfy ALL of:
+    1. Has 2+ lines matching a question-start pattern (numbered or lettered)
+    2. Has at least one STRONG exam-paper signal:
+       - mark allocation pattern like "10", "X2=10", "3X20=60", "5X2"
+       - a SECTION/PART header (SECTION-A, भाग-1, PART B)
+       - explicit instruction phrase ("answer all questions",
+         "सभी प्रश्न अनिवार्य", "TMA", "assignment code", course code pattern)
+    3. Does NOT contain admin/ID-card signals (enrolment number, IGNOU
+       student identity, regional centre, "produced on demand", QR code
+       instructions) — these are registration pages, not exam papers
+    4. Does NOT contain handwritten-answer signals (उत्तर, Ans-, Teacher's
+       Signature, PAGE NO/DATE handwritten template, A.15- style answer
+       labels)
+    """
+    Q_LINE_NUM   = re.compile(r'^\s*\d+[\.\)]\s+.{15,}')
     Q_LINE_LATIN = re.compile(r'^\s*[a-d]\)\s+.{5,}', re.IGNORECASE)
     Q_LINE_DEVA  = re.compile(r'^\s*[क-घ]\)\s+.{5,}')
 
@@ -351,7 +276,7 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
     )
 
     candidate_pages = []
-    weak_pages = []
+    weak_pages = []   # pages with question-like lines but no strong signal — possible continuations
 
     for i, page in enumerate(pages):
         text  = page["raw_text"]
@@ -368,10 +293,10 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
             continue
 
         if ADMIN_PAGE_MARKERS.search(text):
-            continue
+            continue   # ID card / registration page — never a question paper
 
         if ANSWER_PAGE_MARKERS.search(text):
-            continue
+            continue   # student's handwritten answer page
 
         has_strong_signal = bool(
             MARK_ALLOCATION.search(text)
@@ -382,8 +307,14 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
         if has_strong_signal:
             candidate_pages.append(i)
         else:
+            # No strong signal on its own — could be a continuation page
+            # (e.g. a parent question's lettered sub-parts spilling onto
+            # the next page). Only counts if adjacent to a confirmed page.
             weak_pages.append(i)
 
+    # Promote weak pages that are immediately adjacent to a confirmed
+    # question-paper page (continuation of the same question paper),
+    # rather than requiring every single page to repeat the strong signal.
     confirmed_set = set(candidate_pages)
     for i in weak_pages:
         if (i - 1) in confirmed_set or (i + 1) in confirmed_set:
@@ -394,57 +325,28 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
 
 
 # =========================================================
-# FIX (round 3): instruction-line filter
-#
-# Numbered lines that tell the student HOW to answer (word counts,
-# "answer the following questions", marks distribution instructions)
-# were being extracted as if they were real question content. They
-# can never be matched against an answer because students don't
-# restate instructions -- they restate the actual question. This
-# filter removes them from the official question list before matching
-# is ever attempted, so they stop showing up as permanent false
-# "no match found" warnings and stop occupying a "question slot" that
-# a real question should have filled.
-# =========================================================
-
-INSTRUCTION_LINE_RE = re.compile(
-    r'(?:answer\s+(?:the\s+)?(?:following|all)\s+questions'
-    r'|in\s+about\s+\d+\s+words'
-    r'|each\s+question\s+carries'
-    r'|attempt\s+any'
-    r'|all\s+questions\s+are\s+compulsory'
-    r'|सभी\s*प्रश्न\s*अनिवार्य'
-    r'|किसी\s*भी.*?उत्तर\s*दें'
-    r'|शब्दों\s*में\s*उत्तर)',
-    re.IGNORECASE
-)
-
-
-def is_instruction_line(text: str) -> bool:
-    """True if text is a meta-instruction about HOW to answer, not an
-    actual question to be answered."""
-    return bool(INSTRUCTION_LINE_RE.search(text))
-
-
-# =========================================================
-# EXTRACT OFFICIAL QUESTIONS -- scans across MULTIPLE pages
-#
-# FIX (round 3): Q_START is now restricted to ASCII digits [0-9]
-# only. Devanagari numerals (१,२,३...) were previously being matched
-# by \d (Unicode-aware by default), which caused numbered sub-headings
-# inside topic lists / long answers (e.g. "१. द्वंद्व समास") to be
-# extracted as if they were standalone exam questions. Real question
-# papers in this pipeline's domain (IGNOU-style assignments) number
-# questions with Western numerals even in Hindi-medium papers, so this
-# restriction removes a major source of phantom "questions" that could
-# never be matched to a real student answer.
+# EXTRACT OFFICIAL QUESTIONS — scans across MULTIPLE pages
+# Also captures lettered sub-questions (क/ख/ग/घ, a/b/c/d)
+# that appear as a standalone list after a parent question
+# like "Q.9 निम्नलिखित पर टिप्पणी लिखिए" on a DIFFERENT page
+# than where the sub-options are printed.
 # =========================================================
 
 def extract_official_questions_multi_page(pages: list, qp_page_indices: list) -> list:
+    """
+    Extracts numbered questions across all detected question-paper pages,
+    in page order. Handles:
+    - Standard numbered questions: "1. text"
+    - Multi-line questions (continuation lines joined)
+    - Lettered sub-parts within a question: a) b) c) / क) ख) ग) घ)
+    - Sub-parts that appear on a later page than their parent question
+      (common when "Q.9 Write notes on:" is followed by a), b), c), d)
+      printed on the next page)
+    """
     all_questions = []
-    pending_parent = None
+    pending_parent = None   # holds a parent question awaiting sub-parts from next page
 
-    Q_START   = re.compile(r'^\s*([0-9]+)[\.\)]\s+(.+)')
+    Q_START   = re.compile(r'^\s*(\d+)[\.\)]\s+(.+)')
     SUB_LATIN = re.compile(r'^\s*\(?([a-d])\)\s*(.+)', re.IGNORECASE)
     SUB_DEVA  = re.compile(r'^\s*\(?([क-घ])\)\s*(.+)')
     SKIP      = re.compile(r'^#+\s|^भाग|^PART|^\s*$')
@@ -462,6 +364,7 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
                     current = None
                 continue
 
+            # Lettered sub-part (Latin a-d or Devanagari क-घ)
             sub_m = SUB_LATIN.match(stripped) or SUB_DEVA.match(stripped)
             if sub_m:
                 if current:
@@ -479,6 +382,8 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
                 if current:
                     all_questions.append({"text": current.strip(), "parent": None})
                 current = stripped
+                # Track this as a potential parent for sub-parts on a later page
+                # (e.g. ends with "टिप्पणी लिखिए" / "following" / colon)
                 if re.search(r'(?:लिखिए|following|:)\s*$', stripped, re.IGNORECASE):
                     pending_parent = stripped
                 else:
@@ -491,16 +396,13 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
         if current:
             all_questions.append({"text": current.strip(), "parent": None})
 
+    # Now split any question that has 2+ inline sub-parts (a)/b)/c) on one line block)
     final_questions = []
-    SUBPART_RE = re.compile(r'(?:^|\s)\(?([a-z])\)\s', re.UNICODE)
-    SUBPART_DEVA_RE = re.compile(r'(?:^|\s)\(?([क-घ])\)\s', re.UNICODE)
+    SUBPART_RE = re.compile(r'(?:^|\s)\(?([a-zक-घ])\)\s', re.UNICODE)
 
     for q in all_questions:
         text = q["text"]
-        matches = sorted(
-            list(SUBPART_RE.finditer(text)) + list(SUBPART_DEVA_RE.finditer(text)),
-            key=lambda m: m.start()
-        )
+        matches = list(SUBPART_RE.finditer(text))
 
         if len(matches) >= 2:
             preamble = text[:matches[0].start()].strip()
@@ -513,10 +415,7 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
         else:
             final_questions.append(text)
 
-    # FIX: drop instruction lines before dedup/return -- they are never
-    # real questions and can never be matched to a student answer.
-    final_questions = [q for q in final_questions if not is_instruction_line(q)]
-
+    # Deduplicate while preserving order
     seen = set()
     unique = []
     for q in final_questions:
@@ -549,7 +448,10 @@ def is_noise(line: str) -> bool:
 
 
 # =========================================================
-# FIND QUESTION BOUNDARIES IN ANSWER PAGES -- similarity based
+# FIND QUESTION BOUNDARIES IN ANSWER PAGES — similarity based
+# Works for Hindi, English, any language
+# Matches student-written question restatements against the
+# official question paper text using word-overlap similarity
 # =========================================================
 
 def normalize(text: str) -> str:
@@ -568,6 +470,7 @@ def similarity(a: str, b: str) -> float:
 
 
 def strip_leading_label(text: str) -> str:
+    """Strip leading numbering like '1.', 'Q1.', 'प्र.2', '20.', 'a)', '(a)', 'क)', '(क)' etc."""
     text = text.strip()
     text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text, flags=re.IGNORECASE)
     text = re.sub(r'^(?:उत्तर)\s*[\-\:\s]*', '', text)
@@ -585,7 +488,20 @@ def find_question_boundaries_by_similarity(
     similarity_threshold: float = 0.30,
     window: int = 4
 ) -> list:
-    candidates_by_question = {}
+    """
+    Scans answer lines for restated questions matching official questions.
+    Uses sliding window to join multi-line question restatements.
+
+    Correctness guarantees:
+    1. Tracks how many lines (`span`) the matched question text occupies,
+       so the answer slice can start AFTER the full question text.
+    2. Enforces that boundaries appear in the SAME ORDER as the official
+       questions list. If a question's best-scoring candidate would break
+       order (e.g. a false-positive shares vocabulary with an earlier
+       question), the NEXT best-scoring candidate for that same question
+       is tried, and so on, rather than dropping the question entirely.
+    """
+    candidates_by_question = {}   # question -> list of candidates, sorted by score desc
 
     for i in range(len(answer_lines)):
         line_i = answer_lines[i].strip()
@@ -619,9 +535,13 @@ def find_question_boundaries_by_similarity(
                         "score":      score
                     })
 
+    # Sort each question's candidates by score, descending
     for q in candidates_by_question:
         candidates_by_question[q].sort(key=lambda c: -c["score"])
 
+    # Walk questions in official order. For each, try candidates from
+    # highest score downward, accepting the first one that comes after
+    # the previously accepted boundary's line_index.
     final = []
     last_line_index = -1
 
@@ -640,6 +560,11 @@ def find_question_boundaries_by_similarity(
 
 
 def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
+    """
+    For each boundary, answer = raw lines starting AFTER the full matched
+    question span (boundary["span"] lines), up to the next boundary.
+    Pure text slicing, zero LLM.
+    """
     qa_pairs = []
     for i, b in enumerate(boundaries):
         span    = b.get("span", 1)
@@ -669,23 +594,35 @@ def process_pdf(file_input, status_callback=None):
         if status_callback:
             status_callback(msg)
 
-    file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
+    if isinstance(file_input, (str, Path)):
+        file_bytes = Path(file_input).read_bytes()
+        file_name  = Path(file_input).name
+    else:
+        file_bytes = file_input.read()
+        file_name  = getattr(file_input, "name", "document.pdf")
 
+    # Step 1: OCR — send the original PDF directly.
+    # Datalab/Chandra handles native PDFs natively; rasterizing to
+    # images first (as Mistral required) only inflates file size and
+    # can trigger 413 Payload Too Large on upload.
     pages = run_ocr(file_bytes, file_name, status_callback)
 
+    # Step 2: Build OCR JSON
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
+    # Step 4: Scan ALL pages for question-paper-like pages
+    # (handles question papers split across multiple pages/sections,
+    #  rather than assuming a single page holds everything)
     qp_page_indices = find_question_paper_pages(pages)
     log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
 
     if not qp_page_indices:
         raise Exception(
             "Could not detect any question paper pages in this document.\n"
-            "This usually means the document has a different layout than expected, "
-            "OR the OCR output collapsed to fewer pages than expected (check the "
-            "logs above for a 'WARNING: No page-break marker recognized' message).\n"
+            "This usually means the document has a different layout than expected — "
+            "no page was found with multiple numbered question lines.\n"
             f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
         )
 
@@ -698,11 +635,13 @@ def process_pdf(file_input, status_callback=None):
             f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
 
+    # Step 5: Answer pages = every page NOT identified as a question paper page
     answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
     answer_pages = [pages[i] for i in answer_page_indices]
 
     log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
 
+    # Step 6: Flatten answer page lines
     answer_lines = []
     for page in answer_pages:
         for line in page["raw_text"].split("\n"):
@@ -711,6 +650,7 @@ def process_pdf(file_input, status_callback=None):
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
+    # Step 7: Similarity-based matching — works for any language/format
     log("Matching questions via similarity (works for Hindi/English/any format)...")
     boundaries = find_question_boundaries_by_similarity(answer_lines, official_questions)
     log(f"Matched {len(boundaries)} of {len(official_questions)} questions")
@@ -727,8 +667,9 @@ def process_pdf(file_input, status_callback=None):
             f"First 10 answer lines: {answer_lines[:10]}"
         )
 
+    # Step 8: Slice raw answers — zero LLM, pure text slicing
     log("Slicing raw answers...")
     qa_pairs = slice_raw_answers_by_boundaries(answer_lines, boundaries)
 
-    log(f"Done -- {len(qa_pairs)} Q-A pairs")
+    log(f"Done — {len(qa_pairs)} Q-A pairs")
     return ocr_json, qa_pairs
