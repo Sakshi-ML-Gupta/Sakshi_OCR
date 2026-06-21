@@ -2,7 +2,7 @@ import os
 import io
 import re
 import json
-import time
+import base64
 import fitz
 import httpx
 from pathlib import Path
@@ -22,54 +22,81 @@ def get_api_key(name):
 
 
 # =========================================================
-# OCR — Tesseract (local, no API needed)
+# OCR — OCR.Space API
 #
-# Renders each PDF page as a high-DPI image via PyMuPDF,
-# then runs Tesseract OCR with Hindi+English language support.
-# Returns per-page text, same structure as the old Datalab path.
+# Free tier: 25,000 requests/month (no credit card needed).
+# Pure HTTP POST — no binary, no SDK, works on Streamlit Cloud.
+# Supports 90+ languages including Hindi & English.
 # =========================================================
+
+OCR_SPACE_URL = "https://api.ocr.space/parse/image"
+
 
 def run_ocr(file_bytes: bytes, file_name: str, status_callback=None, dpi: int = 300):
     """
-    Run Tesseract OCR on a PDF.
+    Run OCR.Space API on a PDF.
 
-    Requirements:
-        - System: tesseract-ocr  (apt install tesseract-ocr tesseract-ocr-hin)
-        - Python: pip install pytesseract Pillow
-
-    The `dpi` parameter controls image resolution — 300 is a good balance
-    of accuracy vs. speed for handwritten exam booklets.
+    Get a free API key from: https://ocr.space/ocrapi
     """
-    import pytesseract
-    from PIL import Image
-
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
+    api_key = get_api_key("OCR_SPACE_API_KEY")
+    if not api_key:
+        raise Exception(
+            "OCR_SPACE_API_KEY not found in secrets or environment.\n"
+            "Get a free key at: https://ocr.space/ocrapi"
+        )
+
     size_mb = len(file_bytes) / (1024 * 1024)
-    log(f"Opening PDF for Tesseract OCR... ({size_mb:.1f}MB)")
+    log(f"Opening PDF for OCR.Space... ({size_mb:.1f}MB)")
 
     src_doc = fitz.open(stream=file_bytes, filetype="pdf")
     total_pages = len(src_doc)
-    log(f"PDF has {total_pages} page(s) — running Tesseract at {dpi} DPI")
-
-    # Determine language: default to Hindi+English for Indian exam papers.
-    # Users can override with TESS_LANG env var (e.g. "eng", "hin+eng", "tam+eng").
-    lang = os.getenv("TESS_LANG", "hin+eng")
-    log(f"Tesseract language: {lang}")
+    log(f"PDF has {total_pages} page(s) — running OCR at {dpi} DPI")
 
     pages = []
+
     for page_num in range(total_pages):
         page = src_doc[page_num]
         pix = page.get_pixmap(dpi=dpi)
 
-        # Convert PyMuPDF pixmap to PIL Image
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        # Convert to PNG bytes
+        img_bytes = pix.tobytes("png")
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-        # Run Tesseract
-        text = pytesseract.image_to_string(img, lang=lang, config="--psm 6")
+        # Call OCR.Space
+        payload = {
+            "base64Image": f"data:image/png;base64,{img_b64}",
+            "language": "hin+eng",
+            "isOverlayRequired": "false",
+            "OCREngine": "2",          # Engine 2 is more accurate
+            "scale": "true",
+            "detectTables": "false",
+        }
+
+        resp = httpx.post(
+            OCR_SPACE_URL,
+            data=payload,
+            headers={"apikey": api_key},
+            timeout=120
+        )
+
+        if resp.status_code != 200:
+            raise Exception(f"OCR.Space API error {resp.status_code}: {resp.text[:500]}")
+
+        data = resp.json()
+
+        if data.get("IsErroredOnProcessing"):
+            errors = data.get("ErrorMessage", [])
+            raise Exception(f"OCR.Space processing error: {errors}")
+
+        parsed_results = data.get("ParsedResults", [])
+        text = ""
+        if parsed_results:
+            text = parsed_results[0].get("ParsedText", "")
 
         pages.append({
             "page_number": page_num + 1,
@@ -80,7 +107,7 @@ def run_ocr(file_bytes: bytes, file_name: str, status_callback=None, dpi: int = 
             log(f"  OCR progress: {page_num + 1}/{total_pages} pages")
 
     src_doc.close()
-    log(f"Tesseract OCR done — {len(pages)} page(s) extracted")
+    log(f"OCR.Space done — {len(pages)} page(s) extracted")
     return pages
 
 
@@ -99,7 +126,7 @@ def build_ocr_json(pages: list) -> dict:
 
 
 # =========================================================
-# REFERENCE BOOK OCR — Tesseract handles page-by-page natively
+# REFERENCE BOOK OCR
 # =========================================================
 
 def process_reference(file_input, status_callback=None):
@@ -122,33 +149,9 @@ def process_reference(file_input, status_callback=None):
 
 # =========================================================
 # DETECT QUESTION PAPER PAGE
-# The page that contains the printed list of questions
-# Identified by having numbered questions >= 5 items
 # =========================================================
 
 def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
-    """
-    Returns list of page indices (0-based) that look like GENUINE exam
-    question paper pages — as opposed to:
-    - ID card / registration / admin pages (numbered instructions,
-      terms and conditions)
-    - Handwritten answer pages where the student restates the question
-      number before writing their answer
-
-    Strategy: a real question paper page must satisfy ALL of:
-    1. Has 2+ lines matching a question-start pattern (numbered or lettered)
-    2. Has at least one STRONG exam-paper signal:
-       - mark allocation pattern like "10", "X2=10", "3X20=60", "5X2"
-       - a SECTION/PART header (SECTION-A, भाग-1, PART B)
-       - explicit instruction phrase ("answer all questions",
-         "सभी प्रश्न अनिवार्य", "TMA", "assignment code", course code pattern)
-    3. Does NOT contain admin/ID-card signals (enrolment number, IGNOU
-       student identity, regional centre, "produced on demand", QR code
-       instructions) — these are registration pages, not exam papers
-    4. Does NOT contain handwritten-answer signals (उत्तर, Ans-, Teacher's
-       Signature, PAGE NO/DATE handwritten template, A.15- style answer
-       labels)
-    """
     Q_LINE_NUM   = re.compile(r'^\s*\d+[\.\)]\s+.{15,}')
     Q_LINE_LATIN = re.compile(r'^\s*[a-d]\)\s+.{5,}', re.IGNORECASE)
     Q_LINE_DEVA  = re.compile(r'^\s*[क-घ]\)\s+.{5,}')
@@ -182,7 +185,7 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
     )
 
     candidate_pages = []
-    weak_pages = []   # pages with question-like lines but no strong signal
+    weak_pages = []
 
     for i, page in enumerate(pages):
         text  = page["raw_text"]
@@ -199,10 +202,10 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
             continue
 
         if ADMIN_PAGE_MARKERS.search(text):
-            continue   # ID card / registration page
+            continue
 
         if ANSWER_PAGE_MARKERS.search(text):
-            continue   # student's handwritten answer page
+            continue
 
         has_strong_signal = bool(
             MARK_ALLOCATION.search(text)
@@ -215,7 +218,6 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
         else:
             weak_pages.append(i)
 
-    # Promote weak pages adjacent to a confirmed question-paper page
     confirmed_set = set(candidate_pages)
     for i in weak_pages:
         if (i - 1) in confirmed_set or (i + 1) in confirmed_set:
@@ -230,11 +232,6 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
 # =========================================================
 
 def extract_official_questions_multi_page(pages: list, qp_page_indices: list) -> list:
-    """
-    Extracts numbered questions across all detected question-paper pages.
-    Handles standard numbered questions, multi-line continuations, and
-    lettered sub-parts (Latin a-d / Devanagari क-घ).
-    """
     all_questions = []
     pending_parent = None
 
@@ -285,7 +282,6 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
         if current:
             all_questions.append({"text": current.strip(), "parent": None})
 
-    # Split questions that have 2+ inline sub-parts
     final_questions = []
     SUBPART_RE = re.compile(r'(?:^|\s)\(?([a-zक-घ])\)\s', re.UNICODE)
 
@@ -304,7 +300,6 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
         else:
             final_questions.append(text)
 
-    # Deduplicate while preserving order
     seen = set()
     unique = []
     for q in final_questions:
@@ -356,7 +351,6 @@ def similarity(a: str, b: str) -> float:
 
 
 def strip_leading_label(text: str) -> str:
-    """Strip leading numbering like '1.', 'Q1.', 'प्र.2', '20.', 'a)', '(a)', 'क)', '(क)' etc."""
     text = text.strip()
     text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text, flags=re.IGNORECASE)
     text = re.sub(r'^(?:उत्तर)\s*[\-\:\s]*', '', text)
@@ -374,12 +368,6 @@ def find_question_boundaries_by_similarity(
     similarity_threshold: float = 0.30,
     window: int = 4
 ) -> list:
-    """
-    Scans answer lines for restated questions matching official questions.
-    Uses sliding window to join multi-line question restatements.
-    Enforces that boundaries appear in the SAME ORDER as the official
-    questions list.
-    """
     candidates_by_question = {}
 
     for i in range(len(answer_lines)):
@@ -435,10 +423,6 @@ def find_question_boundaries_by_similarity(
 
 
 def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
-    """
-    For each boundary, answer = raw lines starting AFTER the full matched
-    question span, up to the next boundary. Pure text slicing, zero LLM.
-    """
     qa_pairs = []
     for i, b in enumerate(boundaries):
         span    = b.get("span", 1)
@@ -464,13 +448,6 @@ def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> lis
 
 # =========================================================
 # OPENAI-BASED Q&A LINE DETECTION
-#
-# OpenAI's ONLY job: read numbered lines and report which line
-# numbers correspond to question starts and answer starts.
-# It NEVER outputs question text or answer text — only integers.
-# This makes it layout-agnostic (works on any PDF format) while
-# remaining hallucination-safe, because every line number it
-# returns is validated against the real document before use.
 # =========================================================
 
 def get_openai_client():
@@ -482,10 +459,6 @@ def get_openai_client():
 
 
 def build_numbered_line_dump(pages: list) -> list:
-    """
-    Flattens the whole document into a single list of lines,
-    each tagged with its global line number and source page number.
-    """
     line_index = []
     for page in pages:
         for line in page["raw_text"].split("\n"):
@@ -498,12 +471,6 @@ def build_numbered_line_dump(pages: list) -> list:
 
 
 def ask_openai_for_qa_lines(line_index: list, status_callback=None, chunk_size: int = 350):
-    """
-    Sends the numbered line dump to OpenAI in chunks and asks ONLY
-    for line numbers — never content.
-    Returns a list of {question_id, question_start_line, answer_start_line}.
-    Raises on any API/parsing failure so the caller can fall back.
-    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -580,15 +547,6 @@ NUMBERED LINES:
 
 
 def validate_and_clean_llm_items(raw_items: list, line_index: list, status_callback=None) -> list:
-    """
-    Validates every LLM-reported item against the real document.
-    Drops anything that:
-    - has an out-of-range line number
-    - has a question_start_line >= answer_start_line (nonsensical)
-    - points to an empty/too-short line for the question start
-    - duplicates a question_start_line already accepted
-    Enforces overall increasing order of question_start_line.
-    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -636,11 +594,6 @@ def validate_and_clean_llm_items(raw_items: list, line_index: list, status_callb
 
 
 def slice_qa_from_line_items(line_index: list, items: list) -> list:
-    """
-    Pure text slicing — zero LLM. Given validated {question_start_line,
-    answer_start_line} pairs, slices the question and answer directly
-    from the raw OCR line index.
-    """
     qa_pairs = []
 
     for i, item in enumerate(items):
@@ -669,11 +622,6 @@ def slice_qa_from_line_items(line_index: list, items: list) -> list:
 
 
 def try_openai_pipeline(pages: list, status_callback=None):
-    """
-    Attempts the OpenAI line-identification pipeline end to end.
-    Returns (qa_pairs, None) on success, or (None, reason_string)
-    if anything fails/looks unreliable.
-    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -713,10 +661,6 @@ def try_openai_pipeline(pages: list, status_callback=None):
 
 
 def run_regex_pipeline(pages: list, status_callback=None):
-    """
-    The original regex/similarity-based pipeline, used as a fallback
-    when the OpenAI pipeline is unavailable or produces unreliable results.
-    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -784,7 +728,7 @@ def process_pdf(file_input, status_callback=None):
         file_bytes = file_input.read()
         file_name  = getattr(file_input, "name", "document.pdf")
 
-    # Step 1: OCR — Tesseract (local, no API call)
+    # Step 1: OCR — OCR.Space (free, pure HTTP, no binary)
     pages = run_ocr(file_bytes, file_name, status_callback)
 
     # Step 2: Build OCR JSON
