@@ -939,4 +939,3 @@ def process_pdf(file_input, status_callback=None):
 
     log(f"Done — {len(qa_pairs)} Q-A pairs")
     return ocr_json, qa_pairs
-
