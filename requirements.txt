@@ -1,5 +1,7 @@
 streamlit
-pymupdf
+PyMuPDF
+pytesseract
+Pillow
 python-dotenv
 httpx
-groq
+openai
