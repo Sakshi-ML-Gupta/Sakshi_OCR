@@ -810,13 +810,21 @@ def slice_qa_from_line_items(line_index: list, items: list) -> list:
 def try_groq_pipeline(pages: list, status_callback=None):
     """
     Attempts the Groq line-identification pipeline end to end.
-    Returns qa_pairs on success, or None if anything fails/looks
-    unreliable — signalling the caller to fall back to regex.
+    Returns (qa_pairs, None) on success, or (None, reason_string)
+    if anything fails/looks unreliable — signalling the caller to
+    fall back to regex, with a human-readable reason.
     """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
+
+    # Diagnostic: confirm the key is actually visible BEFORE attempting
+    # anything else, so a missing-secret problem is obvious immediately.
+    key_present = bool(get_api_key("GROQ_API_KEY"))
+    log(f"GROQ_API_KEY found in secrets/env: {key_present}")
+    if not key_present:
+        return None, "GROQ_API_KEY is not set in Streamlit secrets or environment"
 
     try:
         line_index = build_numbered_line_dump(pages)
@@ -824,29 +832,26 @@ def try_groq_pipeline(pages: list, status_callback=None):
 
         raw_items = ask_groq_for_qa_lines(line_index, status_callback)
         if not raw_items:
-            log("Groq returned no items — falling back")
-            return None
+            return None, "Groq returned zero items across all chunks"
 
         cleaned = validate_and_clean_groq_items(raw_items, line_index, status_callback)
         if len(cleaned) < 2:
-            log("Too few validated items from Groq — falling back")
-            return None
+            return None, f"Only {len(cleaned)} of {len(raw_items)} Groq items passed validation (need >=2)"
 
         qa_pairs = slice_qa_from_line_items(line_index, cleaned)
         non_empty = [p for p in qa_pairs if p["answer"].strip()]
         if len(non_empty) < len(qa_pairs) * 0.5:
-            log("More than half the answers came out empty — falling back")
-            return None
+            return None, f"Only {len(non_empty)} of {len(qa_pairs)} sliced answers were non-empty"
 
         log(f"Groq pipeline succeeded — {len(qa_pairs)} Q-A pairs")
-        return qa_pairs
+        return qa_pairs, None
 
     except Exception as e:
         import traceback
-        log(f"Groq pipeline failed: {type(e).__name__}: {e}")
-        log(f"Traceback:\n{traceback.format_exc()}")
-        log("Falling back to regex pipeline...")
-        return None
+        tb = traceback.format_exc()
+        log(f"Groq pipeline exception: {type(e).__name__}: {e}")
+        log(tb)
+        return None, f"{type(e).__name__}: {e}"
 
 
 def run_regex_pipeline(pages: list, status_callback=None):
@@ -934,11 +939,23 @@ def process_pdf(file_input, status_callback=None):
     # Groq only ever returns line numbers; all text is sliced by Python
     # from the raw OCR afterward, so answer content is never LLM-touched.
     log("Attempting Groq-based question/answer line detection...")
-    qa_pairs = try_groq_pipeline(pages, status_callback)
+    qa_pairs, groq_fail_reason = try_groq_pipeline(pages, status_callback)
 
-    if qa_pairs is None:
-        log("Falling back to regex/similarity pipeline...")
+    if qa_pairs is not None:
+        log(f"Done — {len(qa_pairs)} Q-A pairs (via Groq)")
+        return ocr_json, qa_pairs
+
+    log(f"Groq pipeline did not produce results. Reason: {groq_fail_reason}")
+    log("Falling back to regex/similarity pipeline...")
+
+    try:
         qa_pairs = run_regex_pipeline(pages, status_callback)
+    except Exception as regex_error:
+        raise Exception(
+            f"Both detection pipelines failed.\n\n"
+            f"Groq pipeline failed because: {groq_fail_reason}\n\n"
+            f"Regex fallback failed because: {regex_error}"
+        )
 
-    log(f"Done — {len(qa_pairs)} Q-A pairs")
+    log(f"Done — {len(qa_pairs)} Q-A pairs (via regex fallback)")
     return ocr_json, qa_pairs
