@@ -1,7 +1,5 @@
 streamlit
 PyMuPDF
-pytesseract
-Pillow
 python-dotenv
 httpx
 openai
