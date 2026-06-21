@@ -1,5 +1,7 @@
 streamlit
-pymupdf
+mistralai>=1.0.0
+pdf2image
+rapidfuzz
 python-dotenv
-httpx
-groq
+Pillow
+PyMuPDF
