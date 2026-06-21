@@ -777,6 +777,32 @@ def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker
             content = response.choices[0].message.content
             return _parse_qp_llm_response(content)
 
+        except groq.AuthenticationError as e:
+            # FIX: a 401 "Invalid API Key" is an AUTH failure, not a rate
+            # limit -- it will NEVER succeed on retry, since the key
+            # itself is wrong/missing/revoked. The previous code let this
+            # fall through to the generic except-Exception branch below,
+            # which retried it 4 more times with a 1s sleep each,
+            # producing a confusing "failed after 5 attempts" message
+            # several seconds later instead of an immediate, clear
+            # explanation of the real problem. Fail fast on the very
+            # first attempt with actionable next steps.
+            raise Exception(
+                f"Groq API rejected the API key (401 Invalid API Key). "
+                f"This will NOT be fixed by retrying. Things to check:\n"
+                f"  1. Is GROQ_API_KEY actually set in your environment or "
+                f"st.secrets? (A missing key often falls back to None or "
+                f"an empty string, which Groq also rejects as invalid.)\n"
+                f"  2. Does the key have any extra whitespace, quotes, or "
+                f"a line break copied in by accident?\n"
+                f"  3. Has the key been revoked or rotated in your Groq "
+                f"console (https://console.groq.com/keys)?\n"
+                f"  4. If using st.secrets, did you restart the Streamlit "
+                f"app after adding/changing the secret? Streamlit does "
+                f"not always hot-reload secrets.toml changes.\n"
+                f"Original error: {e}"
+            ) from e
+
         except (groq.RateLimitError, groq.BadRequestError) as e:
             last_error = e
             detail = _parse_rate_limit_detail(str(e))
