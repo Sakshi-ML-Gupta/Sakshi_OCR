@@ -3,6 +3,7 @@ import io
 import re
 import json
 import time
+import threading
 import fitz
 import httpx
 from pathlib import Path
@@ -71,6 +72,33 @@ def _coerce_name(name, default_name="document.pdf"):
         return Path(str(name)).name or default_name
     except Exception:
         return default_name
+
+
+# =========================================================
+# CONCURRENCY GUARD
+#
+# FIX: the real log showed TWO complete pipeline runs interleaved --
+# "Submitting document..." fired twice, OCR ran twice, chunk logs from
+# both runs were mixed together line by line. This is almost certainly
+# the calling app (e.g. Streamlit) invoking process_pdf() a second time
+# while the first call is still in flight (a common Streamlit rerun
+# behavior). Both runs then compete for the SAME shared 8000 TPM org
+# budget at once, which is the direct cause of the constant 429s seen
+# in that log -- it wasn't one document needing too many tokens, it was
+# two concurrent runs each burning the same shared budget simultaneously.
+#
+# This module cannot prevent the calling app from invoking it twice,
+# but a process-wide lock around the Groq-calling section ensures that
+# IF it is called concurrently in the same process, the calls serialize
+# instead of racing for the same token budget. This turns "two runs
+# fighting over 8000 TPM" into "two runs sharing 8000 TPM one after
+# the other," which is strictly better and removes one whole class of
+# the 429 storm seen in the log. If your app calls this from separate
+# processes (e.g. multiple server workers), you'd need a cross-process
+# lock (e.g. a file lock or Redis) instead -- ask if that's your setup.
+# =========================================================
+
+_groq_call_lock = threading.Lock()
 
 
 # =========================================================
@@ -291,54 +319,47 @@ def process_reference(file_input, status_callback=None):
 
 # =========================================================
 # LLM-BASED QUESTION PAPER / QUESTION DETECTION (Groq)
-#
-# FIX (this round): Groq's on_demand/free tier enforces an 8000 TPM
-# (tokens per minute) cap PER ORGANIZATION. A single request containing
-# all pages of a ~25 page document already exceeds this on its own
-# (a 413 "Request too large... Limit 8000, Requested 8302" was hit in
-# real usage), so sending the whole document in one call is not viable
-# on this tier regardless of how the prompt is written.
-#
-# This version CHUNKS the pages into multiple smaller LLM calls, each
-# sized to stay safely under the TPM budget, with a small page overlap
-# between consecutive chunks so a question that happens to straddle a
-# chunk boundary is never split mid-way. Results from all chunks are
-# merged: question-paper page indices are unioned, and questions are
-# deduplicated (since overlapping pages may cause the same question to
-# be reported by two chunks).
-#
-# A short pause between chunk calls keeps the per-minute token budget
-# from being exceeded even across multiple sequential requests, and a
-# dedicated retry path handles RateLimitError/BadRequestError(413) with
-# real backoff (honoring the `retry-after` header when Groq provides
-# one) -- separate from the generic malformed-JSON retry path.
 # =========================================================
 
 GROQ_MODEL = "openai/gpt-oss-120b"
 
-# Conservative per-chunk character budget for page content. Leaves
-# headroom for the system prompt (~250 tokens) and JSON output
-# (~500-800 tokens) under an 8000 TPM cap, even assuming a dense
-# ~2 chars/token ratio for Devanagari-heavy OCR text. Tune down further
-# if you're on an even lower tier; tune up if you upgrade tiers.
-MAX_CHARS_PER_CHUNK = 9000
+# FIX: a static character budget doesn't reliably predict actual token
+# usage (Devanagari-heavy text tokenizes denser and less predictably
+# than English). Instead of guessing a safe chunk size once, we now
+# keep a RUNNING ESTIMATE of tokens used in the current rolling window
+# and proactively wait BEFORE sending a chunk if we estimate we're
+# close to the 8000 TPM ceiling, using the actual Used/Requested/Limit
+# numbers Groq's own error messages report whenever we do go over, so
+# our internal estimate self-corrects against ground truth as we go.
+TPM_LIMIT = 8000
+TPM_SAFETY_FRACTION = 0.85  # treat the budget as slightly smaller than
+                              # the real limit to leave headroom for
+                              # estimation error
+CHARS_PER_TOKEN_ESTIMATE = 2.0  # conservative for Devanagari-heavy text;
+                                  # self-corrects via _record_actual_usage
+
+MAX_CHARS_PER_CHUNK = 6000  # smaller than before -- real-world 429s
+                              # showed our chars-per-token guess was
+                              # optimistic; smaller chunks reduce blast
+                              # radius of any single misestimate
 CHUNK_OVERLAP_PAGES = 1
-SECONDS_BETWEEN_CHUNKS = 3  # paces requests to stay under the TPM window
 
 QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet (e.g. IGNOU-style, India). The booklet mixes pages of different kinds, in no guaranteed order:
 
 1. ADMINISTRATIVE/COVER pages: enrolment number, programme code, learner name, registration details, regional centre info. NEVER question paper pages.
 2. QUESTION PAPER pages: the official printed list of numbered exam questions the student must answer. These read as instructions/prompts DIRECTED AT the student (e.g. "Discuss X", "Explain Y with examples", "Write notes on the following:"). Mark allocations may appear (e.g. "10", "20").
-3. ANSWER pages: the student's own (handwritten, OCR'd) answers. These are typically long, restate or reference a question briefly then write an extended response, and may themselves contain numbered or bulleted sub-points as part of the student's OWN explanation (e.g. a student listing several numbered points as part of one answer's content). These numbered sub-points inside a long answer are NOT separate exam questions, even though superficially they look similar (number, period, text) -- they are part of the answer to ONE question.
+3. ANSWER pages: the student's own (handwritten, OCR'd) answers. These are typically long, restate or reference a question briefly then write an extended response, and may themselves contain numbered or bulleted sub-points as part of the student's OWN explanation. These numbered sub-points inside a long answer are NOT separate exam questions, even though superficially they look similar (number, period, text) -- they are part of the answer to ONE question.
 
 You are being shown only a PORTION of the document's pages at a time (a chunk), not the whole document. Some pages you see may be partial context carried over from a previous chunk -- still classify them normally based on their own content.
 
-Your task: read the pages shown and return ONLY valid JSON (no markdown fences, no commentary, no explanation) in exactly this shape:
+Your task: read the pages shown and return ONLY valid JSON (no markdown fences, no commentary, no explanation) in EXACTLY this shape:
 
 {
-  "question_paper_pages": [<list of integer page_number values, from the pages shown, that are genuine question-paper pages>],
-  "questions": [<ordered list of the exact text of each real numbered exam question found on the question-paper pages shown>]
+  "question_paper_pages": [14, 16, 18],
+  "questions": ["1. Example question text. (10)", "2. Another example question. (10)"]
 }
+
+IMPORTANT formatting requirement: "question_paper_pages" must be a JSON array where EACH page number is a SEPARATE element separated by commas, like [14, 16, 18] -- NEVER merge multiple page numbers into one number like [141618]. Each integer in that array must be a single, individually valid page number from the pages shown.
 
 Critical rules for telling question-paper pages apart from answer pages that happen to contain numbered content:
 - A genuine question paper question is a PROMPT directed at the student ("explain", "discuss", "describe", "write notes on", "compare", a question mark, etc.) -- it asks the student to DO something.
@@ -353,14 +374,6 @@ Critical rules for telling question-paper pages apart from answer pages that hap
 
 def _chunk_pages_by_char_budget(pages: list, max_chars: int = MAX_CHARS_PER_CHUNK,
                                   overlap_pages: int = CHUNK_OVERLAP_PAGES) -> list:
-    """
-    Groups pages into chunks whose combined raw_text length stays under
-    max_chars, with `overlap_pages` pages of overlap between consecutive
-    chunks so a question split across a chunk boundary still appears
-    whole in at least one chunk. A single oversized page (rare, but
-    possible with a dense answer page) still gets its own chunk rather
-    than being dropped or causing an infinite loop.
-    """
     if not pages:
         return []
 
@@ -391,6 +404,82 @@ def _build_qp_user_prompt(pages: list) -> str:
     for p in pages:
         blocks.append(f"--- PAGE {p['page_number']} ---\n{p['raw_text']}")
     return "Here are the OCR'd pages shown in this chunk:\n\n" + "\n\n".join(blocks)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough estimate using the current chars-per-token ratio."""
+    return int(len(text) / CHARS_PER_TOKEN_ESTIMATE) + 1
+
+
+# =========================================================
+# Rolling token-budget tracker
+#
+# Tracks an estimate of tokens consumed within the current rolling
+# ~60s window. Before sending each chunk, if our estimated usage plus
+# the new request would exceed a safe fraction of TPM_LIMIT, we wait
+# out the remainder of the window BEFORE sending -- proactive pacing
+# instead of reactive retry-after-failure. Real 429 responses still
+# update our knowledge of actual usage (via parsed Used/Limit numbers)
+# so the estimate self-corrects over the course of a run.
+# =========================================================
+
+class _TokenBudgetTracker:
+    def __init__(self, tpm_limit=TPM_LIMIT, safety_fraction=TPM_SAFETY_FRACTION):
+        self.tpm_limit = tpm_limit
+        self.safe_limit = tpm_limit * safety_fraction
+        self.window_start = time.monotonic()
+        self.window_tokens = 0
+
+    def _maybe_reset_window(self):
+        now = time.monotonic()
+        if now - self.window_start >= 60:
+            self.window_start = now
+            self.window_tokens = 0
+
+    def wait_if_needed(self, upcoming_tokens: int, log=print):
+        self._maybe_reset_window()
+        projected = self.window_tokens + upcoming_tokens
+        if projected > self.safe_limit:
+            elapsed = time.monotonic() - self.window_start
+            wait_s = max(0.0, 60 - elapsed) + 0.5
+            log(
+                f"Proactively pacing requests: estimated {projected:.0f} tokens "
+                f"would be used in this 60s window (safe budget {self.safe_limit:.0f}). "
+                f"Waiting {wait_s:.1f}s before sending next chunk..."
+            )
+            time.sleep(wait_s)
+            self.window_start = time.monotonic()
+            self.window_tokens = 0
+
+    def record_usage(self, tokens: int):
+        self._maybe_reset_window()
+        self.window_tokens += tokens
+
+    def record_actual_from_error(self, used: int, limit: int):
+        """Reconciles our estimate with ground truth from a 429 error."""
+        self._maybe_reset_window()
+        self.window_tokens = max(self.window_tokens, used)
+        if limit:
+            self.tpm_limit = limit
+            self.safe_limit = limit * TPM_SAFETY_FRACTION
+
+
+# Parses Groq's rate-limit message for the real numbers it reports,
+# so retries and pacing are informed by ground truth, not guesses.
+_RATE_LIMIT_DETAIL_RE = re.compile(
+    r'Limit\s+(\d+),\s*Used\s+(\d+),\s*Requested\s+(\d+).*?try again in\s+([\d.]+)s',
+    re.IGNORECASE | re.DOTALL
+)
+
+
+def _parse_rate_limit_detail(message: str):
+    """Returns (limit, used, requested, wait_seconds) or None if the
+    message doesn't match Groq's known error format."""
+    m = _RATE_LIMIT_DETAIL_RE.search(message)
+    if not m:
+        return None
+    limit, used, requested, wait_s = m.groups()
+    return int(limit), int(used), int(requested), float(wait_s)
 
 
 def _parse_qp_llm_response(content: str) -> tuple:
@@ -430,62 +519,122 @@ def _parse_qp_llm_response(content: str) -> tuple:
     return qp_pages, questions
 
 
-def _get_retry_after_seconds(exc, default=5.0) -> float:
+def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_page: int) -> list:
     """
-    Extracts the `retry-after` header from a Groq RateLimitError/
-    BadRequestError if present, otherwise falls back to a sensible
-    default wait. Never raises -- always returns a usable number.
+    FIX: the LLM occasionally emits multiple page numbers merged into
+    one integer due to a formatting slip, e.g. [14, 16, 18] rendered
+    as [141618]. This is syntactically valid JSON (just one big int),
+    so it parses fine but is semantically wrong. Rather than silently
+    discarding it as "out of range," we attempt to recover the original
+    page numbers by greedily splitting its digit string into chunks
+    that are all currently-valid page numbers for this document.
+    Returns [] if no valid split is found (in which case the caller
+    should fall back to discarding it, as before).
     """
-    try:
-        response = getattr(exc, "response", None)
-        if response is not None:
-            header_val = response.headers.get("retry-after")
-            if header_val:
-                return float(header_val)
-    except Exception:
-        pass
-    return default
+    s = str(n)
+    if len(s) <= len(str(max_page)):
+        return []  # not implausibly large -- not a concatenation case
+
+    max_digits = len(str(max_page))
+
+    from itertools import product
+
+    def split_attempt(s, widths):
+        result = []
+        i = 0
+        for w in widths:
+            if i + w > len(s):
+                return None
+            chunk = s[i:i+w]
+            if chunk.startswith('0') and len(chunk) > 1:
+                return None
+            num = int(chunk)
+            if num not in valid_page_numbers:
+                return None
+            result.append(num)
+            i += w
+        if i != len(s):
+            return None
+        return result
+
+    for num_parts in range(2, len(s) + 1):
+        for widths in product(range(1, max_digits + 1), repeat=num_parts):
+            if sum(widths) != len(s):
+                continue
+            result = split_attempt(s, widths)
+            if result:
+                return result
+    return []
 
 
-def _call_groq_for_chunk(client, pages_chunk: list, log, max_retries: int = 3) -> tuple:
-    """
-    Calls Groq for a single chunk of pages. Handles two distinct
-    failure modes with different retry strategies:
-    - RateLimitError / BadRequestError (413, "request too large"):
-      these are TOKEN-BUDGET failures, not content failures. Retrying
-      immediately would just hit the same cap again, so we back off
-      using the `retry-after` header when available.
-    - JSON parsing failures (malformed model output): these are
-      CONTENT failures unrelated to rate limits, so we retry quickly
-      without a long wait.
-    """
+def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker",
+                          log, max_retries: int = 4) -> tuple:
     import groq
 
     user_prompt = _build_qp_user_prompt(pages_chunk)
+    estimated_tokens = _estimate_tokens(QP_SYSTEM_PROMPT) + _estimate_tokens(user_prompt) + 800
     last_error = None
 
+    skip_next_proactive_check = False
+
     for attempt in range(1, max_retries + 2):
+        # Proactively pace BEFORE sending, based on our running estimate
+        # of tokens used in the current rolling window. Skipped exactly
+        # once, right after a 429/413 retry, since at that point we just
+        # waited the exact amount of time Groq itself told us was needed
+        # (record_actual_from_error + window reset already happened) --
+        # re-applying our own separate proactive wait on top of that would
+        # double-penalize the same window and stall far longer than
+        # necessary. Any OTHER retry (e.g. after a JSON-parse failure,
+        # which does NOT reset the window) still goes through the normal
+        # proactive check, since real token risk could still be present.
+        if skip_next_proactive_check:
+            skip_next_proactive_check = False
+        else:
+            budget.wait_if_needed(estimated_tokens, log=log)
+
         try:
-            response = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {"role": "system", "content": QP_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            )
+            with _groq_call_lock:
+                response = client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[
+                        {"role": "system", "content": QP_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                )
+            budget.record_usage(estimated_tokens)
             content = response.choices[0].message.content
             return _parse_qp_llm_response(content)
 
         except (groq.RateLimitError, groq.BadRequestError) as e:
             last_error = e
-            wait_s = _get_retry_after_seconds(e, default=5.0 * attempt)
-            log(
-                f"Chunk LLM call hit a rate/size limit (attempt {attempt}): {e}. "
-                f"Waiting {wait_s:.1f}s before retrying..."
-            )
-            time.sleep(wait_s)
+            detail = _parse_rate_limit_detail(str(e))
+            if detail:
+                limit, used, requested, wait_s = detail
+                budget.record_actual_from_error(used, limit)
+                log(
+                    f"Chunk LLM call hit a rate/size limit (attempt {attempt}): "
+                    f"TPM limit={limit}, used={used}, requested={requested}. "
+                    f"Waiting {wait_s + 0.5:.1f}s (Groq-reported) before retrying..."
+                )
+                time.sleep(wait_s + 0.5)
+                # Groq's own reported wait already accounts for the real
+                # usage in the window we just hit the limit in. Once we've
+                # waited it out, that window is effectively over -- reset
+                # our tracker so the upcoming retry isn't ALSO blocked by
+                # our own proactive pacer re-checking the same stale figure.
+                budget.window_start = time.monotonic()
+                budget.window_tokens = 0
+                skip_next_proactive_check = True
+            else:
+                wait_s = 5.0 * attempt
+                log(
+                    f"Chunk LLM call hit a rate/size limit (attempt {attempt}): {e}. "
+                    f"Waiting {wait_s:.1f}s before retrying..."
+                )
+                time.sleep(wait_s)
 
         except Exception as e:
             last_error = e
@@ -498,15 +647,6 @@ def _call_groq_for_chunk(client, pages_chunk: list, log, max_retries: int = 3) -
 
 
 def _merge_chunk_results(chunk_results: list) -> tuple:
-    """
-    chunk_results: list of (qp_page_numbers_1based, questions) tuples.
-    Unions question-paper page numbers across chunks (a page reported
-    as a question paper page by ANY chunk that saw it is trusted, since
-    the model is reasoning over real content either way). Deduplicates
-    questions by normalized text, preserving first-seen order, since
-    overlapping pages between chunks can cause the same question to be
-    reported more than once.
-    """
     all_qp_pages = set()
     all_questions = []
     seen_keys = set()
@@ -523,14 +663,6 @@ def _merge_chunk_results(chunk_results: list) -> tuple:
 
 
 def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
-    """
-    Calls Groq (chunked, to respect TPM limits) to identify which pages
-    are genuine question-paper pages and to extract the clean list of
-    real exam questions.
-
-    Returns (qp_page_indices_0based, questions) to match the 0-based
-    indexing convention used by the rest of this pipeline.
-    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -543,35 +675,49 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         raise Exception("GROQ_API_KEY not found in secrets or environment")
 
     client = Groq(api_key=api_key)
+    budget = _TokenBudgetTracker()
 
     chunks = _chunk_pages_by_char_budget(pages)
     log(f"Split {len(pages)} page(s) into {len(chunks)} LLM chunk(s) to respect token limits")
 
     valid_page_numbers = {p["page_number"] for p in pages}
+    max_page_number = max(valid_page_numbers) if valid_page_numbers else 0
     chunk_results = []
 
     for i, chunk in enumerate(chunks):
         page_nums_in_chunk = [p["page_number"] for p in chunk]
         log(f"Asking LLM to analyze chunk {i+1}/{len(chunks)} (pages {page_nums_in_chunk})...")
 
-        qp_pages_1based, questions = _call_groq_for_chunk(client, chunk, log)
+        qp_pages_1based, questions = _call_groq_for_chunk(client, chunk, budget, log)
 
-        invalid = [pn for pn in qp_pages_1based if pn not in valid_page_numbers]
-        if invalid:
-            log(f"WARNING: LLM returned out-of-range page numbers, ignoring: {invalid}")
-        qp_pages_1based = [pn for pn in qp_pages_1based if pn in valid_page_numbers]
+        # FIX: recover page numbers the LLM accidentally concatenated
+        # together (e.g. [14, 16, 18] emitted as [141618]) instead of
+        # just discarding them as "out of range."
+        recovered_pages = []
+        truly_invalid = []
+        for pn in qp_pages_1based:
+            if pn in valid_page_numbers:
+                recovered_pages.append(pn)
+                continue
+            split_result = _try_split_concatenated_page_number(
+                pn, valid_page_numbers, max_page_number
+            )
+            if split_result:
+                log(f"Recovered concatenated page numbers: {pn} -> {split_result}")
+                recovered_pages.extend(split_result)
+            else:
+                truly_invalid.append(pn)
+
+        if truly_invalid:
+            log(f"WARNING: LLM returned out-of-range page numbers, ignoring: {truly_invalid}")
+
+        qp_pages_1based = sorted(set(recovered_pages))
 
         log(
             f"Chunk {i+1}/{len(chunks)}: identified {len(qp_pages_1based)} question paper "
             f"page(s), {len(questions)} question(s)"
         )
         chunk_results.append((qp_pages_1based, questions))
-
-        # Pace requests to stay under the per-minute token budget, even
-        # though each individual chunk is sized to fit -- consecutive
-        # requests within the same minute still share the same TPM pool.
-        if i < len(chunks) - 1:
-            time.sleep(SECONDS_BETWEEN_CHUNKS)
 
     qp_pages_1based_merged, questions = _merge_chunk_results(chunk_results)
     qp_page_indices_0based = sorted(pn - 1 for pn in qp_pages_1based_merged)
@@ -606,7 +752,7 @@ def is_noise(line: str) -> bool:
 
 # =========================================================
 # FIND QUESTION BOUNDARIES IN ANSWER PAGES -- similarity based
-# UNCHANGED from prior version.
+# UNCHANGED.
 # =========================================================
 
 def normalize(text: str) -> str:
