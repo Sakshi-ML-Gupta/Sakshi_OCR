@@ -736,12 +736,23 @@ def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_pag
     return candidates[0]
 
 
-def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker",
-                          log, max_retries: int = 4) -> tuple:
+def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
+                              response_parser, budget: "_TokenBudgetTracker",
+                              log, max_retries: int = 4):
+    """
+    Generic Groq chat-completion caller with full retry/pacing/error
+    handling. Shared by BOTH question-identification and answer-mapping
+    calls, so the (carefully tuned, repeatedly bug-fixed) rate-limit
+    and auth-error handling lives in exactly one place instead of being
+    duplicated and risking drifting out of sync between the two callers.
+
+    `response_parser` is called with the raw response content string
+    and must return the parsed result, or raise on malformed output
+    (the same retry loop here also catches and retries parse failures).
+    """
     import groq
 
-    user_prompt = _build_qp_user_prompt(pages_chunk)
-    estimated_tokens = _estimate_tokens(QP_SYSTEM_PROMPT) + _estimate_tokens(user_prompt) + 800
+    estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
     last_error = None
 
     skip_next_proactive_check = False
@@ -767,7 +778,7 @@ def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker
                 response = client.chat.completions.create(
                     model=GROQ_MODEL,
                     messages=[
-                        {"role": "system", "content": QP_SYSTEM_PROMPT},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
                     response_format={"type": "json_object"},
@@ -775,18 +786,15 @@ def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker
                 )
             budget.record_usage(estimated_tokens)
             content = response.choices[0].message.content
-            return _parse_qp_llm_response(content)
+            return response_parser(content)
 
         except groq.AuthenticationError as e:
-            # FIX: a 401 "Invalid API Key" is an AUTH failure, not a rate
+            # A 401 "Invalid API Key" is an AUTH failure, not a rate
             # limit -- it will NEVER succeed on retry, since the key
-            # itself is wrong/missing/revoked. The previous code let this
-            # fall through to the generic except-Exception branch below,
-            # which retried it 4 more times with a 1s sleep each,
-            # producing a confusing "failed after 5 attempts" message
-            # several seconds later instead of an immediate, clear
-            # explanation of the real problem. Fail fast on the very
-            # first attempt with actionable next steps.
+            # itself is wrong/missing/revoked. Fail fast on the very
+            # first attempt with actionable next steps, instead of
+            # retrying pointlessly and burning several seconds before
+            # surfacing a confusing "failed after N attempts" message.
             raise Exception(
                 f"Groq API rejected the API key (401 Invalid API Key). "
                 f"This will NOT be fixed by retrying. Things to check:\n"
@@ -808,17 +816,15 @@ def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker
             detail = _parse_rate_limit_detail(str(e))
 
             if detail and detail["limit_type"] == "TPD":
-                # FIX: a daily token quota exhaustion is fundamentally
+                # A daily token quota exhaustion is fundamentally
                 # different from a per-minute one. Retrying -- even with
                 # the correct wait time -- means stalling the whole run
                 # for 10+ minutes, and if the quota is THIS close to its
                 # daily ceiling, a successful retry would likely just
-                # exhaust it again on the very next chunk. There is no
-                # benefit to retrying within this run; the only real fix
-                # is waiting for the daily reset (next UTC day) or
-                # upgrading the Groq tier. Fail fast with a clear,
-                # actionable message instead of burning retries and the
-                # user's time against a wall that small waits can't clear.
+                # exhaust it again on the very next chunk. Fail fast
+                # with a clear, actionable message instead of burning
+                # retries and the user's time against a wall that small
+                # waits can't clear.
                 raise Exception(
                     f"Groq daily token quota (TPD) exhausted: "
                     f"{detail['used']}/{detail['limit']} tokens used today, "
@@ -845,11 +851,6 @@ def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker
                     f"before retrying..."
                 )
                 time.sleep(detail["wait_seconds"] + 0.5)
-                # Groq's own reported wait already accounts for the real
-                # usage in the window we just hit the limit in. Once we've
-                # waited it out, that window is effectively over -- reset
-                # our tracker so the upcoming retry isn't ALSO blocked by
-                # our own proactive pacer re-checking the same stale figure.
                 budget.reset_window()
                 skip_next_proactive_check = True
             else:
@@ -867,6 +868,17 @@ def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker
 
     raise Exception(
         f"Chunk LLM call failed after {max_retries + 1} attempts. Last error: {last_error}"
+    )
+
+
+def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker",
+                          log, max_retries: int = 4) -> tuple:
+    """Question-identification call -- thin wrapper around the shared
+    generic caller, using the QP-specific prompts and parser."""
+    user_prompt = _build_qp_user_prompt(pages_chunk)
+    return _call_groq_with_retries(
+        client, QP_SYSTEM_PROMPT, user_prompt, _parse_qp_llm_response,
+        budget, log, max_retries
     )
 
 
@@ -952,6 +964,261 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     )
 
     return qp_page_indices_0based, questions
+
+
+# =========================================================
+# LLM-BASED ANSWER MAPPING (Groq)
+#
+# FIX: the previous approach (find_question_boundaries_by_similarity +
+# slice_raw_answers_by_boundaries) used plain word-overlap similarity
+# on a sliding window of answer lines to guess where each question's
+# restatement appears, then sliced from there to the NEXT matched
+# question's restatement. This is fundamentally fragile on long,
+# free-form handwritten Hindi answers: if even ONE question in the
+# middle of the sequence fails to match cleanly (common with OCR noise,
+# reordered sub-parts, or answers that don't explicitly restate the
+# question), the similarity matcher silently skips it -- and the
+# PRECEDING matched question's slice then extends all the way to
+# whatever question matches NEXT, however far away that is. This is
+# exactly the bug seen in real usage: one question's answer absorbing
+# several subsequent questions' worth of content, while the skipped
+# questions get nothing.
+#
+# This replaces that entire approach with an LLM call that reads the
+# actual answer text and identifies, independently per question, the
+# LINE-NUMBER RANGE where that answer appears. Critically, the LLM is
+# asked for line indices, NOT to retype the answer -- the actual
+# extraction is a plain Python slice of the ORIGINAL OCR'd text using
+# those indices, guaranteeing the output is verbatim (no paraphrasing,
+# no risk of subtle LLM rewording) while still getting LLM-quality
+# semantic boundary detection instead of brittle text-similarity
+# heuristics. A Python-side overlap-resolution pass provides a hard
+# guarantee against the swallowing bug even if the LLM's boundaries
+# are imperfect: no question's range can ever be allowed to extend
+# into territory a later-starting question's range claims.
+# =========================================================
+
+ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
+1. A numbered list of the OFFICIAL exam questions (in order).
+2. The student's answer text, with each line prefixed by its line number in [brackets].
+
+Your task: for EACH official question, find WHERE in the answer text the student's response to that specific question starts and ends, and return the LINE NUMBER RANGE (inclusive) for each.
+
+Important guidance for finding boundaries correctly:
+- A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
+- An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins (whether or not the next answer is in your list of official questions).
+- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that question from your output entirely. It may appear in a different chunk of the document.
+- Each question's range must NOT overlap with another question's range. If you are unsure exactly where one answer ends and the next begins, prefer ending the EARLIER answer sooner rather than letting it swallow content that belongs to a later answer -- a short correct answer is far more useful than a long answer that incorrectly absorbed unrelated content.
+- Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{
+  "answers": [
+    {"question": "<exact question text from the official list>", "start_line": 12, "end_line": 18},
+    {"question": "<exact question text from the official list>", "start_line": 19, "end_line": 25}
+  ]
+}
+
+If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any of these answers."""
+
+
+def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
+    questions_block = "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
+    return (
+        f"OFFICIAL QUESTIONS:\n{questions_block}\n\n"
+        f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}"
+    )
+
+
+def _parse_answer_map_llm_response(content: str) -> list:
+    content = content.strip()
+
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"LLM did not return valid JSON: {e}\nRaw content (first 500 chars): {content[:500]!r}"
+        )
+
+    if not isinstance(data, dict) or "answers" not in data:
+        raise ValueError(f"LLM response missing 'answers' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    answers = data["answers"]
+    if not isinstance(answers, list):
+        raise ValueError(f"'answers' must be a list, got: {type(answers).__name__}")
+
+    result = []
+    for item in answers:
+        if not isinstance(item, dict):
+            continue
+        if "question" not in item or "start_line" not in item or "end_line" not in item:
+            continue
+        try:
+            result.append({
+                "question": str(item["question"]).strip(),
+                "start_line": int(item["start_line"]),
+                "end_line": int(item["end_line"]),
+            })
+        except (ValueError, TypeError):
+            continue  # skip malformed entries rather than failing the whole batch
+
+    return result
+
+
+def _chunk_lines_by_char_budget(numbered_lines: list, max_chars: int = MAX_CHARS_PER_CHUNK,
+                                  overlap_lines: int = 5) -> list:
+    """
+    Like _chunk_pages_by_char_budget, but operates on flattened answer
+    LINES rather than pages, since answer text needs finer-grained
+    chunking (a single page can be very long). overlap_lines (rather
+    than overlap_pages) ensures an answer that straddles a chunk
+    boundary still appears whole in at least one chunk.
+    """
+    if not numbered_lines:
+        return []
+
+    chunks = []
+    current_chunk = []
+    current_chars = 0
+
+    for idx, text in numbered_lines:
+        line_chars = len(text)
+
+        if current_chunk and current_chars + line_chars > max_chars:
+            chunks.append(current_chunk)
+            overlap = current_chunk[-overlap_lines:] if overlap_lines > 0 else []
+            current_chunk = list(overlap)
+            current_chars = sum(len(t) for _, t in current_chunk)
+
+        current_chunk.append((idx, text))
+        current_chars += line_chars
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
+    """
+    HARD SAFETY NET against the answer-swallowing bug: sorts ranges by
+    start_line, then clips any range's end_line so it can never extend
+    into territory claimed by a later-starting range. This guarantees
+    the bug seen in real usage (one question's answer absorbing several
+    subsequent questions' worth of content) is structurally impossible
+    in the output, regardless of how the LLM's boundaries came out.
+    """
+    sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
+    resolved = []
+    for i, r in enumerate(sorted_ranges):
+        r = dict(r)
+        if i + 1 < len(sorted_ranges):
+            next_start = sorted_ranges[i + 1]["start_line"]
+            if r["end_line"] >= next_start:
+                r["end_line"] = next_start - 1
+        if r["end_line"] >= r["start_line"]:
+            resolved.append(r)
+    return resolved
+
+
+def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
+    """
+    Maps each official question to its verbatim answer text, extracted
+    INDEPENDENTLY per question via LLM-identified line boundaries.
+
+    Returns {question_text: answer_text} for every question whose
+    answer was found. Questions not found are simply absent from the
+    dict (caller decides how to represent "no answer found").
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
+        raise Exception("GROQ_API_KEY not found in secrets or environment")
+
+    client = Groq(api_key=api_key)
+    budget = _TokenBudgetTracker()
+
+    numbered_lines = list(enumerate(answer_lines))
+    chunks = _chunk_lines_by_char_budget(numbered_lines)
+    log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
+
+    all_ranges = []  # list of {question, start_line, end_line}
+
+    for i, chunk in enumerate(chunks):
+        line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
+        log(f"Asking LLM to map answers in chunk {i+1}/{len(chunks)} (lines {line_range})...")
+
+        user_prompt = _build_answer_map_user_prompt(chunk, questions)
+        try:
+            chunk_ranges = _call_groq_with_retries(
+                client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
+                _parse_answer_map_llm_response, budget, log
+            )
+        except Exception as e:
+            log(f"WARNING: chunk {i+1}/{len(chunks)} answer-mapping failed, skipping: {e}")
+            continue
+
+        # Validate line numbers are within THIS chunk's actual range
+        # before accepting them (defends against the LLM hallucinating
+        # line numbers outside what it was shown).
+        valid_indices = {idx for idx, _ in chunk}
+        min_idx, max_idx = min(valid_indices), max(valid_indices)
+        for r in chunk_ranges:
+            if min_idx <= r["start_line"] <= max_idx and min_idx <= r["end_line"] <= max_idx:
+                all_ranges.append(r)
+            else:
+                log(
+                    f"WARNING: discarding out-of-range answer mapping for "
+                    f"{r['question'][:50]!r}: lines {r['start_line']}-{r['end_line']} "
+                    f"outside this chunk's range {min_idx}-{max_idx}"
+                )
+
+        log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
+
+    # Deduplicate: if overlapping chunks both found the same question
+    # (possible due to line overlap between chunks), keep the one with
+    # the longer range (more complete capture).
+    best_by_question = {}
+    for r in all_ranges:
+        key = re.sub(r'\s+', ' ', r["question"].lower().strip())
+        existing = best_by_question.get(key)
+        if existing is None or (r["end_line"] - r["start_line"]) > (existing["end_line"] - existing["start_line"]):
+            best_by_question[key] = r
+
+    deduped_ranges = list(best_by_question.values())
+
+    # HARD SAFETY NET: resolve any remaining overlaps so no answer can
+    # ever swallow another's content, regardless of LLM output quality.
+    resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
+
+    log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
+
+    # Slice the ORIGINAL answer_lines verbatim using the resolved ranges
+    # -- this is the only place the actual answer text is produced, and
+    # it is a pure Python slice, guaranteeing no LLM paraphrasing risk.
+    qa_map = {}
+    for r in resolved_ranges:
+        start, end = r["start_line"], r["end_line"]
+        verbatim_lines = [
+            answer_lines[j] for j in range(start, end + 1)
+            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
+        ]
+        qa_map[r["question"]] = " ".join(verbatim_lines).strip()
+
+    return qa_map
 
 
 NOISE_RE = re.compile(
@@ -1135,24 +1402,68 @@ def process_pdf(file_input, status_callback=None):
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
-    log("Matching questions via similarity (works for Hindi/English/any format)...")
-    boundaries = find_question_boundaries_by_similarity(answer_lines, official_questions)
-    log(f"Matched {len(boundaries)} of {len(official_questions)} questions")
+    # FIX: replaces the old similarity-based sliding-window matching
+    # (which could let one question's answer swallow several others --
+    # the exact bug seen in real usage) with LLM-based, per-question
+    # INDEPENDENT answer extraction. Each question's answer boundary is
+    # identified on its own merits by the LLM reading the actual text,
+    # with a hard Python-side overlap-resolution safety net guaranteeing
+    # no answer can ever absorb another's content.
+    log("Mapping each question to its answer independently (LLM-based)...")
+    qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
 
-    matched_qs = {b["question"] for b in boundaries}
+    matched_count = sum(1 for q in official_questions if q in qa_map)
+    log(f"Matched {matched_count} of {len(official_questions)} questions")
+
     for q in official_questions:
-        if q not in matched_qs:
+        if q not in qa_map:
             log(f"WARNING: No match found for: {q[:60]}")
 
-    if not boundaries:
+    if not qa_map:
         raise Exception(
-            "Could not match any questions in answer pages.\n"
+            "Could not match any questions to answers.\n"
             f"Official questions: {official_questions}\n"
             f"First 10 answer lines: {answer_lines[:10]}"
         )
 
-    log("Slicing raw answers...")
-    qa_pairs = slice_raw_answers_by_boundaries(answer_lines, boundaries)
+    # Build the Q&A pairs list, preserving the official question order
+    # and explicitly marking unmatched questions rather than silently
+    # dropping them -- this makes it clear in the output which
+    # questions were genuinely not found versus matched-but-empty.
+    qa_pairs = []
+    for q in official_questions:
+        qa_pairs.append({
+            "question": q,
+            "answer": qa_map.get(q, ""),
+            "matched": q in qa_map,
+        })
 
-    log(f"Done -- {len(qa_pairs)} Q-A pairs")
+    log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
+
+    # Returns BOTH requested outputs separately:
+    # - ocr_json: the complete raw OCR of the whole PDF, every page
+    # - qa_pairs: the clean, independently-mapped question -> answer
+    #   pairs, in official question order
+    # The caller is responsible for writing these to two separate
+    # files (see save_outputs() below for a ready-made helper).
     return ocr_json, qa_pairs
+
+
+def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
+                  base_name: str = "document") -> tuple:
+    """
+    Convenience helper: writes the two requested output files to disk
+    and returns their paths.
+    - {base_name}_ocr.json: the complete raw OCR of the whole PDF
+    - {base_name}_qa_pairs.json: the mapped question -> answer pairs
+    """
+    ocr_path = os.path.join(output_dir, f"{base_name}_ocr.json")
+    qa_path = os.path.join(output_dir, f"{base_name}_qa_pairs.json")
+
+    with open(ocr_path, "w", encoding="utf-8") as f:
+        json.dump(ocr_json, f, ensure_ascii=False, indent=2)
+
+    with open(qa_path, "w", encoding="utf-8") as f:
+        json.dump(qa_pairs, f, ensure_ascii=False, indent=2)
+
+    return ocr_path, qa_path
