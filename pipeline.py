@@ -4,7 +4,6 @@ import re
 import json
 import base64
 import fitz
-import httpx
 from pathlib import Path
 
 # =========================================================
@@ -22,40 +21,40 @@ def get_api_key(name):
 
 
 # =========================================================
-# OCR — OCR.Space API
+# OCR — GPT-4o-mini Vision
 #
-# Free tier: 25,000 requests/month (no credit card needed).
-# Pure HTTP POST — no binary, no SDK, works on Streamlit Cloud.
-# Supports 90+ languages including Hindi & English.
+# Supports ALL Indian languages natively (Hindi, Tamil, Telugu,
+# Kannada, Malayalam, Marathi, Bengali, Gujarati, Punjabi, Odia,
+# Urdu, Assamese, Sanskrit, etc.) — no language codes needed.
+#
+# Cost: ~$0.0002 per page. A 20-page PDF costs ~$0.004.
+# Pure HTTP via OpenAI SDK — no binaries, works on Streamlit Cloud.
 # =========================================================
 
-OCR_SPACE_URL = "https://api.ocr.space/parse/image"
-
-
-def run_ocr(file_bytes: bytes, file_name: str, status_callback=None, dpi: int = 300):
+def run_ocr(file_bytes: bytes, file_name: str, status_callback=None, dpi: int = 200):
     """
-    Run OCR.Space API on a PDF.
-
-    Get a free API key from: https://ocr.space/ocrapi
+    Run GPT-4o-mini Vision OCR on a PDF.
+    Automatically detects any language — no configuration needed.
     """
+    from openai import OpenAI
+
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    api_key = get_api_key("OCR_SPACE_API_KEY")
+    api_key = get_api_key("OPENAI_API_KEY")
     if not api_key:
-        raise Exception(
-            "OCR_SPACE_API_KEY not found in secrets or environment.\n"
-            "Get a free key at: https://ocr.space/ocrapi"
-        )
+        raise Exception("OPENAI_API_KEY not found in secrets or environment")
+
+    client = OpenAI(api_key=api_key)
 
     size_mb = len(file_bytes) / (1024 * 1024)
-    log(f"Opening PDF for OCR.Space... ({size_mb:.1f}MB)")
+    log(f"Opening PDF for GPT-4o-mini Vision OCR... ({size_mb:.1f}MB)")
 
     src_doc = fitz.open(stream=file_bytes, filetype="pdf")
     total_pages = len(src_doc)
-    log(f"PDF has {total_pages} page(s) — running OCR at {dpi} DPI")
+    log(f"PDF has {total_pages} page(s) — running Vision OCR at {dpi} DPI")
 
     pages = []
 
@@ -67,47 +66,49 @@ def run_ocr(file_bytes: bytes, file_name: str, status_callback=None, dpi: int = 
         img_bytes = pix.tobytes("png")
         img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-        # Call OCR.Space
-        payload = {
-            "base64Image": f"data:image/png;base64,{img_b64}",
-            "language": "hin+eng",
-            "isOverlayRequired": "false",
-            "OCREngine": "2",          # Engine 2 is more accurate
-            "scale": "true",
-            "detectTables": "false",
-        }
+        log(f"  Scanning page {page_num + 1}/{total_pages}...")
 
-        resp = httpx.post(
-            OCR_SPACE_URL,
-            data=payload,
-            headers={"apikey": api_key},
-            timeout=120
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Extract ALL text from this image exactly as written. "
+                                "Rules:\n"
+                                "- Preserve every line break exactly as it appears.\n"
+                                "- Do NOT translate, summarize, correct, or modify any text.\n"
+                                "- Keep original numbering (1., 2., a), b), क), ख), etc.).\n"
+                                "- The text may be in ANY Indian language or English or mixed — output it exactly as written.\n"
+                                "- Output ONLY the extracted text, nothing else."
+                            )
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_b64}",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=4096,
+            temperature=0
         )
 
-        if resp.status_code != 200:
-            raise Exception(f"OCR.Space API error {resp.status_code}: {resp.text[:500]}")
-
-        data = resp.json()
-
-        if data.get("IsErroredOnProcessing"):
-            errors = data.get("ErrorMessage", [])
-            raise Exception(f"OCR.Space processing error: {errors}")
-
-        parsed_results = data.get("ParsedResults", [])
-        text = ""
-        if parsed_results:
-            text = parsed_results[0].get("ParsedText", "")
+        text = resp.choices[0].message.content.strip()
 
         pages.append({
             "page_number": page_num + 1,
-            "raw_text": text.strip()
+            "raw_text": text
         })
 
-        if (page_num + 1) % 5 == 0 or (page_num + 1) == total_pages:
-            log(f"  OCR progress: {page_num + 1}/{total_pages} pages")
-
     src_doc.close()
-    log(f"OCR.Space done — {len(pages)} page(s) extracted")
+    log(f"GPT-4o-mini Vision OCR done — {len(pages)} page(s) extracted")
     return pages
 
 
@@ -728,7 +729,7 @@ def process_pdf(file_input, status_callback=None):
         file_bytes = file_input.read()
         file_name  = getattr(file_input, "name", "document.pdf")
 
-    # Step 1: OCR — OCR.Space (free, pure HTTP, no binary)
+    # Step 1: OCR — GPT-4o-mini Vision (all Indian languages, no extra key)
     pages = run_ocr(file_bytes, file_name, status_callback)
 
     # Step 2: Build OCR JSON
@@ -736,7 +737,7 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    # Step 3: Try OpenAI-based line identification first
+    # Step 3: Try OpenAI-based line identification
     log("Attempting OpenAI-based question/answer line detection...")
     qa_pairs, openai_fail_reason = try_openai_pipeline(pages, status_callback)
 
