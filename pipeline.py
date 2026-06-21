@@ -29,7 +29,7 @@ def get_gemini_model():
     
     genai.configure(api_key=api_key)
     # Flash 1.5 is extremely fast, free, and supports all Indian languages natively
-    return genai.GenerativeModel('gemini-1.5-flash')
+        return genai.GenerativeModel('gemini-2.0-flash')
 
 
 # =========================================================
