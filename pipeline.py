@@ -22,158 +22,65 @@ def get_api_key(name):
 
 
 # =========================================================
-# PREPROCESS PDF
-# =========================================================
-
-def preprocess_pdf(file_bytes, dpi=250):
-    src_doc = fitz.open(stream=file_bytes, filetype="pdf")
-    out_doc = fitz.open()
-    for page in src_doc:
-        pix = page.get_pixmap(dpi=dpi)
-        new_page = out_doc.new_page(width=pix.width, height=pix.height)
-        new_page.insert_image(new_page.rect, pixmap=pix)
-    buf = io.BytesIO()
-    out_doc.save(buf)
-    src_doc.close()
-    out_doc.close()
-    buf.seek(0)
-    return buf.read()
-
-
-# =========================================================
-# OCR — Datalab (Chandra model) via /convert endpoint
+# OCR — Tesseract (local, no API needed)
 #
-# Datalab's /convert is async: submit -> poll request_check_url
-# until status == "complete". paginate=True returns markdown with
-# page-break markers so we can split back into per-page text,
-# matching the page-based structure the rest of the pipeline needs.
+# Renders each PDF page as a high-DPI image via PyMuPDF,
+# then runs Tesseract OCR with Hindi+English language support.
+# Returns per-page text, same structure as the old Datalab path.
 # =========================================================
 
-DATALAB_BASE_URL = "https://www.datalab.to"
-
-# Marker for page breaks when paginate=True
-# Datalab inserts a horizontal rule with the page number between pages.
-PAGE_BREAK_RE = re.compile(
-    r'\n?-{3,}\s*\n+\s*\{(\d+)\}-{3,}\s*\n?|\n?\{(\d+)\}-{3,}\s*\n?',
-)
-
-
-def _split_paginated_markdown(markdown: str, total_pages_hint: int = None) -> list:
+def run_ocr(file_bytes: bytes, file_name: str, status_callback=None, dpi: int = 300):
     """
-    Datalab paginated markdown separates pages with a horizontal rule
-    containing the page number, e.g.:
-        page 1 content
-        ------- Page 1 -------
-        page 2 content
-    Exact format can vary slightly by version, so we fall back to a
-    generic split on form-feed / page-marker patterns, and if no
-    markers are found at all, return the whole text as one page.
+    Run Tesseract OCR on a PDF.
+
+    Requirements:
+        - System: tesseract-ocr  (apt install tesseract-ocr tesseract-ocr-hin)
+        - Python: pip install pytesseract Pillow
+
+    The `dpi` parameter controls image resolution — 300 is a good balance
+    of accuracy vs. speed for handwritten exam booklets.
     """
-    # Try splitting on common Datalab page break patterns
-    generic_break = re.compile(r'\n-{3,}\s*Page\s*\d+\s*-{3,}\n', re.IGNORECASE)
+    import pytesseract
+    from PIL import Image
 
-    parts = generic_break.split(markdown)
-    if len(parts) > 1:
-        return [p.strip() for p in parts]
-
-    # Fallback: no recognizable page breaks — return as single block
-    return [markdown.strip()]
-
-
-def run_ocr(file_content: bytes, file_name: str, status_callback=None):
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    api_key = get_api_key("DATALAB_API_KEY")
-    if not api_key:
-        raise Exception("DATALAB_API_KEY not found in secrets or environment")
+    size_mb = len(file_bytes) / (1024 * 1024)
+    log(f"Opening PDF for Tesseract OCR... ({size_mb:.1f}MB)")
 
-    # Guard against oversized uploads — fail with a clear message
-    # instead of a cryptic Cloudflare 413 HTML page.
-    size_mb = len(file_content) / (1024 * 1024)
-    MAX_MB  = 45   # conservative margin under typical Cloudflare limits
-    if size_mb > MAX_MB:
-        raise Exception(
-            f"File is {size_mb:.1f}MB, which exceeds the {MAX_MB}MB upload limit. "
-            f"Try compressing the PDF or splitting it into smaller files before uploading."
-        )
+    src_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    total_pages = len(src_doc)
+    log(f"PDF has {total_pages} page(s) — running Tesseract at {dpi} DPI")
 
-    headers = {"X-API-Key": api_key}
-
-    log(f"Submitting document to Datalab (Chandra OCR)... ({size_mb:.1f}MB)")
-
-    resp = httpx.post(
-        f"{DATALAB_BASE_URL}/api/v1/convert",
-        headers=headers,
-        files={"file": (file_name, file_content, "application/pdf")},
-        data={
-            "output_format": "markdown",
-            "mode": "accurate",     # highest accuracy — best for handwriting
-            "paginate": "true"      # keep page boundaries in the output
-        },
-        timeout=120
-    )
-
-    if resp.status_code != 200:
-        raise Exception(f"Datalab submit error {resp.status_code}: {resp.text}")
-
-    data = resp.json()
-
-    if not data.get("success", True):
-        raise Exception(f"Datalab submit failed: {data.get('error')}")
-
-    check_url = data["request_check_url"]
-    log("Document submitted — polling for OCR result...")
-
-    # ── Poll until complete ─────────────────────────────────
-    max_polls = 150          # ~150 * 2s = 5 minutes max wait
-    poll_interval = 2
-
-    result = None
-    for attempt in range(max_polls):
-        poll_resp = httpx.get(check_url, headers=headers, timeout=60)
-
-        if poll_resp.status_code != 200:
-            raise Exception(f"Datalab poll error {poll_resp.status_code}: {poll_resp.text}")
-
-        result = poll_resp.json()
-        status = result.get("status")
-
-        if status == "complete":
-            log("OCR complete — parsing pages...")
-            break
-
-        if status == "failed" or result.get("error"):
-            raise Exception(f"Datalab conversion failed: {result.get('error')}")
-
-        if attempt % 5 == 0:
-            log(f"Still processing... ({attempt * poll_interval}s elapsed)")
-
-        time.sleep(poll_interval)
-    else:
-        raise Exception("Datalab conversion timed out after 5 minutes")
-
-    if not result.get("success", True):
-        raise Exception(f"Datalab conversion error: {result.get('error')}")
-
-    markdown = result.get("markdown") or ""
-
-    if not markdown.strip():
-        raise Exception("Datalab returned empty markdown output")
-
-    page_count_hint = result.get("page_count")
-    page_texts = _split_paginated_markdown(markdown, page_count_hint)
+    # Determine language: default to Hindi+English for Indian exam papers.
+    # Users can override with TESS_LANG env var (e.g. "eng", "hin+eng", "tam+eng").
+    lang = os.getenv("TESS_LANG", "hin+eng")
+    log(f"Tesseract language: {lang}")
 
     pages = []
-    for idx, text in enumerate(page_texts):
+    for page_num in range(total_pages):
+        page = src_doc[page_num]
+        pix = page.get_pixmap(dpi=dpi)
+
+        # Convert PyMuPDF pixmap to PIL Image
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        # Run Tesseract
+        text = pytesseract.image_to_string(img, lang=lang, config="--psm 6")
+
         pages.append({
-            "page_number": idx + 1,
-            "raw_text":    text
+            "page_number": page_num + 1,
+            "raw_text": text.strip()
         })
 
-    log(f"OCR done — {len(pages)} page(s) extracted")
+        if (page_num + 1) % 5 == 0 or (page_num + 1) == total_pages:
+            log(f"  OCR progress: {page_num + 1}/{total_pages} pages")
+
+    src_doc.close()
+    log(f"Tesseract OCR done — {len(pages)} page(s) extracted")
     return pages
 
 
@@ -192,8 +99,7 @@ def build_ocr_json(pages: list) -> dict:
 
 
 # =========================================================
-# REFERENCE BOOK OCR — Datalab handles full multi-page PDFs
-# natively, so no manual page-splitting is needed here.
+# REFERENCE BOOK OCR — Tesseract handles page-by-page natively
 # =========================================================
 
 def process_reference(file_input, status_callback=None):
@@ -276,7 +182,7 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
     )
 
     candidate_pages = []
-    weak_pages = []   # pages with question-like lines but no strong signal — possible continuations
+    weak_pages = []   # pages with question-like lines but no strong signal
 
     for i, page in enumerate(pages):
         text  = page["raw_text"]
@@ -293,7 +199,7 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
             continue
 
         if ADMIN_PAGE_MARKERS.search(text):
-            continue   # ID card / registration page — never a question paper
+            continue   # ID card / registration page
 
         if ANSWER_PAGE_MARKERS.search(text):
             continue   # student's handwritten answer page
@@ -307,14 +213,9 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
         if has_strong_signal:
             candidate_pages.append(i)
         else:
-            # No strong signal on its own — could be a continuation page
-            # (e.g. a parent question's lettered sub-parts spilling onto
-            # the next page). Only counts if adjacent to a confirmed page.
             weak_pages.append(i)
 
-    # Promote weak pages that are immediately adjacent to a confirmed
-    # question-paper page (continuation of the same question paper),
-    # rather than requiring every single page to repeat the strong signal.
+    # Promote weak pages adjacent to a confirmed question-paper page
     confirmed_set = set(candidate_pages)
     for i in weak_pages:
         if (i - 1) in confirmed_set or (i + 1) in confirmed_set:
@@ -326,25 +227,16 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
 
 # =========================================================
 # EXTRACT OFFICIAL QUESTIONS — scans across MULTIPLE pages
-# Also captures lettered sub-questions (क/ख/ग/घ, a/b/c/d)
-# that appear as a standalone list after a parent question
-# like "Q.9 निम्नलिखित पर टिप्पणी लिखिए" on a DIFFERENT page
-# than where the sub-options are printed.
 # =========================================================
 
 def extract_official_questions_multi_page(pages: list, qp_page_indices: list) -> list:
     """
-    Extracts numbered questions across all detected question-paper pages,
-    in page order. Handles:
-    - Standard numbered questions: "1. text"
-    - Multi-line questions (continuation lines joined)
-    - Lettered sub-parts within a question: a) b) c) / क) ख) ग) घ)
-    - Sub-parts that appear on a later page than their parent question
-      (common when "Q.9 Write notes on:" is followed by a), b), c), d)
-      printed on the next page)
+    Extracts numbered questions across all detected question-paper pages.
+    Handles standard numbered questions, multi-line continuations, and
+    lettered sub-parts (Latin a-d / Devanagari क-घ).
     """
     all_questions = []
-    pending_parent = None   # holds a parent question awaiting sub-parts from next page
+    pending_parent = None
 
     Q_START   = re.compile(r'^\s*(\d+)[\.\)]\s+(.+)')
     SUB_LATIN = re.compile(r'^\s*\(?([a-d])\)\s*(.+)', re.IGNORECASE)
@@ -364,7 +256,6 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
                     current = None
                 continue
 
-            # Lettered sub-part (Latin a-d or Devanagari क-घ)
             sub_m = SUB_LATIN.match(stripped) or SUB_DEVA.match(stripped)
             if sub_m:
                 if current:
@@ -382,8 +273,6 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
                 if current:
                     all_questions.append({"text": current.strip(), "parent": None})
                 current = stripped
-                # Track this as a potential parent for sub-parts on a later page
-                # (e.g. ends with "टिप्पणी लिखिए" / "following" / colon)
                 if re.search(r'(?:लिखिए|following|:)\s*$', stripped, re.IGNORECASE):
                     pending_parent = stripped
                 else:
@@ -396,7 +285,7 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
         if current:
             all_questions.append({"text": current.strip(), "parent": None})
 
-    # Now split any question that has 2+ inline sub-parts (a)/b)/c) on one line block)
+    # Split questions that have 2+ inline sub-parts
     final_questions = []
     SUBPART_RE = re.compile(r'(?:^|\s)\(?([a-zक-घ])\)\s', re.UNICODE)
 
@@ -449,9 +338,6 @@ def is_noise(line: str) -> bool:
 
 # =========================================================
 # FIND QUESTION BOUNDARIES IN ANSWER PAGES — similarity based
-# Works for Hindi, English, any language
-# Matches student-written question restatements against the
-# official question paper text using word-overlap similarity
 # =========================================================
 
 def normalize(text: str) -> str:
@@ -491,17 +377,10 @@ def find_question_boundaries_by_similarity(
     """
     Scans answer lines for restated questions matching official questions.
     Uses sliding window to join multi-line question restatements.
-
-    Correctness guarantees:
-    1. Tracks how many lines (`span`) the matched question text occupies,
-       so the answer slice can start AFTER the full question text.
-    2. Enforces that boundaries appear in the SAME ORDER as the official
-       questions list. If a question's best-scoring candidate would break
-       order (e.g. a false-positive shares vocabulary with an earlier
-       question), the NEXT best-scoring candidate for that same question
-       is tried, and so on, rather than dropping the question entirely.
+    Enforces that boundaries appear in the SAME ORDER as the official
+    questions list.
     """
-    candidates_by_question = {}   # question -> list of candidates, sorted by score desc
+    candidates_by_question = {}
 
     for i in range(len(answer_lines)):
         line_i = answer_lines[i].strip()
@@ -535,13 +414,9 @@ def find_question_boundaries_by_similarity(
                         "score":      score
                     })
 
-    # Sort each question's candidates by score, descending
     for q in candidates_by_question:
         candidates_by_question[q].sort(key=lambda c: -c["score"])
 
-    # Walk questions in official order. For each, try candidates from
-    # highest score downward, accepting the first one that comes after
-    # the previously accepted boundary's line_index.
     final = []
     last_line_index = -1
 
@@ -562,8 +437,7 @@ def find_question_boundaries_by_similarity(
 def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
     """
     For each boundary, answer = raw lines starting AFTER the full matched
-    question span (boundary["span"] lines), up to the next boundary.
-    Pure text slicing, zero LLM.
+    question span, up to the next boundary. Pure text slicing, zero LLM.
     """
     qa_pairs = []
     for i, b in enumerate(boundaries):
@@ -589,36 +463,28 @@ def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> lis
 # =========================================================
 
 # =========================================================
-# GROQ-BASED Q&A LINE DETECTION
+# OPENAI-BASED Q&A LINE DETECTION
 #
-# Groq's ONLY job: read numbered lines and report which line
+# OpenAI's ONLY job: read numbered lines and report which line
 # numbers correspond to question starts and answer starts.
 # It NEVER outputs question text or answer text — only integers.
 # This makes it layout-agnostic (works on any PDF format) while
 # remaining hallucination-safe, because every line number it
-# returns is validated against the real document before use:
-#   - must be a real, in-range line index
-#   - must be in increasing order
-#   - the line at that index must actually look like the kind
-#     of content claimed (a question line / a non-empty line)
-# If validation fails for too many entries, or Groq is unavailable,
-# the caller falls back to the regex/similarity pipeline.
+# returns is validated against the real document before use.
 # =========================================================
 
-def get_groq_client():
-    from groq import Groq
-    key = get_api_key("GROQ_API_KEY")
+def get_openai_client():
+    from openai import OpenAI
+    key = get_api_key("OPENAI_API_KEY")
     if not key:
-        raise Exception("GROQ_API_KEY not found")
-    return Groq(api_key=key)
+        raise Exception("OPENAI_API_KEY not found")
+    return OpenAI(api_key=key)
 
 
 def build_numbered_line_dump(pages: list) -> list:
     """
     Flattens the whole document into a single list of lines,
     each tagged with its global line number and source page number.
-    This numbering is what gets shown to Groq and is the same
-    numbering used afterward for validation and slicing.
     """
     line_index = []
     for page in pages:
@@ -631,10 +497,10 @@ def build_numbered_line_dump(pages: list) -> list:
     return line_index
 
 
-def ask_groq_for_qa_lines(line_index: list, status_callback=None, chunk_size: int = 350):
+def ask_openai_for_qa_lines(line_index: list, status_callback=None, chunk_size: int = 350):
     """
-    Sends the numbered line dump to Groq in chunks (to stay under
-    token limits) and asks ONLY for line numbers — never content.
+    Sends the numbered line dump to OpenAI in chunks and asks ONLY
+    for line numbers — never content.
     Returns a list of {question_id, question_start_line, answer_start_line}.
     Raises on any API/parsing failure so the caller can fall back.
     """
@@ -643,7 +509,7 @@ def ask_groq_for_qa_lines(line_index: list, status_callback=None, chunk_size: in
         if status_callback:
             status_callback(msg)
 
-    groq = get_groq_client()
+    client = get_openai_client()
     total = len(line_index)
     all_results = []
 
@@ -658,7 +524,7 @@ def ask_groq_for_qa_lines(line_index: list, status_callback=None, chunk_size: in
             f"[L{e['line_number']}] {e['text']}" for e in chunk
         )
 
-        log(f"Groq scanning lines {start}-{end} (chunk {ci+1}/{num_chunks})...")
+        log(f"OpenAI scanning lines {start}-{end} (chunk {ci+1}/{num_chunks})...")
 
         prompt = f"""You are scanning OCR text from a scanned exam answer booklet.
 The document may be in ANY language (Hindi, English, mixed) and the
@@ -690,8 +556,8 @@ Do NOT include question text or answer text in your response — line numbers on
 NUMBERED LINES:
 {numbered_text}"""
 
-        resp = groq.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
@@ -707,23 +573,21 @@ NUMBERED LINES:
         raw = resp.choices[0].message.content.strip()
         data = json.loads(raw)
         items = data.get("items", [])
-        log(f"  Chunk {ci+1}: Groq reported {len(items)} item(s)")
+        log(f"  Chunk {ci+1}: OpenAI reported {len(items)} item(s)")
         all_results.extend(items)
 
     return all_results
 
 
-def validate_and_clean_groq_items(raw_items: list, line_index: list, status_callback=None) -> list:
+def validate_and_clean_llm_items(raw_items: list, line_index: list, status_callback=None) -> list:
     """
-    Validates every Groq-reported item against the real document.
+    Validates every LLM-reported item against the real document.
     Drops anything that:
     - has an out-of-range line number
     - has a question_start_line >= answer_start_line (nonsensical)
     - points to an empty/too-short line for the question start
     - duplicates a question_start_line already accepted
-    Also enforces overall increasing order of question_start_line,
-    dropping any item that goes backwards (same safeguard as the
-    regex pipeline's order enforcement).
+    Enforces overall increasing order of question_start_line.
     """
     def log(msg):
         print(msg)
@@ -734,7 +598,6 @@ def validate_and_clean_groq_items(raw_items: list, line_index: list, status_call
     cleaned = []
     seen_start_lines = set()
 
-    # Sort by question_start_line first so order-enforcement is meaningful
     raw_items_sorted = sorted(
         [it for it in raw_items if isinstance(it.get("question_start_line"), int)],
         key=lambda it: it["question_start_line"]
@@ -750,16 +613,15 @@ def validate_and_clean_groq_items(raw_items: list, line_index: list, status_call
         if qsl in seen_start_lines:
             continue
         if qsl <= last_start:
-            continue   # out of order — likely hallucinated, skip
+            continue
 
         q_line_text = line_index[qsl]["text"].strip()
         if len(q_line_text) < 2:
-            continue   # points to a blank/near-empty line — not a real question
+            continue
 
-        # Validate answer_start_line if provided
         if asl is not None:
             if not isinstance(asl, int) or not (0 <= asl < total_lines) or asl <= qsl:
-                asl = None   # invalid — will be treated as "not found", filled in later
+                asl = None
 
         cleaned.append({
             "question_id":        it.get("question_id", f"Q{len(cleaned)+1}"),
@@ -769,7 +631,7 @@ def validate_and_clean_groq_items(raw_items: list, line_index: list, status_call
         seen_start_lines.add(qsl)
         last_start = qsl
 
-    log(f"Validation: {len(cleaned)} of {len(raw_items)} Groq items passed checks")
+    log(f"Validation: {len(cleaned)} of {len(raw_items)} OpenAI items passed checks")
     return cleaned
 
 
@@ -777,8 +639,7 @@ def slice_qa_from_line_items(line_index: list, items: list) -> list:
     """
     Pure text slicing — zero LLM. Given validated {question_start_line,
     answer_start_line} pairs, slices the question and answer directly
-    from the raw OCR line index. If answer_start_line is missing for
-    an item, defaults to question_start_line + 1 (next line).
+    from the raw OCR line index.
     """
     qa_pairs = []
 
@@ -807,49 +668,46 @@ def slice_qa_from_line_items(line_index: list, items: list) -> list:
     return qa_pairs
 
 
-def try_groq_pipeline(pages: list, status_callback=None):
+def try_openai_pipeline(pages: list, status_callback=None):
     """
-    Attempts the Groq line-identification pipeline end to end.
+    Attempts the OpenAI line-identification pipeline end to end.
     Returns (qa_pairs, None) on success, or (None, reason_string)
-    if anything fails/looks unreliable — signalling the caller to
-    fall back to regex, with a human-readable reason.
+    if anything fails/looks unreliable.
     """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    # Diagnostic: confirm the key is actually visible BEFORE attempting
-    # anything else, so a missing-secret problem is obvious immediately.
-    key_present = bool(get_api_key("GROQ_API_KEY"))
-    log(f"GROQ_API_KEY found in secrets/env: {key_present}")
+    key_present = bool(get_api_key("OPENAI_API_KEY"))
+    log(f"OPENAI_API_KEY found in secrets/env: {key_present}")
     if not key_present:
-        return None, "GROQ_API_KEY is not set in Streamlit secrets or environment"
+        return None, "OPENAI_API_KEY is not set in Streamlit secrets or environment"
 
     try:
         line_index = build_numbered_line_dump(pages)
         log(f"Built line index: {len(line_index)} total lines")
 
-        raw_items = ask_groq_for_qa_lines(line_index, status_callback)
+        raw_items = ask_openai_for_qa_lines(line_index, status_callback)
         if not raw_items:
-            return None, "Groq returned zero items across all chunks"
+            return None, "OpenAI returned zero items across all chunks"
 
-        cleaned = validate_and_clean_groq_items(raw_items, line_index, status_callback)
+        cleaned = validate_and_clean_llm_items(raw_items, line_index, status_callback)
         if len(cleaned) < 2:
-            return None, f"Only {len(cleaned)} of {len(raw_items)} Groq items passed validation (need >=2)"
+            return None, f"Only {len(cleaned)} of {len(raw_items)} OpenAI items passed validation (need >=2)"
 
         qa_pairs = slice_qa_from_line_items(line_index, cleaned)
         non_empty = [p for p in qa_pairs if p["answer"].strip()]
         if len(non_empty) < len(qa_pairs) * 0.5:
             return None, f"Only {len(non_empty)} of {len(qa_pairs)} sliced answers were non-empty"
 
-        log(f"Groq pipeline succeeded — {len(qa_pairs)} Q-A pairs")
+        log(f"OpenAI pipeline succeeded — {len(qa_pairs)} Q-A pairs")
         return qa_pairs, None
 
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        log(f"Groq pipeline exception: {type(e).__name__}: {e}")
+        log(f"OpenAI pipeline exception: {type(e).__name__}: {e}")
         log(tb)
         return None, f"{type(e).__name__}: {e}"
 
@@ -857,7 +715,7 @@ def try_groq_pipeline(pages: list, status_callback=None):
 def run_regex_pipeline(pages: list, status_callback=None):
     """
     The original regex/similarity-based pipeline, used as a fallback
-    when the Groq pipeline is unavailable or produces unreliable results.
+    when the OpenAI pipeline is unavailable or produces unreliable results.
     """
     def log(msg):
         print(msg)
@@ -870,7 +728,7 @@ def run_regex_pipeline(pages: list, status_callback=None):
     if not qp_page_indices:
         raise Exception(
             "Could not detect any question paper pages in this document, "
-            "and the Groq-based detection also failed.\n"
+            "and the OpenAI-based detection also failed.\n"
             f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
         )
 
@@ -926,7 +784,7 @@ def process_pdf(file_input, status_callback=None):
         file_bytes = file_input.read()
         file_name  = getattr(file_input, "name", "document.pdf")
 
-    # Step 1: OCR — send the original PDF directly.
+    # Step 1: OCR — Tesseract (local, no API call)
     pages = run_ocr(file_bytes, file_name, status_callback)
 
     # Step 2: Build OCR JSON
@@ -934,18 +792,15 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    # Step 3: Try Groq-based line identification first — layout-agnostic,
-    # works regardless of where the question paper appears in the PDF.
-    # Groq only ever returns line numbers; all text is sliced by Python
-    # from the raw OCR afterward, so answer content is never LLM-touched.
-    log("Attempting Groq-based question/answer line detection...")
-    qa_pairs, groq_fail_reason = try_groq_pipeline(pages, status_callback)
+    # Step 3: Try OpenAI-based line identification first
+    log("Attempting OpenAI-based question/answer line detection...")
+    qa_pairs, openai_fail_reason = try_openai_pipeline(pages, status_callback)
 
     if qa_pairs is not None:
-        log(f"Done — {len(qa_pairs)} Q-A pairs (via Groq)")
+        log(f"Done — {len(qa_pairs)} Q-A pairs (via OpenAI)")
         return ocr_json, qa_pairs
 
-    log(f"Groq pipeline did not produce results. Reason: {groq_fail_reason}")
+    log(f"OpenAI pipeline did not produce results. Reason: {openai_fail_reason}")
     log("Falling back to regex/similarity pipeline...")
 
     try:
@@ -953,7 +808,7 @@ def process_pdf(file_input, status_callback=None):
     except Exception as regex_error:
         raise Exception(
             f"Both detection pipelines failed.\n\n"
-            f"Groq pipeline failed because: {groq_fail_reason}\n\n"
+            f"OpenAI pipeline failed because: {openai_fail_reason}\n\n"
             f"Regex fallback failed because: {regex_error}"
         )
 
