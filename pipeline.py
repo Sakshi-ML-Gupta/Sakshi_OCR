@@ -640,20 +640,31 @@ def _parse_qp_llm_response(content: str) -> tuple:
 
 def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_page: int) -> list:
     """
-    FIX: the LLM occasionally emits multiple page numbers merged into
-    one integer due to a formatting slip, e.g. [14, 16, 18] rendered
-    as [141618]. This is syntactically valid JSON (just one big int),
-    so it parses fine but is semantically wrong. Rather than silently
-    discarding it as "out of range," we attempt to recover the original
-    page numbers by greedily splitting its digit string into chunks
-    that are all currently-valid page numbers for this document.
-    Returns [] if no valid split is found (in which case the caller
-    should fall back to discarding it, as before).
-    """
-    s = str(n)
-    if len(s) <= len(str(max_page)):
-        return []  # not implausibly large -- not a concatenation case
+    FIX (this round): the previous version only attempted recovery when
+    n had MORE digits than max_page's digit-length (e.g. only tried for
+    3+ digit numbers in a 25-page document). This missed a real case
+    seen in production: page numbers 6 and 9 concatenated into 69 --
+    which has exactly 2 digits, the SAME as max_page (25), so the old
+    "len(s) <= len(str(max_page))" guard incorrectly treated it as
+    "plausible on its own" and skipped recovery entirely, silently
+    discarding two genuinely real question-paper pages.
 
+    The correct guard is not about digit-length at all: we should only
+    skip recovery when n is ALREADY a valid page number (nothing to
+    recover), not based on how many digits it happens to have.
+
+    A second fix: when multiple splits are mathematically possible
+    (e.g. 99 could split into [9, 9] since page 9 is valid), we reject
+    any split containing a REPEATED page number -- a genuine
+    concatenation bug merges DIFFERENT page numbers together; it would
+    not plausibly repeat the same page twice in one list. This prevents
+    a genuinely invalid number like 99 from being incorrectly "recovered"
+    into a nonsensical duplicate.
+    """
+    if n in valid_page_numbers:
+        return []  # already valid -- nothing to recover
+
+    s = str(n)
     max_digits = len(str(max_page))
 
     from itertools import product
@@ -674,16 +685,26 @@ def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_pag
             i += w
         if i != len(s):
             return None
+        if len(set(result)) != len(result):
+            return None  # reject splits with a repeated page number
         return result
 
+    candidates = []
     for num_parts in range(2, len(s) + 1):
         for widths in product(range(1, max_digits + 1), repeat=num_parts):
             if sum(widths) != len(s):
                 continue
             result = split_attempt(s, widths)
             if result:
-                return result
-    return []
+                candidates.append(result)
+
+    if not candidates:
+        return []
+
+    # Prefer the split with fewer parts when multiple are mathematically
+    # possible -- the more conservative recovery, less likely to overfit.
+    candidates.sort(key=len)
+    return candidates[0]
 
 
 def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker",
