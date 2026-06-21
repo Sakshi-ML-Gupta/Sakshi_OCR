@@ -2,9 +2,10 @@ import os
 import io
 import re
 import json
-import base64
+import time
 import fitz
 from pathlib import Path
+from PIL import Image
 
 # =========================================================
 # API KEY
@@ -20,41 +21,38 @@ def get_api_key(name):
         return os.getenv(name)
 
 
+def get_gemini_model():
+    import google.generativeai as genai
+    api_key = get_api_key("GEMINI_API_KEY")
+    if not api_key:
+        raise Exception("GEMINI_API_KEY not found. Get a free one at https://aistudio.google.com/apikey")
+    
+    genai.configure(api_key=api_key)
+    # Flash 1.5 is extremely fast, free, and supports all Indian languages natively
+    return genai.GenerativeModel('gemini-1.5-flash')
+
+
 # =========================================================
-# OCR — GPT-4o-mini Vision
+# OCR — Google Gemini 1.5 Flash (Vision)
 #
-# Supports ALL Indian languages natively (Hindi, Tamil, Telugu,
-# Kannada, Malayalam, Marathi, Bengali, Gujarati, Punjabi, Odia,
-# Urdu, Assamese, Sanskrit, etc.) — no language codes needed.
-#
-# Cost: ~$0.0002 per page. A 20-page PDF costs ~$0.004.
-# Pure HTTP via OpenAI SDK — no binaries, works on Streamlit Cloud.
+# Supports ALL Indian languages natively. Zero cost.
+# Pure Python SDK — no binaries, works instantly on Streamlit Cloud.
 # =========================================================
 
 def run_ocr(file_bytes: bytes, file_name: str, status_callback=None, dpi: int = 200):
-    """
-    Run GPT-4o-mini Vision OCR on a PDF.
-    Automatically detects any language — no configuration needed.
-    """
-    from openai import OpenAI
-
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    api_key = get_api_key("OPENAI_API_KEY")
-    if not api_key:
-        raise Exception("OPENAI_API_KEY not found in secrets or environment")
-
-    client = OpenAI(api_key=api_key)
-
+    model = get_gemini_model()
+    
     size_mb = len(file_bytes) / (1024 * 1024)
-    log(f"Opening PDF for GPT-4o-mini Vision OCR... ({size_mb:.1f}MB)")
+    log(f"Opening PDF for Gemini Vision OCR... ({size_mb:.1f}MB)")
 
     src_doc = fitz.open(stream=file_bytes, filetype="pdf")
     total_pages = len(src_doc)
-    log(f"PDF has {total_pages} page(s) — running Vision OCR at {dpi} DPI")
+    log(f"PDF has {total_pages} page(s)")
 
     pages = []
 
@@ -62,53 +60,36 @@ def run_ocr(file_bytes: bytes, file_name: str, status_callback=None, dpi: int = 
         page = src_doc[page_num]
         pix = page.get_pixmap(dpi=dpi)
 
-        # Convert to PNG bytes
-        img_bytes = pix.tobytes("png")
-        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+        # Convert directly to PIL Image (Gemini SDK accepts PIL natively)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
         log(f"  Scanning page {page_num + 1}/{total_pages}...")
 
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Extract ALL text from this image exactly as written. "
-                                "Rules:\n"
-                                "- Preserve every line break exactly as it appears.\n"
-                                "- Do NOT translate, summarize, correct, or modify any text.\n"
-                                "- Keep original numbering (1., 2., a), b), क), ख), etc.).\n"
-                                "- The text may be in ANY Indian language or English or mixed — output it exactly as written.\n"
-                                "- Output ONLY the extracted text, nothing else."
-                            )
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{img_b64}",
-                                "detail": "high"
-                            }
-                        }
-                    ]
-                }
-            ],
-            max_tokens=4096,
-            temperature=0
+        prompt = (
+            "Extract ALL text from this image exactly as written. "
+            "Rules:\n"
+            "- Preserve every line break exactly as it appears.\n"
+            "- Do NOT translate, summarize, correct, or modify any text.\n"
+            "- Keep original numbering (1., 2., a), b), क), அ), etc.).\n"
+            "- The text may be in ANY Indian language or English or mixed — output it exactly as written.\n"
+            "- Output ONLY the extracted text, nothing else."
         )
 
-        text = resp.choices[0].message.content.strip()
+        response = model.generate_content([prompt, img])
+        text = response.text.strip()
 
         pages.append({
             "page_number": page_num + 1,
             "raw_text": text
         })
 
+        # Gemini free tier is 15 requests per minute. 
+        # Adding a 4.5s sleep ensures we never hit a rate limit, even on large PDFs.
+        if page_num < total_pages - 1:
+            time.sleep(4.5)
+
     src_doc.close()
-    log(f"GPT-4o-mini Vision OCR done — {len(pages)} page(s) extracted")
+    log(f"Gemini Vision OCR done — {len(pages)} page(s) extracted")
     return pages
 
 
@@ -157,33 +138,11 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
     Q_LINE_LATIN = re.compile(r'^\s*[a-d]\)\s+.{5,}', re.IGNORECASE)
     Q_LINE_DEVA  = re.compile(r'^\s*[क-घ]\)\s+.{5,}')
 
-    MARK_ALLOCATION = re.compile(
-        r'(?:\d+\s*[xX]\s*\d+\s*=?\s*\d*|\b\d{1,3}\s*$|\(\s*\d+\s*\))',
-    )
-    SECTION_HEADER = re.compile(
-        r'(?:SECTION\s*[-–]?\s*[A-Z]|PART\s*[-–]?\s*\d|भाग\s*[-–]?\s*\d|भाग\s*[-–]?\s*[१-९])',
-        re.IGNORECASE
-    )
-    EXAM_INSTRUCTION = re.compile(
-        r'(?:answer\s+all\s+questions|all\s+questions\s+are\s+compulsory'
-        r'|सभी\s*प्रश्न\s*अनिवार्य|assignment\s*code|TMA\b|कुल\s*अंक'
-        r'|words?\s+each|शब्दों\s*में)',
-        re.IGNORECASE
-    )
-
-    ADMIN_PAGE_MARKERS = re.compile(
-        r'(?:enrolment\s*number|enrollment\s*no|student\s*identity\s*card'
-        r'|regional\s*cent[er]+|study\s*cent[er]+|produced\s+on\s+demand'
-        r'|qr\s*code|registration\s*details|admission\s*status'
-        r'|father.?s\s*name|programme\s*registered|IGNOU\s*-\s*Student)',
-        re.IGNORECASE
-    )
-
-    ANSWER_PAGE_MARKERS = re.compile(
-        r'(?:उत्तर\s*[\-\:]|Ans\.?\s*[\-\:]|A\.\d|A\d+\s*[\-\:]'
-        r'|Teacher.?s\s*Signature|PAGE\s*NO[\.\:]?\s*\d*\s*DATE)',
-        re.IGNORECASE
-    )
+    MARK_ALLOCATION = re.compile(r'(?:\d+\s*[xX]\s*\d+\s*=?\s*\d*|\b\d{1,3}\s*$|\(\s*\d+\s*\))')
+    SECTION_HEADER = re.compile(r'(?:SECTION\s*[-–]?\s*[A-Z]|PART\s*[-–]?\s*\d|भाग\s*[-–]?\s*\d|भाग\s*[-–]?\s*[१-९])', re.IGNORECASE)
+    EXAM_INSTRUCTION = re.compile(r'(?:answer\s+all\s+questions|all\s+questions\s+are\s+compulsory|सभी\s*प्रश्न\s*अनिवार्य|assignment\s*code|TMA\b|कुल\s*अंक|words?\s+each|शब्दों\s*में)', re.IGNORECASE)
+    ADMIN_PAGE_MARKERS = re.compile(r'(?:enrolment\s*number|enrollment\s*no|student\s*identity\s*card|regional\s*cent[er]+|study\s*cent[er]+|produced\s+on\s+demand|qr\s*code|registration\s*details|admission\s*status|father.?s\s*name|programme\s*registered|IGNOU\s*-\s*Student)', re.IGNORECASE)
+    ANSWER_PAGE_MARKERS = re.compile(r'(?:उत्तर\s*[\-\:]|Ans\.?\s*[\-\:]|A\.\d|A\d+\s*[\-\:]|Teacher.?s\s*Signature|PAGE\s*NO[\.\:]?\s*\d*\s*DATE)', re.IGNORECASE)
 
     candidate_pages = []
     weak_pages = []
@@ -192,32 +151,16 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
         text  = page["raw_text"]
         lines = text.split("\n")
 
-        q_count = sum(
-            1 for line in lines
-            if Q_LINE_NUM.match(line.strip())
-            or Q_LINE_LATIN.match(line.strip())
-            or Q_LINE_DEVA.match(line.strip())
-        )
+        q_count = sum(1 for line in lines if Q_LINE_NUM.match(line.strip()) or Q_LINE_LATIN.match(line.strip()) or Q_LINE_DEVA.match(line.strip()))
 
-        if q_count < min_questions:
-            continue
+        if q_count < min_questions: continue
+        if ADMIN_PAGE_MARKERS.search(text): continue
+        if ANSWER_PAGE_MARKERS.search(text): continue
 
-        if ADMIN_PAGE_MARKERS.search(text):
-            continue
+        has_strong_signal = bool(MARK_ALLOCATION.search(text) or SECTION_HEADER.search(text) or EXAM_INSTRUCTION.search(text))
 
-        if ANSWER_PAGE_MARKERS.search(text):
-            continue
-
-        has_strong_signal = bool(
-            MARK_ALLOCATION.search(text)
-            or SECTION_HEADER.search(text)
-            or EXAM_INSTRUCTION.search(text)
-        )
-
-        if has_strong_signal:
-            candidate_pages.append(i)
-        else:
-            weak_pages.append(i)
+        if has_strong_signal: candidate_pages.append(i)
+        else: weak_pages.append(i)
 
     confirmed_set = set(candidate_pages)
     for i in weak_pages:
@@ -229,7 +172,7 @@ def find_question_paper_pages(pages: list, min_questions: int = 2) -> list:
 
 
 # =========================================================
-# EXTRACT OFFICIAL QUESTIONS — scans across MULTIPLE pages
+# EXTRACT OFFICIAL QUESTIONS
 # =========================================================
 
 def extract_official_questions_multi_page(pages: list, qp_page_indices: list) -> list:
@@ -247,109 +190,67 @@ def extract_official_questions_multi_page(pages: list, qp_page_indices: list) ->
 
         for line in lines:
             stripped = line.strip()
-
             if not stripped or SKIP.match(stripped):
-                if current:
-                    all_questions.append({"text": current.strip(), "parent": None})
-                    current = None
+                if current: all_questions.append({"text": current.strip(), "parent": None}); current = None
                 continue
 
             sub_m = SUB_LATIN.match(stripped) or SUB_DEVA.match(stripped)
             if sub_m:
-                if current:
-                    all_questions.append({"text": current.strip(), "parent": None})
-                    current = None
-                label = sub_m.group(1)
-                body  = sub_m.group(2)
+                if current: all_questions.append({"text": current.strip(), "parent": None}); current = None
+                label = sub_m.group(1); body  = sub_m.group(2)
                 parent_text = pending_parent if pending_parent else ""
-                combined = f"{parent_text} {label}) {body}".strip()
-                all_questions.append({"text": combined, "parent": pending_parent})
+                all_questions.append({"text": f"{parent_text} {label}) {body}".strip(), "parent": pending_parent})
                 continue
 
             m = Q_START.match(stripped)
             if m:
-                if current:
-                    all_questions.append({"text": current.strip(), "parent": None})
+                if current: all_questions.append({"text": current.strip(), "parent": None})
                 current = stripped
-                if re.search(r'(?:लिखिए|following|:)\s*$', stripped, re.IGNORECASE):
-                    pending_parent = stripped
-                else:
-                    pending_parent = None
+                pending_parent = stripped if re.search(r'(?:लिखिए|following|:)\s*$', stripped, re.IGNORECASE) else None
                 continue
 
-            if current:
-                current += " " + stripped
+            if current: current += " " + stripped
 
-        if current:
-            all_questions.append({"text": current.strip(), "parent": None})
+        if current: all_questions.append({"text": current.strip(), "parent": None})
 
     final_questions = []
     SUBPART_RE = re.compile(r'(?:^|\s)\(?([a-zक-घ])\)\s', re.UNICODE)
 
     for q in all_questions:
-        text = q["text"]
-        matches = list(SUBPART_RE.finditer(text))
-
+        text = q["text"]; matches = list(SUBPART_RE.finditer(text))
         if len(matches) >= 2:
             preamble = text[:matches[0].start()].strip()
             for idx, m in enumerate(matches):
-                start = m.start(1)
-                end   = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+                start = m.start(1); end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
                 part_text = text[start:end].strip()
-                full_q = f"{preamble} {part_text}".strip() if preamble else part_text
-                final_questions.append(full_q)
-        else:
-            final_questions.append(text)
+                final_questions.append(f"{preamble} {part_text}".strip() if preamble else part_text)
+        else: final_questions.append(text)
 
-    seen = set()
-    unique = []
+    seen = set(); unique = []
     for q in final_questions:
         key = re.sub(r'\s+', ' ', q.lower().strip())
-        if key not in seen:
-            seen.add(key)
-            unique.append(q)
-
+        if key not in seen: seen.add(key); unique.append(q)
     return unique
 
 
-NOISE_RE = re.compile(
-    r'(?:Teacher\'?s?\s*Signature'
-    r'|Tancher\'?s?\s*Signature'
-    r'|Facebook\'?s?\s*Signature'
-    r'|PAGE\s*NO'
-    r'|^\s*DATE\b'
-    r'|Neel?\s*Kamal'
-    r'|Neal?\s*Kamal'
-    r'|Need?\s*Komal'
-    r'|Nod\s*Komal'
-    r'|TAKMA\s*SINAN'
-    r'|^\s*\d{1,3}\s*$)',
-    re.IGNORECASE
-)
-
+NOISE_RE = re.compile(r'(?:Teacher\'?s?\s*Signature|Tancher\'?s?\s*Signature|Facebook\'?s?\s*Signature|PAGE\s*NO|^\s*DATE\b|Neel?\s*Kamal|Neal?\s*Kamal|Need?\s*Komal|Nod\s*Komal|TAKMA\s*SINAN|^\s*\d{1,3}\s*$)', re.IGNORECASE)
 
 def is_noise(line: str) -> bool:
     return bool(NOISE_RE.search(line))
 
 
 # =========================================================
-# FIND QUESTION BOUNDARIES IN ANSWER PAGES — similarity based
+# SIMILARITY & BOUNDARY LOGIC
 # =========================================================
 
 def normalize(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r'[^\w\s]', ' ', text, flags=re.UNICODE)
-    text = re.sub(r'\s+', ' ', text)
+    text = text.lower(); text = re.sub(r'[^\w\s]', ' ', text, flags=re.UNICODE); text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
-
 def similarity(a: str, b: str) -> float:
-    wa = set(normalize(a).split())
-    wb = set(normalize(b).split())
-    if not wa or not wb:
-        return 0.0
+    wa = set(normalize(a).split()); wb = set(normalize(b).split())
+    if not wa or not wb: return 0.0
     return len(wa & wb) / max(len(wa), len(wb))
-
 
 def strip_leading_label(text: str) -> str:
     text = text.strip()
@@ -362,374 +263,205 @@ def strip_leading_label(text: str) -> str:
     text = re.sub(r'^\(?[क-घ]\)\s*', '', text)
     return text.strip()
 
-
-def find_question_boundaries_by_similarity(
-    answer_lines: list,
-    questions: list,
-    similarity_threshold: float = 0.30,
-    window: int = 4
-) -> list:
+def find_question_boundaries_by_similarity(answer_lines: list, questions: list, similarity_threshold: float = 0.30, window: int = 4) -> list:
     candidates_by_question = {}
-
     for i in range(len(answer_lines)):
         line_i = answer_lines[i].strip()
-        if len(line_i) < 8:
-            continue
-
+        if len(line_i) < 8: continue
         for w in range(1, window + 1):
-            if i + w > len(answer_lines):
-                break
-
-            combined = " ".join(
-                answer_lines[i + k].strip()
-                for k in range(w) if answer_lines[i + k].strip()
-            )
-            if len(combined) < 10:
-                continue
-
+            if i + w > len(answer_lines): break
+            combined = " ".join(answer_lines[i + k].strip() for k in range(w) if answer_lines[i + k].strip())
+            if len(combined) < 10: continue
             combined_clean = strip_leading_label(combined)
-
             for q in questions:
                 q_clean = strip_leading_label(q)
-                s1 = similarity(combined, q)
-                s2 = similarity(combined_clean, q_clean)
-                score = max(s1, s2)
-
+                score = max(similarity(combined, q), similarity(combined_clean, q_clean))
                 if score >= similarity_threshold:
-                    candidates_by_question.setdefault(q, []).append({
-                        "question":   q,
-                        "line_index": i,
-                        "span":       w,
-                        "score":      score
-                    })
+                    candidates_by_question.setdefault(q, []).append({"question": q, "line_index": i, "span": w, "score": score})
 
-    for q in candidates_by_question:
-        candidates_by_question[q].sort(key=lambda c: -c["score"])
+    for q in candidates_by_question: candidates_by_question[q].sort(key=lambda c: -c["score"])
 
-    final = []
-    last_line_index = -1
-
+    final = []; last_line_index = -1
     for q in questions:
-        cands = candidates_by_question.get(q, [])
-        chosen = None
-        for c in cands:
+        for c in candidates_by_question.get(q, []):
             if c["line_index"] > last_line_index:
-                chosen = c
-                break
-        if chosen is not None:
-            final.append(chosen)
-            last_line_index = chosen["line_index"]
-
+                final.append(c); last_line_index = c["line_index"]; break
     return final
-
 
 def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
     qa_pairs = []
     for i, b in enumerate(boundaries):
-        span    = b.get("span", 1)
-        a_start = b["line_index"] + span
+        a_start = b["line_index"] + b.get("span", 1)
         a_end   = boundaries[i + 1]["line_index"] if i + 1 < len(boundaries) else len(answer_lines)
-
-        raw = [
-            answer_lines[j] for j in range(a_start, a_end)
-            if answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ]
-
-        qa_pairs.append({
-            "question": b["question"],
-            "answer":   " ".join(raw).strip()
-        })
-
+        raw = [answer_lines[j] for j in range(a_start, a_end) if answer_lines[j].strip() and not is_noise(answer_lines[j])]
+        qa_pairs.append({"question": b["question"], "answer": " ".join(raw).strip()})
     return qa_pairs
 
 
 # =========================================================
-# COMPLETE PIPELINE
+# GEMINI-BASED Q&A LINE DETECTION
 # =========================================================
-
-# =========================================================
-# OPENAI-BASED Q&A LINE DETECTION
-# =========================================================
-
-def get_openai_client():
-    from openai import OpenAI
-    key = get_api_key("OPENAI_API_KEY")
-    if not key:
-        raise Exception("OPENAI_API_KEY not found")
-    return OpenAI(api_key=key)
-
 
 def build_numbered_line_dump(pages: list) -> list:
     line_index = []
     for page in pages:
         for line in page["raw_text"].split("\n"):
-            line_index.append({
-                "line_number": len(line_index),
-                "page_number": page["page_number"],
-                "text": line
-            })
+            line_index.append({"line_number": len(line_index), "page_number": page["page_number"], "text": line})
     return line_index
 
-
-def ask_openai_for_qa_lines(line_index: list, status_callback=None, chunk_size: int = 350):
+def ask_gemini_for_qa_lines(line_index: list, status_callback=None, chunk_size: int = 350):
+    import google.generativeai as genai
+    
     def log(msg):
         print(msg)
-        if status_callback:
-            status_callback(msg)
+        if status_callback: status_callback(msg)
 
-    client = get_openai_client()
+    model = get_gemini_model()
     total = len(line_index)
     all_results = []
-
     num_chunks = (total + chunk_size - 1) // chunk_size
 
     for ci in range(num_chunks):
-        start = ci * chunk_size
-        end   = min(start + chunk_size, total)
+        start = ci * chunk_size; end = min(start + chunk_size, total)
         chunk = line_index[start:end]
+        numbered_text = "\n".join(f"[L{e['line_number']}] {e['text']}" for e in chunk)
 
-        numbered_text = "\n".join(
-            f"[L{e['line_number']}] {e['text']}" for e in chunk
-        )
+        log(f"Gemini scanning lines {start}-{end} (chunk {ci+1}/{num_chunks})...")
 
-        log(f"OpenAI scanning lines {start}-{end} (chunk {ci+1}/{num_chunks})...")
-
-        prompt = f"""You are scanning OCR text from a scanned exam answer booklet.
-The document may be in ANY language (Hindi, English, mixed) and the
-layout varies between documents — do not assume a fixed structure.
+        prompt = f"""You are scanning OCR text from a scanned exam answer booklet. The document may be in ANY Indian language (Hindi, Tamil, Telugu, etc.) or English or mixed.
 
 Each line below is tagged with its line number like [L42].
+Find every QUESTION and the START of its ANSWER in this chunk. 
+A question is a numbered/lettered exam prompt (e.g. "1.", "Q.1", "क)", "(a)"). The answer is the handwritten response that follows (often after "Ans-", "उत्तर-", or just the next line).
 
-Find every QUESTION and the START of its ANSWER in this chunk.
-A question is a numbered/lettered exam prompt the student must answer
-(e.g. "1.", "Q.1", "क)", "(a)", "9.", roman numerals, etc — in any
-language). The answer is the student's handwritten response that
-follows, often after a marker like "Ans-", "उत्तर-", "A.1-", or with
-no marker at all (answer just starts on the next line).
-
-Return ONLY this JSON, nothing else:
+Return ONLY valid JSON:
 {{
   "items": [
     {{
-      "question_id": "<a short label for this question, e.g. Q1, Q9-a>",
-      "question_start_line": <integer line number where the question starts>,
-      "answer_start_line": <integer line number where the answer starts, or null if not found in this chunk>
+      "question_id": "<e.g. Q1, Q9-a>",
+      "question_start_line": <integer>,
+      "answer_start_line": <integer or null>
     }}
   ]
 }}
-
-If no questions are found in this chunk, return {{"items": []}}.
-Do NOT include question text or answer text in your response — line numbers only.
+If no questions found, return {{"items": []}}. Do NOT output text content.
 
 NUMBERED LINES:
 {numbered_text}"""
 
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You identify line numbers only. Never output document content. Return valid JSON only."
-                },
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
-            max_tokens=1500,
-            response_format={"type": "json_object"}
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                response_mime_type="application/json"
+            )
         )
-
-        raw = resp.choices[0].message.content.strip()
-        data = json.loads(raw)
+        
+        data = json.loads(response.text)
         items = data.get("items", [])
-        log(f"  Chunk {ci+1}: OpenAI reported {len(items)} item(s)")
+        log(f"  Chunk {ci+1}: Gemini reported {len(items)} item(s)")
         all_results.extend(items)
+        
+        if ci < num_chunks - 1:
+            time.sleep(4.5) # Stay safely under free tier rate limits
 
     return all_results
-
 
 def validate_and_clean_llm_items(raw_items: list, line_index: list, status_callback=None) -> list:
     def log(msg):
         print(msg)
-        if status_callback:
-            status_callback(msg)
+        if status_callback: status_callback(msg)
 
-    total_lines = len(line_index)
-    cleaned = []
-    seen_start_lines = set()
-
-    raw_items_sorted = sorted(
-        [it for it in raw_items if isinstance(it.get("question_start_line"), int)],
-        key=lambda it: it["question_start_line"]
-    )
-
+    total_lines = len(line_index); cleaned = []; seen_start_lines = set()
+    raw_items_sorted = sorted([it for it in raw_items if isinstance(it.get("question_start_line"), int)], key=lambda it: it["question_start_line"])
     last_start = -1
+
     for it in raw_items_sorted:
-        qsl = it.get("question_start_line")
-        asl = it.get("answer_start_line")
+        qsl = it.get("question_start_line"); asl = it.get("answer_start_line")
+        if qsl is None or not (0 <= qsl < total_lines): continue
+        if qsl in seen_start_lines or qsl <= last_start: continue
+        if len(line_index[qsl]["text"].strip()) < 2: continue
+        if asl is not None and (not isinstance(asl, int) or not (0 <= asl < total_lines) or asl <= qsl): asl = None
+        
+        cleaned.append({"question_id": it.get("question_id", f"Q{len(cleaned)+1}"), "question_start_line": qsl, "answer_start_line": asl})
+        seen_start_lines.add(qsl); last_start = qsl
 
-        if qsl is None or not (0 <= qsl < total_lines):
-            continue
-        if qsl in seen_start_lines:
-            continue
-        if qsl <= last_start:
-            continue
-
-        q_line_text = line_index[qsl]["text"].strip()
-        if len(q_line_text) < 2:
-            continue
-
-        if asl is not None:
-            if not isinstance(asl, int) or not (0 <= asl < total_lines) or asl <= qsl:
-                asl = None
-
-        cleaned.append({
-            "question_id":        it.get("question_id", f"Q{len(cleaned)+1}"),
-            "question_start_line": qsl,
-            "answer_start_line":   asl
-        })
-        seen_start_lines.add(qsl)
-        last_start = qsl
-
-    log(f"Validation: {len(cleaned)} of {len(raw_items)} OpenAI items passed checks")
+    log(f"Validation: {len(cleaned)} of {len(raw_items)} Gemini items passed checks")
     return cleaned
-
 
 def slice_qa_from_line_items(line_index: list, items: list) -> list:
     qa_pairs = []
-
     for i, item in enumerate(items):
-        q_start = item["question_start_line"]
-        a_start = item["answer_start_line"]
-        if a_start is None:
-            a_start = q_start + 1
-
+        q_start = item["question_start_line"]; a_start = item["answer_start_line"] or q_start + 1
         a_end = items[i + 1]["question_start_line"] if i + 1 < len(items) else len(line_index)
-
-        q_lines = [
-            line_index[j]["text"] for j in range(q_start, min(a_start, len(line_index)))
-            if line_index[j]["text"].strip()
-        ]
-        a_lines = [
-            line_index[j]["text"] for j in range(a_start, max(a_end, a_start))
-            if line_index[j]["text"].strip() and not is_noise(line_index[j]["text"])
-        ]
-
-        qa_pairs.append({
-            "question": " ".join(q_lines).strip(),
-            "answer":   " ".join(a_lines).strip()
-        })
-
+        
+        q_lines = [line_index[j]["text"] for j in range(q_start, min(a_start, len(line_index))) if line_index[j]["text"].strip()]
+        a_lines = [line_index[j]["text"] for j in range(a_start, max(a_end, a_start)) if line_index[j]["text"].strip() and not is_noise(line_index[j]["text"])]
+        
+        qa_pairs.append({"question": " ".join(q_lines).strip(), "answer": " ".join(a_lines).strip()})
     return qa_pairs
 
-
-def try_openai_pipeline(pages: list, status_callback=None):
+def try_gemini_pipeline(pages: list, status_callback=None):
     def log(msg):
         print(msg)
-        if status_callback:
-            status_callback(msg)
+        if status_callback: status_callback(msg)
 
-    key_present = bool(get_api_key("OPENAI_API_KEY"))
-    log(f"OPENAI_API_KEY found in secrets/env: {key_present}")
-    if not key_present:
-        return None, "OPENAI_API_KEY is not set in Streamlit secrets or environment"
+    if not get_api_key("GEMINI_API_KEY"): return None, "GEMINI_API_KEY is not set"
 
     try:
         line_index = build_numbered_line_dump(pages)
         log(f"Built line index: {len(line_index)} total lines")
 
-        raw_items = ask_openai_for_qa_lines(line_index, status_callback)
-        if not raw_items:
-            return None, "OpenAI returned zero items across all chunks"
+        raw_items = ask_gemini_for_qa_lines(line_index, status_callback)
+        if not raw_items: return None, "Gemini returned zero items"
 
         cleaned = validate_and_clean_llm_items(raw_items, line_index, status_callback)
-        if len(cleaned) < 2:
-            return None, f"Only {len(cleaned)} of {len(raw_items)} OpenAI items passed validation (need >=2)"
+        if len(cleaned) < 2: return None, f"Only {len(cleaned)} Gemini items passed validation"
 
         qa_pairs = slice_qa_from_line_items(line_index, cleaned)
         non_empty = [p for p in qa_pairs if p["answer"].strip()]
-        if len(non_empty) < len(qa_pairs) * 0.5:
-            return None, f"Only {len(non_empty)} of {len(qa_pairs)} sliced answers were non-empty"
+        if len(non_empty) < len(qa_pairs) * 0.5: return None, f"Too many empty answers sliced"
 
-        log(f"OpenAI pipeline succeeded — {len(qa_pairs)} Q-A pairs")
+        log(f"Gemini pipeline succeeded — {len(qa_pairs)} Q-A pairs")
         return qa_pairs, None
-
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        log(f"OpenAI pipeline exception: {type(e).__name__}: {e}")
-        log(tb)
         return None, f"{type(e).__name__}: {e}"
 
 
 def run_regex_pipeline(pages: list, status_callback=None):
     def log(msg):
         print(msg)
-        if status_callback:
-            status_callback(msg)
+        if status_callback: status_callback(msg)
 
     qp_page_indices = find_question_paper_pages(pages)
-    log(f"[fallback] Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
-
-    if not qp_page_indices:
-        raise Exception(
-            "Could not detect any question paper pages in this document, "
-            "and the OpenAI-based detection also failed.\n"
-            f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
-        )
-
+    if not qp_page_indices: raise Exception("Could not detect question paper pages.")
+    
     official_questions = extract_official_questions_multi_page(pages, qp_page_indices)
-    log(f"[fallback] Official questions extracted: {len(official_questions)}")
-
-    if not official_questions:
-        raise Exception(
-            "Question paper pages were found, but no questions could be parsed from them.\n"
-            f"Detected pages: {[p+1 for p in qp_page_indices]}"
-        )
+    if not official_questions: raise Exception("No questions parsed from question paper pages.")
 
     answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
-    answer_pages = [pages[i] for i in answer_page_indices]
-    log(f"[fallback] Answer pages: {[i+1 for i in answer_page_indices]}")
-
-    answer_lines = []
-    for page in answer_pages:
-        for line in page["raw_text"].split("\n"):
-            if not is_noise(line):
-                answer_lines.append(line)
-
-    log(f"[fallback] Flattened {len(answer_lines)} answer lines")
+    answer_lines = [line for page in [pages[i] for i in answer_page_indices] for line in page["raw_text"].split("\n") if not is_noise(line)]
 
     boundaries = find_question_boundaries_by_similarity(answer_lines, official_questions)
-    log(f"[fallback] Matched {len(boundaries)} of {len(official_questions)} questions")
+    if not boundaries: raise Exception("Could not match any questions in answer pages.")
+    
+    return slice_raw_answers_by_boundaries(answer_lines, boundaries)
 
-    matched_qs = {b["question"] for b in boundaries}
-    for q in official_questions:
-        if q not in matched_qs:
-            log(f"[fallback] WARNING: No match found for: {q[:60]}")
 
-    if not boundaries:
-        raise Exception(
-            "Could not match any questions in answer pages (fallback also failed).\n"
-            f"Official questions: {official_questions}"
-        )
-
-    qa_pairs = slice_raw_answers_by_boundaries(answer_lines, boundaries)
-    return qa_pairs
-
+# =========================================================
+# COMPLETE PIPELINE
+# =========================================================
 
 def process_pdf(file_input, status_callback=None):
     def log(msg):
         print(msg)
-        if status_callback:
-            status_callback(msg)
+        if status_callback: status_callback(msg)
 
     if isinstance(file_input, (str, Path)):
-        file_bytes = Path(file_input).read_bytes()
-        file_name  = Path(file_input).name
+        file_bytes = Path(file_input).read_bytes(); file_name  = Path(file_input).name
     else:
-        file_bytes = file_input.read()
-        file_name  = getattr(file_input, "name", "document.pdf")
+        file_bytes = file_input.read(); file_name  = getattr(file_input, "name", "document.pdf")
 
-    # Step 1: OCR — GPT-4o-mini Vision (all Indian languages, no extra key)
+    # Step 1: OCR (Gemini Vision - Free, All Indian Languages)
     pages = run_ocr(file_bytes, file_name, status_callback)
 
     # Step 2: Build OCR JSON
@@ -737,25 +469,21 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    # Step 3: Try OpenAI-based line identification
-    log("Attempting OpenAI-based question/answer line detection...")
-    qa_pairs, openai_fail_reason = try_openai_pipeline(pages, status_callback)
+    # Step 3: Try Gemini-based line identification
+    log("Attempting Gemini-based question/answer line detection...")
+    qa_pairs, gemini_fail_reason = try_gemini_pipeline(pages, status_callback)
 
     if qa_pairs is not None:
-        log(f"Done — {len(qa_pairs)} Q-A pairs (via OpenAI)")
+        log(f"Done — {len(qa_pairs)} Q-A pairs (via Gemini)")
         return ocr_json, qa_pairs
 
-    log(f"OpenAI pipeline did not produce results. Reason: {openai_fail_reason}")
+    log(f"Gemini pipeline did not produce results. Reason: {gemini_fail_reason}")
     log("Falling back to regex/similarity pipeline...")
 
     try:
         qa_pairs = run_regex_pipeline(pages, status_callback)
     except Exception as regex_error:
-        raise Exception(
-            f"Both detection pipelines failed.\n\n"
-            f"OpenAI pipeline failed because: {openai_fail_reason}\n\n"
-            f"Regex fallback failed because: {regex_error}"
-        )
+        raise Exception(f"Both pipelines failed.\nGemini: {gemini_fail_reason}\nRegex: {regex_error}")
 
     log(f"Done — {len(qa_pairs)} Q-A pairs (via regex fallback)")
     return ocr_json, qa_pairs
