@@ -1207,14 +1207,33 @@ def _parse_answer_map_llm_response(content: str) -> list:
     return result
 
 
-def _chunk_lines_by_char_budget(numbered_lines: list, max_chars: int = MAX_CHARS_PER_CHUNK,
-                                  overlap_lines: int = 5) -> list:
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 8000  # larger than the question-ID
+# chunk size: answer text needs more room per chunk since a single
+# long essay answer can run 1500-3000+ characters, and a tighter
+# budget increases how often a chunk boundary falls mid-answer.
+
+ANSWER_MAP_OVERLAP_CHARS = 3500  # FIX: a fixed LINE-COUNT overlap (the
+# previous default was 5 lines) is unreliable because OCR'd answer
+# lines vary wildly in length -- 5 lines might cover a full paragraph
+# or just a few words, depending on how the page wrapped. A long essay
+# answer (confirmed in real usage to run 1500-3000+ characters) could
+# easily exceed a 5-line overlap entirely, meaning NEITHER chunk that
+# saw a piece of it ever saw the WHOLE thing -- which is exactly why
+# answers were coming back cut off mid-sentence. Character-based
+# overlap, sized generously above the longest realistic single answer,
+# guarantees that even if a chunk boundary falls mid-answer, the
+# complete answer still appears intact in at least one chunk's view.
+
+
+def _chunk_lines_by_char_budget(numbered_lines: list,
+                                  max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
+                                  overlap_chars: int = ANSWER_MAP_OVERLAP_CHARS) -> list:
     """
     Like _chunk_pages_by_char_budget, but operates on flattened answer
-    LINES rather than pages, since answer text needs finer-grained
-    chunking (a single page can be very long). overlap_lines (rather
-    than overlap_pages) ensures an answer that straddles a chunk
-    boundary still appears whole in at least one chunk.
+    LINES rather than pages, and uses CHARACTER-based overlap (not a
+    fixed line count) between consecutive chunks -- see module-level
+    comment above for why line-count overlap was insufficient for long
+    answers in practice.
     """
     if not numbered_lines:
         return []
@@ -1228,8 +1247,21 @@ def _chunk_lines_by_char_budget(numbered_lines: list, max_chars: int = MAX_CHARS
 
         if current_chunk and current_chars + line_chars > max_chars:
             chunks.append(current_chunk)
-            overlap = current_chunk[-overlap_lines:] if overlap_lines > 0 else []
-            current_chunk = list(overlap)
+
+            # Build character-based overlap: walk backward from the
+            # end of the current chunk, accumulating whole lines until
+            # we've covered at least overlap_chars worth of content --
+            # this is robust regardless of how long or short individual
+            # OCR lines happen to be.
+            overlap = []
+            overlap_total = 0
+            for item in reversed(current_chunk):
+                overlap.insert(0, item)
+                overlap_total += len(item[1])
+                if overlap_total >= overlap_chars:
+                    break
+
+            current_chunk = overlap
             current_chars = sum(len(t) for _, t in current_chunk)
 
         current_chunk.append((idx, text))
@@ -1261,6 +1293,41 @@ def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
         if r["end_line"] >= r["start_line"]:
             resolved.append(r)
     return resolved
+
+
+QUESTION_PREFIX_RE = re.compile(
+    r'^\s*(?:'
+    r'Ans(?:wer)?[.\s:-]+\d*[.\s:-]*'        # "Ans 5-", "Answer:", "Ans."
+    r'|उत्तर\s*\d*\s*[\-\:]?\s*'              # "उत्तर-", "उत्तर 5-"
+    r'|प्र[०.\s]*\d*[.\s:-]*'                 # "प्र. 8.", "प्र० 6."
+    r'|प्रश्न[.\s:-]*\d*[.\s:-]*'              # "प्रश्न. 2."
+    r'|Q\.?\s*\d+[.\s:-]*'                    # "Q.8", "Q5-"
+    r')',
+    re.IGNORECASE
+)
+
+
+def strip_question_restatement(answer_text: str) -> str:
+    """
+    FIX: real verbatim answers were starting with the student's own
+    restatement/label of the question (e.g. "Ans 5-", "उत्तर-",
+    "प्र. 8.") -- legitimate raw OCR content, but redundant once shown
+    alongside the question field in the final output, and confirmed in
+    real usage to read as "the question repeating at the start of the
+    answer." This strips ONLY a leading restatement label from the
+    very start of the text -- it never touches a restatement that
+    might legitimately appear mid-answer (e.g. a student referencing a
+    different sub-question within their own response). Repeats the
+    strip up to 2 times in case of doubled prefixes from messy OCR
+    (e.g. "उत्तर- Ans 5-"), then stops.
+    """
+    text = answer_text
+    for _ in range(2):
+        new_text = QUESTION_PREFIX_RE.sub('', text, count=1).strip()
+        if new_text == text:
+            break
+        text = new_text
+    return text
 
 
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
@@ -1381,7 +1448,8 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
         ]
         original_question = ref_to_question[r["ref"]]
-        qa_map[original_question] = " ".join(verbatim_lines).strip()
+        answer_text = " ".join(verbatim_lines).strip()
+        qa_map[original_question] = strip_question_restatement(answer_text)
 
     return qa_map
 
