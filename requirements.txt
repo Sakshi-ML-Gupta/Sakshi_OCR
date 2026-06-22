@@ -1,5 +1,6 @@
 streamlit
-PyMuPDF
-Pillow
+pymupdf
 python-dotenv
-groq
+pytesseract
+pillow
+google-genai
