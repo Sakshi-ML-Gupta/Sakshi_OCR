@@ -6,22 +6,14 @@ Run with:
     streamlit run app.py
 
 Requires these files in the SAME folder:
-    - pipeline_llm_v4.py          (the OCR + LLM pipeline module)
-    - tuple_error_diagnostic.py   (diagnostic instrumentation)
+    - pipeline.py   (the OCR + LLM pipeline module)
 
 Required environment variables / st.secrets entries:
-    - DATALAB_API_KEY
-    - GROQ_API_KEY
+    - GEMINI_API_KEY
 """
 
-# THIS MUST BE THE VERY FIRST IMPORT -- before streamlit, before
-# anything else. It installs diagnostic instrumentation that will
-# print the exact file/line responsible if the
-# "expected str, bytes or os.PathLike object, not tuple" error ever
-# occurs anywhere in this process, instead of it surfacing as an
-# unexplained crash deep inside Streamlit's own error handling.
-import tuple_error_diagnostic  # noqa: F401  (imported for its side effect)
-
+import io
+import json
 import streamlit as st
 from pipeline import process_pdf
 
@@ -41,11 +33,8 @@ st.caption(
 # reconnect in some environments). Without this guard, a rerun that
 # happens WHILE process_pdf() is still running (it can take minutes:
 # OCR + several paced LLM calls) would start a SECOND, fully
-# independent run -- both competing for the same shared Groq token
-# budget at once. This is the exact cause of the doubled log lines
-# seen in earlier debugging sessions ("Asking LLM to analyze chunk
-# 2/8" printed twice back-to-back) and the reason the daily token
-# quota got burned twice as fast as it should have.
+# independent run -- both competing for the same shared LLM token
+# budget at once.
 #
 # st.session_state persists across reruns WITHIN one user's session,
 # so this flag correctly blocks a second run from starting no matter
@@ -110,13 +99,18 @@ if (
 
     try:
         file_bytes = st.session_state.pending_file_bytes
-        file_name = st.session_state.pending_file_name
+        file_name  = st.session_state.pending_file_name
 
-        # process_pdf accepts (filename, bytes) tuples directly --
-        # this matches pipeline_llm_v4.py's documented input shapes
-        # exactly, so no manual file-handle juggling is needed here.
+        # process_pdf expects either a path (str/Path) or a file-like
+        # object with .read() and a .name attribute -- NOT a tuple.
+        # Wrap the raw bytes we captured earlier in a BytesIO and
+        # attach .name so process_pdf can read it exactly like an
+        # uploaded file.
+        file_like = io.BytesIO(file_bytes)
+        file_like.name = file_name
+
         ocr_json, qa_pairs = process_pdf(
-            (file_name, file_bytes),
+            file_like,
             status_callback=status_callback,
         )
         st.session_state.result = (ocr_json, qa_pairs)
@@ -154,7 +148,6 @@ if st.session_state.result:
             st.markdown("**Answer:**")
             st.write(qa["answer"] if qa["answer"] else "_(no answer text matched)_")
 
-    import json
     result_json = json.dumps(qa_pairs, ensure_ascii=False, indent=2)
     st.download_button(
         "Download Q&A pairs as JSON",
