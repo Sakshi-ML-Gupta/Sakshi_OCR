@@ -1,6 +1,5 @@
 streamlit
 pymupdf
 python-dotenv
-pytesseract
-pillow
-google-genai
+groq
+
