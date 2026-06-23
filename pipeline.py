@@ -309,8 +309,8 @@ TPM_LIMIT = 8000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 
-MAX_CHARS_PER_CHUNK = 10000  # Increased for longer questions
-CHUNK_OVERLAP_PAGES = 3  # Increased overlap for better context
+MAX_CHARS_PER_CHUNK = 10000
+CHUNK_OVERLAP_PAGES = 3
 
 QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet (e.g. IGNOU-style, India). The booklet mixes pages of different kinds, in no guaranteed order:
 
@@ -327,16 +327,15 @@ Your task: read the pages shown and return ONLY valid JSON (no markdown fences, 
   "questions": ["1. Example question text. (10)", "2. Another example question. (10)"]
 }
 
-IMPORTANT formatting requirement: "question_paper_pages" must be a JSON array where EACH page number is a SEPARATE element separated by commas, like [14, 16, 18] -- NEVER merge multiple page numbers into one number like [141618]. Each integer in that array must be a single, individually valid page number from the pages shown.
+IMPORTANT: Each question must be extracted as a SEPARATE item in the questions array. If a question has sub-parts like (i), (ii), (iii), each sub-part must be a SEPARATE question in the array, formatted like:
+"1. (i) What is the theme of concealment? (10)"
+"1. (ii) How does the curse function? (10)"
+"1. (iii) Analyze the role of the ring. (10)"
 
-Critical rules for telling question-paper pages apart from answer pages that happen to contain numbered content:
-- A genuine question paper question is a PROMPT directed at the student ("explain", "discuss", "describe", "write notes on", "compare", a question mark, etc.) -- it asks the student to DO something.
-- A numbered point inside a long answer is typically a STATEMENT or FACT that is part of an explanation the student is giving -- it does not ask the reader to do anything; it's content, not an instruction.
-- If a page's numbered items closely follow words like "उत्तर" (answer), "Ans", "Ans-", or come after a long paragraph of explanatory prose in the same block, that page is almost certainly an ANSWER page, not a question paper page -- exclude it from question_paper_pages even if it has multiple numbered lines.
-- A real question paper is usually self-contained and concise per question (a question, maybe a mark allocation) -- not a long flowing essay with numbered sub-points woven into running prose.
-- When genuinely uncertain whether a page is a question paper page, prefer NOT including it as one, and prefer NOT extracting its numbered items as separate questions.
-- If NONE of the pages shown in this chunk are question paper pages, return empty lists for both fields -- that is a valid and expected result for chunks that only contain answer/admin pages.
-- Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate, do not fix any OCR errors or grammar mistakes. Return the text EXACTLY as shown.
+CRITICAL RULES:
+- Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate, do not fix any OCR errors or grammar mistakes.
+- Extract questions EXACTLY as they appear on the question paper pages.
+- If a question has sub-questions (i), (ii), (iii), they must each be their own separate entry in the questions array.
 - Output ONLY the JSON object described above. No prose before or after it. No markdown code fences."""
 
 
@@ -808,7 +807,7 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
 
 # =========================================================
-# LLM-BASED ANSWER MAPPING (Groq) - STRICTLY RAW TEXT ONLY
+# LLM-BASED ANSWER MAPPING (Groq) - WITH SUB-QUESTION SPLITTING
 # =========================================================
 
 ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
@@ -822,11 +821,14 @@ CRITICAL INSTRUCTIONS:
 - You must NOT modify, fix, correct, improve, or change ANY of the answer text.
 - You must NOT correct spelling mistakes, grammar errors, or OCR errors.
 - You must NOT strip or remove any content from the answers.
+- You must NOT include the question text in the answer range.
+- The answer starts AFTER the question restatement (e.g., after "Ans:", "उत्तर:", etc.).
 - The actual answer text will be extracted by the system using the line numbers you provide.
 - Your output should ONLY contain line number ranges, nothing else about the content.
 
 Important guidance for finding boundaries correctly:
 - A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
+- The answer content STARTS AFTER the question restatement. Do NOT include the restatement in the range.
 - An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins.
 - If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely from your output.
 - Each REF's range must NOT overlap with another REF's range.
@@ -852,7 +854,8 @@ def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
     return (
         f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label):\n{questions_block}\n\n"
         f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}\n\n"
-        f"REMINDER: Return ONLY line number ranges. Do NOT modify the answer text."
+        f"REMINDER: Return ONLY line number ranges. Do NOT modify the answer text. "
+        f"The answer STARTS AFTER the question restatement."
     )
 
 
@@ -896,18 +899,14 @@ def _parse_answer_map_llm_response(content: str) -> list:
     return result
 
 
-# MAXIMUM CHUNK SIZES FOR VERY LONG ANSWERS (6+ pages)
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 20000  # Massive chunk size for long answers
-ANSWER_MAP_OVERLAP_CHARS = 8000  # Large overlap to ensure no content is missed
+# MAXIMUM CHUNK SIZES FOR VERY LONG ANSWERS
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 20000
+ANSWER_MAP_OVERLAP_CHARS = 8000
 
 
 def _chunk_lines_by_char_budget(numbered_lines: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
                                   overlap_chars: int = ANSWER_MAP_OVERLAP_CHARS) -> list:
-    """
-    Chunks the answer text into large overlapping segments to ensure
-    even 6+ page answers are fully captured across chunks.
-    """
     if not numbered_lines:
         return []
 
@@ -921,7 +920,6 @@ def _chunk_lines_by_char_budget(numbered_lines: list,
         if current_chunk and current_chars + line_chars > max_chars:
             chunks.append(current_chunk)
 
-            # Build a generous overlap to ensure long answers are not cut off
             overlap = []
             overlap_total = 0
             for item in reversed(current_chunk):
@@ -943,10 +941,6 @@ def _chunk_lines_by_char_budget(numbered_lines: list,
 
 
 def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
-    """
-    Ensures no answer range overlaps with another. If there's overlap,
-    the earlier answer's end is clipped to just before the next answer starts.
-    """
     sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
     resolved = []
     for i, r in enumerate(sorted_ranges):
@@ -960,13 +954,37 @@ def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
     return resolved
 
 
+def _find_answer_start(line: str) -> bool:
+    """Check if a line looks like the start of an answer (contains answer marker)."""
+    answer_markers = [
+        r'Ans(?:wer)?[.\s:-]+\d*[.\s:-]*',
+        r'उत्तर\s*\d*\s*[\-\:]?\s*',
+        r'प्र[०.\s]*\d*[.\s:-]*',
+        r'प्रश्न[.\s:-]*\d*[.\s:-]*',
+        r'Q\.?\s*\d+[.\s:-]*',
+        r'Answer\s*[:\-]',
+        r'Ans\.?\s*[:\-]',
+    ]
+    for pattern in answer_markers:
+        if re.search(pattern, line, re.IGNORECASE):
+            return True
+    return False
+
+
+def _extract_question_number(question_text: str) -> str:
+    """Extract the question number from the question text."""
+    match = re.search(r'^(\d+\.?\s*\(?[ivx]+\)?)', question_text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
     """
     Maps each official question to its verbatim answer text.
     The LLM ONLY identifies line boundaries. The actual answer text
     is extracted via pure Python slice - completely untouched.
     NO modifications, NO grammar fixes, NO stripping of prefixes.
-    The answer is returned EXACTLY as it appears in the OCR.
     """
     def log(msg):
         print(msg)
@@ -1021,7 +1039,7 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
         log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
 
-    # Deduplicate: keep the longest range for each REF (most complete capture)
+    # Deduplicate: keep the longest range for each REF
     best_by_ref = {}
     for r in all_ranges:
         existing = best_by_ref.get(r["ref"])
@@ -1040,16 +1058,30 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         
         # Get ALL lines in the range - preserve EVERYTHING
         raw_lines = []
+        answer_started = False
+        
         for j in range(start, end + 1):
             if 0 <= j < len(answer_lines):
                 line = answer_lines[j]
-                # Only filter out obvious noise (page numbers, signatures)
-                # Everything else is preserved exactly as OCR'd
-                if line.strip() and not is_noise(line):
+                
+                # Skip lines that are just noise
+                if is_noise(line):
+                    continue
+                
+                # If this is the first line and it contains an answer marker,
+                # skip it (it's the question restatement)
+                if not answer_started and _find_answer_start(line):
+                    # Skip the restatement line
+                    continue
+                
+                # Mark that we've passed the restatement
+                answer_started = True
+                
+                # Add the line (preserving everything else)
+                if line.strip():
                     raw_lines.append(line)
         
-        # Join with newlines to preserve original formatting and structure
-        # NO stripping of prefixes, NO fixing of grammar, NO corrections
+        # Join with newlines to preserve original formatting
         answer_text = "\n".join(raw_lines)
         
         original_question = ref_to_question[r["ref"]]
@@ -1145,19 +1177,18 @@ def process_pdf(file_input, status_callback=None):
             log(f"WARNING: No match found for: {q[:60]}...")
 
     # Build Q&A pairs in official question order
-    # The answer text is RAW from the OCR - NO modifications whatsoever
     qa_pairs = []
     for q in official_questions:
         qa_pairs.append({
             "question": q,
-            "answer": qa_map.get(q, ""),  # Raw, unmodified OCR text
+            "answer": qa_map.get(q, ""),
             "matched": q in qa_map,
         })
 
-    # Log sample of first answer to verify it's raw
+    # Log sample of first answer to verify it's raw and doesn't have the question repeated
     if qa_pairs and qa_pairs[0]["answer"]:
-        sample = qa_pairs[0]["answer"][:200]
-        log(f"Sample raw answer (first 200 chars):\n{sample}...")
+        sample = qa_pairs[0]["answer"][:300]
+        log(f"Sample raw answer (first 300 chars):\n{sample}...")
 
     log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
 
