@@ -309,8 +309,8 @@ TPM_LIMIT = 8000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 
-MAX_CHARS_PER_CHUNK = 8000  # Increased from 6000 to handle longer questions
-CHUNK_OVERLAP_PAGES = 2  # Increased from 1 for better context
+MAX_CHARS_PER_CHUNK = 8000  # Increased for longer questions
+CHUNK_OVERLAP_PAGES = 2
 
 QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet (e.g. IGNOU-style, India). The booklet mixes pages of different kinds, in no guaranteed order:
 
@@ -336,7 +336,7 @@ Critical rules for telling question-paper pages apart from answer pages that hap
 - A real question paper is usually self-contained and concise per question (a question, maybe a mark allocation) -- not a long flowing essay with numbered sub-points woven into running prose.
 - When genuinely uncertain whether a page is a question paper page, prefer NOT including it as one, and prefer NOT extracting its numbered items as separate questions.
 - If NONE of the pages shown in this chunk are question paper pages, return empty lists for both fields -- that is a valid and expected result for chunks that only contain answer/admin pages.
-- Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate.
+- Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate, do not fix any OCR errors or grammar mistakes. Return the text EXACTLY as shown.
 - Output ONLY the JSON object described above. No prose before or after it. No markdown code fences."""
 
 
@@ -375,7 +375,6 @@ def _build_qp_user_prompt(pages: list) -> str:
 
 
 def _estimate_tokens(text: str) -> int:
-    """Rough estimate using the current chars-per-token ratio."""
     return int(len(text) / CHARS_PER_TOKEN_ESTIMATE) + 1
 
 
@@ -809,7 +808,7 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
 
 # =========================================================
-# LLM-BASED ANSWER MAPPING (Groq)
+# LLM-BASED ANSWER MAPPING (Groq) - FIXED FOR RAW TEXT
 # =========================================================
 
 ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
@@ -822,9 +821,10 @@ Important guidance for finding boundaries correctly:
 - A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
 - An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins (whether or not the next answer is in your list of official questions).
 - If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely from your output. It may appear in a different chunk of the document.
-- Each REF's range must NOT overlap with another REF's range. If you are unsure exactly where one answer ends and the next begins, prefer ending the EARLIER answer sooner rather than letting it swallow content that belongs to a later answer -- a short correct answer is far more useful than a long answer that incorrectly absorbed unrelated content.
+- Each REF's range must NOT overlap with another REF's range. If you are unsure exactly where one answer ends and the next begins, prefer ending the EARLIER answer sooner rather than letting it swallow content that belongs to a later answer.
 - Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
 - Use the EXACT REF label (e.g. "REF-A") to identify each question. Do NOT retype or paraphrase the question text itself -- the REF label is all that's needed.
+- CRITICAL: You are only identifying line number ranges. Do NOT modify, fix, correct, or change any of the answer text. The actual text will be extracted by the system using the line numbers you provide.
 
 Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
 
@@ -847,7 +847,9 @@ def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
         f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label -- "
         f"use the REF label, not retyped question text, to identify which "
         f"question an answer belongs to):\n{questions_block}\n\n"
-        f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}"
+        f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}\n\n"
+        f"IMPORTANT: Return ONLY line number ranges for each answer. "
+        f"Do NOT modify, correct, or change any of the answer text."
     )
 
 
@@ -891,9 +893,9 @@ def _parse_answer_map_llm_response(content: str) -> list:
     return result
 
 
-# Increased chunk size for answer mapping to handle long answers
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 12000  # Increased from 8000
-ANSWER_MAP_OVERLAP_CHARS = 5000  # Increased from 3500
+# FURTHER INCREASED CHUNK SIZES FOR LONG ANSWERS
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 15000  # Increased significantly
+ANSWER_MAP_OVERLAP_CHARS = 6000  # Increased for better overlap
 
 
 def _chunk_lines_by_char_budget(numbered_lines: list,
@@ -946,44 +948,18 @@ def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
     return resolved
 
 
-QUESTION_PREFIX_RE = re.compile(
-    r'^\s*(?:'
-    r'Ans(?:wer)?[.\s:-]+\d*[.\s:-]*'
-    r'|उत्तर\s*\d*\s*[\-\:]?\s*'
-    r'|प्र[०.\s]*\d*[.\s:-]*'
-    r'|प्रश्न[.\s:-]*\d*[.\s:-]*'
-    r'|Q\.?\s*\d+[.\s:-]*'
-    r')',
-    re.IGNORECASE
-)
-
-
-def strip_question_restatement(answer_text: str) -> str:
-    """
-    IMPROVED: Better stripping of question restatements from the beginning of answers.
-    Now handles multiple patterns and ensures the question text itself is not repeated.
-    """
-    text = answer_text.strip()
-    
-    # First, remove common answer prefixes
-    for _ in range(3):  # Try up to 3 times for nested prefixes
-        new_text = QUESTION_PREFIX_RE.sub('', text, count=1).strip()
-        if new_text == text:
-            break
-        text = new_text
-    
-    # Remove any remaining leading numbering or punctuation
-    text = re.sub(r'^[\d\.\s\-:]+', '', text).strip()
-    text = re.sub(r'^[\)\]]+', '', text).strip()
-    
-    # If after stripping we have an empty string, return original (something went wrong)
-    if not text:
-        return answer_text.strip()
-    
-    return text
+# REMOVED - we don't strip anything anymore, keep answers RAW
+# The old strip_question_restatement function is removed
+# We want the raw OCR text, exactly as extracted
 
 
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
+    """
+    Maps each official question to its verbatim answer text.
+    CRITICAL: The LLM only identifies line boundaries. The actual answer
+    text is extracted via pure Python slice - completely untouched.
+    No modifications, no grammar fixes, no stripping of prefixes.
+    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -1037,7 +1013,7 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
         log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
 
-    # Deduplicate and resolve overlaps
+    # Deduplicate: keep the longest range for each REF
     best_by_ref = {}
     for r in all_ranges:
         existing = best_by_ref.get(r["ref"])
@@ -1049,16 +1025,29 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
     log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
 
+    # CRITICAL FIX: Extract raw text via pure Python slice - NO modifications
+    # The answer text is taken EXACTLY as it appears in the OCR, line by line
     qa_map = {}
     for r in resolved_ranges:
         start, end = r["start_line"], r["end_line"]
-        verbatim_lines = [
-            answer_lines[j] for j in range(start, end + 1)
-            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ]
+        
+        # Get ALL lines in the range, preserving exact OCR text
+        raw_lines = []
+        for j in range(start, end + 1):
+            if 0 <= j < len(answer_lines):
+                line = answer_lines[j]
+                # Only filter out obvious noise lines (date stamps, page numbers, etc.)
+                # but preserve everything else exactly as OCR'd
+                if line.strip() and not is_noise(line):
+                    raw_lines.append(line)
+        
+        # Join with newlines to preserve original formatting
+        answer_text = "\n".join(raw_lines).strip()
+        
         original_question = ref_to_question[r["ref"]]
-        answer_text = " ".join(verbatim_lines).strip()
-        qa_map[original_question] = strip_question_restatement(answer_text)
+        
+        # NO modifications - store the raw text exactly as extracted
+        qa_map[original_question] = answer_text
 
     return qa_map
 
@@ -1236,40 +1225,35 @@ def process_pdf(file_input, status_callback=None):
 
     log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
 
-    # Flatten answer lines
+    # Flatten answer lines - keep EVERYTHING, including question restatements
     answer_lines = []
     for page in answer_pages:
         for line in page["raw_text"].split("\n"):
+            # Only filter obvious noise, but keep everything else
             if not is_noise(line):
                 answer_lines.append(line)
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
-    # Map answers to questions using LLM
-    log("Mapping each question to its answer independently (LLM-based)...")
+    # Map answers to questions using LLM (line boundaries only)
+    log("Mapping each question to its answer using LLM line boundaries...")
     qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
 
     matched_count = sum(1 for q in official_questions if q in qa_map)
     log(f"Matched {matched_count} of {len(official_questions)} questions")
 
-    # Check for monotonic alignment - ensure questions are in proper order
-    # and no question text is repeated at the start of answers
+    # Check for any questions that didn't get matched
     for q in official_questions:
-        if q in qa_map:
-            answer = qa_map[q]
-            # Check if the question text appears at the start of the answer
-            # and strip it if present (additional safety)
-            cleaned_answer = strip_question_restatement(answer)
-            if cleaned_answer != answer:
-                qa_map[q] = cleaned_answer
-                log(f"Stripped question restatement from answer to: {q[:50]}...")
+        if q not in qa_map:
+            log(f"WARNING: No match found for: {q[:60]}...")
 
     # Build Q&A pairs in official question order
+    # The answer text is already raw from the OCR - no modifications
     qa_pairs = []
     for q in official_questions:
         qa_pairs.append({
             "question": q,
-            "answer": qa_map.get(q, ""),
+            "answer": qa_map.get(q, ""),  # Raw, unmodified OCR text
             "matched": q in qa_map,
         })
 
