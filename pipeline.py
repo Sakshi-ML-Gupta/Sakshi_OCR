@@ -309,8 +309,8 @@ TPM_LIMIT = 8000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 
-MAX_CHARS_PER_CHUNK = 8000  # Increased for longer questions
-CHUNK_OVERLAP_PAGES = 2
+MAX_CHARS_PER_CHUNK = 10000  # Increased for longer questions
+CHUNK_OVERLAP_PAGES = 3  # Increased overlap for better context
 
 QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet (e.g. IGNOU-style, India). The booklet mixes pages of different kinds, in no guaranteed order:
 
@@ -808,7 +808,7 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
 
 # =========================================================
-# LLM-BASED ANSWER MAPPING (Groq) - FIXED FOR RAW TEXT
+# LLM-BASED ANSWER MAPPING (Groq) - STRICTLY RAW TEXT ONLY
 # =========================================================
 
 ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
@@ -817,14 +817,20 @@ ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers 
 
 Your task: for EACH official question, find WHERE in the answer text the student's response to that specific question starts and ends, and return the LINE NUMBER RANGE (inclusive) for each, identified by its REF label.
 
+CRITICAL INSTRUCTIONS:
+- You are ONLY identifying line number ranges. That is your ONLY job.
+- You must NOT modify, fix, correct, improve, or change ANY of the answer text.
+- You must NOT correct spelling mistakes, grammar errors, or OCR errors.
+- You must NOT strip or remove any content from the answers.
+- The actual answer text will be extracted by the system using the line numbers you provide.
+- Your output should ONLY contain line number ranges, nothing else about the content.
+
 Important guidance for finding boundaries correctly:
 - A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
-- An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins (whether or not the next answer is in your list of official questions).
-- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely from your output. It may appear in a different chunk of the document.
-- Each REF's range must NOT overlap with another REF's range. If you are unsure exactly where one answer ends and the next begins, prefer ending the EARLIER answer sooner rather than letting it swallow content that belongs to a later answer.
+- An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins.
+- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely from your output.
+- Each REF's range must NOT overlap with another REF's range.
 - Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
-- Use the EXACT REF label (e.g. "REF-A") to identify each question. Do NOT retype or paraphrase the question text itself -- the REF label is all that's needed.
-- CRITICAL: You are only identifying line number ranges. Do NOT modify, fix, correct, or change any of the answer text. The actual text will be extracted by the system using the line numbers you provide.
 
 Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
 
@@ -835,7 +841,7 @@ Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape
   ]
 }
 
-If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any of these answers."""
+If NONE of the official questions' answers appear in the text shown, return {"answers": []}."""
 
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
@@ -844,12 +850,9 @@ def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
     )
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
     return (
-        f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label -- "
-        f"use the REF label, not retyped question text, to identify which "
-        f"question an answer belongs to):\n{questions_block}\n\n"
+        f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label):\n{questions_block}\n\n"
         f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}\n\n"
-        f"IMPORTANT: Return ONLY line number ranges for each answer. "
-        f"Do NOT modify, correct, or change any of the answer text."
+        f"REMINDER: Return ONLY line number ranges. Do NOT modify the answer text."
     )
 
 
@@ -893,14 +896,18 @@ def _parse_answer_map_llm_response(content: str) -> list:
     return result
 
 
-# FURTHER INCREASED CHUNK SIZES FOR LONG ANSWERS
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 15000  # Increased significantly
-ANSWER_MAP_OVERLAP_CHARS = 6000  # Increased for better overlap
+# MAXIMUM CHUNK SIZES FOR VERY LONG ANSWERS (6+ pages)
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 20000  # Massive chunk size for long answers
+ANSWER_MAP_OVERLAP_CHARS = 8000  # Large overlap to ensure no content is missed
 
 
 def _chunk_lines_by_char_budget(numbered_lines: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
                                   overlap_chars: int = ANSWER_MAP_OVERLAP_CHARS) -> list:
+    """
+    Chunks the answer text into large overlapping segments to ensure
+    even 6+ page answers are fully captured across chunks.
+    """
     if not numbered_lines:
         return []
 
@@ -914,6 +921,7 @@ def _chunk_lines_by_char_budget(numbered_lines: list,
         if current_chunk and current_chars + line_chars > max_chars:
             chunks.append(current_chunk)
 
+            # Build a generous overlap to ensure long answers are not cut off
             overlap = []
             overlap_total = 0
             for item in reversed(current_chunk):
@@ -935,6 +943,10 @@ def _chunk_lines_by_char_budget(numbered_lines: list,
 
 
 def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
+    """
+    Ensures no answer range overlaps with another. If there's overlap,
+    the earlier answer's end is clipped to just before the next answer starts.
+    """
     sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
     resolved = []
     for i, r in enumerate(sorted_ranges):
@@ -948,17 +960,13 @@ def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
     return resolved
 
 
-# REMOVED - we don't strip anything anymore, keep answers RAW
-# The old strip_question_restatement function is removed
-# We want the raw OCR text, exactly as extracted
-
-
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
     """
     Maps each official question to its verbatim answer text.
-    CRITICAL: The LLM only identifies line boundaries. The actual answer
-    text is extracted via pure Python slice - completely untouched.
-    No modifications, no grammar fixes, no stripping of prefixes.
+    The LLM ONLY identifies line boundaries. The actual answer text
+    is extracted via pure Python slice - completely untouched.
+    NO modifications, NO grammar fixes, NO stripping of prefixes.
+    The answer is returned EXACTLY as it appears in the OCR.
     """
     def log(msg):
         print(msg)
@@ -1013,7 +1021,7 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
         log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
 
-    # Deduplicate: keep the longest range for each REF
+    # Deduplicate: keep the longest range for each REF (most complete capture)
     best_by_ref = {}
     for r in all_ranges:
         existing = best_by_ref.get(r["ref"])
@@ -1025,28 +1033,28 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
     log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
 
-    # CRITICAL FIX: Extract raw text via pure Python slice - NO modifications
-    # The answer text is taken EXACTLY as it appears in the OCR, line by line
+    # EXTRACT RAW TEXT - PURE PYTHON SLICE, NO MODIFICATIONS
     qa_map = {}
     for r in resolved_ranges:
         start, end = r["start_line"], r["end_line"]
         
-        # Get ALL lines in the range, preserving exact OCR text
+        # Get ALL lines in the range - preserve EVERYTHING
         raw_lines = []
         for j in range(start, end + 1):
             if 0 <= j < len(answer_lines):
                 line = answer_lines[j]
-                # Only filter out obvious noise lines (date stamps, page numbers, etc.)
-                # but preserve everything else exactly as OCR'd
+                # Only filter out obvious noise (page numbers, signatures)
+                # Everything else is preserved exactly as OCR'd
                 if line.strip() and not is_noise(line):
                     raw_lines.append(line)
         
-        # Join with newlines to preserve original formatting
-        answer_text = "\n".join(raw_lines).strip()
+        # Join with newlines to preserve original formatting and structure
+        # NO stripping of prefixes, NO fixing of grammar, NO corrections
+        answer_text = "\n".join(raw_lines)
         
         original_question = ref_to_question[r["ref"]]
         
-        # NO modifications - store the raw text exactly as extracted
+        # Store the raw, unmodified text
         qa_map[original_question] = answer_text
 
     return qa_map
@@ -1070,117 +1078,6 @@ NOISE_RE = re.compile(
 
 def is_noise(line: str) -> bool:
     return bool(NOISE_RE.search(line))
-
-
-# =========================================================
-# FIND QUESTION BOUNDARIES IN ANSWER PAGES -- similarity based
-# =========================================================
-
-def normalize(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r'[^\w\s]', ' ', text, flags=re.UNICODE)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-
-def similarity(a: str, b: str) -> float:
-    wa = set(normalize(a).split())
-    wb = set(normalize(b).split())
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / max(len(wa), len(wb))
-
-
-def strip_leading_label(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^(?:उत्तर)\s*[\-\:\s]*', '', text)
-    text = re.sub(r'^(?:प्र|प्रो|प्रश्न)[\.\s]*\d*[\.\s]*', '', text)
-    text = re.sub(r'^[१-९०][०-९]*[\.\-\s]*', '', text)
-    text = re.sub(r'^(?:Q\.?\s*)?\d+[.)]\s*', '', text)
-    text = re.sub(r'^\(?[a-z]\)\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^\(?[क-घ]\)\s*', '', text)
-    return text.strip()
-
-
-def find_question_boundaries_by_similarity(
-    answer_lines: list,
-    questions: list,
-    similarity_threshold: float = 0.30,
-    window: int = 4
-) -> list:
-    candidates_by_question = {}
-
-    for i in range(len(answer_lines)):
-        line_i = answer_lines[i].strip()
-        if len(line_i) < 8:
-            continue
-
-        for w in range(1, window + 1):
-            if i + w > len(answer_lines):
-                break
-
-            combined = " ".join(
-                answer_lines[i + k].strip()
-                for k in range(w) if answer_lines[i + k].strip()
-            )
-            if len(combined) < 10:
-                continue
-
-            combined_clean = strip_leading_label(combined)
-
-            for q in questions:
-                q_clean = strip_leading_label(q)
-                s1 = similarity(combined, q)
-                s2 = similarity(combined_clean, q_clean)
-                score = max(s1, s2)
-
-                if score >= similarity_threshold:
-                    candidates_by_question.setdefault(q, []).append({
-                        "question":   q,
-                        "line_index": i,
-                        "span":       w,
-                        "score":      score
-                    })
-
-    for q in candidates_by_question:
-        candidates_by_question[q].sort(key=lambda c: -c["score"])
-
-    final = []
-    last_line_index = -1
-
-    for q in questions:
-        cands = candidates_by_question.get(q, [])
-        chosen = None
-        for c in cands:
-            if c["line_index"] > last_line_index:
-                chosen = c
-                break
-        if chosen is not None:
-            final.append(chosen)
-            last_line_index = chosen["line_index"]
-
-    return final
-
-
-def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
-    qa_pairs = []
-    for i, b in enumerate(boundaries):
-        span    = b.get("span", 1)
-        a_start = b["line_index"] + span
-        a_end   = boundaries[i + 1]["line_index"] if i + 1 < len(boundaries) else len(answer_lines)
-
-        raw = [
-            answer_lines[j] for j in range(a_start, a_end)
-            if answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ]
-
-        qa_pairs.append({
-            "question": b["question"],
-            "answer":   " ".join(raw).strip()
-        })
-
-    return qa_pairs
 
 
 # =========================================================
@@ -1225,7 +1122,7 @@ def process_pdf(file_input, status_callback=None):
 
     log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
 
-    # Flatten answer lines - keep EVERYTHING, including question restatements
+    # Flatten answer lines - keep EVERYTHING except obvious noise
     answer_lines = []
     for page in answer_pages:
         for line in page["raw_text"].split("\n"):
@@ -1248,7 +1145,7 @@ def process_pdf(file_input, status_callback=None):
             log(f"WARNING: No match found for: {q[:60]}...")
 
     # Build Q&A pairs in official question order
-    # The answer text is already raw from the OCR - no modifications
+    # The answer text is RAW from the OCR - NO modifications whatsoever
     qa_pairs = []
     for q in official_questions:
         qa_pairs.append({
@@ -1256,6 +1153,11 @@ def process_pdf(file_input, status_callback=None):
             "answer": qa_map.get(q, ""),  # Raw, unmodified OCR text
             "matched": q in qa_map,
         })
+
+    # Log sample of first answer to verify it's raw
+    if qa_pairs and qa_pairs[0]["answer"]:
+        sample = qa_pairs[0]["answer"][:200]
+        log(f"Sample raw answer (first 200 chars):\n{sample}...")
 
     log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
 
