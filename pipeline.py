@@ -792,170 +792,139 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
 
 # =========================================================
-# CRITICAL FIX: DIRECT OCR TEXT EXTRACTION - NO LLM FOR ANSWERS
+# CRITICAL FIX: MATCH QUESTIONS TO ANSWERS DIRECTLY FROM OCR
 # =========================================================
 
-def extract_answers_directly_from_ocr(pages: list, question_page_indices: list) -> list:
+def extract_all_ocr_text(pages: list) -> str:
+    """Extract ALL text from all pages as a single string."""
+    all_text = []
+    for page in pages:
+        all_text.append(f"--- PAGE {page['page_number']} ---")
+        all_text.append(page["raw_text"])
+    return "\n".join(all_text)
+
+
+def find_answer_for_question(full_ocr_text: str, question: str, answer_pages_text: str) -> str:
     """
-    Extracts answer text directly from OCR pages WITHOUT using LLM.
-    This ensures 100% raw text extraction.
+    Find the answer for a question by looking for the question text
+    or its key phrases in the OCR text.
     """
-    # Answer pages are all pages that are NOT question paper pages
+    # Clean the question
+    q_clean = question.strip()
+    # Remove leading numbers/markers
+    q_clean = re.sub(r'^[\d\.\(\)ivx]+\s*', '', q_clean)
+    q_clean = re.sub(r'^[A-Z]\.\s*', '', q_clean)
+    q_clean = re.sub(r'\([\d]+\)$', '', q_clean).strip()
+    
+    # Try to find the question in the OCR text
+    # Look for the question text followed by answer content
+    patterns = [
+        # Question with answer marker
+        re.escape(q_clean[:50]) + r'.*?(?:Ans|उत्तर|Answer)[\s:]*([^\n]+(?:\n[^\n]+)*?)(?=\n\s*(?:Q\.|Q\s|Question|प्रश्न|\d+\.|Page|\Z))',
+        # Question followed by answer
+        re.escape(q_clean[:30]) + r'.*?(?:\n)([^\n]+(?:\n[^\n]+)*?)(?=\n\s*(?:Q\.|Q\s|Question|प्रश्न|\d+\.|Page|\Z))',
+        # Answer marker followed by content near question
+        r'(?:Ans|उत्तर|Answer)[\s:]*([^\n]+(?:\n[^\n]+)*?)(?=\n\s*(?:Q\.|Q\s|Question|प्रश्न|\d+\.|Page|\Z))',
+    ]
+    
+    for pattern in patterns:
+        try:
+            matches = re.findall(pattern, full_ocr_text, re.IGNORECASE | re.DOTALL)
+            if matches:
+                # Return the first match that seems like an actual answer
+                for match in matches:
+                    if len(match.strip()) > 20:  # At least 20 chars
+                        return match.strip()
+        except:
+            continue
+    
+    # If no match found, try splitting by question markers and finding the closest match
+    sections = re.split(r'\n\s*(?:Q\.|Q\s|Question|प्रश्न|\d+\.)\s*', full_ocr_text, re.IGNORECASE)
+    
+    if len(sections) > 1:
+        # Find which section contains the question
+        for i, section in enumerate(sections):
+            if i == 0:
+                continue  # Skip header
+            if q_clean[:30].lower() in section.lower():
+                # This section likely contains the answer
+                # Extract the answer part (after the question marker)
+                lines = section.split('\n')
+                answer_lines = []
+                for line in lines:
+                    # Skip lines that look like questions
+                    if re.search(r'^(?:Q\.|Q\s|Question|प्रश्न)', line, re.IGNORECASE):
+                        continue
+                    answer_lines.append(line)
+                return '\n'.join(answer_lines).strip()
+    
+    # Try to find by looking for answer markers near the question text
+    q_words = set(q_clean.lower().split())
+    if len(q_words) > 2:
+        # Look for a section that contains most of the question words
+        sections = re.split(r'\n\s*(?:Ans|उत्तर|Answer)[\s:]*', full_ocr_text, re.IGNORECASE)
+        best_section = None
+        best_score = 0
+        
+        for i, section in enumerate(sections):
+            if i == 0:
+                continue
+            section_words = set(section.lower().split())
+            overlap = len(q_words & section_words) / len(q_words) if q_words else 0
+            if overlap > best_score and overlap > 0.3:
+                best_score = overlap
+                best_section = section
+        
+        if best_section:
+            return best_section.strip()
+    
+    return ""
+
+
+def map_answers_directly(pages: list, questions: list, question_page_indices: list) -> dict:
+    """
+    Maps questions to answers by extracting directly from OCR pages.
+    Uses the FULL OCR text to find answers.
+    """
+    qa_map = {}
+    
+    # Get all answer pages (not question paper pages)
     answer_page_indices = [i for i in range(len(pages)) if i not in question_page_indices]
     answer_pages = [pages[i] for i in answer_page_indices]
     
-    # Extract all text from answer pages
-    all_answer_text = []
+    # Build full OCR text from answer pages
+    answer_text = ""
     for page in answer_pages:
-        # Split into lines and filter noise
-        lines = page["raw_text"].split("\n")
-        for line in lines:
-            if line.strip() and not is_noise(line):
-                all_answer_text.append(line.strip())
+        answer_text += f"\n--- PAGE {page['page_number']} ---\n"
+        answer_text += page["raw_text"]
+        answer_text += "\n"
     
-    return all_answer_text
-
-
-def split_answers_by_question_markers(answer_lines: list, questions: list) -> dict:
-    """
-    Splits the raw answer text by question markers (e.g., "Q1.", "Q2.", "Ans", "उत्तर")
-    to map each question to its answer.
-    """
-    qa_map = {}
+    # Build full OCR text from ALL pages (as fallback)
+    full_text = ""
+    for page in pages:
+        full_text += f"\n--- PAGE {page['page_number']} ---\n"
+        full_text += page["raw_text"]
+        full_text += "\n"
     
-    # Build a map of question numbers to questions
-    question_numbers = {}
-    for q in questions:
-        # Extract question number (e.g., "1.", "1.(i)", "Q.5")
-        match = re.search(r'^([\d\.\(\)ivx]+)\s*[\.\)]?\s*', q, re.IGNORECASE)
-        if match:
-            num = match.group(1).strip()
-            question_numbers[num] = q
+    print(f"Extracted {len(answer_pages)} answer pages with {len(answer_text)} characters of text")
+    print(f"Looking for answers to {len(questions)} questions...")
+    
+    # For each question, try to find its answer
+    for i, q in enumerate(questions):
+        # Try to find answer in answer pages first
+        answer = find_answer_for_question(answer_text, q, answer_text)
+        
+        # If not found, try full text
+        if not answer:
+            answer = find_answer_for_question(full_text, q, answer_text)
+        
+        if answer:
+            qa_map[q] = answer
+            print(f"Found answer for Q{i+1}: {q[:50]}... ({len(answer)} chars)")
         else:
-            # Try to match by partial text
-            for existing_q in question_numbers.values():
-                if similarity(q, existing_q) > 0.7:
-                    question_numbers[existing_q] = q
-                    break
+            print(f"WARNING: No answer found for Q{i+1}: {q[:50]}...")
+            qa_map[q] = ""
     
-    # Find question markers in the answer text
-    current_question = None
-    current_answer = []
-    
-    for line in answer_lines:
-        # Check if this line starts a new answer
-        marker_match = re.search(r'(?:^|\.\s*)(Q\.?\s*[\d\.\(\)ivx]+|Ans|उत्तर|प्र\.?\s*[\d\.\(\)ivx]+)', line, re.IGNORECASE)
-        
-        if marker_match:
-            # Save previous answer if any
-            if current_question and current_answer:
-                qa_map[current_question] = "\n".join(current_answer)
-            
-            # Find which question this marker corresponds to
-            marker_text = marker_match.group(1).strip()
-            found = False
-            for q_num, q_text in question_numbers.items():
-                if q_num in marker_text or marker_text in q_num:
-                    current_question = q_text
-                    found = True
-                    current_answer = []
-                    break
-            
-            if not found:
-                # Try fuzzy matching
-                for q_num, q_text in question_numbers.items():
-                    if similarity(marker_text, q_num) > 0.5 or similarity(marker_text, q_text[:20]) > 0.5:
-                        current_question = q_text
-                        found = True
-                        current_answer = []
-                        break
-            
-            if not found:
-                current_question = None
-                current_answer = []
-        else:
-            # Add line to current answer if we have a current question
-            if current_question and line.strip():
-                current_answer.append(line.strip())
-    
-    # Save the last answer
-    if current_question and current_answer:
-        qa_map[current_question] = "\n".join(current_answer)
-    
-    return qa_map
-
-
-def map_answers_without_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
-    """
-    Maps questions to answers WITHOUT using LLM.
-    Uses pattern matching and similarity to extract raw text.
-    """
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
-    
-    log("Extracting answers directly from OCR text (no LLM)...")
-    
-    # Method 1: Try to find answers by question markers
-    qa_map = split_answers_by_question_markers(answer_lines, questions)
-    
-    # If we found matches, return them
-    if qa_map:
-        log(f"Found {len(qa_map)} answers using marker-based extraction")
-        return qa_map
-    
-    # Method 2: Fallback - try to match by similarity to question text
-    log("Marker-based extraction failed, trying similarity-based matching...")
-    
-    qa_map = {}
-    used_indices = set()
-    
-    for q in questions:
-        best_match = None
-        best_score = 0
-        best_start = -1
-        best_end = -1
-        
-        # Clean the question for matching
-        q_clean = q.lower()
-        q_clean = re.sub(r'^[\d\.\(\)ivx]+\s*', '', q_clean)
-        q_clean = re.sub(r'\([\d]+\)$', '', q_clean).strip()
-        
-        # Look for the question in the answer text
-        for i, line in enumerate(answer_lines):
-            if i in used_indices:
-                continue
-            
-            line_clean = line.lower()
-            line_clean = re.sub(r'^(?:ans|उत्तर|प्र|q\.?)\s*[\d\.\(\)ivx]*\s*', '', line_clean)
-            
-            # Check if this line contains the question text
-            score = similarity(q_clean, line_clean)
-            
-            if score > best_score and score > 0.3:
-                best_score = score
-                best_start = i
-                # Find where this answer ends (at next question marker or end)
-                best_end = i
-                for j in range(i + 1, len(answer_lines)):
-                    if re.search(r'(?:^|\.\s*)(Q\.?\s*[\d\.\(\)ivx]+|Ans|उत्तर|प्र\.?\s*[\d\.\(\)ivx]+)', answer_lines[j], re.IGNORECASE):
-                        break
-                    best_end = j
-        
-        if best_start >= 0 and best_end >= best_start:
-            # Extract the answer
-            answer_parts = []
-            for j in range(best_start, best_end + 1):
-                if answer_lines[j].strip():
-                    answer_parts.append(answer_lines[j].strip())
-            qa_map[q] = "\n".join(answer_parts)
-            
-            # Mark these lines as used
-            for j in range(best_start, best_end + 1):
-                used_indices.add(j)
-    
-    log(f"Found {len(qa_map)} answers using similarity-based matching")
     return qa_map
 
 
@@ -979,21 +948,8 @@ def is_noise(line: str) -> bool:
     return bool(NOISE_RE.search(line))
 
 
-def similarity(a: str, b: str) -> float:
-    """Simple similarity check for text matching."""
-    if not a or not b:
-        return 0.0
-    a_words = set(re.findall(r'\w+', a.lower()))
-    b_words = set(re.findall(r'\w+', b.lower()))
-    if not a_words or not b_words:
-        return 0.0
-    intersection = len(a_words & b_words)
-    union = len(a_words | b_words)
-    return intersection / union if union > 0 else 0.0
-
-
 # =========================================================
-# COMPLETE PIPELINE - NO LLM FOR ANSWER EXTRACTION
+# COMPLETE PIPELINE - DIRECT OCR EXTRACTION
 # =========================================================
 
 def process_pdf(file_input, status_callback=None):
@@ -1028,26 +984,13 @@ def process_pdf(file_input, status_callback=None):
             f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
 
-    # Extract answer pages (non-question paper pages)
-    answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
-    answer_pages = [pages[i] for i in answer_page_indices]
+    # Show sample of first question
+    if official_questions:
+        log(f"Sample question: {official_questions[0][:100]}...")
 
-    log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
-
-    # Extract raw answer lines from OCR - NO LLM MODIFICATION
-    raw_answer_lines = []
-    for page in answer_pages:
-        for line in page["raw_text"].split("\n"):
-            if line.strip() and not is_noise(line):
-                raw_answer_lines.append(line.strip())
-
-    log(f"Extracted {len(raw_answer_lines)} raw answer lines from OCR")
-
-    # Map answers to questions WITHOUT using LLM
-    log("Mapping answers to questions using direct OCR extraction...")
-    
-    # First try to get answers from the raw OCR text
-    qa_map = map_answers_without_llm(raw_answer_lines, official_questions, status_callback)
+    # DIRECTLY extract answers from OCR - NO LLM
+    log("Extracting answers directly from OCR pages...")
+    qa_map = map_answers_directly(pages, official_questions, qp_page_indices)
 
     matched_count = sum(1 for q in official_questions if q in qa_map and qa_map[q])
     log(f"Matched {matched_count} of {len(official_questions)} questions")
@@ -1064,12 +1007,14 @@ def process_pdf(file_input, status_callback=None):
         if not answer:
             log(f"WARNING: No answer found for: {q[:60]}...")
 
-    # Log sample of first answer to verify it's raw
-    if qa_pairs and qa_pairs[0]["answer"]:
-        sample = qa_pairs[0]["answer"][:500]
-        log(f"VERIFICATION - Sample raw answer (first 500 chars):\n{sample}\n...")
+    # Log sample of first answer if found
+    for i, pair in enumerate(qa_pairs):
+        if pair["answer"]:
+            sample = pair["answer"][:300]
+            log(f"VERIFICATION - Q{i+1} answer (first 300 chars):\n{sample}\n...")
+            break
 
-    log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
+    log(f"Done -- {len(qa_pairs)} Q&A pair(s) extracted from {len(pages)} page(s).")
 
     return ocr_json, qa_pairs
 
