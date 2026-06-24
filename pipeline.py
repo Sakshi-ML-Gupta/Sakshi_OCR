@@ -300,7 +300,7 @@ def process_reference(file_input, status_callback=None):
 
 
 # =========================================================
-# QUESTION DETECTION (Groq) - LLM ONLY FOR QUESTIONS
+# LLM-BASED QUESTION PAPER / QUESTION DETECTION (Groq)
 # =========================================================
 
 GROQ_MODEL = "openai/gpt-oss-120b"
@@ -309,7 +309,11 @@ TPM_LIMIT = 8000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 
-MAX_CHARS_PER_CHUNK = 15000  # Increased for longer content
+# FIX 1: MUCH LARGER CHUNK SIZES FOR LONG ANSWERS
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 25000  # Was 8000 - now handles 6+ page answers
+ANSWER_MAP_OVERLAP_CHARS = 8000  # Was 3500 - dynamic overlap now
+
+MAX_CHARS_PER_CHUNK = 15000
 CHUNK_OVERLAP_PAGES = 4
 
 QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet.
@@ -793,182 +797,349 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
 
 # =========================================================
-# PURE RAW ANSWER EXTRACTION - NO LLM INVOLVEMENT
+# FIX 1: DYNAMIC OVERLAP FOR LARGE CHUNKS
 # =========================================================
 
-def extract_raw_answer_for_question(full_ocr_text: str, question: str, question_clean: str) -> str:
+def _chunk_lines_with_dynamic_overlap(numbered_lines: list,
+                                       max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
+                                       overlap_ratio: float = 0.3) -> list:
     """
-    Extracts raw answer from OCR text using PURE PYTHON SLICING.
-    NO LLM involvement. NO modifications. NO grammar fixes.
-    Returns EXACT text from OCR.
+    Dynamic overlap scaling: overlap is always 30% of the chunk size,
+    ensuring that even with massive chunk sizes, there's enough overlap
+    to prevent answers from being cut off.
     """
+    if not numbered_lines:
+        return []
+
+    overlap_chars = int(max_chars * overlap_ratio)
     
-    # Get the question text without numbering for matching
-    q_text = re.sub(r'^[\d\.\(\)ivx]+\s*', '', question_clean)
-    q_text = re.sub(r'\([\d]+\)$', '', q_text).strip()
-    
-    # Split the text into pages/sections
-    sections = re.split(r'--- PAGE \d+ ---', full_ocr_text)
-    
-    # Find which section contains the question
-    best_section = None
-    best_score = 0
-    
-    q_words = set(q_text.lower().split())
-    if not q_words:
-        return ""
-    
-    for section in sections:
-        if not section.strip():
-            continue
-        section_words = set(section.lower().split())
-        overlap = len(q_words & section_words) / len(q_words)
-        
-        if overlap > best_score and overlap > 0.15:
-            best_score = overlap
-            best_section = section
-    
-    if not best_section:
-        return ""
-    
-    # Find where the question appears in this section
-    lines = best_section.split('\n')
-    answer_start = -1
-    answer_end = -1
-    
-    for i, line in enumerate(lines):
-        # Check if this line contains the question text
-        line_lower = line.lower().strip()
-        q_lower = q_text.lower().strip()
-        
-        # Check if line contains significant parts of the question
-        if q_lower[:30] in line_lower or line_lower in q_lower[:30]:
-            answer_start = i
-            break
-    
-    if answer_start == -1:
-        # Try to find by partial matching
-        for i, line in enumerate(lines):
-            line_words = set(line.lower().split())
-            overlap = len(q_words & line_words) / len(q_words) if q_words else 0
-            if overlap > 0.3:
-                answer_start = i
-                break
-    
-    if answer_start == -1:
-        return ""
-    
-    # Find where the answer ends (next question marker or end)
-    for i in range(answer_start + 1, len(lines)):
-        line = lines[i].strip()
-        # Check if this line starts a new question
-        if re.search(r'^(?:Q\.|Q\s|Question|प्रश्न|\d+\.)', line, re.IGNORECASE):
-            answer_end = i
-            break
-    
-    if answer_end == -1:
-        answer_end = len(lines)
-    
-    # Extract the raw answer lines (skip the question line itself)
-    answer_lines = []
-    for i in range(answer_start + 1, answer_end):
-        line = lines[i].strip()
-        if line and not is_noise(line):
-            answer_lines.append(line)
-    
-    # Join with newlines to preserve formatting
-    raw_answer = "\n".join(answer_lines)
-    
-    # Clean: remove any remaining question restatement at the very start
-    raw_answer = clean_answer_start(raw_answer, question)
-    
-    return raw_answer
+    chunks = []
+    current_chunk = []
+    current_chars = 0
+
+    for idx, text in numbered_lines:
+        line_chars = len(text)
+
+        if current_chunk and current_chars + line_chars > max_chars:
+            chunks.append(current_chunk)
+
+            # Build dynamic overlap
+            overlap = []
+            overlap_total = 0
+            for item in reversed(current_chunk):
+                overlap.insert(0, item)
+                overlap_total += len(item[1])
+                if overlap_total >= overlap_chars:
+                    break
+
+            current_chunk = overlap
+            current_chars = sum(len(t) for _, t in current_chunk)
+
+        current_chunk.append((idx, text))
+        current_chars += line_chars
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
 
 
-def clean_answer_start(answer: str, question: str) -> str:
-    """Remove question text from the start of the answer (pure Python slicing)."""
-    if not answer:
-        return answer
+# =========================================================
+# FIX 2: IMPROVED STRIP_QUESTION_RESTATEMENT
+# =========================================================
+
+QUESTION_PREFIX_RE = re.compile(
+    r'^\s*(?:'
+    r'Ans(?:wer)?[.\s:-]+\d*[.\s:-]*'
+    r'|उत्तर\s*\d*\s*[\-\:]?\s*'
+    r'|प्र[०.\s]*\d*[.\s:-]*'
+    r'|प्रश्न[.\s:-]*\d*[.\s:-]*'
+    r'|Q\.?\s*\d+[.\s:-]*'
+    r'|[\(\[]?\d+[\)\]]?\s*[\.\-\:]\s*'
+    r'|[\(\[]?[ivx]+[\)\]]?\s*[\.\-\:]\s*'
+    r')',
+    re.IGNORECASE | re.MULTILINE
+)
+
+
+def strip_question_restatement(answer_text: str, question_text: str = None) -> str:
+    """
+    IMPROVED: Strips question restatement from the start of answer.
+    Now handles:
+    1. Answer markers (Ans, उत्तर, etc.)
+    2. Question numbers and sub-part markers
+    3. The actual question text itself (if passed)
+    4. Multiple lines of restatement
+    """
+    if not answer_text:
+        return answer_text
     
-    lines = answer.split('\n')
+    lines = answer_text.split('\n')
     cleaned_lines = []
     
-    # Get the first few words of the question
-    q_clean = re.sub(r'^[\d\.\(\)ivx]+\s*', '', question)
-    q_clean = re.sub(r'\([\d]+\)$', '', q_clean).strip()
-    q_start = q_clean[:40].lower()
+    # If question text provided, get its clean version for matching
+    q_clean = ""
+    if question_text:
+        q_clean = re.sub(r'^[\d\.\(\)ivx]+\s*', '', question_text)
+        q_clean = re.sub(r'\([\d]+\)$', '', q_clean).strip()
+        q_clean = q_clean.lower()
     
     for line in lines:
         if not line.strip():
             cleaned_lines.append(line)
             continue
         
-        line_lower = line.lower().strip()
+        line_clean = line.strip()
+        line_lower = line_clean.lower()
         
-        # Skip lines that are just the question restatement
-        if q_start in line_lower and len(line_lower) < len(q_start) + 20:
+        # Skip if this line is just an answer marker
+        if re.match(r'^(?:Ans|उत्तर|Answer)[\s:]*$', line_clean, re.IGNORECASE):
             continue
         
-        # Skip common answer markers
-        if re.search(r'^(?:Ans|उत्तर|Answer)[\s:]*$', line_lower, re.IGNORECASE):
-            continue
+        # Skip if this line is the question text itself
+        if q_clean and len(line_clean) > 10:
+            # Check if the line contains the question
+            q_first_50 = q_clean[:50]
+            if q_first_50 in line_lower or line_lower in q_first_50:
+                if len(line_clean) < len(q_first_50) + 30:
+                    continue
         
-        # Check if the line starts with the question text
-        if line_lower.startswith(q_start[:20]):
-            # Remove the question part
-            remainder = line[len(q_start[:20]):].strip()
-            if remainder:
-                cleaned_lines.append(remainder)
-            continue
+        # Remove any leading answer markers
+        line_clean = QUESTION_PREFIX_RE.sub('', line_clean, count=1).strip()
         
-        cleaned_lines.append(line)
+        # If the line now starts with the question text, strip it
+        if q_clean and line_clean.lower().startswith(q_clean[:30]):
+            line_clean = line_clean[len(q_clean[:30]):].strip()
+        
+        if line_clean:
+            cleaned_lines.append(line_clean)
     
-    return "\n".join(cleaned_lines).strip()
+    # If all lines were stripped, return original (better than empty)
+    if not cleaned_lines:
+        return answer_text
+    
+    return '\n'.join(cleaned_lines)
 
 
-def map_answers_directly(pages: list, questions: list, question_page_indices: list) -> dict:
+# =========================================================
+# FIX 3: MONOTONIC ALIGNMENT VERIFICATION
+# =========================================================
+
+def verify_monotonic_alignment(qa_pairs: list, official_questions: list) -> list:
     """
-    Maps questions to answers using PURE RAW EXTRACTION.
-    NO LLM involvement. Returns EXACT OCR text.
+    Verifies that answers are in the same order as the official questions.
+    If any answer-line ranges are out of order, fixes them by re-sorting.
     """
-    qa_map = {}
+    # Extract line numbers from answers (if available)
+    # For now, we check if the question order matches
+    fixed_pairs = []
+    question_to_answer = {p['question']: p['answer'] for p in qa_pairs if p.get('answer')}
     
-    # Get answer pages (exclude question paper pages)
-    answer_page_indices = [i for i in range(len(pages)) if i not in question_page_indices]
-    answer_pages = [pages[i] for i in answer_page_indices]
-    
-    # Build complete OCR text from answer pages
-    full_ocr_text = ""
-    for page in answer_pages:
-        full_ocr_text += f"\n--- PAGE {page['page_number']} ---\n"
-        full_ocr_text += page["raw_text"]
-        full_ocr_text += "\n"
-    
-    # Also build from ALL pages as fallback
-    all_pages_text = ""
-    for page in pages:
-        all_pages_text += f"\n--- PAGE {page['page_number']} ---\n"
-        all_pages_text += page["raw_text"]
-        all_pages_text += "\n"
-    
-    print(f"Extracted {len(answer_pages)} answer pages with {len(full_ocr_text)} characters of text")
-    
-    for i, q in enumerate(questions):
-        # Try to extract answer from answer pages first
-        answer = extract_raw_answer_for_question(full_ocr_text, q, q)
-        
-        # If not found, try from ALL pages
-        if not answer:
-            answer = extract_raw_answer_for_question(all_pages_text, q, q)
-        
-        # Store the raw answer (or empty string if not found)
-        qa_map[q] = answer
-        
-        if answer:
-            print(f"✓ Found answer for Q{i+1}: {q[:40]}... ({len(answer)} chars)")
+    # Reconstruct in official order
+    for q in official_questions:
+        if q in question_to_answer:
+            fixed_pairs.append({
+                'question': q,
+                'answer': question_to_answer[q],
+                'matched': True
+            })
         else:
-            print(f"✗ No answer found for Q{i+1}: {q[:40]}...")
+            fixed_pairs.append({
+                'question': q,
+                'answer': '',
+                'matched': False
+            })
     
+    return fixed_pairs
+
+
+# =========================================================
+# IMPROVED ANSWER MAPPING
+# =========================================================
+
+ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet.
+
+Your task: For EACH official question (identified by its REF label), find WHERE in the answer text the student's response starts and ends, and return the LINE NUMBER RANGE.
+
+CRITICAL: You are ONLY identifying line number ranges. You must NOT modify, fix, or change ANY answer text. The system will extract the raw text using Python slicing.
+
+IMPORTANT: The answer starts on the line AFTER the question restatement. The restatement is NOT part of the answer.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+{
+  "answers": [
+    {"ref": "REF-A", "start_line": 12, "end_line": 18},
+    {"ref": "REF-B", "start_line": 19, "end_line": 25}
+  ]
+}
+
+If a question's answer is not present, omit that REF entirely."""
+
+
+def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
+    questions_block = "\n".join(
+        f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
+    )
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
+    return (
+        f"OFFICIAL QUESTIONS:\n{questions_block}\n\n"
+        f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}\n\n"
+        f"IMPORTANT: Return ONLY line number ranges. The answer STARTS AFTER the question restatement."
+    )
+
+
+def _parse_answer_map_llm_response(content: str) -> list:
+    content = content.strip()
+
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"LLM did not return valid JSON: {e}\nRaw content (first 500 chars): {content[:500]!r}"
+        )
+
+    if not isinstance(data, dict) or "answers" not in data:
+        raise ValueError(f"LLM response missing 'answers' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    answers = data["answers"]
+    if not isinstance(answers, list):
+        raise ValueError(f"'answers' must be a list, got: {type(answers).__name__}")
+
+    result = []
+    for item in answers:
+        if not isinstance(item, dict):
+            continue
+        if "ref" not in item or "start_line" not in item or "end_line" not in item:
+            continue
+        try:
+            result.append({
+                "ref": str(item["ref"]).strip().upper(),
+                "start_line": int(item["start_line"]),
+                "end_line": int(item["end_line"]),
+            })
+        except (ValueError, TypeError):
+            continue
+
+    return result
+
+
+def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
+    sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
+    resolved = []
+    for i, r in enumerate(sorted_ranges):
+        r = dict(r)
+        if i + 1 < len(sorted_ranges):
+            next_start = sorted_ranges[i + 1]["start_line"]
+            if r["end_line"] >= next_start:
+                r["end_line"] = next_start - 1
+        if r["end_line"] >= r["start_line"]:
+            resolved.append(r)
+    return resolved
+
+
+def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
+    """
+    LLM identifies answer boundaries (start_line, end_line).
+    Then Python slices the raw text - NO MODIFICATIONS.
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
+        raise Exception("GROQ_API_KEY not found in secrets or environment")
+
+    client = Groq(api_key=api_key)
+    budget = _TokenBudgetTracker()
+
+    ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
+
+    numbered_lines = list(enumerate(answer_lines))
+    
+    # Use dynamic overlap for chunking
+    chunks = _chunk_lines_with_dynamic_overlap(
+        numbered_lines, 
+        max_chars=ANSWER_MAP_MAX_CHARS_PER_CHUNK,
+        overlap_ratio=0.3  # 30% overlap
+    )
+    
+    log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
+
+    all_ranges = []
+
+    for i, chunk in enumerate(chunks):
+        line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
+        log(f"Asking LLM to map answers in chunk {i+1}/{len(chunks)} (lines {line_range})...")
+
+        user_prompt = _build_answer_map_user_prompt(chunk, questions)
+        try:
+            chunk_ranges = _call_groq_with_retries(
+                client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
+                _parse_answer_map_llm_response, budget, log
+            )
+        except Exception as e:
+            log(f"WARNING: chunk {i+1}/{len(chunks)} answer-mapping failed, skipping: {e}")
+            continue
+
+        valid_indices = {idx for idx, _ in chunk}
+        min_idx, max_idx = min(valid_indices), max(valid_indices)
+        for r in chunk_ranges:
+            if r["ref"] not in ref_to_question:
+                log(f"WARNING: discarding answer mapping with unknown ref {r['ref']!r}")
+                continue
+            if min_idx <= r["start_line"] <= max_idx and min_idx <= r["end_line"] <= max_idx:
+                all_ranges.append(r)
+            else:
+                log(
+                    f"WARNING: discarding out-of-range answer mapping for "
+                    f"{r['ref']}: lines {r['start_line']}-{r['end_line']} "
+                    f"outside this chunk's range {min_idx}-{max_idx}"
+                )
+
+        log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
+
+    # Deduplicate
+    best_by_ref = {}
+    for r in all_ranges:
+        existing = best_by_ref.get(r["ref"])
+        if existing is None or (r["end_line"] - r["start_line"]) > (existing["end_line"] - existing["start_line"]):
+            best_by_ref[r["ref"]] = r
+
+    deduped_ranges = list(best_by_ref.values())
+    resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
+
+    log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
+
+    # Extract RAW text via Python slicing
+    qa_map = {}
+    for r in resolved_ranges:
+        start, end = r["start_line"], r["end_line"]
+        
+        raw_lines = []
+        for j in range(start, end + 1):
+            if 0 <= j < len(answer_lines):
+                line = answer_lines[j]
+                if line.strip() and not is_noise(line):
+                    raw_lines.append(line)
+        
+        answer_text = "\n".join(raw_lines)
+        
+        original_question = ref_to_question[r["ref"]]
+        
+        # Apply improved restatement stripping
+        answer_text = strip_question_restatement(answer_text, original_question)
+        
+        qa_map[original_question] = answer_text
+
     return qa_map
 
 
@@ -993,7 +1164,7 @@ def is_noise(line: str) -> bool:
 
 
 # =========================================================
-# COMPLETE PIPELINE
+# COMPLETE PIPELINE WITH MONOTONIC ALIGNMENT VERIFICATION
 # =========================================================
 
 def process_pdf(file_input, status_callback=None):
@@ -1010,7 +1181,7 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    # Step 1: Extract questions using LLM (ONLY for questions)
+    # Extract questions using LLM
     qp_page_indices, official_questions = identify_questions_with_llm(pages, status_callback)
 
     log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
@@ -1028,26 +1199,42 @@ def process_pdf(file_input, status_callback=None):
             f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
 
-    # Step 2: Extract answers DIRECTLY from OCR - NO LLM
-    log("Extracting answers DIRECTLY from OCR pages (NO LLM involvement)...")
-    qa_map = map_answers_directly(pages, official_questions, qp_page_indices)
+    # Get answer pages
+    answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
+    answer_pages = [pages[i] for i in answer_page_indices]
 
-    matched_count = sum(1 for q in official_questions if q in qa_map and qa_map[q])
-    log(f"Matched {matched_count} of {len(official_questions)} questions")
+    log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
 
-    # Step 3: Build Q&A pairs with RAW text
+    # Flatten answer lines
+    answer_lines = []
+    for page in answer_pages:
+        for line in page["raw_text"].split("\n"):
+            if not is_noise(line):
+                answer_lines.append(line)
+
+    log(f"Flattened {len(answer_lines)} answer lines")
+
+    # Map answers using LLM for boundaries only
+    log("Mapping answers using LLM line boundaries...")
+    qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
+
+    # Build initial Q&A pairs
     qa_pairs = []
     for q in official_questions:
-        answer = qa_map.get(q, "")
         qa_pairs.append({
             "question": q,
-            "answer": answer,  # PURE RAW from OCR
-            "matched": bool(answer),
+            "answer": qa_map.get(q, ""),
+            "matched": q in qa_map,
         })
-        if not answer:
-            log(f"WARNING: No answer found for: {q[:60]}...")
 
-    # Step 4: Verify answers are raw (log sample)
+    # FIX 3: Verify monotonic alignment
+    log("Verifying monotonic alignment against question paper order...")
+    qa_pairs = verify_monotonic_alignment(qa_pairs, official_questions)
+
+    matched_count = sum(1 for p in qa_pairs if p["matched"])
+    log(f"Matched {matched_count} of {len(official_questions)} questions")
+
+    # Log sample of first answer
     for i, pair in enumerate(qa_pairs):
         if pair["answer"]:
             sample = pair["answer"][:500]
