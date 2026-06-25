@@ -1116,6 +1116,10 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 # into territory a later-starting question's range claims.
 # =========================================================
 
+# =========================================================
+# LLM-BASED ANSWER MAPPING (Groq)
+# =========================================================
+
 ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
 1. A numbered list of the OFFICIAL exam questions, each tagged with a reference label like [REF-A], [REF-B], etc.
 2. The student's answer text, with each line prefixed by its line number in [brackets].
@@ -1143,17 +1147,6 @@ If NONE of the official questions' answers appear in the text shown, return {"an
 
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
-    # FIX: previously this prepended "1.", "2.", etc. directly in front
-    # of each question, e.g. "1. 5. प्रत्ययों...". Since most real
-    # questions ALREADY contain their own original numbering ("5.",
-    # "Q.8", "प्र. 6", etc.), this created confusing double-numbering
-    # that risked the LLM echoing back the WRONG (prompt-added) number,
-    # or the whole "1. 5. ..." string, neither of which would exactly
-    # match the canonical question text downstream. Using "REF-A",
-    # "REF-B" style reference labels instead avoids any visual or
-    # semantic collision with the question's own real numbering, making
-    # it unambiguous that these are just our own internal reference
-    # tags, not part of the question itself.
     questions_block = "\n".join(
         f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
     )
@@ -1207,22 +1200,15 @@ def _parse_answer_map_llm_response(content: str) -> list:
     return result
 
 
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 8000  # larger than the question-ID
-# chunk size: answer text needs more room per chunk since a single
-# long essay answer can run 1500-3000+ characters, and a tighter
-# budget increases how often a chunk boundary falls mid-answer.
+# =========================================================
+# FIX: INCREASED CHUNK SIZES FOR LONG ANSWERS (5-6 PAGES)
+# =========================================================
 
-ANSWER_MAP_OVERLAP_CHARS = 3500  # FIX: a fixed LINE-COUNT overlap (the
-# previous default was 5 lines) is unreliable because OCR'd answer
-# lines vary wildly in length -- 5 lines might cover a full paragraph
-# or just a few words, depending on how the page wrapped. A long essay
-# answer (confirmed in real usage to run 1500-3000+ characters) could
-# easily exceed a 5-line overlap entirely, meaning NEITHER chunk that
-# saw a piece of it ever saw the WHOLE thing -- which is exactly why
-# answers were coming back cut off mid-sentence. Character-based
-# overlap, sized generously above the longest realistic single answer,
-# guarantees that even if a chunk boundary falls mid-answer, the
-# complete answer still appears intact in at least one chunk's view.
+# INCREASED from 8000 to 25000 - handles 5-6 page answers completely
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 25000
+
+# INCREASED from 3500 to 8000 - ensures enough overlap between chunks
+ANSWER_MAP_OVERLAP_CHARS = 8000
 
 
 def _chunk_lines_by_char_budget(numbered_lines: list,
