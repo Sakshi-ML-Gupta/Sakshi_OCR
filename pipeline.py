@@ -75,6 +75,10 @@ def _coerce_name(name, default_name="document.pdf"):
         return default_name
 
 
+# =========================================================
+# DIAGNOSTIC GUARD
+# =========================================================
+
 def _diagnose_tuple_errors(func):
     import functools
 
@@ -96,8 +100,16 @@ def _diagnose_tuple_errors(func):
     return wrapper
 
 
+# =========================================================
+# CONCURRENCY GUARD
+# =========================================================
+
 _groq_call_lock = threading.Lock()
 
+
+# =========================================================
+# PREPROCESS PDF
+# =========================================================
 
 def preprocess_pdf(file_bytes, dpi=250):
     src_doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -189,7 +201,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         raise Exception("DATALAB_API_KEY not found in secrets or environment")
 
     size_mb = len(file_content) / (1024 * 1024)
-    MAX_MB = 45
+    MAX_MB  = 45
     if size_mb > MAX_MB:
         raise Exception(
             f"File is {size_mb:.1f}MB, which exceeds the {MAX_MB}MB upload limit. "
@@ -265,7 +277,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
     for idx, text in enumerate(page_texts):
         pages.append({
             "page_number": idx + 1,
-            "raw_text": text
+            "raw_text":    text
         })
 
     log(f"OCR done -- {len(pages)} page(s) extracted")
@@ -280,6 +292,10 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
     return pages
 
 
+# =========================================================
+# BUILD OCR JSON
+# =========================================================
+
 def build_ocr_json(pages: list) -> dict:
     return {
         "total_pages": len(pages),
@@ -289,6 +305,10 @@ def build_ocr_json(pages: list) -> dict:
         ]
     }
 
+
+# =========================================================
+# REFERENCE BOOK OCR
+# =========================================================
 
 @_diagnose_tuple_errors
 def process_reference(file_input, status_callback=None):
@@ -305,7 +325,7 @@ def process_reference(file_input, status_callback=None):
 
 
 # =========================================================
-# QUESTION DETECTION - USING LLM
+# LLM-BASED QUESTION PAPER / QUESTION DETECTION (Groq)
 # =========================================================
 
 GROQ_MODEL = "openai/gpt-oss-120b"
@@ -317,20 +337,32 @@ CHARS_PER_TOKEN_ESTIMATE = 2.0
 MAX_CHARS_PER_CHUNK = 6000
 CHUNK_OVERLAP_PAGES = 1
 
-QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet.
+QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet (e.g. IGNOU-style, India). The booklet mixes pages of different kinds, in no guaranteed order:
 
-Your task: read the pages shown and return ONLY valid JSON (no markdown fences, no commentary) in EXACTLY this shape:
+1. ADMINISTRATIVE/COVER pages: enrolment number, programme code, learner name, registration details, regional centre info. NEVER question paper pages.
+2. QUESTION PAPER pages: the official printed list of numbered exam questions the student must answer. These read as instructions/prompts DIRECTED AT the student (e.g. "Discuss X", "Explain Y with examples", "Write notes on the following:"). Mark allocations may appear (e.g. "10", "20").
+3. ANSWER pages: the student's own (handwritten, OCR'd) answers. These are typically long, restate or reference a question briefly then write an extended response, and may themselves contain numbered or bulleted sub-points as part of the student's OWN explanation. These numbered sub-points inside a long answer are NOT separate exam questions, even though superficially they look similar (number, period, text) -- they are part of the answer to ONE question.
+
+You are being shown only a PORTION of the document's pages at a time (a chunk), not the whole document. Some pages you see may be partial context carried over from a previous chunk -- still classify them normally based on their own content.
+
+Your task: read the pages shown and return ONLY valid JSON (no markdown fences, no commentary, no explanation) in EXACTLY this shape:
 
 {
   "question_paper_pages": [14, 16, 18],
   "questions": ["1. Example question text. (10)", "2. Another example question. (10)"]
 }
 
-CRITICAL RULES:
-- Extract questions EXACTLY as they appear on the question paper pages.
-- If a question has sub-parts like (i), (ii), (iii), extract each as a SEPARATE question.
-- Preserve the EXACT original text -- do not paraphrase, do not fix OCR errors.
-- Output ONLY the JSON object. No prose before or after."""
+IMPORTANT formatting requirement: "question_paper_pages" must be a JSON array where EACH page number is a SEPARATE element separated by commas, like [14, 16, 18] -- NEVER merge multiple page numbers into one number like [141618]. Each integer in that array must be a single, individually valid page number from the pages shown.
+
+Critical rules for telling question-paper pages apart from answer pages that happen to contain numbered content:
+- A genuine question paper question is a PROMPT directed at the student ("explain", "discuss", "describe", "write notes on", "compare", a question mark, etc.) -- it asks the student to DO something.
+- A numbered point inside a long answer is typically a STATEMENT or FACT that is part of an explanation the student is giving -- it does not ask the reader to do anything; it's content, not an instruction.
+- If a page's numbered items closely follow words like "उत्तर" (answer), "Ans", "Ans-", or come after a long paragraph of explanatory prose in the same block, that page is almost certainly an ANSWER page, not a question paper page -- exclude it from question_paper_pages even if it has multiple numbered lines.
+- A real question paper is usually self-contained and concise per question (a question, maybe a mark allocation) -- not a long flowing essay with numbered sub-points woven into running prose.
+- When genuinely uncertain whether a page is a question paper page, prefer NOT including it as one, and prefer NOT extracting its numbered items as separate questions.
+- If NONE of the pages shown in this chunk are question paper pages, return empty lists for both fields -- that is a valid and expected result for chunks that only contain answer/admin pages.
+- Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate.
+- Output ONLY the JSON object described above. No prose before or after it. No markdown code fences."""
 
 
 def _chunk_pages_by_char_budget(pages: list, max_chars: int = MAX_CHARS_PER_CHUNK,
@@ -370,6 +402,10 @@ def _build_qp_user_prompt(pages: list) -> str:
 def _estimate_tokens(text: str) -> int:
     return int(len(text) / CHARS_PER_TOKEN_ESTIMATE) + 1
 
+
+# =========================================================
+# Rolling token-budget tracker
+# =========================================================
 
 class _TokenBudgetTracker:
     def __init__(self, tpm_limit=TPM_LIMIT, safety_fraction=TPM_SAFETY_FRACTION):
@@ -793,8 +829,247 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
 
 # =========================================================
-# NEW APPROACH: DIRECT OCR EXTRACTION - NO LLM FOR ANSWERS
+# LLM-BASED ANSWER MAPPING (Groq)
 # =========================================================
+
+ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
+1. A numbered list of the OFFICIAL exam questions, each tagged with a reference label like [REF-A], [REF-B], etc.
+2. The student's answer text, with each line prefixed by its line number in [brackets].
+
+Your task: for EACH official question, find WHERE in the answer text the student's response to that specific question starts and ends, and return the LINE NUMBER RANGE (inclusive) for each, identified by its REF label.
+
+Important guidance for finding boundaries correctly:
+- A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
+- An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins (whether or not the next answer is in your list of official questions).
+- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely from your output. It may appear in a different chunk of the document.
+- Each REF's range must NOT overlap with another REF's range. If you are unsure exactly where one answer ends and the next begins, prefer ending the EARLIER answer sooner rather than letting it swallow content that belongs to a later answer -- a short correct answer is far more useful than a long answer that incorrectly absorbed unrelated content.
+- Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
+- Use the EXACT REF label (e.g. "REF-A") to identify each question. Do NOT retype or paraphrase the question text itself -- the REF label is all that's needed.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{
+  "answers": [
+    {"ref": "REF-A", "start_line": 12, "end_line": 18},
+    {"ref": "REF-B", "start_line": 19, "end_line": 25}
+  ]
+}
+
+If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any of these answers."""
+
+
+def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
+    questions_block = "\n".join(
+        f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
+    )
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
+    return (
+        f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label -- "
+        f"use the REF label, not retyped question text, to identify which "
+        f"question an answer belongs to):\n{questions_block}\n\n"
+        f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}"
+    )
+
+
+def _parse_answer_map_llm_response(content: str) -> list:
+    content = content.strip()
+
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"LLM did not return valid JSON: {e}\nRaw content (first 500 chars): {content[:500]!r}"
+        )
+
+    if not isinstance(data, dict) or "answers" not in data:
+        raise ValueError(f"LLM response missing 'answers' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    answers = data["answers"]
+    if not isinstance(answers, list):
+        raise ValueError(f"'answers' must be a list, got: {type(answers).__name__}")
+
+    result = []
+    for item in answers:
+        if not isinstance(item, dict):
+            continue
+        if "ref" not in item or "start_line" not in item or "end_line" not in item:
+            continue
+        try:
+            result.append({
+                "ref": str(item["ref"]).strip().upper(),
+                "start_line": int(item["start_line"]),
+                "end_line": int(item["end_line"]),
+            })
+        except (ValueError, TypeError):
+            continue
+
+    return result
+
+
+# =========================================================
+# FIX: INCREASED CHUNK SIZES FOR LONG ANSWERS (5-6 PAGES)
+# =========================================================
+
+# YAHI DO LINES CHANGE KI HAIN - BAS YAHI
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 60000  # Pehle 25000 tha
+ANSWER_MAP_OVERLAP_CHARS = 20000        # Pehle 8000 tha
+
+
+def _chunk_lines_by_char_budget(numbered_lines: list,
+                                  max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
+                                  overlap_chars: int = ANSWER_MAP_OVERLAP_CHARS) -> list:
+    if not numbered_lines:
+        return []
+
+    chunks = []
+    current_chunk = []
+    current_chars = 0
+
+    for idx, text in numbered_lines:
+        line_chars = len(text)
+
+        if current_chunk and current_chars + line_chars > max_chars:
+            chunks.append(current_chunk)
+
+            overlap = []
+            overlap_total = 0
+            for item in reversed(current_chunk):
+                overlap.insert(0, item)
+                overlap_total += len(item[1])
+                if overlap_total >= overlap_chars:
+                    break
+
+            current_chunk = overlap
+            current_chars = sum(len(t) for _, t in current_chunk)
+
+        current_chunk.append((idx, text))
+        current_chars += line_chars
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
+    sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
+    resolved = []
+    for i, r in enumerate(sorted_ranges):
+        r = dict(r)
+        if i + 1 < len(sorted_ranges):
+            next_start = sorted_ranges[i + 1]["start_line"]
+            if r["end_line"] >= next_start:
+                r["end_line"] = next_start - 1
+        if r["end_line"] >= r["start_line"]:
+            resolved.append(r)
+    return resolved
+
+
+QUESTION_PREFIX_RE = re.compile(
+    r'^\s*(?:'
+    r'Ans(?:wer)?[.\s:-]+\d*[.\s:-]*'
+    r'|उत्तर\s*\d*\s*[\-\:]?\s*'
+    r'|प्र[०.\s]*\d*[.\s:-]*'
+    r'|प्रश्न[.\s:-]*\d*[.\s:-]*'
+    r'|Q\.?\s*\d+[.\s:-]*'
+    r')',
+    re.IGNORECASE
+)
+
+
+def strip_question_restatement(answer_text: str) -> str:
+    text = answer_text
+    for _ in range(2):
+        new_text = QUESTION_PREFIX_RE.sub('', text, count=1).strip()
+        if new_text == text:
+            break
+        text = new_text
+    return text
+
+
+def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
+        raise Exception("GROQ_API_KEY not found in secrets or environment")
+
+    client = Groq(api_key=api_key)
+    budget = _TokenBudgetTracker()
+
+    ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
+
+    numbered_lines = list(enumerate(answer_lines))
+    chunks = _chunk_lines_by_char_budget(numbered_lines)
+    log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
+
+    all_ranges = []
+
+    for i, chunk in enumerate(chunks):
+        line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
+        log(f"Asking LLM to map answers in chunk {i+1}/{len(chunks)} (lines {line_range})...")
+
+        user_prompt = _build_answer_map_user_prompt(chunk, questions)
+        try:
+            chunk_ranges = _call_groq_with_retries(
+                client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
+                _parse_answer_map_llm_response, budget, log
+            )
+        except Exception as e:
+            log(f"WARNING: chunk {i+1}/{len(chunks)} answer-mapping failed, skipping: {e}")
+            continue
+
+        valid_indices = {idx for idx, _ in chunk}
+        min_idx, max_idx = min(valid_indices), max(valid_indices)
+        for r in chunk_ranges:
+            if r["ref"] not in ref_to_question:
+                log(f"WARNING: discarding answer mapping with unknown ref {r['ref']!r}")
+                continue
+            if min_idx <= r["start_line"] <= max_idx and min_idx <= r["end_line"] <= max_idx:
+                all_ranges.append(r)
+            else:
+                log(
+                    f"WARNING: discarding out-of-range answer mapping for "
+                    f"{r['ref']}: lines {r['start_line']}-{r['end_line']} "
+                    f"outside this chunk's range {min_idx}-{max_idx}"
+                )
+
+        log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
+
+    best_by_ref = {}
+    for r in all_ranges:
+        existing = best_by_ref.get(r["ref"])
+        if existing is None or (r["end_line"] - r["start_line"]) > (existing["end_line"] - existing["start_line"]):
+            best_by_ref[r["ref"]] = r
+
+    deduped_ranges = list(best_by_ref.values())
+    resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
+
+    log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
+
+    qa_map = {}
+    for r in resolved_ranges:
+        start, end = r["start_line"], r["end_line"]
+        verbatim_lines = [
+            answer_lines[j] for j in range(start, end + 1)
+            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
+        ]
+        original_question = ref_to_question[r["ref"]]
+        answer_text = " ".join(verbatim_lines).strip()
+        qa_map[original_question] = strip_question_restatement(answer_text)
+
+    return qa_map
+
 
 NOISE_RE = re.compile(
     r'(?:Teacher\'?s?\s*Signature'
@@ -816,120 +1091,6 @@ def is_noise(line: str) -> bool:
     return bool(NOISE_RE.search(line))
 
 
-def extract_answer_directly(full_ocr_text: str, question: str) -> str:
-    """
-    Extracts answer directly from OCR text by finding where the question appears
-    and taking everything after it until the next question marker.
-    NO LLM INVOLVED - PURE PYTHON SLICING.
-    """
-    # Clean the question for matching
-    q_clean = question.strip()
-    # Remove numbering
-    q_clean = re.sub(r'^[\d\.\(\)ivx]+\s*', '', q_clean)
-    q_clean = re.sub(r'\([\d]+\)$', '', q_clean).strip()
-    
-    # Split the text into lines
-    lines = full_ocr_text.split('\n')
-    
-    # Find where the question appears
-    question_line_index = -1
-    q_first_30 = q_clean[:30].lower()
-    
-    for i, line in enumerate(lines):
-        if q_first_30 in line.lower() and len(line.strip()) > 20:
-            question_line_index = i
-            break
-    
-    if question_line_index == -1:
-        # Try with first 50 chars
-        q_first_50 = q_clean[:50].lower()
-        for i, line in enumerate(lines):
-            if q_first_50 in line.lower() and len(line.strip()) > 20:
-                question_line_index = i
-                break
-    
-    if question_line_index == -1:
-        return ""
-    
-    # Find where the answer ends (next question marker or section marker)
-    answer_end = len(lines)
-    for i in range(question_line_index + 1, len(lines)):
-        line = lines[i].strip()
-        # Check for next question marker
-        if re.search(r'^(?:Q\.|Q\s|Question|प्रश्न|Section|--- PAGE \d+ ---|\d+\.\s*[A-Z])', line, re.IGNORECASE):
-            answer_end = i
-            break
-        # Also stop at teacher signature
-        if re.search(r'Teacher\'?s?\s*Signature', line, re.IGNORECASE):
-            answer_end = i
-            break
-    
-    # Extract answer lines (skip the question line itself)
-    answer_lines = []
-    for i in range(question_line_index + 1, answer_end):
-        line = lines[i].strip()
-        if not line:
-            continue
-        if is_noise(line):
-            continue
-        # Skip page markers
-        if re.search(r'^--- PAGE \d+ ---', line):
-            continue
-        answer_lines.append(line)
-    
-    # Join with newlines
-    answer_text = "\n".join(answer_lines)
-    
-    # Remove question restatement from start if present
-    if answer_text:
-        # Remove "Ans:", "उत्तर:", "Answer:" etc.
-        answer_text = re.sub(r'^(?:Ans|उत्तर|Answer)[\s:]*', '', answer_text, flags=re.IGNORECASE)
-        # Remove the question text if it appears at the start
-        q_start = q_clean[:40].lower()
-        if answer_text.lower().startswith(q_start[:30]):
-            # Find where the question ends
-            for i in range(30, min(len(q_start), len(answer_text))):
-                if answer_text[i] in ['.', '?', '!', '\n']:
-                    answer_text = answer_text[i+1:].strip()
-                    break
-    
-    return answer_text
-
-
-def map_answers_directly(pages: list, questions: list, qp_page_indices: list) -> dict:
-    """
-    Maps questions to answers using DIRECT OCR EXTRACTION.
-    NO LLM INVOLVED.
-    """
-    qa_map = {}
-    
-    # Get answer pages (all pages except question paper pages)
-    answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
-    answer_pages = [pages[i] for i in answer_page_indices]
-    
-    # Build complete OCR text from answer pages
-    full_ocr_text = ""
-    for page in answer_pages:
-        full_ocr_text += f"\n--- PAGE {page['page_number']} ---\n"
-        full_ocr_text += page["raw_text"]
-        full_ocr_text += "\n"
-    
-    print(f"Extracted {len(answer_pages)} answer pages with {len(full_ocr_text)} characters")
-    
-    # For each question, extract the answer
-    for i, q in enumerate(questions):
-        answer = extract_answer_directly(full_ocr_text, q)
-        
-        if answer:
-            print(f"✓ Found answer for Q{i+1}: {q[:40]}... ({len(answer)} chars)")
-        else:
-            print(f"✗ No answer found for Q{i+1}: {q[:40]}...")
-        
-        qa_map[q] = answer
-    
-    return qa_map
-
-
 # =========================================================
 # COMPLETE PIPELINE
 # =========================================================
@@ -949,7 +1110,6 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    # Step 1: Extract questions using LLM (ONLY for questions)
     qp_page_indices, official_questions = identify_questions_with_llm(pages, status_callback)
 
     log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
@@ -967,33 +1127,45 @@ def process_pdf(file_input, status_callback=None):
             f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
 
-    # Step 2: Extract answers DIRECTLY from OCR - NO LLM
-    log("Extracting answers DIRECTLY from OCR pages (NO LLM involvement)...")
-    qa_map = map_answers_directly(pages, official_questions, qp_page_indices)
+    answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
+    answer_pages = [pages[i] for i in answer_page_indices]
 
-    matched_count = sum(1 for q in official_questions if q in qa_map and qa_map[q])
+    log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
+
+    answer_lines = []
+    for page in answer_pages:
+        for line in page["raw_text"].split("\n"):
+            if not is_noise(line):
+                answer_lines.append(line)
+
+    log(f"Flattened {len(answer_lines)} answer lines")
+
+    log("Mapping each question to its answer independently (LLM-based)...")
+    qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
+
+    matched_count = sum(1 for q in official_questions if q in qa_map)
     log(f"Matched {matched_count} of {len(official_questions)} questions")
 
-    # Build Q&A pairs with RAW text
+    for q in official_questions:
+        if q not in qa_map:
+            log(f"WARNING: No match found for: {q[:60]}")
+
+    if not qa_map:
+        raise Exception(
+            "Could not match any questions to answers.\n"
+            f"Official questions: {official_questions}\n"
+            f"First 10 answer lines: {answer_lines[:10]}"
+        )
+
     qa_pairs = []
     for q in official_questions:
-        answer = qa_map.get(q, "")
         qa_pairs.append({
             "question": q,
-            "answer": answer,
-            "matched": bool(answer),
+            "answer": qa_map.get(q, ""),
+            "matched": q in qa_map,
         })
-        if not answer:
-            log(f"WARNING: No answer found for: {q[:60]}...")
 
-    # Log sample of first answer for verification
-    for i, pair in enumerate(qa_pairs):
-        if pair["answer"]:
-            sample = pair["answer"][:500]
-            log(f"VERIFICATION - Q{i+1} answer (first 500 chars, total {len(pair['answer'])} chars):\n{sample}\n...")
-            break
-
-    log(f"Done -- {len(qa_pairs)} Q&A pair(s) extracted from {len(pages)} page(s).")
+    log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
 
     return ocr_json, qa_pairs
 
