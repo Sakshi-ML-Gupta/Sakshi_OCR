@@ -334,27 +334,35 @@ TPM_LIMIT = 8000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 
-MAX_CHARS_PER_CHUNK = 15000
-CHUNK_OVERLAP_PAGES = 4
+MAX_CHARS_PER_CHUNK = 6000
+CHUNK_OVERLAP_PAGES = 1
 
-QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet.
+QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet (e.g. IGNOU-style, India). The booklet mixes pages of different kinds, in no guaranteed order:
 
-Your task: read the pages shown and return ONLY valid JSON (no markdown fences, no commentary) in EXACTLY this shape:
+1. ADMINISTRATIVE/COVER pages: enrolment number, programme code, learner name, registration details, regional centre info. NEVER question paper pages.
+2. QUESTION PAPER pages: the official printed list of numbered exam questions the student must answer. These read as instructions/prompts DIRECTED AT the student (e.g. "Discuss X", "Explain Y with examples", "Write notes on the following:"). Mark allocations may appear (e.g. "10", "20").
+3. ANSWER pages: the student's own (handwritten, OCR'd) answers. These are typically long, restate or reference a question briefly then write an extended response, and may themselves contain numbered or bulleted sub-points as part of the student's OWN explanation. These numbered sub-points inside a long answer are NOT separate exam questions, even though superficially they look similar (number, period, text) -- they are part of the answer to ONE question.
+
+You are being shown only a PORTION of the document's pages at a time (a chunk), not the whole document. Some pages you see may be partial context carried over from a previous chunk -- still classify them normally based on their own content.
+
+Your task: read the pages shown and return ONLY valid JSON (no markdown fences, no commentary, no explanation) in EXACTLY this shape:
 
 {
   "question_paper_pages": [14, 16, 18],
   "questions": ["1. Example question text. (10)", "2. Another example question. (10)"]
 }
 
-CRITICAL RULES:
-- Extract questions EXACTLY as they appear on the question paper pages - word for word.
-- IMPORTANT: Each sub-question like (i), (ii), (iii), (iv) or a), b), c) must be a SEPARATE question entry.
-- Format sub-questions as: "1. (i) Sub-question text" (with the main number and sub-part)
-- For example, if you see "1. a) Renaissance" and "1. b) Amoretti", extract them as:
-  "1. a) Renaissance" and "1. b) Amoretti" as SEPARATE entries.
-- Do NOT merge multiple sub-questions into one entry.
-- Preserve the EXACT original text -- do not paraphrase, do not fix OCR errors.
-- Output ONLY the JSON object. No prose before or after."""
+IMPORTANT formatting requirement: "question_paper_pages" must be a JSON array where EACH page number is a SEPARATE element separated by commas, like [14, 16, 18] -- NEVER merge multiple page numbers into one number like [141618]. Each integer in that array must be a single, individually valid page number from the pages shown.
+
+Critical rules for telling question-paper pages apart from answer pages that happen to contain numbered content:
+- A genuine question paper question is a PROMPT directed at the student ("explain", "discuss", "describe", "write notes on", "compare", a question mark, etc.) -- it asks the student to DO something.
+- A numbered point inside a long answer is typically a STATEMENT or FACT that is part of an explanation the student is giving -- it does not ask the reader to do anything; it's content, not an instruction.
+- If a page's numbered items closely follow words like "उत्तर" (answer), "Ans", "Ans-", or come after a long paragraph of explanatory prose in the same block, that page is almost certainly an ANSWER page, not a question paper page -- exclude it from question_paper_pages even if it has multiple numbered lines.
+- A real question paper is usually self-contained and concise per question (a question, maybe a mark allocation) -- not a long flowing essay with numbered sub-points woven into running prose.
+- When genuinely uncertain whether a page is a question paper page, prefer NOT including it as one, and prefer NOT extracting its numbered items as separate questions.
+- If NONE of the pages shown in this chunk are question paper pages, return empty lists for both fields -- that is a valid and expected result for chunks that only contain answer/admin pages.
+- Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate.
+- Output ONLY the JSON object described above. No prose before or after it. No markdown code fences."""
 
 
 def _chunk_pages_by_char_budget(pages: list, max_chars: int = MAX_CHARS_PER_CHUNK,
@@ -532,22 +540,7 @@ def _parse_qp_llm_response(content: str) -> tuple:
         raise ValueError(f"questions must be a list, got: {type(questions).__name__}")
     questions = [str(x).strip() for x in questions if str(x).strip()]
 
-    # FIX: Ensure sub-questions are properly split
-    # If any question contains multiple sub-parts like "(i)", "(ii)", "(iii)" 
-    # that were merged, split them
-    final_questions = []
-    for q in questions:
-        # Check if this question contains multiple sub-parts
-        sub_parts = re.findall(r'\([ivx]+\)\s*[^\(]*?(?=\s*\([ivx]+\)|\Z)', q, re.IGNORECASE)
-        if len(sub_parts) > 1:
-            # This question has multiple sub-parts - split them
-            for sub in sub_parts:
-                if sub.strip():
-                    final_questions.append(sub.strip())
-        else:
-            final_questions.append(q)
-    
-    return qp_pages, final_questions
+    return qp_pages, questions
 
 
 def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_page: int) -> list:
@@ -919,26 +912,21 @@ def _parse_answer_map_llm_response(content: str) -> list:
 
 
 # =========================================================
-# FIX 1: INCREASED CHUNK SIZES FOR LONG ANSWERS (5-6 PAGES)
+# FIX: MASSIVELY INCREASED CHUNK SIZES FOR COMPLETE ANSWERS
 # =========================================================
 
-# INCREASED from 8000 to 25000 - handles 5-6 page answers completely
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 40000
+# INCREASED to 50000 - handles 5-6 page answers COMPLETELY
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 50000
 
-# INCREASED from 3500 to 8000 - ensures enough overlap between chunks
-ANSWER_MAP_OVERLAP_CHARS = 12000
+# INCREASED to 15000 - ensures massive overlap
+ANSWER_MAP_OVERLAP_CHARS = 15000
 
-CHUNK_OVERLAP_PAGES = 5  # Increased from 4
 
 def _chunk_lines_by_char_budget(numbered_lines: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
                                   overlap_chars: int = ANSWER_MAP_OVERLAP_CHARS) -> list:
     """
-    Like _chunk_pages_by_char_budget, but operates on flattened answer
-    LINES rather than pages, and uses CHARACTER-based overlap (not a
-    fixed line count) between consecutive chunks -- see module-level
-    comment above for why line-count overlap was insufficient for long
-    answers in practice.
+    Chunks answer lines with massive character budget and overlap.
     """
     if not numbered_lines:
         return []
@@ -953,11 +941,7 @@ def _chunk_lines_by_char_budget(numbered_lines: list,
         if current_chunk and current_chars + line_chars > max_chars:
             chunks.append(current_chunk)
 
-            # Build character-based overlap: walk backward from the
-            # end of the current chunk, accumulating whole lines until
-            # we've covered at least overlap_chars worth of content --
-            # this is robust regardless of how long or short individual
-            # OCR lines happen to be.
+            # Build overlap
             overlap = []
             overlap_total = 0
             for item in reversed(current_chunk):
@@ -977,39 +961,20 @@ def _chunk_lines_by_char_budget(numbered_lines: list,
 
     return chunks
 
+
 def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
-    """
-    HARD SAFETY NET against the answer-swallowing bug: sorts ranges by
-    start_line, then clips any range's end_line so it can never extend
-    into territory claimed by a later-starting range.
-    """
     sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
     resolved = []
     for i, r in enumerate(sorted_ranges):
         r = dict(r)
         if i + 1 < len(sorted_ranges):
             next_start = sorted_ranges[i + 1]["start_line"]
-            # FIX: If ranges overlap, clip the earlier one to end BEFORE the next starts
             if r["end_line"] >= next_start:
                 r["end_line"] = next_start - 1
-        # FIX: Only add if the range has at least 1 line
         if r["end_line"] >= r["start_line"]:
             resolved.append(r)
     return resolved
 
-def ensure_complete_answers(qa_pairs: list, min_answer_length: int = 100) -> list:
-    """
-    Checks if answers are complete (not cut off). If an answer is too short,
-    logs a warning so the user knows which answers might be incomplete.
-    """
-    for pair in qa_pairs:
-        if pair["matched"] and pair["answer"]:
-            answer_len = len(pair["answer"])
-            if answer_len < min_answer_length:
-                print(f"WARNING: Answer for '{pair['question'][:50]}...' is only {answer_len} chars - might be incomplete")
-            elif answer_len > 5000:
-                print(f"INFO: Answer for '{pair['question'][:50]}...' is {answer_len} chars - complete long answer")
-    return qa_pairs
 
 QUESTION_PREFIX_RE = re.compile(
     r'^\s*(?:'
@@ -1035,8 +1000,7 @@ def strip_question_restatement(answer_text: str) -> str:
 
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
     """
-    Maps each official question to its verbatim answer text, extracted
-    INDEPENDENTLY per question via LLM-identified line boundaries.
+    Maps each official question to its verbatim answer text.
     """
     def log(msg):
         print(msg)
@@ -1052,15 +1016,13 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
-    # Deterministic REF label <-> question index mapping, built once
-    # here and never touched by anything the LLM returns.
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
 
     numbered_lines = list(enumerate(answer_lines))
     chunks = _chunk_lines_by_char_budget(numbered_lines)
     log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
 
-    all_ranges = []  # list of {ref, start_line, end_line}
+    all_ranges = []
 
     for i, chunk in enumerate(chunks):
         line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
@@ -1076,9 +1038,6 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             log(f"WARNING: chunk {i+1}/{len(chunks)} answer-mapping failed, skipping: {e}")
             continue
 
-        # Validate BOTH that the ref label is one we actually issued
-        # AND that line numbers are within THIS chunk's actual range
-        # (defends against the LLM hallucinating either).
         valid_indices = {idx for idx, _ in chunk}
         min_idx, max_idx = min(valid_indices), max(valid_indices)
         for r in chunk_ranges:
@@ -1096,10 +1055,6 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
         log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
 
-    # Deduplicate: if overlapping chunks both found the same REF
-    # (possible due to line overlap between chunks), keep the one with
-    # the longer range (more complete capture). This is now a trivial
-    # exact-match on the ref label -- no text fuzziness involved at all.
     best_by_ref = {}
     for r in all_ranges:
         existing = best_by_ref.get(r["ref"])
@@ -1107,43 +1062,23 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             best_by_ref[r["ref"]] = r
 
     deduped_ranges = list(best_by_ref.values())
-
-    # HARD SAFETY NET: resolve any remaining overlaps so no answer can
-    # ever swallow another's content, regardless of LLM output quality.
     resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
 
     log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
 
-    # Slice the ORIGINAL answer_lines verbatim using the resolved ranges
-    # -- this is the only place the actual answer text is produced, and
-    # it is a pure Python slice, guaranteeing no LLM paraphrasing risk.
-    # The dict is keyed on the ORIGINAL canonical question text (looked
-    # up deterministically via ref_to_question), guaranteeing it matches
-    # whatever process_pdf() looks it up with later.
     qa_map = {}
     for r in resolved_ranges:
         start, end = r["start_line"], r["end_line"]
-        
-        # FIX: Ensure we get ALL lines including the end line
-        verbatim_lines = []
-        for j in range(start, end + 1):
-            if 0 <= j < len(answer_lines):
-                line = answer_lines[j]
-                # Only filter noise, keep everything else
-                if line.strip() and not is_noise(line):
-                    verbatim_lines.append(line)
-        
-        # Join with proper spacing
-        answer_text = "\n".join(verbatim_lines).strip()
-        
-        # Only apply restatement stripping if the answer is long enough
-        if len(answer_text) > 50:
-            answer_text = strip_question_restatement(answer_text)
-        
+        verbatim_lines = [
+            answer_lines[j] for j in range(start, end + 1)
+            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
+        ]
         original_question = ref_to_question[r["ref"]]
-        qa_map[original_question] = answer_text
+        answer_text = "\n".join(verbatim_lines).strip()
+        qa_map[original_question] = strip_question_restatement(answer_text)
 
     return qa_map
+
 
 NOISE_RE = re.compile(
     r'(?:Teacher\'?s?\s*Signature'
@@ -1163,193 +1098,6 @@ NOISE_RE = re.compile(
 
 def is_noise(line: str) -> bool:
     return bool(NOISE_RE.search(line))
-
-
-# =========================================================
-# FIND QUESTION BOUNDARIES IN ANSWER PAGES -- similarity based
-# =========================================================
-
-def normalize(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r'[^\w\s]', ' ', text, flags=re.UNICODE)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-
-def similarity(a: str, b: str) -> float:
-    wa = set(normalize(a).split())
-    wb = set(normalize(b).split())
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / max(len(wa), len(wb))
-
-
-def strip_leading_label(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^(?:उत्तर)\s*[\-\:\s]*', '', text)
-    text = re.sub(r'^(?:प्र|प्रो|प्रश्न)[\.\s]*\d*[\.\s]*', '', text)
-    text = re.sub(r'^[१-९०][०-९]*[\.\-\s]*', '', text)
-    text = re.sub(r'^(?:Q\.?\s*)?\d+[.)]\s*', '', text)
-    text = re.sub(r'^\(?[a-z]\)\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^\(?[क-घ]\)\s*', '', text)
-    return text.strip()
-
-
-def find_question_boundaries_by_similarity(
-    answer_lines: list,
-    questions: list,
-    similarity_threshold: float = 0.30,
-    window: int = 4
-) -> list:
-    candidates_by_question = {}
-
-    for i in range(len(answer_lines)):
-        line_i = answer_lines[i].strip()
-        if len(line_i) < 8:
-            continue
-
-        for w in range(1, window + 1):
-            if i + w > len(answer_lines):
-                break
-
-            combined = " ".join(
-                answer_lines[i + k].strip()
-                for k in range(w) if answer_lines[i + k].strip()
-            )
-            if len(combined) < 10:
-                continue
-
-            combined_clean = strip_leading_label(combined)
-
-            for q in questions:
-                q_clean = strip_leading_label(q)
-                s1 = similarity(combined, q)
-                s2 = similarity(combined_clean, q_clean)
-                score = max(s1, s2)
-
-                if score >= similarity_threshold:
-                    candidates_by_question.setdefault(q, []).append({
-                        "question":   q,
-                        "line_index": i,
-                        "span":       w,
-                        "score":      score
-                    })
-
-    for q in candidates_by_question:
-        candidates_by_question[q].sort(key=lambda c: -c["score"])
-
-    final = []
-    last_line_index = -1
-
-    for q in questions:
-        cands = candidates_by_question.get(q, [])
-        chosen = None
-        for c in cands:
-            if c["line_index"] > last_line_index:
-                chosen = c
-                break
-        if chosen is not None:
-            final.append(chosen)
-            last_line_index = chosen["line_index"]
-
-    return final
-
-
-def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
-    qa_pairs = []
-    for i, b in enumerate(boundaries):
-        span    = b.get("span", 1)
-        a_start = b["line_index"] + span
-        a_end   = boundaries[i + 1]["line_index"] if i + 1 < len(boundaries) else len(answer_lines)
-
-        raw = [
-            answer_lines[j] for j in range(a_start, a_end)
-            if answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ]
-
-        qa_pairs.append({
-            "question": b["question"],
-            "answer":   " ".join(raw).strip()
-        })
-
-    return qa_pairs
-
-
-# =========================================================
-# FIX 2: SPLIT MERGED SUB-ANSWERS INTO SEPARATE Q&A PAIRS
-# =========================================================
-
-def split_merged_answers(qa_pairs: list, questions: list) -> list:
-    """
-    FIX: Splits merged answers into separate Q&A pairs for each sub-question.
-    If an answer contains multiple sub-answers like "1.(i)" and "1.(ii)" merged,
-    this splits them into separate entries for evaluation.
-    """
-    final_pairs = []
-    
-    # First, create a mapping of question text to its answer
-    qa_map = {}
-    for pair in qa_pairs:
-        qa_map[pair["question"]] = pair["answer"]
-    
-    # Process each question
-    for q in questions:
-        answer = qa_map.get(q, "")
-        
-        # Check if this question has sub-parts in the answer
-        # Look for patterns like "1.(i)", "1.(ii)" etc. in the answer
-        sub_answer_pattern = re.compile(r'(\d+\.?\s*\([ivx]+\))\s*([^\n]*?(?=\s*\d+\.?\s*\([ivx]+\)|\Z))', re.IGNORECASE | re.DOTALL)
-        sub_matches = list(sub_answer_pattern.finditer(answer))
-        
-        if len(sub_matches) > 1:
-            # Multiple sub-answers found in this answer - split them
-            for match in sub_matches:
-                sub_label = match.group(1).strip()
-                sub_text = match.group(2).strip()
-                
-                # Find which question this sub-label belongs to
-                found = False
-                for question in questions:
-                    if sub_label.lower() in question.lower() or question.lower().startswith(sub_label.lower()):
-                        # Check if we already have this pair
-                        existing = next((p for p in final_pairs if p["question"] == question), None)
-                        if existing:
-                            existing["answer"] = sub_text
-                        else:
-                            final_pairs.append({
-                                "question": question,
-                                "answer": sub_text,
-                                "matched": True
-                            })
-                        found = True
-                        break
-                
-                if not found:
-                    # Create new entry with the sub-label as question
-                    final_pairs.append({
-                        "question": sub_label,
-                        "answer": sub_text,
-                        "matched": True
-                    })
-        else:
-            # No sub-answers found - keep as is
-            final_pairs.append({
-                "question": q,
-                "answer": answer,
-                "matched": bool(answer)
-            })
-    
-    # Remove duplicates
-    seen = set()
-    unique_pairs = []
-    for pair in final_pairs:
-        key = pair["question"]
-        if key not in seen:
-            seen.add(key)
-            unique_pairs.append(pair)
-    
-    return unique_pairs
 
 
 # =========================================================
@@ -1401,7 +1149,6 @@ def process_pdf(file_input, status_callback=None):
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
-    # Map each question to its answer independently
     log("Mapping each question to its answer independently (LLM-based)...")
     qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
 
@@ -1419,7 +1166,6 @@ def process_pdf(file_input, status_callback=None):
             f"First 10 answer lines: {answer_lines[:10]}"
         )
 
-    # Build the Q&A pairs list
     qa_pairs = []
     for q in official_questions:
         qa_pairs.append({
@@ -1428,17 +1174,12 @@ def process_pdf(file_input, status_callback=None):
             "matched": q in qa_map,
         })
 
-    # FIX: Check for answer completeness
-    log("Checking answer completeness...")
-    qa_pairs = ensure_complete_answers(qa_pairs)
-
-    # Log sample of first answer for verification
+    # Log answer lengths to verify completeness
     for i, pair in enumerate(qa_pairs):
         if pair["answer"]:
-            sample = pair["answer"][:300]
-            answer_len = len(pair["answer"])
-            log(f"VERIFICATION - Q{i+1} answer length: {answer_len} chars (first 300 chars):\n{sample}\n...")
-            break
+            log(f"Q{i+1} answer length: {len(pair['answer'])} chars")
+            if len(pair['answer']) < 100:
+                log(f"WARNING: Q{i+1} answer seems short ({len(pair['answer'])} chars)")
 
     log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
 
