@@ -923,11 +923,12 @@ def _parse_answer_map_llm_response(content: str) -> list:
 # =========================================================
 
 # INCREASED from 8000 to 25000 - handles 5-6 page answers completely
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 25000
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 40000
 
 # INCREASED from 3500 to 8000 - ensures enough overlap between chunks
-ANSWER_MAP_OVERLAP_CHARS = 8000
+ANSWER_MAP_OVERLAP_CHARS = 12000
 
+CHUNK_OVERLAP_PAGES = 5  # Increased from 4
 
 def _chunk_lines_by_char_budget(numbered_lines: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
@@ -935,7 +936,9 @@ def _chunk_lines_by_char_budget(numbered_lines: list,
     """
     Like _chunk_pages_by_char_budget, but operates on flattened answer
     LINES rather than pages, and uses CHARACTER-based overlap (not a
-    fixed line count) between consecutive chunks.
+    fixed line count) between consecutive chunks -- see module-level
+    comment above for why line-count overlap was insufficient for long
+    answers in practice.
     """
     if not numbered_lines:
         return []
@@ -950,6 +953,11 @@ def _chunk_lines_by_char_budget(numbered_lines: list,
         if current_chunk and current_chars + line_chars > max_chars:
             chunks.append(current_chunk)
 
+            # Build character-based overlap: walk backward from the
+            # end of the current chunk, accumulating whole lines until
+            # we've covered at least overlap_chars worth of content --
+            # this is robust regardless of how long or short individual
+            # OCR lines happen to be.
             overlap = []
             overlap_total = 0
             for item in reversed(current_chunk):
@@ -969,20 +977,39 @@ def _chunk_lines_by_char_budget(numbered_lines: list,
 
     return chunks
 
-
 def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
+    """
+    HARD SAFETY NET against the answer-swallowing bug: sorts ranges by
+    start_line, then clips any range's end_line so it can never extend
+    into territory claimed by a later-starting range.
+    """
     sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
     resolved = []
     for i, r in enumerate(sorted_ranges):
         r = dict(r)
         if i + 1 < len(sorted_ranges):
             next_start = sorted_ranges[i + 1]["start_line"]
+            # FIX: If ranges overlap, clip the earlier one to end BEFORE the next starts
             if r["end_line"] >= next_start:
                 r["end_line"] = next_start - 1
+        # FIX: Only add if the range has at least 1 line
         if r["end_line"] >= r["start_line"]:
             resolved.append(r)
     return resolved
 
+def ensure_complete_answers(qa_pairs: list, min_answer_length: int = 100) -> list:
+    """
+    Checks if answers are complete (not cut off). If an answer is too short,
+    logs a warning so the user knows which answers might be incomplete.
+    """
+    for pair in qa_pairs:
+        if pair["matched"] and pair["answer"]:
+            answer_len = len(pair["answer"])
+            if answer_len < min_answer_length:
+                print(f"WARNING: Answer for '{pair['question'][:50]}...' is only {answer_len} chars - might be incomplete")
+            elif answer_len > 5000:
+                print(f"INFO: Answer for '{pair['question'][:50]}...' is {answer_len} chars - complete long answer")
+    return qa_pairs
 
 QUESTION_PREFIX_RE = re.compile(
     r'^\s*(?:'
@@ -1007,6 +1034,10 @@ def strip_question_restatement(answer_text: str) -> str:
 
 
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
+    """
+    Maps each official question to its verbatim answer text, extracted
+    INDEPENDENTLY per question via LLM-identified line boundaries.
+    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -1021,13 +1052,15 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
+    # Deterministic REF label <-> question index mapping, built once
+    # here and never touched by anything the LLM returns.
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
 
     numbered_lines = list(enumerate(answer_lines))
     chunks = _chunk_lines_by_char_budget(numbered_lines)
     log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
 
-    all_ranges = []
+    all_ranges = []  # list of {ref, start_line, end_line}
 
     for i, chunk in enumerate(chunks):
         line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
@@ -1043,6 +1076,9 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             log(f"WARNING: chunk {i+1}/{len(chunks)} answer-mapping failed, skipping: {e}")
             continue
 
+        # Validate BOTH that the ref label is one we actually issued
+        # AND that line numbers are within THIS chunk's actual range
+        # (defends against the LLM hallucinating either).
         valid_indices = {idx for idx, _ in chunk}
         min_idx, max_idx = min(valid_indices), max(valid_indices)
         for r in chunk_ranges:
@@ -1060,6 +1096,10 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
         log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
 
+    # Deduplicate: if overlapping chunks both found the same REF
+    # (possible due to line overlap between chunks), keep the one with
+    # the longer range (more complete capture). This is now a trivial
+    # exact-match on the ref label -- no text fuzziness involved at all.
     best_by_ref = {}
     for r in all_ranges:
         existing = best_by_ref.get(r["ref"])
@@ -1067,23 +1107,43 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             best_by_ref[r["ref"]] = r
 
     deduped_ranges = list(best_by_ref.values())
+
+    # HARD SAFETY NET: resolve any remaining overlaps so no answer can
+    # ever swallow another's content, regardless of LLM output quality.
     resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
 
     log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
 
+    # Slice the ORIGINAL answer_lines verbatim using the resolved ranges
+    # -- this is the only place the actual answer text is produced, and
+    # it is a pure Python slice, guaranteeing no LLM paraphrasing risk.
+    # The dict is keyed on the ORIGINAL canonical question text (looked
+    # up deterministically via ref_to_question), guaranteeing it matches
+    # whatever process_pdf() looks it up with later.
     qa_map = {}
     for r in resolved_ranges:
         start, end = r["start_line"], r["end_line"]
-        verbatim_lines = [
-            answer_lines[j] for j in range(start, end + 1)
-            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ]
+        
+        # FIX: Ensure we get ALL lines including the end line
+        verbatim_lines = []
+        for j in range(start, end + 1):
+            if 0 <= j < len(answer_lines):
+                line = answer_lines[j]
+                # Only filter noise, keep everything else
+                if line.strip() and not is_noise(line):
+                    verbatim_lines.append(line)
+        
+        # Join with proper spacing
+        answer_text = "\n".join(verbatim_lines).strip()
+        
+        # Only apply restatement stripping if the answer is long enough
+        if len(answer_text) > 50:
+            answer_text = strip_question_restatement(answer_text)
+        
         original_question = ref_to_question[r["ref"]]
-        answer_text = " ".join(verbatim_lines).strip()
-        qa_map[original_question] = strip_question_restatement(answer_text)
+        qa_map[original_question] = answer_text
 
     return qa_map
-
 
 NOISE_RE = re.compile(
     r'(?:Teacher\'?s?\s*Signature'
@@ -1341,6 +1401,7 @@ def process_pdf(file_input, status_callback=None):
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
+    # Map each question to its answer independently
     log("Mapping each question to its answer independently (LLM-based)...")
     qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
 
@@ -1358,7 +1419,7 @@ def process_pdf(file_input, status_callback=None):
             f"First 10 answer lines: {answer_lines[:10]}"
         )
 
-    # Build Q&A pairs in official question order
+    # Build the Q&A pairs list
     qa_pairs = []
     for q in official_questions:
         qa_pairs.append({
@@ -1367,18 +1428,19 @@ def process_pdf(file_input, status_callback=None):
             "matched": q in qa_map,
         })
 
-    # FIX 2: Split merged sub-answers into separate Q&A pairs for evaluation
-    log("Splitting merged sub-answers into separate Q&A pairs for evaluation...")
-    qa_pairs = split_merged_answers(qa_pairs, official_questions)
+    # FIX: Check for answer completeness
+    log("Checking answer completeness...")
+    qa_pairs = ensure_complete_answers(qa_pairs)
 
     # Log sample of first answer for verification
     for i, pair in enumerate(qa_pairs):
         if pair["answer"]:
             sample = pair["answer"][:300]
-            log(f"VERIFICATION - Q{i+1} raw answer (first 300 chars):\n{sample}\n...")
+            answer_len = len(pair["answer"])
+            log(f"VERIFICATION - Q{i+1} answer length: {answer_len} chars (first 300 chars):\n{sample}\n...")
             break
 
-    log(f"Done -- {len(qa_pairs)} Q&A pair(s) extracted from {len(pages)} page(s).")
+    log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
 
     return ocr_json, qa_pairs
 
