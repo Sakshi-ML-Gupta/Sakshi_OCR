@@ -415,6 +415,7 @@ Critical rules for telling question-paper pages apart from answer pages that hap
 - A numbered point inside a long answer is typically a STATEMENT or FACT that is part of an explanation the student is giving -- it does not ask the reader to do anything; it's content, not an instruction.
 - If a page's numbered items closely follow words like "उत्तर" (answer), "Ans", "Ans-", or come after a long paragraph of explanatory prose in the same block, that page is almost certainly an ANSWER page, not a question paper page -- exclude it from question_paper_pages even if it has multiple numbered lines.
 - A real question paper is usually self-contained and concise per question (a question, maybe a mark allocation) -- not a long flowing essay with numbered sub-points woven into running prose.
+- CRITICAL TRAP TO AVOID: students very commonly RESTATE the question itself as the FIRST SENTENCE of their answer, before writing their actual response (e.g. an answer's opening page reads "Examine the theme of concealment in X. Discuss with reference to Y. The theme of concealment is central to..." where everything after the first sentence is the student's OWN original explanation, not more instructions). Such a page can superficially look like a question-paper page because it contains prompt-style verbs ("Examine", "Discuss") -- but it is the FIRST page of a long, multi-page ANSWER, not a question paper page. Signals that this is really an answer's opening page, not a real question paper page: (a) the page has noticeably MORE text than a typical printed question would need, especially if it keeps going well past where a concise instruction would end; (b) the prose quality looks like a developing argument/explanation rather than a terse instruction; (c) the SAME or very similar question text already appears verbatim on a page you are more confident is the genuine, concise question paper (in which case this longer, messier page is almost certainly the student's restatement -- exclude it). When uncertain whether a page is the real question paper or a student's restatement-then-answer, treat brevity and conciseness as the deciding signal: genuine question papers are short per question; answer pages (including their opening restatement) run much longer.
 - When genuinely uncertain whether a page is a question paper page, prefer NOT including it as one, and prefer NOT extracting its numbered items as separate questions.
 - If NONE of the pages shown in this chunk are question paper pages, return empty lists for both fields -- that is a valid and expected result for chunks that only contain answer/admin pages.
 - Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate.
@@ -1180,6 +1181,68 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     qp_page_indices_0based = sorted(pn - 1 for pn in qp_pages_1based_merged)
 
     log(f"Question paper pages identified: {len(qp_page_indices_0based)} page(s)")
+
+    # FIX (this round): real-world failure confirmed -- a student's
+    # ANSWER often opens by restating the question itself ("Examine
+    # the theme of X. Discuss with reference to Y...") before writing
+    # their actual original explanation. That opening page can
+    # superficially look like a genuine question-paper page to the
+    # LLM, since it legitimately contains prompt-style verbs. If this
+    # happens, that page gets WRONGLY EXCLUDED from answer_lines
+    # entirely (since only non-question-paper pages become answer
+    # text), which silently deletes the FIRST page of that answer --
+    # exactly matching the real symptom reported ("one page skipped
+    # from the start" of an answer).
+    #
+    # A real question-paper page is reliably CONCISE (a question, maybe
+    # a mark allocation) -- a misclassified answer-opening page is
+    # reliably much LONGER (it's the start of a multi-page essay). This
+    # checks for length outliers among the pages classified as
+    # question-paper pages and logs a clear warning so the issue is
+    # immediately visible rather than silently losing content -- it
+    # does not auto-correct (since a genuinely long, dense question
+    # paper page is possible, e.g. one with many sub-parts), but makes
+    # the failure mode loud instead of silent.
+    if len(qp_page_indices_0based) >= 2:
+        qp_page_lengths = [
+            (i, len(pages[i]["raw_text"])) for i in qp_page_indices_0based
+        ]
+
+        def _true_median(values):
+            s = sorted(values)
+            n = len(s)
+            mid = n // 2
+            return (s[mid - 1] + s[mid]) / 2 if n % 2 == 0 else s[mid]
+
+        for page_idx, length in qp_page_lengths:
+            # FIX: the baseline must be computed from the OTHER pages
+            # only (leave-one-out), not from all pages including the
+            # candidate itself -- the original version included the
+            # candidate in its own median, which with an even page
+            # count could make the outlier page BECOME the median,
+            # making the threshold mathematically impossible to exceed
+            # (confirmed bug: a 1185-char misclassified page against a
+            # 61-char real page produced a "median" of 1185 -- itself).
+            other_lengths = [l for i, l in qp_page_lengths if i != page_idx]
+            if not other_lengths:
+                continue
+            baseline = _true_median(other_lengths)
+            # 800 chars is a realistic absolute floor: real question-
+            # paper text per page is typically well under this even
+            # with several sub-parts, while an answer's restated-
+            # question-plus-opening-paragraph reliably exceeds it.
+            if length > max(baseline * 3, 800):
+                log(
+                    f"WARNING: page {page_idx + 1} was classified as a question "
+                    f"paper page but is {length} chars long -- much longer than "
+                    f"the typical {baseline:.0f} chars for this document's other "
+                    f"question paper pages. This commonly means the page is "
+                    f"actually the OPENING of a student's answer (where they "
+                    f"restated the question before writing their real response), "
+                    f"which would cause that answer's first page to be silently "
+                    f"excluded. Check page {page_idx + 1} in the OCR output if an "
+                    f"answer appears to be missing its beginning."
+                )
 
     # Stage 2: single consistent pass over the CONFIRMED question-paper
     # pages' full text, producing one canonical, non-fragmented question
