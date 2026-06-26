@@ -1154,17 +1154,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
             log(f"WARNING: LLM returned out-of-range page numbers, ignoring: {truly_invalid}")
 
         qp_pages_1based = sorted(set(recovered_pages))
-
-        log(
-            f"Chunk {i+1}/{len(chunks)}: identified {len(qp_pages_1based)} question paper "
-            f"page(s) (questions from this stage are discarded -- see stage 2 below)"
-        )
-        # NOTE: this stage's own per-chunk `questions` are intentionally
-        # NOT collected anymore -- they are exactly the inconsistent,
-        # possibly-conflicting splits described above. Only the PAGE
-        # indices from this stage are kept; the actual question list
-        # comes from extract_canonical_questions() in a single pass,
-        # below, once we know which pages to look at.
         chunk_results.append((qp_pages_1based, []))
 
     if chunk_failures and not chunk_results:
@@ -1181,69 +1170,21 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     qp_pages_1based_merged, _ = _merge_chunk_results(chunk_results)
     qp_page_indices_0based = sorted(pn - 1 for pn in qp_pages_1based_merged)
 
-    log(f"Question paper pages identified: {len(qp_page_indices_0based)} page(s)")
+    # =========================================================
+    # FIX: AUTO-CORRECT MISCLASSIFIED ANSWER-OPENING PAGES
+    # =========================================================
+    corrected_qp_indices = _auto_correct_misclassified_answer_pages(pages, qp_page_indices_0based, log)
+    
+    if corrected_qp_indices != qp_page_indices_0based:
+        log(
+            f"AUTO-CORRECT applied: moved {len(qp_page_indices_0based) - len(corrected_qp_indices)} "
+            f"page(s) from question paper to answer pages. "
+            f"Original QP pages: {[p+1 for p in qp_page_indices_0based]} "
+            f"Corrected QP pages: {[p+1 for p in corrected_qp_indices]}"
+        )
+        qp_page_indices_0based = corrected_qp_indices
 
-    # FIX (this round): real-world failure confirmed -- a student's
-    # ANSWER often opens by restating the question itself ("Examine
-    # the theme of X. Discuss with reference to Y...") before writing
-    # their actual original explanation. That opening page can
-    # superficially look like a genuine question-paper page to the
-    # LLM, since it legitimately contains prompt-style verbs. If this
-    # happens, that page gets WRONGLY EXCLUDED from answer_lines
-    # entirely (since only non-question-paper pages become answer
-    # text), which silently deletes the FIRST page of that answer --
-    # exactly matching the real symptom reported ("one page skipped
-    # from the start" of an answer).
-    #
-    # A real question-paper page is reliably CONCISE (a question, maybe
-    # a mark allocation) -- a misclassified answer-opening page is
-    # reliably much LONGER (it's the start of a multi-page essay). This
-    # checks for length outliers among the pages classified as
-    # question-paper pages and logs a clear warning so the issue is
-    # immediately visible rather than silently losing content -- it
-    # does not auto-correct (since a genuinely long, dense question
-    # paper page is possible, e.g. one with many sub-parts), but makes
-    # the failure mode loud instead of silent.
-    if len(qp_page_indices_0based) >= 2:
-        qp_page_lengths = [
-            (i, len(pages[i]["raw_text"])) for i in qp_page_indices_0based
-        ]
-
-        def _true_median(values):
-            s = sorted(values)
-            n = len(s)
-            mid = n // 2
-            return (s[mid - 1] + s[mid]) / 2 if n % 2 == 0 else s[mid]
-
-        for page_idx, length in qp_page_lengths:
-            # FIX: the baseline must be computed from the OTHER pages
-            # only (leave-one-out), not from all pages including the
-            # candidate itself -- the original version included the
-            # candidate in its own median, which with an even page
-            # count could make the outlier page BECOME the median,
-            # making the threshold mathematically impossible to exceed
-            # (confirmed bug: a 1185-char misclassified page against a
-            # 61-char real page produced a "median" of 1185 -- itself).
-            other_lengths = [l for i, l in qp_page_lengths if i != page_idx]
-            if not other_lengths:
-                continue
-            baseline = _true_median(other_lengths)
-            # 800 chars is a realistic absolute floor: real question-
-            # paper text per page is typically well under this even
-            # with several sub-parts, while an answer's restated-
-            # question-plus-opening-paragraph reliably exceeds it.
-            if length > max(baseline * 3, 800):
-                log(
-                    f"WARNING: page {page_idx + 1} was classified as a question "
-                    f"paper page but is {length} chars long -- much longer than "
-                    f"the typical {baseline:.0f} chars for this document's other "
-                    f"question paper pages. This commonly means the page is "
-                    f"actually the OPENING of a student's answer (where they "
-                    f"restated the question before writing their real response), "
-                    f"which would cause that answer's first page to be silently "
-                    f"excluded. Check page {page_idx + 1} in the OCR output if an "
-                    f"answer appears to be missing its beginning."
-                )
+    log(f"Question paper pages identified (after auto-correction): {len(qp_page_indices_0based)} page(s)")
 
     # Stage 2: single consistent pass over the CONFIRMED question-paper
     # pages' full text, producing one canonical, non-fragmented question
