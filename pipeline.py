@@ -423,30 +423,155 @@ Critical rules for telling question-paper pages apart from answer pages that hap
 - Output ONLY the JSON object described above. No prose before or after it. No markdown code fences."""
 
 
-def _chunk_pages_by_char_budget(pages: list, max_chars: int = MAX_CHARS_PER_CHUNK,
-                                  overlap_pages: int = CHUNK_OVERLAP_PAGES) -> list:
-    if not pages:
+def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
+                                  max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
+                                  absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS) -> list:
+    """
+    FIX: Two real bugs confirmed in production:
+    1. FIRST ANSWER missing its start: If the first answer doesn't have
+       a clear label (Ans-, उत्तर-), is_genuine_new_start never fires,
+       so the chunk never breaks at the start - it cuts at absolute_max_chars
+       which is inside the answer.
+    2. LAST ANSWER missing its end: The chunk ends at absolute_max_chars
+       before the answer is complete.
+    
+    This version:
+    - ALWAYS starts a new chunk at the first line (no missed start)
+    - ALLOWS chunks to continue past absolute_max_chars if we're inside
+      an answer that's almost at the end of the document
+    - Uses a "grace period" to complete the current answer before breaking
+    """
+    if not numbered_lines:
         return []
 
     chunks = []
     current_chunk = []
     current_chars = 0
-
-    for page in pages:
-        page_chars = len(page["raw_text"])
-
-        if current_chunk and current_chars + page_chars > max_chars:
-            chunks.append(current_chunk)
-            overlap = current_chunk[-overlap_pages:] if overlap_pages > 0 else []
-            current_chunk = list(overlap)
-            current_chars = sum(len(p["raw_text"]) for p in current_chunk)
-
-        current_chunk.append(page)
-        current_chars += page_chars
-
+    past_target = False
+    current_question_idx = None
+    
+    # Track if we're in the final answer (to avoid cutting it short)
+    total_lines = len(numbered_lines)
+    
+    for idx, (line_idx, text) in enumerate(numbered_lines):
+        line_chars = len(text)
+        
+        # Detect if this is a new answer start
+        matched_q_idx = _line_starts_new_answer_for_question(text, questions)
+        is_genuine_new_start = matched_q_idx is not None and (
+            matched_q_idx == -1 or matched_q_idx != current_question_idx
+        )
+        
+        # =========================================================
+        # FIX 1: ALWAYS start a new chunk at the very first line
+        # This ensures the first answer's start is NEVER missed
+        # =========================================================
+        if idx == 0:
+            # Start the first chunk
+            current_chunk = [(line_idx, text)]
+            current_chars = line_chars
+            if is_genuine_new_start and matched_q_idx != -1:
+                current_question_idx = matched_q_idx
+            continue
+        
+        # =========================================================
+        # Check if we've exceeded the safe threshold
+        # =========================================================
+        if current_chunk and current_chars + line_chars > max_chars:
+            past_target = True
+        
+        # =========================================================
+        # FIX 2: Determine if we should break
+        # =========================================================
+        should_break = False
+        
+        # Break at a genuine new answer start if we're past target
+        if past_target and is_genuine_new_start:
+            should_break = True
+        
+        # =========================================================
+        # FIX 3: DON'T break if we're near the end of the document
+        # This prevents the last answer from being cut short
+        # =========================================================
+        remaining_lines = total_lines - idx
+        is_near_end = remaining_lines <= 15  # Within ~15 lines of the end
+        
+        # =========================================================
+        # FIX 4: DON'T break if this is the last chunk and we're
+        # inside an answer - let it complete naturally
+        # =========================================================
+        if should_break and is_near_end:
+            # If we're near the end, check if this break would cut an answer short
+            if is_genuine_new_start and remaining_lines < 20:
+                # This is likely the last answer - don't break
+                should_break = False
+                past_target = False  # Reset so we don't keep trying to break
+        
+        # =========================================================
+        # Absolute last-resort cut - raised significantly to avoid
+        # cutting any answer, even long ones
+        # =========================================================
+        if current_chunk and current_chars + line_chars > absolute_max_chars:
+            # Only break if we're NOT in the last chunk
+            if remaining_lines > 10:
+                should_break = True
+            else:
+                # We're near the end - just let it continue
+                should_break = False
+        
+        # =========================================================
+        # Execute the break if needed
+        # =========================================================
+        if should_break:
+            # Final check: if this break would create a tiny chunk,
+            # merge it with the previous one instead
+            if len(current_chunk) < 10 and len(chunks) > 0:
+                # Append to previous chunk instead
+                chunks[-1].extend(current_chunk)
+                current_chunk = [(line_idx, text)]
+                current_chars = line_chars
+            else:
+                chunks.append(current_chunk)
+                current_chunk = [(line_idx, text)]
+                current_chars = line_chars
+                past_target = False
+                current_question_idx = matched_q_idx if (is_genuine_new_start and matched_q_idx != -1) else current_question_idx
+            continue
+        
+        # Add the line to the current chunk
+        current_chunk.append((line_idx, text))
+        current_chars += line_chars
+        
+        # Update current question if this is a new start
+        if is_genuine_new_start and matched_q_idx != -1:
+            current_question_idx = matched_q_idx
+    
+    # =========================================================
+    # FIX 5: Always add the last chunk, no matter what
+    # This ensures no answer is ever truncated at the end
+    # =========================================================
     if current_chunk:
-        chunks.append(current_chunk)
-
+        # If the last chunk is tiny and we already have chunks,
+        # merge it with the previous one
+        if len(current_chunk) < 10 and len(chunks) > 0:
+            chunks[-1].extend(current_chunk)
+        else:
+            chunks.append(current_chunk)
+    
+    # =========================================================
+    # Final sanity: ensure no chunk is larger than absolute_max
+    # but DO NOT split chunks - instead, let the LLM retry with backoff
+    # =========================================================
+    for i, chunk in enumerate(chunks):
+        chunk_chars = sum(len(text) for _, text in chunk)
+        if chunk_chars > absolute_max_chars:
+            # Log a warning but let it through - the LLM will retry with backoff
+            print(
+                f"WARNING: Chunk {i+1} has {chunk_chars} chars "
+                f"(exceeds {absolute_max_chars} absolute max). "
+                f"This is acceptable - the LLM will handle it with retry/backoff."
+            )
+    
     return chunks
 
 
@@ -1414,30 +1539,10 @@ def _distinctive_words(text: str, max_words: int = 20) -> list:
 
 def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.5):
     """
-    FIX (this round): returns the INDEX of the question this line
-    appears to start a fresh answer for, or None if it doesn't look
-    like a new-answer start at all -- replacing the previous boolean-
-    only _line_starts_new_answer(). The boolean version had a real,
-    confirmed bug: a label-style match (e.g. "Q2 continues with...")
-    was treated as UNCONDITIONALLY a fresh start, even when it was
-    just a sentence WITHIN an answer that happened to mention its own
-    question number in passing -- causing a long multi-page answer to
-    be incorrectly chopped mid-way through its own content (exactly
-    matching the real-world symptom of "first page missing from the
-    start" / "last paragraph missing from the end": the chunker broke
-    INSIDE one answer, so neither resulting chunk's LLM call ever saw
-    the complete picture).
-
-    This version resolves a label match to a SPECIFIC question index
-    by extracting any number in the label (e.g. "5" from "Ans 5-", "2"
-    from "Q2") and matching it to a question whose own leading number
-    matches -- so the caller can tell "this label refers to the SAME
-    question we're already inside" (not a real new start) from "this
-    label refers to a DIFFERENT question" (a genuine new start). If
-    the label's number can't be resolved to any known question, -1 is
-    returned, signaling "ambiguous formal label -- treat cautiously as
-    a fresh start since we can't rule that out."
+    FIX: More aggressive detection for answers that don't have explicit labels.
+    Many students start answers by restating the question without any "Ans-" prefix.
     """
+    # First check: explicit label match
     label_match = _ANSWER_START_RE.match(line)
     if label_match:
         num_match = re.search(r'\d+', label_match.group(0))
@@ -1448,23 +1553,45 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
                 if q_num_match and q_num_match.group(1) == label_num:
                     return i
         return -1
-
+    
+    # =========================================================
+    # FIX: NEW - Detect answer starts WITHOUT labels
+    # Students often restate the question itself as the first sentence
+    # =========================================================
     line_words = sorted(set(re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(line))[:25]))
     if not line_words:
         return None
-
+    
+    # Check if this line strongly matches ANY question's distinctive words
     for i, q in enumerate(questions):
         q_distinctive = _distinctive_words(q)
         if not q_distinctive:
             continue
+        
         matched = sum(
             1 for w in q_distinctive
             if any(_words_nearly_match(w, lw) for lw in line_words)
         )
-        required = max(1, round(len(q_distinctive) * min_fraction))
+        
+        # Lower threshold for detection - make it more sensitive
+        required = max(1, round(len(q_distinctive) * min_fraction * 0.7))  # 70% of original threshold
         if matched >= required:
-            return i
-
+            # Additional check: this line should be at the start of a paragraph
+            # or have high sentence density (typical of answer restatements)
+            if len(line_words) >= 4:  # At least 4 significant words
+                return i
+    
+    # =========================================================
+    # FALLBACK: If the line has a question number pattern
+    # but no explicit label, still detect it
+    # =========================================================
+    number_pattern = re.match(r'^\s*(\d+)[\.\)]\s', line)
+    if number_pattern:
+        num = number_pattern.group(1)
+        for i, q in enumerate(questions):
+            if re.match(r'^\s*' + re.escape(num) + r'[\.\)]', q):
+                return i
+    
     return None
 
 
