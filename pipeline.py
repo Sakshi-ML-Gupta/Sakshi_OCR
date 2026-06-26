@@ -1449,7 +1449,17 @@ def _parse_answer_map_llm_response(content: str) -> list:
     return result
 
 
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 11000  # FIX (this round): increased
+# =========================================================
+# CONSTANTS - Move these to the top with other constants
+# =========================================================
+
+# Answer mapping chunk size constants
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 11000  # Safe under 8000 TPM ceiling
+ANSWER_MAP_ABSOLUTE_MAX_CHARS = 60000   # Last-resort ceiling, very generous
+
+# =========================================================
+# Rest of your code follows...
+# =========================================================  # FIX (this round): increased
 # from 9000. The PREVIOUS truncation reports were not actually caused
 # by chunk size being too small -- they were caused by the answer-
 # start detector finding ZERO safe break points in documents where
@@ -1468,7 +1478,7 @@ ANSWER_MAP_MAX_CHARS_PER_CHUNK = 11000  # FIX (this round): increased
 # appearing at all) -- so this is very close to the real ceiling on
 # the current Groq free tier, not an arbitrary number.
 
-ANSWER_MAP_ABSOLUTE_MAX_CHARS = 60000  # FIX (this round): replaces the
+  # FIX (this round): replaces the
 # old 2x-multiplier hard cap (~22000 chars), which could still force a
 # break mid-answer purely on SIZE with no regard for safety. Real usage
 # confirmed single answers can legitimately span 5-6 pages of OCR'd
