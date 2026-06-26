@@ -1407,25 +1407,48 @@ def _distinctive_words(text: str, max_words: int = 20) -> list:
     return sorted(set(w for w in words if w not in _QUESTION_STOPWORDS))
 
 
-def _line_starts_new_answer(line: str, questions: list, min_fraction: float = 0.5) -> bool:
+def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.5):
     """
-    A line is a safe chunk-break point if EITHER it matches a formal
-    answer-label pattern, OR its content carries forward at least half
-    of any official question's DISTINCTIVE (topic-specific) words --
-    catching the "student restates or paraphrases the question itself,
-    with no formal label" pattern confirmed in real documents. Word
-    matching tolerates small OCR-level misspellings (e.g.
-    "Mrichchhkatika" vs "Mrichchhakatika") via the same fuzzy matcher
-    used for question deduplication.
+    FIX (this round): returns the INDEX of the question this line
+    appears to start a fresh answer for, or None if it doesn't look
+    like a new-answer start at all -- replacing the previous boolean-
+    only _line_starts_new_answer(). The boolean version had a real,
+    confirmed bug: a label-style match (e.g. "Q2 continues with...")
+    was treated as UNCONDITIONALLY a fresh start, even when it was
+    just a sentence WITHIN an answer that happened to mention its own
+    question number in passing -- causing a long multi-page answer to
+    be incorrectly chopped mid-way through its own content (exactly
+    matching the real-world symptom of "first page missing from the
+    start" / "last paragraph missing from the end": the chunker broke
+    INSIDE one answer, so neither resulting chunk's LLM call ever saw
+    the complete picture).
+
+    This version resolves a label match to a SPECIFIC question index
+    by extracting any number in the label (e.g. "5" from "Ans 5-", "2"
+    from "Q2") and matching it to a question whose own leading number
+    matches -- so the caller can tell "this label refers to the SAME
+    question we're already inside" (not a real new start) from "this
+    label refers to a DIFFERENT question" (a genuine new start). If
+    the label's number can't be resolved to any known question, -1 is
+    returned, signaling "ambiguous formal label -- treat cautiously as
+    a fresh start since we can't rule that out."
     """
-    if _ANSWER_START_RE.match(line):
-        return True
+    label_match = _ANSWER_START_RE.match(line)
+    if label_match:
+        num_match = re.search(r'\d+', label_match.group(0))
+        if num_match:
+            label_num = num_match.group(0)
+            for i, q in enumerate(questions):
+                q_num_match = re.match(r'\s*(\d+)', q)
+                if q_num_match and q_num_match.group(1) == label_num:
+                    return i
+        return -1
 
     line_words = sorted(set(re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(line))[:25]))
     if not line_words:
-        return False
+        return None
 
-    for q in questions:
+    for i, q in enumerate(questions):
         q_distinctive = _distinctive_words(q)
         if not q_distinctive:
             continue
@@ -1435,9 +1458,9 @@ def _line_starts_new_answer(line: str, questions: list, min_fraction: float = 0.
         )
         required = max(1, round(len(q_distinctive) * min_fraction))
         if matched >= required:
-            return True
+            return i
 
-    return False
+    return None
 
 
 def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
@@ -1445,34 +1468,47 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
                                   absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS) -> list:
     """
     Answer-boundary-aware chunking: a chunk break is only allowed at a
-    line that looks like the start of a new answer -- either a formal
-    label (Ans-, उत्तर-, etc.) OR a line whose content overlaps
-    substantially with an official question's distinctive words (the
-    "student restates/paraphrases the question, no label" pattern).
+    line that genuinely starts a DIFFERENT question's answer than the
+    one currently being accumulated.
 
-    FIX (this round): real answers can legitimately span 5-6 PAGES of
-    OCR'd text for a single sub-part question (confirmed need from
-    real usage with detailed essay answers). The previous hard-cap
-    multiplier (2x of max_chars) would force a break purely on
-    accumulated SIZE, with no regard for whether that break point was
-    actually safe -- meaning a single long answer could still be cut
-    in half if it happened to push the running total past the hard cap
-    mid-sentence. This is now a genuine last resort ONLY:
-    - A break at max_chars is preferred, but ONLY taken at a safe
-      answer-start boundary (unchanged from before).
-    - If no safe boundary appears, the chunk is allowed to keep
-      growing past max_chars indefinitely -- a single long answer
-      simply makes its own larger chunk, rather than ever being cut.
-    - absolute_max_chars is a true last-resort ceiling (deliberately
-      generous) that only matters if something has gone catastrophically
-      wrong (e.g. answer-start detection totally failing across an
-      entire very long document) -- in ordinary use it should never be
-      reached, since a real single answer reaching this size is
-      vanishingly unlikely even at 5-6 pages.
-    A chunk occasionally exceeding the TPM-safe target size is handled
-    by the existing 413/429 retry-with-backoff logic already in place
-    (see _call_groq_with_retries) -- a slower retry cycle is a vastly
-    better outcome than ever silently truncating real answer content.
+    FIX (this round): two real, confirmed bugs in the previous version,
+    both producing the same real-world symptom (an answer's start or
+    end going missing -- "first page gone from the start" / "last
+    paragraph gone from the end"):
+
+    1. The break condition only fired on the SAME line that crossed
+       max_chars, AND only if that exact line was itself an answer-
+       start. In practice, max_chars is usually crossed mid-answer
+       (somewhere in the MIDDLE of a long answer's own content, not
+       conveniently on a boundary line), so the real next answer-start
+       boundary could be 20-30+ lines later -- by which point a chunk
+       break finally fires, but only after already consuming a chunk's
+       worth of the WRONG answer's content alongside the start of the
+       next one, corrupting both. Fixed: `past_target` is now standing
+       state -- once max_chars is crossed, the chunker waits and breaks
+       at the VERY NEXT genuine answer-start, however many lines later
+       that turns out to be, rather than requiring it on the exact
+       threshold-crossing line.
+
+    2. A label-style match (e.g. text that happens to look like
+       "Q2 ...") was treated as UNCONDITIONALLY a fresh start, even
+       when it was just a sentence WITHIN an answer mentioning its own
+       question in passing. This could cause a long answer's own later
+       lines to incorrectly "restart" a chunk break against the SAME
+       question, slicing that one answer into two separate, incomplete
+       pieces. Fixed: `_line_starts_new_answer_for_question` now
+       resolves a label match to a specific question index via its
+       number, so a break only fires when the matched index genuinely
+       DIFFERS from the question currently being accumulated.
+
+    Beyond a safe boundary, a chunk is allowed to keep growing past
+    max_chars indefinitely (a single long, multi-page answer simply
+    makes its own larger chunk) -- absolute_max_chars is a true last-
+    resort ceiling that should essentially never be reached in
+    practice. A chunk occasionally exceeding the TPM-safe target size
+    is handled by the existing 413/429 retry-with-backoff logic already
+    in place (see _call_groq_with_retries) -- a slower retry cycle is a
+    vastly better outcome than ever silently truncating real content.
     """
     if not numbered_lines:
         return []
@@ -1480,14 +1516,27 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
     chunks = []
     current_chunk = []
     current_chars = 0
+    past_target = False
+    current_question_idx = None  # which question's answer we believe
+                                   # we're currently accumulating
 
     for idx, text in numbered_lines:
         line_chars = len(text)
-        is_answer_start = _line_starts_new_answer(text, questions)
 
-        should_break_at_answer_start = (
-            current_chunk and current_chars + line_chars > max_chars and is_answer_start
+        if current_chunk and current_chars + line_chars > max_chars:
+            past_target = True
+
+        matched_q_idx = _line_starts_new_answer_for_question(text, questions)
+        # -1 means "ambiguous formal label, couldn't resolve to a known
+        # question" -- treated cautiously as a genuine fresh start,
+        # since we can't positively confirm it's the same question.
+        # A resolved index only counts as a genuinely NEW start if it
+        # differs from the question we believe we're already inside.
+        is_genuine_new_start = matched_q_idx is not None and (
+            matched_q_idx == -1 or matched_q_idx != current_question_idx
         )
+
+        should_break_at_answer_start = past_target and is_genuine_new_start
         should_force_break_absolute = (
             current_chunk and current_chars + line_chars > absolute_max_chars
         )
@@ -1496,6 +1545,10 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
             chunks.append(current_chunk)
             current_chunk = []
             current_chars = 0
+            past_target = False
+
+        if is_genuine_new_start and matched_q_idx != -1:
+            current_question_idx = matched_q_idx
 
         current_chunk.append((idx, text))
         current_chars += line_chars
