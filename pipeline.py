@@ -1178,6 +1178,10 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
 
 
 def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
+    """
+    Modified to use simpler extraction for question pages,
+    with LLM only used for identifying which pages are question papers.
+    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -1193,21 +1197,22 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     budget = _TokenBudgetTracker()
 
     chunks = _chunk_pages_by_char_budget(pages)
-    log(f"Split {len(pages)} page(s) into {len(chunks)} LLM chunk(s) to respect token limits")
+    log(f"Split {len(pages)} page(s) into {len(chunks)} LLM chunk(s) for page identification")
 
     valid_page_numbers = {p["page_number"] for p in pages}
     max_page_number = max(valid_page_numbers) if valid_page_numbers else 0
     chunk_results = []
     chunk_failures = []
 
+    # Only use LLM for identifying which pages are question papers
     for i, chunk in enumerate(chunks):
         page_nums_in_chunk = [p["page_number"] for p in chunk]
-        log(f"Asking LLM to analyze chunk {i+1}/{len(chunks)} (pages {page_nums_in_chunk})...")
+        log(f"Asking LLM to identify question paper pages in chunk {i+1}/{len(chunks)} (pages {page_nums_in_chunk})...")
 
         try:
-            qp_pages_1based, questions = _call_groq_for_chunk(client, chunk, budget, log)
+            qp_pages_1based, _ = _call_groq_for_chunk(client, chunk, budget, log)
         except Exception as e:
-            log(f"WARNING: chunk {i+1}/{len(chunks)} question-identification failed, skipping: {e}")
+            log(f"WARNING: chunk {i+1}/{len(chunks)} failed, skipping: {e}")
             chunk_failures.append(str(e))
             continue
 
@@ -1230,17 +1235,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
             log(f"WARNING: LLM returned out-of-range page numbers, ignoring: {truly_invalid}")
 
         qp_pages_1based = sorted(set(recovered_pages))
-
-        log(
-            f"Chunk {i+1}/{len(chunks)}: identified {len(qp_pages_1based)} question paper "
-            f"page(s) (questions from this stage are discarded -- see stage 2 below)"
-        )
-        # NOTE: this stage's own per-chunk `questions` are intentionally
-        # NOT collected anymore -- they are exactly the inconsistent,
-        # possibly-conflicting splits described above. Only the PAGE
-        # indices from this stage are kept; the actual question list
-        # comes from extract_canonical_questions() in a single pass,
-        # below, once we know which pages to look at.
         chunk_results.append((qp_pages_1based, []))
 
     if chunk_failures and not chunk_results:
@@ -1259,31 +1253,16 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
     log(f"Question paper pages identified: {len(qp_page_indices_0based)} page(s)")
 
-    # FIX (this round): real-world failure confirmed -- a student's
-    # ANSWER often opens by restating the question itself ("Examine
-    # the theme of X. Discuss with reference to Y...") before writing
-    # their actual original explanation. That opening page can
-    # superficially look like a genuine question-paper page to the
-    # LLM, since it legitimately contains prompt-style verbs. If this
-    # happens, that page gets WRONGLY EXCLUDED from answer_lines
-    # entirely (since only non-question-paper pages become answer
-    # text), which silently deletes the FIRST page of that answer --
-    # exactly matching the real symptom reported ("one page skipped
-    # from the start" of an answer).
-    #
-    # A real question-paper page is reliably CONCISE (a question, maybe
-    # a mark allocation) -- a misclassified answer-opening page is
-    # reliably much LONGER (it's the start of a multi-page essay). This
-    # checks for length outliers among the pages classified as
-    # question-paper pages and logs a clear warning so the issue is
-    # immediately visible rather than silently losing content -- it
-    # does not auto-correct (since a genuinely long, dense question
-    # paper page is possible, e.g. one with many sub-parts), but makes
-    # the failure mode loud instead of silent.
-    if len(qp_page_indices_0based) >= 2:
-        qp_page_lengths = [
-            (i, len(pages[i]["raw_text"])) for i in qp_page_indices_0based
-        ]
+    # Use SIMPLE rule-based extraction instead of LLM
+    qp_pages_full = [pages[i] for i in qp_page_indices_0based]
+    questions = extract_canonical_questions_simple(qp_pages_full, status_callback)
+
+    log(
+        f"Final result: {len(qp_page_indices_0based)} question paper "
+        f"page(s), {len(questions)} question(s) extracted (rule-based)"
+    )
+
+    return qp_page_indices_0based, questions
 
         def _true_median(values):
             s = sorted(values)
@@ -1893,185 +1872,125 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
     return answer_text
 
 
-def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
+# Replace the map_answers_with_llm and enhanced_map_answers_with_llm 
+# with this similarity-based approach that uses NO LLM calls
+
+def map_answers_with_similarity(
+    answer_lines: list,
+    questions: list,
+    status_callback=None
+) -> dict:
     """
-    Maps each official question to its verbatim answer text, extracted
-    INDEPENDENTLY per question via LLM-identified line boundaries.
-
-    FIX: this used to key the result dict on whatever question TEXT the
-    LLM echoed back, then rely on that text matching the ORIGINAL
-    question string later in process_pdf()'s qa_map.get(q, "") lookup --
-    a plain, EXACT dict lookup. Any discrepancy between the echoed text
-    and the original (different punctuation, the prompt's own added
-    numbering accidentally retyped, subtle rewording despite
-    instructions not to) meant the answer was built correctly but
-    silently became UNREACHABLE under the original question's key,
-    making it disappear from the final output. This was confirmed as
-    a real, structural cause of badly incomplete Q&A mapping in
-    production.
-
-    This version has the LLM identify questions by an unambiguous
-    REF-A/REF-B/... label (assigned by US, not retyped by the model)
-    instead of by echoing question text at all. Resolving a REF label
-    back to its question is a deterministic Python list index lookup
-    with zero text-matching ambiguity -- the LLM's only job is finding
-    line boundaries, never identifying *which* question by text.
-
-    Returns {question_text: answer_text} for every question whose
-    answer was found, using the EXACT original question strings from
-    `questions` as keys -- guaranteed to match downstream lookups.
+    SIMILARITY-BASED approach - NO LLM calls.
+    Uses the enhanced slicing with intro handling to map questions to answers.
+    This is much more token-efficient than the LLM-based approach.
     """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
-
-    from groq import Groq
-
-    api_key = get_api_key("GROQ_API_KEY")
-    if not api_key:
-        raise Exception("GROQ_API_KEY not found in secrets or environment")
-
-    client = Groq(api_key=api_key)
-    budget = _TokenBudgetTracker()
-
-    # Deterministic REF label <-> question index mapping, built once
-    # here and never touched by anything the LLM returns.
-    ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
-
-    numbered_lines = list(enumerate(answer_lines))
-    chunks = _chunk_lines_by_char_budget(numbered_lines, questions)
-    log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
-
-    all_ranges = []  # list of {ref, start_line, end_line}
-    chunk_failures = []
-    chunk_zero_matches = 0
-
-    for i, chunk in enumerate(chunks):
-        line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
-        log(f"Asking LLM to map answers in chunk {i+1}/{len(chunks)} (lines {line_range})...")
-
-        user_prompt = _build_answer_map_user_prompt(chunk, questions)
-        try:
-            chunk_ranges = _call_groq_with_retries(
-                client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
-                _parse_answer_map_llm_response, budget, log
-            )
-        except Exception as e:
-            log(f"WARNING: chunk {i+1}/{len(chunks)} answer-mapping failed, skipping: {e}")
-            chunk_failures.append(str(e))
-            continue
-
-        if not chunk_ranges:
-            chunk_zero_matches += 1
-
-        # Validate BOTH that the ref label is one we actually issued
-        # AND that line numbers are within THIS chunk's actual range
-        # (defends against the LLM hallucinating either).
-        valid_indices = {idx for idx, _ in chunk}
-        min_idx, max_idx = min(valid_indices), max(valid_indices)
-        for r in chunk_ranges:
-            if r["ref"] not in ref_to_question:
-                log(f"WARNING: discarding answer mapping with unknown ref {r['ref']!r}")
-                continue
-            if min_idx <= r["start_line"] <= max_idx and min_idx <= r["end_line"] <= max_idx:
-                all_ranges.append(r)
-            else:
-                log(
-                    f"WARNING: discarding out-of-range answer mapping for "
-                    f"{r['ref']}: lines {r['start_line']}-{r['end_line']} "
-                    f"outside this chunk's range {min_idx}-{max_idx}"
-                )
-
-        log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
-
-    # Deduplicate: if overlapping chunks both found the same REF
-    # (possible due to line overlap between chunks), keep the one with
-    # the longer range (more complete capture). This is now a trivial
-    # exact-match on the ref label -- no text fuzziness involved at all.
-    best_by_ref = {}
-    for r in all_ranges:
-        existing = best_by_ref.get(r["ref"])
-        if existing is None or (r["end_line"] - r["start_line"]) > (existing["end_line"] - existing["start_line"]):
-            best_by_ref[r["ref"]] = r
-
-    deduped_ranges = list(best_by_ref.values())
-
-    # HARD SAFETY NET: resolve any remaining overlaps so no answer can
-    # ever swallow another's content, regardless of LLM output quality.
-    resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
-
-    log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
-
-    # FIX: this function previously had NO failure path at all -- if
-    # every chunk's call raised an exception, OR every chunk's call
-    # succeeded but genuinely found zero answers (a strong signal the
-    # "answer pages" don't actually contain real answers -- e.g. the
-    # question-paper/answer-page split upstream misclassified pages),
-    # it silently returned an empty dict. The real cause then surfaced
-    # several steps downstream in process_pdf() as a generic
-    # "Could not match any questions to answers" error, with none of
-    # the specific diagnostic information available here. This raises
-    # immediately with the actual cause and enough context to act on.
-    if not resolved_ranges:
-        if chunk_failures and len(chunk_failures) == len(chunks):
-            raise Exception(
-                f"Answer mapping failed: ALL {len(chunks)} chunk(s) raised an "
-                f"error (none succeeded). First failure: {chunk_failures[0]}"
-            )
-        elif chunk_zero_matches == len(chunks):
-            sample_lines = [l for l in answer_lines[:15] if l.strip()][:8]
-            raise Exception(
-                f"Answer mapping found ZERO matches across all {len(chunks)} chunk(s), "
-                f"even though the LLM calls themselves succeeded. This usually means "
-                f"the 'answer pages' passed in do NOT actually contain the student's "
-                f"answers -- most likely the question-paper/answer-page page split "
-                f"upstream misclassified pages (e.g. real answer pages were wrongly "
-                f"identified as question-paper pages, leaving only cover/admin pages "
-                f"as 'answers'). Sample of the answer text actually searched: "
-                f"{sample_lines}"
-            )
-
-    # Slice the ORIGINAL answer_lines verbatim using the resolved ranges
-    # -- this is the only place the actual answer text is produced, and
-    # it is a pure Python slice, guaranteeing no LLM paraphrasing risk.
-    # The dict is keyed on the ORIGINAL canonical question text (looked
-    # up deterministically via ref_to_question), guaranteeing it matches
-    # whatever process_pdf() looks it up with later.
+    
+    log(f"Using similarity-based answer mapping (NO LLM calls)...")
+    
+    # Use the enhanced slicing approach
+    qa_pairs = enhanced_slice_qa_from_line_items(
+        answer_lines,
+        questions,
+        similarity_threshold=0.25,
+        window=5
+    )
+    
+    # Convert to dict format
     qa_map = {}
-    for r in resolved_ranges:
-        start, end = r["start_line"], r["end_line"]
-        verbatim_lines = [
-            answer_lines[j] for j in range(start, end + 1)
-            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ]
-        original_question = ref_to_question[r["ref"]]
-        answer_text = " ".join(verbatim_lines).strip()
-        # Apply both fixes in sequence: short label prefixes ("Ans 5-")
-        # first, then a full question-sentence echo if the student
-        # re-copied the entire question before their actual answer.
-        answer_text = strip_question_restatement(answer_text)
-        answer_text = strip_full_question_echo(answer_text, original_question)
-        qa_map[original_question] = answer_text
-
+    for pair in qa_pairs:
+        qa_map[pair["question"]] = pair["answer"]
+        if pair.get("has_intro", False):
+            log(f"Preserved introductory text for question: {pair['question'][:60]}...")
+    
+    matched_count = sum(1 for q in questions if q in qa_map and qa_map[q].strip())
+    log(f"Matched {matched_count} of {len(questions)} questions using similarity-based approach")
+    
     return qa_map
 
 
-NOISE_RE = re.compile(
-    r'(?:Teacher\'?s?\s*Signature'
-    r'|Tancher\'?s?\s*Signature'
-    r'|Facebook\'?s?\s*Signature'
-    r'|PAGE\s*NO'
-    r'|^\s*DATE\b'
-    r'|Neel?\s*Kamal'
-    r'|Neal?\s*Kamal'
-    r'|Need?\s*Komal'
-    r'|Nod\s*Komal'
-    r'|TAKMA\s*SINAN'
-    r'|^\s*\d{1,3}\s*$)',
-    re.IGNORECASE
-)
+# Also simplify the extract_canonical_questions function to use less token
+# or skip it entirely if it's causing quota issues
 
+def extract_canonical_questions_simple(qp_pages: list, status_callback=None) -> list:
+    """
+    SIMPLIFIED version - extracts questions from question paper pages
+    using regex/rule-based approach instead of LLM, saving tokens.
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+    
+    if not qp_pages:
+        return []
+    
+    log(f"Extracting questions from {len(qp_pages)} question paper pages using rule-based approach...")
+    
+    all_questions = []
+    
+    for page in qp_pages:
+        text = page["raw_text"]
+        
+        # Split by lines and look for question patterns
+        lines = text.split('\n')
+        current_question = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check if this line starts a new question
+            # Patterns: "1.", "1)", "Q1.", "प्र. 1", "1. (a)", etc.
+            question_start = re.match(
+                r'^\s*(?:\d+[\.\)]\s*|Q\.?\s*\d+\s*[\.\)]\s*|प्र\.?\s*\d+\s*[\.\)]\s*|\([a-z]\)\s*|\([क-घ]\)\s*)',
+                line,
+                re.IGNORECASE
+            )
+            
+            if question_start:
+                # Save previous question if exists
+                if current_question:
+                    q_text = " ".join(current_question).strip()
+                    if q_text and len(q_text) > 10:  # Avoid very short fragments
+                        all_questions.append(q_text)
+                    current_question = []
+                
+                # Start new question
+                current_question.append(line)
+            else:
+                # Continue current question
+                if current_question:
+                    current_question.append(line)
+                elif len(line) > 30:  # Could be a question without numbering
+                    # Check if it looks like a question (contains question words or is long enough)
+                    if re.search(r'\b(?:what|why|how|explain|discuss|describe|examine|write|comment|compare|analyse|analyze)\b', line, re.IGNORECASE):
+                        current_question.append(line)
+        
+        # Don't forget the last question
+        if current_question:
+            q_text = " ".join(current_question).strip()
+            if q_text and len(q_text) > 10:
+                all_questions.append(q_text)
+    
+    # Deduplicate questions
+    unique_questions = []
+    for q in all_questions:
+        is_duplicate = False
+        for existing in unique_questions:
+            if _is_near_duplicate_question(q, existing):
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            unique_questions.append(q)
+    
+    log(f"Extracted {len(unique_questions)} questions using rule-based approach")
+    return unique_questions
 
 def is_noise(line: str) -> bool:
     return bool(NOISE_RE.search(line))
@@ -2682,9 +2601,7 @@ def process_pdf(file_input, status_callback=None):
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
-    # FIX: catches a misclassified page split BEFORE spending any
-    # answer-mapping LLM calls, rather than discovering it only after
-    # a full (doomed) round of calls produces zero matches.
+    # Check if answer pages look plausible
     pages_look_plausible = _sanity_check_answer_pages(answer_lines, len(official_questions), log)
     if not pages_look_plausible:
         raise Exception(
@@ -2693,54 +2610,31 @@ def process_pdf(file_input, status_callback=None):
             f"{len(official_questions)} question(s) found. This usually means the "
             "question-paper/answer-page page split misclassified pages -- check the "
             "'Question paper pages detected' log line above against the actual "
-            "document structure. No answer-mapping LLM calls were made, since they "
-            "would be guaranteed to fail."
+            "document structure."
         )
 
-    # FIX: replaces the old similarity-based sliding-window matching
-    # (which could let one question's answer swallow several others --
-    # the exact bug seen in real usage) with LLM-based, per-question
-    # INDEPENDENT answer extraction. Each question's answer boundary is
-    # identified on its own merits by the LLM reading the actual text,
-    # with a hard Python-side overlap-resolution safety net guaranteeing
-    # no answer can ever absorb another's content.
-    log("Mapping each question to its answer independently (LLM-based)...")
-    qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
+    # Use SIMILARITY-BASED mapping (NO LLM calls) - saves token quota
+    log("Mapping each question to its answer using similarity-based approach (NO LLM calls)...")
+    qa_map = map_answers_with_similarity(answer_lines, official_questions, status_callback)
 
-    matched_count = sum(1 for q in official_questions if q in qa_map)
+    matched_count = sum(1 for q in official_questions if q in qa_map and qa_map[q].strip())
     log(f"Matched {matched_count} of {len(official_questions)} questions")
 
     for q in official_questions:
-        if q not in qa_map:
-            log(f"WARNING: No match found for: {q[:60]}")
-
-    if not qa_map:
-        raise Exception(
-            "Could not match any questions to answers.\n"
-            f"Official questions: {official_questions}\n"
-            f"First 10 answer lines: {answer_lines[:10]}"
-        )
+        if q not in qa_map or not qa_map[q].strip():
+            log(f"WARNING: No match found for: {q[:60]}...")
 
     # Build the Q&A pairs list, preserving the official question order
-    # and explicitly marking unmatched questions rather than silently
-    # dropping them -- this makes it clear in the output which
-    # questions were genuinely not found versus matched-but-empty.
     qa_pairs = []
     for q in official_questions:
         qa_pairs.append({
             "question": q,
             "answer": qa_map.get(q, ""),
-            "matched": q in qa_map,
+            "matched": q in qa_map and bool(qa_map[q].strip()),
         })
 
     log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
 
-    # Returns BOTH requested outputs separately:
-    # - ocr_json: the complete raw OCR of the whole PDF, every page
-    # - qa_pairs: the clean, independently-mapped question -> answer
-    #   pairs, in official question order
-    # The caller is responsible for writing these to two separate
-    # files (see save_outputs() below for a ready-made helper).
     return ocr_json, qa_pairs
 
 
