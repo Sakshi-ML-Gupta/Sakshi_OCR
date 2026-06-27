@@ -2167,7 +2167,417 @@ def find_question_boundaries_by_similarity(
             last_line_index = chosen["line_index"]
 
     return final
+# Add these fixes after the existing imports and before the answer mapping functions
 
+# =========================================================
+# FIX: Enhanced Answer Boundary Detection for Cross-Pollution
+# =========================================================
+
+def detect_question_boundaries_with_intro_handling(
+    answer_lines: list,
+    questions: list,
+    similarity_threshold: float = 0.25,
+    window: int = 5
+) -> list:
+    """
+    ENHANCED FIX: Detects where each question's answer STARTS, with special
+    handling for:
+    1. Introductory text before the first answer
+    2. Cross-pollution between adjacent answers
+    3. Answers that restate the question without formal labels
+    
+    Returns a list of boundary objects with 'line_index' and 'span' for each question.
+    """
+    # First, try to find answer starts using multiple strategies
+    
+    boundaries = []
+    used_line_indices = set()
+    
+    # Strategy 1: Look for explicit answer labels with question numbers
+    for i, line in enumerate(answer_lines):
+        if i in used_line_indices:
+            continue
+            
+        line_stripped = line.strip()
+        if len(line_stripped) < 10:
+            continue
+            
+        # Check if this line contains an explicit answer label with a question number
+        label_match = re.search(
+            r'(?:Ans(?:wer)?[.\s:-]+\s*(\d+)|उत्तर\s*(\d+)|प्र[\.\s]*(\d+)|Q\.?\s*(\d+))',
+            line_stripped,
+            re.IGNORECASE
+        )
+        
+        if label_match:
+            q_num = None
+            for group in label_match.groups():
+                if group:
+                    q_num = int(group)
+                    break
+            
+            if q_num and 1 <= q_num <= len(questions):
+                # Find which question index this corresponds to
+                for idx, q in enumerate(questions):
+                    q_num_match = re.match(r'\s*(\d+)', q)
+                    if q_num_match and int(q_num_match.group(1)) == q_num:
+                        boundaries.append({
+                            'question': q,
+                            'question_index': idx,
+                            'line_index': i,
+                            'span': 0,  # No extra text to skip
+                            'score': 1.0,
+                            'method': 'explicit_label'
+                        })
+                        used_line_indices.add(i)
+                        break
+    
+    # Strategy 2: For questions not found by explicit labels, use similarity
+    # with improved matching that handles introductory text
+    remaining_questions = []
+    for idx, q in enumerate(questions):
+        if not any(b.get('question_index') == idx for b in boundaries):
+            remaining_questions.append((idx, q))
+    
+    if remaining_questions:
+        # Build a candidate map for remaining questions
+        candidates_by_question = {}
+        
+        for q_idx, q in remaining_questions:
+            candidates_by_question[q] = []
+            
+            # Search for the answer start - look for restatement or content match
+            for i in range(len(answer_lines)):
+                if i in used_line_indices:
+                    continue
+                    
+                line_i = answer_lines[i].strip()
+                if len(line_i) < 8:
+                    continue
+                
+                # Try different window sizes to capture the restatement
+                for w in range(1, window + 1):
+                    if i + w > len(answer_lines):
+                        break
+                    
+                    combined = " ".join(
+                        answer_lines[i + k].strip()
+                        for k in range(w) if answer_lines[i + k].strip()
+                    )
+                    if len(combined) < 10:
+                        continue
+                    
+                    # Strip common prefixes for better matching
+                    combined_clean = strip_leading_label(combined)
+                    q_clean = strip_leading_label(q)
+                    
+                    # Calculate multiple similarity scores
+                    s1 = similarity(combined, q)
+                    s2 = similarity(combined_clean, q_clean)
+                    
+                    # Also check for distinctive word overlap (fixes the 
+                    # "akam" vs "puram" issue mentioned in the code comments)
+                    distinctive_q = _distinctive_words(q)
+                    distinctive_combined = _distinctive_words(combined)
+                    word_overlap = 0
+                    if distinctive_q and distinctive_combined:
+                        word_overlap = len(set(distinctive_q) & set(distinctive_combined)) / max(len(distinctive_q), len(distinctive_combined))
+                    
+                    score = max(s1, s2, word_overlap)
+                    
+                    if score >= similarity_threshold:
+                        candidates_by_question[q].append({
+                            'question': q,
+                            'question_index': q_idx,
+                            'line_index': i,
+                            'span': w,
+                            'score': score,
+                            'method': 'similarity'
+                        })
+        
+        # Sort candidates by score and pick the best for each question
+        for q in candidates_by_question:
+            candidates_by_question[q].sort(key=lambda c: -c['score'])
+        
+        # Greedy assignment - ensure each line is used only once
+        for q in remaining_questions:
+            q_text = q[1]
+            cands = candidates_by_question.get(q_text, [])
+            
+            for c in cands:
+                if c['line_index'] not in used_line_indices:
+                    boundaries.append(c)
+                    used_line_indices.add(c['line_index'])
+                    break
+    
+    # Sort boundaries by line index
+    boundaries.sort(key=lambda b: b['line_index'])
+    
+    # Strategy 3: If we still have missing questions, look for them
+    # in the answer text using content-based search (including intro text)
+    found_indices = set(b.get('question_index') for b in boundaries if 'question_index' in b)
+    missing_indices = [i for i in range(len(questions)) if i not in found_indices]
+    
+    if missing_indices:
+        for q_idx in missing_indices:
+            q = questions[q_idx]
+            
+            # Try to find this question's answer by looking for its 
+            # distinctive content in the remaining lines
+            best_match = None
+            best_score = 0.0
+            
+            for i in range(len(answer_lines)):
+                if i in used_line_indices:
+                    continue
+                    
+                line = answer_lines[i].strip()
+                if len(line) < 20:  # Answers typically start with substantial text
+                    continue
+                
+                # Check if this line contains distinctive content from the question
+                # (even without a formal label, the answer might restate the topic)
+                q_words = set(normalize(q).split())
+                line_words = set(normalize(line).split())
+                
+                if q_words and line_words:
+                    overlap = len(q_words & line_words) / max(len(q_words), 1)
+                    
+                    # Also check the next few lines for better context
+                    context_lines = [line]
+                    for j in range(1, 4):
+                        if i + j < len(answer_lines):
+                            context_lines.append(answer_lines[i + j].strip())
+                    context = " ".join(context_lines)
+                    context_words = set(normalize(context).split())
+                    context_overlap = len(q_words & context_words) / max(len(q_words), 1)
+                    
+                    score = max(overlap, context_overlap)
+                    
+                    if score > best_score and score >= 0.15:
+                        best_score = score
+                        best_match = {
+                            'question': q,
+                            'question_index': q_idx,
+                            'line_index': i,
+                            'span': 0,
+                            'score': score,
+                            'method': 'content_search'
+                        }
+            
+            if best_match:
+                boundaries.append(best_match)
+                used_line_indices.add(best_match['line_index'])
+    
+    # Final sort by line index
+    boundaries.sort(key=lambda b: b['line_index'])
+    
+    return boundaries
+
+
+def slice_qa_with_intro_handling(
+    answer_lines: list, 
+    boundaries: list, 
+    questions: list
+) -> list:
+    """
+    ENHANCED FIX: Slices answers from the raw text, with special handling
+    for:
+    1. Preserving introductory text before the first answer
+    2. Preventing cross-pollution between adjacent answers
+    3. Handling partial or missing boundaries
+    """
+    if not boundaries:
+        return []
+    
+    qa_pairs = []
+    
+    # Ensure we have the full list of questions
+    question_map = {q: i for i, q in enumerate(questions)}
+    
+    # First, find the start of the first answer (including intro text)
+    first_answer_start = boundaries[0]['line_index']
+    
+    # Check if there's introductory text before the first answer
+    intro_lines = []
+    if first_answer_start > 0:
+        # Look for introductory text (3-4 lines that don't match any question)
+        intro_candidate = []
+        for j in range(0, first_answer_start):
+            line = answer_lines[j].strip()
+            if line and not is_noise(line):
+                intro_candidate.append(line)
+        
+        # Check if this looks like genuine intro text (substantial content)
+        if intro_candidate and len(" ".join(intro_candidate)) > 100:
+            intro_lines = intro_candidate
+    
+    # Now slice the answers
+    for i, b in enumerate(boundaries):
+        span = b.get("span", 0)
+        a_start = b["line_index"] + span
+        
+        # Determine end of this answer
+        if i + 1 < len(boundaries):
+            a_end = boundaries[i + 1]["line_index"]
+        else:
+            a_end = len(answer_lines)
+        
+        # Extract the answer text
+        raw_lines = []
+        
+        # Special case: first answer gets the intro text
+        if i == 0 and intro_lines:
+            raw_lines.extend(intro_lines)
+            # Also add the actual answer lines, but avoid duplication
+            for j in range(a_start, a_end):
+                line = answer_lines[j].strip()
+                if line and not is_noise(line):
+                    # Avoid duplicating intro text if it appears again
+                    if line not in intro_lines or len(intro_lines) < 3:
+                        raw_lines.append(line)
+        else:
+            for j in range(a_start, a_end):
+                line = answer_lines[j].strip()
+                if line and not is_noise(line):
+                    raw_lines.append(line)
+        
+        # Check if the question's answer is genuinely in this slice
+        q = b["question"]
+        answer_text = " ".join(raw_lines).strip()
+        
+        # If the answer text is too short or doesn't contain relevant content,
+        # try to find the real answer in the surrounding text
+        if len(answer_text) < 50 and i + 1 < len(boundaries):
+            # This might be a boundary error - expand to include more text
+            next_start = boundaries[i + 1]["line_index"]
+            expanded_lines = []
+            for j in range(a_start, next_start):
+                line = answer_lines[j].strip()
+                if line and not is_noise(line):
+                    expanded_lines.append(line)
+            if expanded_lines:
+                expanded_text = " ".join(expanded_lines).strip()
+                if len(expanded_text) > len(answer_text):
+                    # Check if this expanded text contains content relevant to this question
+                    q_words = set(normalize(q).split())
+                    exp_words = set(normalize(expanded_text).split())
+                    if q_words and exp_words:
+                        overlap = len(q_words & exp_words) / max(len(q_words), 1)
+                        if overlap > 0.1:  # Some relevance
+                            answer_text = expanded_text
+                            raw_lines = expanded_lines
+        
+        # Clean up the answer
+        answer_text = strip_question_restatement(answer_text)
+        answer_text = strip_full_question_echo(answer_text, q)
+        
+        # Remove any trailing empty lines
+        answer_text = "\n".join(
+            line for line in answer_text.split("\n") 
+            if line.strip()
+        )
+        
+        # Determine which question this is (using the question text, not index)
+        # This handles the case where boundaries might be mis-indexed
+        matching_question = None
+        q_idx = None
+        
+        # First try exact match
+        for q_text in questions:
+            if q_text == q:
+                matching_question = q_text
+                break
+        
+        # If not found, try fuzzy match
+        if not matching_question:
+            for q_text in questions:
+                if _is_near_duplicate_question(q, q_text):
+                    matching_question = q_text
+                    break
+        
+        # If still not found, use the original question
+        if not matching_question:
+            matching_question = q
+        
+        qa_pairs.append({
+            "question": matching_question,
+            "answer": answer_text,
+            "matched": True,
+            "has_intro": i == 0 and bool(intro_lines)
+        })
+    
+    return qa_pairs
+
+
+def enhanced_slice_qa_from_line_items(
+    answer_lines: list,
+    questions: list,
+    similarity_threshold: float = 0.25,
+    window: int = 5
+) -> list:
+    """
+    ENHANCED FIX: Complete replacement for the problematic slicing function
+    that caused:
+    1. Cross-polluted answers (bleeding)
+    2. Dropped introductory text
+    
+    This function combines the improved boundary detection and slicing
+    to produce clean, properly segmented question-answer pairs.
+    """
+    # Step 1: Detect boundaries with intro handling
+    boundaries = detect_question_boundaries_with_intro_handling(
+        answer_lines,
+        questions,
+        similarity_threshold,
+        window
+    )
+    
+    # Step 2: If we didn't find enough boundaries, use content-based fallback
+    if len(boundaries) < len(questions) * 0.5:
+        # Fallback: use the original similarity approach but with improvements
+        boundaries = find_question_boundaries_by_similarity(
+            answer_lines,
+            questions,
+            similarity_threshold,
+            window
+        )
+    
+    # Step 3: Slice the answers with intro handling
+    qa_pairs = slice_qa_with_intro_handling(
+        answer_lines,
+        official_questions,
+        similarity_threshold=0.25,
+        window=5
+    )
+    
+    # Step 4: Ensure we have all questions covered
+    matched_questions = [pair["question"] for pair in qa_pairs]
+    
+    # Find any missing questions
+    for q in questions:
+        if q not in matched_questions:
+            # Try to find this question's answer in the remaining content
+            found = False
+            for pair in qa_pairs:
+                if _is_near_duplicate_question(q, pair["question"]):
+                    found = True
+                    break
+            
+            if not found:
+                # Add an empty entry for this question
+                qa_pairs.append({
+                    "question": q,
+                    "answer": "",
+                    "matched": False,
+                    "has_intro": False
+                })
+    
+    # Step 5: Sort by question order
+    question_order = {q: i for i, q in enumerate(questions)}
+    qa_pairs.sort(key=lambda p: question_order.get(p["question"], 999))
+    
+    return qa_pairs
 
 def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
     qa_pairs = []
