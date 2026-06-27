@@ -1597,8 +1597,32 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
             1 for w in q_distinctive
             if any(_words_nearly_match(w, lw) for lw in line_words)
         )
-        required = max(1, round(len(q_distinctive) * min_fraction))
-        if matched >= required:
+        # FIX (this round): a genuinely long (e.g. 7-page) answer is
+        # statistically much more likely to organically reference
+        # ANOTHER question's topic in passing somewhere within its own
+        # span -- confirmed in testing with realistic comparative
+        # sentences ("This mirrors the jealousy Duryodhana felt toward
+        # the Pandavas...", appearing INSIDE a different question's
+        # long answer). The previous formula (round(n * 0.5), with no
+        # floor above 1) let such passing mentions through as if they
+        # were a genuine new-answer start, incorrectly splitting one
+        # long answer into two broken pieces wherever it happened to
+        # mention another question's vocabulary.
+        #
+        # required_matches() now requires AT LEAST 2 distinctive words
+        # to match whenever a question has 2 or more distinctive words
+        # at all (only single-distinctive-word questions, e.g. just
+        # "Mrichchhkatika", fall back to requiring that one word) --
+        # a single shared topic word is common in passing references,
+        # but two or more matching is a much stronger, rarer signal
+        # that genuinely correlates with an actual restatement opening
+        # rather than an incidental mention.
+        def _required_matches(n_distinctive, fraction=min_fraction):
+            if n_distinctive <= 1:
+                return n_distinctive
+            return max(2, round(n_distinctive * fraction))
+
+        if matched >= _required_matches(len(q_distinctive)):
             return i
 
     return None
@@ -1741,7 +1765,16 @@ QUESTION_PREFIX_RE = re.compile(
     r'|उत्तर\s*\d*\s*[\-\:]\s*'                # "उत्तर-", "उत्तर 5-" (dash/colon required)
     r'|प्र[०.\s]+\d+[.\s:-]*'                   # "प्र. 8." (number required)
     r'|प्रश्न[.\s]+\d+[.\s:-]*'                 # "प्रश्न. 2." (number required)
-    r'|Q\.?\s*\d+[.\s:-]*'                      # "Q.8", "Q5-"
+    r'|Q\.?\s*\d+\s*[.:\-]\s*'                  # FIX: "Q.8-", "Q5:" now require
+    # explicit trailing punctuation, matching every other branch above.
+    # The previous version ("Q\.?\s*\d+[.\s:-]*", trailing punctuation
+    # OPTIONAL via "*") matched legitimate answer content like "Q.8
+    # marks allocated suggest this requires..." -- the student
+    # discussing the question's own mark allocation as part of their
+    # REAL answer, not restating a label -- silently eating "Q.8 "
+    # from genuine content. A real label always has a dash/colon/period
+    # right after the number ("Q.8-", "Q.8:"); ordinary prose mentioning
+    # a question number does not.
     r')',
     re.IGNORECASE
 )
