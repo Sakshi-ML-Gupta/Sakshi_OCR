@@ -983,6 +983,50 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
 
 # =========================================================
+# SUB-PART QUESTION EXTRACTION
+# =========================================================
+
+def _extract_clean_subpart_question(question_text: str) -> tuple:
+    """
+    Extracts clean sub-part from a question like:
+    "9. निम्नलिखित पर टिप्पणी लिखिए।\n\n4×5 = 20\n\n(क) सूचना प्रौद्योगिकी और हिंदी भाषा"
+    Returns: (parent_num, subpart_label, clean_text)
+    """
+    # Pattern for sub-part with full parent context
+    subpart_pattern = re.compile(
+        r'^(\d+)\.\s*.*?(?:\(([क-घa-d])\)|\(([ivx]+)\))\s*(.*?)$',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    # Clean the text first - remove common noise
+    cleaned = question_text.strip()
+    cleaned = re.sub(r'\n+', ' ', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    
+    match = subpart_pattern.search(cleaned)
+    if match:
+        parent_num = match.group(1)
+        # Check which subpart pattern matched
+        if match.group(2):  # क-घ or a-d
+            subpart = match.group(2)
+            clean_text = match.group(4).strip()
+        elif match.group(3):  # i, ii, iii, iv
+            subpart = match.group(3)
+            clean_text = match.group(4).strip()
+        else:
+            return None, None, None
+        
+        # Remove any remaining parent instruction noise
+        clean_text = re.sub(r'^\s*[\.\s]+', '', clean_text)
+        clean_text = re.sub(r'\s*\d+\s*$', '', clean_text)  # Remove trailing numbers
+        clean_text = re.sub(r'^\s*[\(\）]', '', clean_text)  # Remove stray parentheses
+        
+        return parent_num, subpart, clean_text
+    
+    return None, None, None
+
+
+# =========================================================
 # LLM-BASED ANSWER MAPPING (Groq)
 # =========================================================
 
@@ -994,13 +1038,13 @@ Your task: for EACH official question, find WHERE in the answer text the student
 
 Important guidance for finding boundaries correctly:
 - A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
-- CRITICAL -- introductory lines before the first numbered point: a student's answer frequently opens with 2-4 lines of general, introductory prose BEFORE reaching their first specific numbered point, sub-heading, or detailed argument (e.g. defining a general concept before listing specific examples). This introduction often does NOT explicitly restate the question's exact topic words. Do NOT mistake the first numbered point (e.g. "1.") or first detailed sub-heading for the TRUE start of the answer -- look BACKWARD from that point to check whether the immediately preceding lines are still part of the SAME train of thought (general scene-setting that leads into it), rather than belonging to a different, earlier question. If the preceding lines do not look like they belong to a different question (no restatement of a different topic, no different question's distinctive content), include them as part of THIS answer's start, even though they don't contain an obvious "start marker" themselves.
-- An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins (whether or not the next answer is in your list of official questions).
-- CRITICAL -- ambiguous boundaries between adjacent sub-parts (e.g. (क)/(ख)/(ग)/(घ) or (i)/(ii)/(iii)): when you cannot find a clear marker for where one labeled sub-part's answer ends and the next begins, do NOT default to including everything up to the next REF's start line as a fallback -- this routinely causes one sub-part's content to "bleed" into the next, mixing genuinely distinct paragraphs that belong to different sub-answers. Instead, look for a CONTENT-level shift: a new sentence that introduces a different specific concept, term, or sub-topic than what was just being discussed is a much more reliable boundary than line proximity alone. If you truly cannot distinguish where one sub-part ends and the next begins even by content, it is better to end the range slightly EARLIER (a shorter but cleanly correct answer) than to extend it through content that may belong to the next sub-part.
-- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely from your output. It may appear in a different chunk of the document.
-- Each REF's range must NOT overlap with another REF's range. If you are unsure exactly where one answer ends and the next begins, prefer ending the EARLIER answer sooner rather than letting it swallow content that belongs to a later answer -- a short correct answer is far more useful than a long answer that incorrectly absorbed unrelated content.
-- Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
-- Use the EXACT REF label (e.g. "REF-A") to identify each question. Do NOT retype or paraphrase the question text itself -- the REF label is all that's needed.
+- CRITICAL -- introductory lines before the first numbered point: a student's answer frequently opens with 2-4 lines of general, introductory prose BEFORE reaching their first specific numbered point, sub-heading, or detailed argument. Do NOT mistake the first numbered point for the TRUE start of the answer -- look BACKWARD.
+- An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins.
+- CRITICAL -- ambiguous boundaries between adjacent sub-parts (e.g. (क)/(ख)/(ग)/(घ) or (i)/(ii)/(iii)): look for a CONTENT-level shift. A new sentence that introduces a different specific concept, term, or sub-topic than what was just being discussed is a more reliable boundary.
+- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely.
+- Each REF's range must NOT overlap with another REF's range.
+- Use the line numbers EXACTLY as given in [brackets].
+- Use the EXACT REF label (e.g. "REF-A") to identify each question.
 
 Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
 
@@ -1011,68 +1055,38 @@ Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape
   ]
 }
 
-If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any of these answers."""
+If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result."""
 
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
     """
-    Enhanced to handle sub-part questions better by grouping them.
+    Enhanced to handle sub-part questions with clean labels.
     """
-    # Group questions by parent number for sub-parts
-    grouped_questions = []
-    current_group = []
-    parent_prefix = None
-    
-    # Pattern for sub-part questions: 9.(क), 9.(ख), etc.
-    sub_part_pattern = re.compile(r'^(\d+)\.\s*\(([क-घa-d])\)')
-    
+    # First, clean up sub-part questions for better mapping
+    cleaned_questions = []
     for i, q in enumerate(questions):
-        match = sub_part_pattern.match(q.strip())
-        if match:
-            question_num = match.group(1)
-            if parent_prefix is None:
-                parent_prefix = question_num
-            if parent_prefix == question_num:
-                current_group.append((i, q))
-            else:
-                if current_group:
-                    grouped_questions.append(current_group)
-                current_group = [(i, q)]
-                parent_prefix = question_num
+        parent_num, subpart, clean_text = _extract_clean_subpart_question(q)
+        if parent_num and subpart:
+            # This is a sub-part - use clean text
+            cleaned_questions.append((i, f"{parent_num}.({subpart}) {clean_text}"))
         else:
-            if current_group:
-                grouped_questions.append(current_group)
-                current_group = []
-                parent_prefix = None
-            grouped_questions.append([(i, q)])
+            cleaned_questions.append((i, q))
     
-    if current_group:
-        grouped_questions.append(current_group)
-    
-    # Build the prompt with grouped sub-parts
+    # Build the prompt with clean questions
     questions_block_parts = []
-    for group in grouped_questions:
-        if len(group) > 1:
-            # This is a multi-part question with sub-parts
-            parent_idx, parent_q = group[0]
-            questions_block_parts.append(f"[REF-{chr(65+parent_idx)}] {parent_q}")
-            for idx, q in group[1:]:
-                questions_block_parts.append(f"  [REF-{chr(65+idx)}] {q}")
-        else:
-            idx, q = group[0]
-            questions_block_parts.append(f"[REF-{chr(65+idx)}] {q}")
+    for idx, q_text in cleaned_questions:
+        ref_label = f"REF-{chr(65+idx)}"
+        questions_block_parts.append(f"[{ref_label}] {q_text}")
     
     questions_block = "\n".join(questions_block_parts)
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
     
     return (
-        f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label -- "
-        f"use the REF label, not retyped question text, to identify which "
-        f"question an answer belongs to):\n{questions_block}\n\n"
+        f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label):\n{questions_block}\n\n"
         f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}\n\n"
-        f"IMPORTANT: For multi-part questions (like 9.(क), 9.(ख), 9.(ग), 9.(घ)), "
+        f"IMPORTANT: For multi-part questions like 9.(क), 9.(ख), 9.(ग), 9.(घ), "
         f"each sub-part has its own REF label. Map each sub-part's answer separately "
-        f"based on the specific sub-part content, not the parent question."
+        f"based on the specific content of that sub-part."
     )
 
 
@@ -1154,9 +1168,9 @@ def _distinctive_words(text: str, max_words: int = 20) -> list:
     return sorted(set(w for w in words if w not in _QUESTION_STOPWORDS))
 
 
-def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.4) -> int:
+def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.35) -> int:
     """
-    Enhanced to better detect sub-part answer starts.
+    Enhanced to better detect sub-part answer starts with fuzzy matching.
     """
     # First check for explicit label matches
     label_match = _ANSWER_START_RE.match(line)
@@ -1166,22 +1180,22 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
             label_num = num_match.group(0)
             # Check for sub-part pattern in the line
             sub_match = re.search(r'[\(（]([क-घa-d])[\)）]', line, re.IGNORECASE)
-            sub_label = sub_match.group(1) if sub_match else None
+            sub_label = sub_match.group(1).lower() if sub_match else None
             
             for i, q in enumerate(questions):
-                q_num_match = re.match(r'\s*(\d+)', q)
-                if q_num_match and q_num_match.group(1) == label_num:
-                    # Check if this is a sub-part question
-                    q_sub_match = re.search(r'[\(（]([क-घa-d])[\)）]', q, re.IGNORECASE)
-                    if q_sub_match and sub_label:
-                        if q_sub_match.group(1).lower() == sub_label.lower():
+                # Extract clean sub-part info
+                parent_num, q_subpart, _ = _extract_clean_subpart_question(q)
+                
+                if parent_num == label_num:
+                    if q_subpart and sub_label:
+                        if q_subpart.lower() == sub_label:
                             return i
-                    elif not q_sub_match and not sub_label:
+                    elif not q_subpart and not sub_label:
                         return i
             return -1
         return -1
 
-    # Content-based matching
+    # Content-based matching with lower threshold for sub-parts
     line_words = sorted(set(re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(line))[:25]))
     if not line_words:
         return None
@@ -1189,8 +1203,18 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
     # Check if the line contains sub-part indicators
     has_sub_part = bool(re.search(r'[\(（]([क-घa-d])[\)）]', line, re.IGNORECASE))
     
+    best_match = None
+    best_score = 0
+    
     for i, q in enumerate(questions):
-        q_distinctive = _distinctive_words(q)
+        # Use cleaned text for comparison
+        _, _, clean_q = _extract_clean_subpart_question(q)
+        if clean_q:
+            q_text = clean_q
+        else:
+            q_text = q
+            
+        q_distinctive = _distinctive_words(q_text)
         if not q_distinctive:
             continue
             
@@ -1211,13 +1235,15 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
         
         def _required_matches(n_distinctive, fraction=min_fraction):
             if n_distinctive <= 2:
-                return n_distinctive
+                return 1  # More lenient for sub-parts
             return max(2, round(n_distinctive * fraction))
 
-        if matched >= _required_matches(len(q_distinctive)):
-            return i
+        required = _required_matches(len(q_distinctive))
+        if matched >= required and matched > best_score:
+            best_score = matched
+            best_match = i
 
-    return None
+    return best_match
 
 
 def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
@@ -1372,6 +1398,47 @@ _PARENT_INSTRUCTION_PREFIX_RE = re.compile(
     r'comment on|explain the following|discuss the following)\s*:?\s*',
     re.IGNORECASE
 )
+
+
+def _extract_answer_for_subpart(answer_text: str, question_text: str) -> str:
+    """
+    Extracts clean answer for a sub-part question.
+    """
+    if not answer_text:
+        return ""
+    
+    # Extract sub-part info from question
+    parent_num, subpart, clean_q = _extract_clean_subpart_question(question_text)
+    
+    if not clean_q:
+        return answer_text
+    
+    # Look for the sub-part label in the answer
+    subpart_pattern = re.compile(
+        rf'[\(（]{re.escape(subpart)}[\)）]',
+        re.IGNORECASE
+    )
+    
+    # If subpart label found, extract content after it
+    match = subpart_pattern.search(answer_text)
+    if match:
+        # Extract from the subpart label to the next subpart or end
+        remaining = answer_text[match.end():].strip()
+        
+        # Check if there's another subpart
+        next_subpart = re.search(r'[\(（]([क-घa-d])[\)）]', remaining)
+        if next_subpart:
+            remaining = remaining[:next_subpart.start()].strip()
+        
+        # Clean up
+        remaining = strip_question_restatement(remaining)
+        remaining = strip_full_question_echo(remaining, clean_q)
+        
+        return remaining
+    
+    # If no subpart label found, try content-based extraction
+    # Use the clean question to find the answer
+    return strip_full_question_echo(answer_text, clean_q)
 
 
 def strip_full_question_echo(answer_text: str, question_text: str) -> str:
@@ -1532,8 +1599,15 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         ]
         original_question = ref_to_question[r["ref"]]
         answer_text = " ".join(verbatim_lines).strip()
-        answer_text = strip_question_restatement(answer_text)
-        answer_text = strip_full_question_echo(answer_text, original_question)
+        
+        # Use enhanced extraction for sub-parts
+        parent_num, subpart, _ = _extract_clean_subpart_question(original_question)
+        if parent_num and subpart:
+            answer_text = _extract_answer_for_subpart(answer_text, original_question)
+        else:
+            answer_text = strip_question_restatement(answer_text)
+            answer_text = strip_full_question_echo(answer_text, original_question)
+        
         qa_map[original_question] = answer_text
 
     return qa_map
