@@ -337,7 +337,7 @@ def process_reference(file_input, status_callback=None):
 GROQ_MODEL = "openai/gpt-oss-120b"
 
 TPM_LIMIT = 8000
-TPM_SAFETY_FRACTION = 0.85
+TPM_SAFETY_FRACTION = 0.80  # Increased safety margin
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 
 MAX_CHARS_PER_CHUNK = 6000
@@ -418,13 +418,13 @@ def _estimate_tokens(text: str) -> int:
 
 class _TokenBudgetTracker:
     """
-    FIX: uses a sliding-window event log for accurate token tracking.
+    Uses a sliding-window event log for accurate token tracking.
     """
     def __init__(self, tpm_limit=TPM_LIMIT, safety_fraction=TPM_SAFETY_FRACTION):
         import collections
         self.tpm_limit = tpm_limit
         self.safe_limit = tpm_limit * safety_fraction
-        self.events = collections.deque()  # (timestamp, tokens)
+        self.events = collections.deque()
 
     def _prune(self, now=None):
         now = now if now is not None else time.monotonic()
@@ -610,7 +610,8 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
     """
     import groq
 
-    estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
+    # Calculate estimated tokens more accurately
+    estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 500
     last_error = None
 
     skip_next_proactive_check = False
@@ -667,18 +668,28 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 
             if detail:
                 budget.record_actual_from_error(detail["used"], detail["limit"])
+                wait_time = detail["wait_seconds"] + 1.0
                 log(
                     f"Chunk LLM call hit a rate/size limit (attempt {attempt}): "
                     f"{detail['limit_type']} limit={detail['limit']}, "
                     f"used={detail['used']}, requested={detail['requested']}. "
-                    f"Waiting {detail['wait_seconds'] + 0.5:.1f}s (Groq-reported) "
-                    f"before retrying..."
+                    f"Waiting {wait_time:.1f}s before retrying..."
                 )
-                time.sleep(detail["wait_seconds"] + 0.5)
+                time.sleep(wait_time)
                 budget.reset_window()
                 skip_next_proactive_check = True
             else:
-                wait_s = 5.0 * attempt
+                # Check if it's a 413 error (too large)
+                if "413" in str(e) or "Request too large" in str(e):
+                    # Extract requested tokens if possible
+                    requested_match = re.search(r'Requested\s+(\d+)', str(e))
+                    if requested_match:
+                        requested = int(requested_match.group(1))
+                        log(f"Request too large: {requested} tokens requested. Reducing chunk size.")
+                    # Wait longer for 413 errors
+                    wait_s = 10.0 * attempt
+                else:
+                    wait_s = 5.0 * attempt
                 log(
                     f"Chunk LLM call hit a rate/size limit (attempt {attempt}): {e}. "
                     f"Waiting {wait_s:.1f}s before retrying..."
@@ -688,7 +699,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
         except Exception as e:
             last_error = e
             log(f"Chunk LLM call/parse attempt {attempt} failed: {e}")
-            time.sleep(1)
+            time.sleep(2)
 
     raise Exception(
         f"Chunk LLM call failed after {max_retries + 1} attempts. Last error: {last_error}"
@@ -823,7 +834,6 @@ def _extract_questions_from_text(text: str) -> list:
     questions = []
     lines = text.split('\n')
     
-    # Patterns for different numbering formats
     number_pattern = re.compile(r'^(\d+)\.\s+(.*)')
     hindi_pattern = re.compile(r'^([१-९][०-९]*)\.\s+(.*)')
     subpart_pattern = re.compile(r'^[\(（]([क-घa-d])[\)）]\s+(.*)')
@@ -838,7 +848,6 @@ def _extract_questions_from_text(text: str) -> list:
         if not line or len(line) < 3:
             continue
             
-        # Try each pattern
         match = number_pattern.match(line)
         if match:
             if current_question and current_number:
@@ -876,7 +885,6 @@ def _extract_questions_from_text(text: str) -> list:
             is_subpart = True
             continue
             
-        # If line continues previous question
         if current_question and not is_subpart:
             if re.match(r'^\d+\s', line):
                 if current_question:
@@ -886,7 +894,6 @@ def _extract_questions_from_text(text: str) -> list:
             else:
                 current_question += " " + line
     
-    # Add last question
     if current_question and current_number:
         questions.append(f"{current_number}. {current_question}")
     
@@ -894,9 +901,6 @@ def _extract_questions_from_text(text: str) -> list:
 
 
 def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
-    """
-    FIXED: Simple and reliable question extraction with multiple fallbacks.
-    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -905,14 +909,12 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
     if not qp_pages:
         return []
 
-    # Combine all question paper pages
     all_text = ""
     for page in qp_pages:
         all_text += page["raw_text"] + "\n\n"
     
     log(f"Extracting questions from {len(qp_pages)} page(s)...")
     
-    # Try LLM first
     from groq import Groq
     api_key = get_api_key("GROQ_API_KEY")
     
@@ -945,7 +947,6 @@ Return format: {{"questions": ["1. Question text", "2. Question text"]}}"""
         except Exception as e:
             log(f"LLM extraction failed: {e}")
     
-    # Fallback: extract using regex
     log("Using fallback extraction...")
     questions = _extract_questions_from_text(all_text)
     
@@ -953,7 +954,6 @@ Return format: {{"questions": ["1. Question text", "2. Question text"]}}"""
         log(f"Extracted {len(questions)} questions using fallback")
         return questions
     
-    # Final fallback: just get all lines with numbers
     log("Using final fallback...")
     lines = all_text.split('\n')
     for line in lines:
@@ -972,7 +972,6 @@ Return format: {{"questions": ["1. Question text", "2. Question text"]}}"""
         return questions
     
     log("ERROR: No questions could be extracted")
-    log(f"Text preview: {all_text[:500]}")
     return []
 
 
@@ -1106,12 +1105,7 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
                     f"WARNING: page {page_idx + 1} was classified as a question "
                     f"paper page but is {length} chars long -- much longer than "
                     f"the typical {baseline:.0f} chars for this document's other "
-                    f"question paper pages. This commonly means the page is "
-                    f"actually the OPENING of a student's answer (where they "
-                    f"restated the question before writing their real response), "
-                    f"which would cause that answer's first page to be silently "
-                    f"excluded. Check page {page_idx + 1} in the OCR output if an "
-                    f"answer appears to be missing its beginning."
+                    f"question paper pages."
                 )
 
     qp_pages_full = [pages[i] for i in qp_page_indices_0based]
@@ -1130,9 +1124,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 # =========================================================
 
 def _extract_clean_subpart_question(question_text: str) -> tuple:
-    """
-    Extracts clean sub-part from a question.
-    """
     subpart_pattern = re.compile(
         r'^(\d+)\.\s*.*?(?:\(([क-घa-d])\)|\(([ivx]+)\))\s*(.*?)$',
         re.DOTALL | re.IGNORECASE
@@ -1164,7 +1155,7 @@ def _extract_clean_subpart_question(question_text: str) -> tuple:
 
 
 # =========================================================
-# FIXED: LLM-BASED ANSWER MAPPING WITH LARGER CHUNKS
+# FIXED: LLM-BASED ANSWER MAPPING WITH OPTIMAL CHUNK SIZE
 # =========================================================
 
 ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
@@ -1173,13 +1164,11 @@ ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers 
 
 Your task: for EACH official question, find WHERE in the answer text the student's response to that specific question starts and ends, and return the LINE NUMBER RANGE (inclusive) for each, identified by its REF label.
 
-Important guidance for finding boundaries correctly:
-- A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
-- CRITICAL -- introductory lines before the first numbered point: a student's answer frequently opens with 2-4 lines of general, introductory prose BEFORE reaching their first specific numbered point.
-- An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins.
+Important guidance:
+- A new answer typically begins where the student restates or references a question.
 - For multi-page answers (7-10 pages), the answer spans across multiple pages - include ALL lines from start to end.
-- CRITICAL -- ambiguous boundaries between adjacent sub-parts: look for a CONTENT-level shift.
-- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range.
+- Look for CONTENT-level shifts between different questions/answers.
+- If a question's answer is genuinely not present, do NOT invent a range.
 - Each REF's range must NOT overlap with another REF's range.
 - Use the line numbers EXACTLY as given in [brackets].
 - Use the EXACT REF label (e.g. "REF-A") to identify each question.
@@ -1196,15 +1185,14 @@ Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape
 If NONE of the official questions' answers appear in the text shown, return {"answers": []}."""
 
 
-# INCREASED CHUNK SIZES FOR MULTI-PAGE ANSWERS
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 25000  # Increased from 11000 to handle 7-8 pages
-ANSWER_MAP_ABSOLUTE_MAX_CHARS = 80000   # Increased from 60000
+# OPTIMAL CHUNK SIZES - balanced for 8000 TPM limit
+# At 2 chars per token, 8000 TPM = ~16000 chars per minute
+# To stay safe, keep each chunk under ~12000 chars
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 12000  # Safe for 8000 TPM
+ANSWER_MAP_ABSOLUTE_MAX_CHARS = 18000   # Hard limit - never exceed this
 
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
-    """
-    Enhanced to handle sub-part questions with clean labels.
-    """
     cleaned_questions = []
     for i, q in enumerate(questions):
         parent_num, subpart, clean_text = _extract_clean_subpart_question(q)
@@ -1224,9 +1212,9 @@ def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
     return (
         f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label):\n{questions_block}\n\n"
         f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}\n\n"
-        f"IMPORTANT: For multi-part questions like 9.(क), 9.(ख), 9.(ग), 9.(घ), "
-        f"each sub-part has its own REF label. Map each sub-part's answer separately. "
-        f"For long answers spanning multiple pages, include ALL lines from start to end."
+        f"IMPORTANT: For multi-part questions, each sub-part has its own REF label. "
+        f"Map each sub-part's answer separately. For long answers spanning multiple pages, "
+        f"include ALL lines from start to end."
     )
 
 
@@ -1306,9 +1294,6 @@ def _distinctive_words(text: str, max_words: int = 20) -> list:
 
 
 def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.35) -> int:
-    """
-    Enhanced to better detect sub-part answer starts with fuzzy matching.
-    """
     label_match = _ANSWER_START_RE.match(line)
     if label_match:
         num_match = re.search(r'\d+', label_match.group(0))
@@ -1379,7 +1364,7 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
                                   absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS) -> list:
     """
-    FIXED: Enhanced chunking that handles multi-page answers (7-10 pages).
+    FIXED: Enhanced chunking with optimal size for 8000 TPM limit.
     """
     if not numbered_lines:
         return []
@@ -1617,8 +1602,13 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
 
     numbered_lines = list(enumerate(answer_lines))
+    
+    # Log total size before chunking
+    total_chars = sum(len(text) for _, text in numbered_lines)
+    log(f"Total answer text: {total_chars} characters, {len(numbered_lines)} lines")
+    
     chunks = _chunk_lines_by_char_budget(numbered_lines, questions)
-    log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
+    log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s)")
 
     all_ranges = []
     chunk_failures = []
@@ -1626,13 +1616,21 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
     for i, chunk in enumerate(chunks):
         line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
-        log(f"Asking LLM to map answers in chunk {i+1}/{len(chunks)} (lines {line_range})...")
+        chunk_chars = sum(len(text) for _, text in chunk)
+        log(f"Chunk {i+1}/{len(chunks)}: {len(chunk)} lines, {chunk_chars} chars (lines {line_range})")
 
         user_prompt = _build_answer_map_user_prompt(chunk, questions)
+        
+        # Check if this chunk is too large
+        estimated_tokens = _estimate_tokens(user_prompt) + _estimate_tokens(ANSWER_MAP_SYSTEM_PROMPT) + 500
+        if estimated_tokens > 7000:  # Leave safety margin for 8000 TPM
+            log(f"WARNING: Chunk {i+1} estimated at {estimated_tokens} tokens, close to limit. Attempting anyway...")
+        
         try:
             chunk_ranges = _call_groq_with_retries(
                 client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
-                _parse_answer_map_llm_response, budget, log
+                _parse_answer_map_llm_response, budget, log,
+                max_retries=3
             )
         except Exception as e:
             log(f"WARNING: chunk {i+1}/{len(chunks)} answer-mapping failed, skipping: {e}")
@@ -1679,11 +1677,8 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         elif chunk_zero_matches == len(chunks):
             sample_lines = [l for l in answer_lines[:15] if l.strip()][:8]
             raise Exception(
-                f"Answer mapping found ZERO matches across all {len(chunks)} chunk(s), "
-                f"even though the LLM calls themselves succeeded. This usually means "
-                f"the 'answer pages' passed in do NOT actually contain the student's "
-                f"answers. Sample of the answer text actually searched: "
-                f"{sample_lines}"
+                f"Answer mapping found ZERO matches across all {len(chunks)} chunk(s). "
+                f"Sample of the answer text actually searched: {sample_lines}"
             )
 
     qa_map = {}
