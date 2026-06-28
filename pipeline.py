@@ -337,7 +337,7 @@ def process_reference(file_input, status_callback=None):
 GROQ_MODEL = "openai/gpt-oss-120b"
 
 TPM_LIMIT = 8000
-TPM_SAFETY_FRACTION = 0.80  # Increased safety margin
+TPM_SAFETY_FRACTION = 0.80
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 
 MAX_CHARS_PER_CHUNK = 6000
@@ -417,9 +417,6 @@ def _estimate_tokens(text: str) -> int:
 # =========================================================
 
 class _TokenBudgetTracker:
-    """
-    Uses a sliding-window event log for accurate token tracking.
-    """
     def __init__(self, tpm_limit=TPM_LIMIT, safety_fraction=TPM_SAFETY_FRACTION):
         import collections
         self.tpm_limit = tpm_limit
@@ -494,7 +491,6 @@ class _TokenBudgetTracker:
             self.events.clear()
 
 
-# Parses Groq's rate-limit message
 _RATE_LIMIT_DETAIL_RE = re.compile(
     r'on\s+tokens\s+per\s+(minute|day)\s*\((TPM|TPD)\).*?'
     r'Limit\s+(\d+),\s*Used\s+(\d+),\s*Requested\s+(\d+).*?'
@@ -604,13 +600,8 @@ def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_pag
 def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                               response_parser, budget: "_TokenBudgetTracker",
                               log, max_retries: int = 4):
-    """
-    Generic Groq chat-completion caller with full retry/pacing/error
-    handling.
-    """
     import groq
 
-    # Calculate estimated tokens more accurately
     estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 500
     last_error = None
 
@@ -679,14 +670,11 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                 budget.reset_window()
                 skip_next_proactive_check = True
             else:
-                # Check if it's a 413 error (too large)
                 if "413" in str(e) or "Request too large" in str(e):
-                    # Extract requested tokens if possible
                     requested_match = re.search(r'Requested\s+(\d+)', str(e))
                     if requested_match:
                         requested = int(requested_match.group(1))
                         log(f"Request too large: {requested} tokens requested. Reducing chunk size.")
-                    # Wait longer for 413 errors
                     wait_s = 10.0 * attempt
                 else:
                     wait_s = 5.0 * attempt
@@ -793,10 +781,6 @@ def _merge_chunk_results(chunk_results: list) -> tuple:
     return sorted(all_qp_pages), deduped_questions
 
 
-# =========================================================
-# FIXED: ENHANCED QUESTION EXTRACTION
-# =========================================================
-
 QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are reading the OFFICIAL question paper pages of a student exam assignment booklet. You are given the complete, exact text of these pages, in order.
 
 Your task: extract the COMPLETE, clean list of every distinct question/sub-part, exactly as printed, and return them in printed order.
@@ -827,10 +811,6 @@ If you cannot find ANY questions, return {"questions": []} - but ONLY if there i
 
 
 def _extract_questions_from_text(text: str) -> list:
-    """
-    Simple but effective question extraction from text.
-    Works with any numbering format.
-    """
     questions = []
     lines = text.split('\n')
     
@@ -1155,7 +1135,7 @@ def _extract_clean_subpart_question(question_text: str) -> tuple:
 
 
 # =========================================================
-# FIXED: LLM-BASED ANSWER MAPPING WITH OPTIMAL CHUNK SIZE
+# FIXED: LLM-BASED ANSWER MAPPING WITH OPTIMAL CHUNK SIZES
 # =========================================================
 
 ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
@@ -1185,11 +1165,14 @@ Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape
 If NONE of the official questions' answers appear in the text shown, return {"answers": []}."""
 
 
-# OPTIMAL CHUNK SIZES - balanced for 8000 TPM limit
+# =========================================================
+# FIXED: OPTIMAL CHUNK SIZES FOR 8000 TPM LIMIT
+# =========================================================
+
 # At 2 chars per token, 8000 TPM = ~16000 chars per minute
-# To stay safe, keep each chunk under ~12000 chars
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 12000  # Safe for 8000 TPM
-ANSWER_MAP_ABSOLUTE_MAX_CHARS = 18000   # Hard limit - never exceed this
+# Keep each chunk under 10000 chars to stay safe
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 10000    # Safe for 8000 TPM
+ANSWER_MAP_ABSOLUTE_MAX_CHARS = 15000     # Hard limit - never exceed
 
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
@@ -1363,9 +1346,6 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
 def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
                                   absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS) -> list:
-    """
-    FIXED: Enhanced chunking with optimal size for 8000 TPM limit.
-    """
     if not numbered_lines:
         return []
 
@@ -1603,7 +1583,6 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
     numbered_lines = list(enumerate(answer_lines))
     
-    # Log total size before chunking
     total_chars = sum(len(text) for _, text in numbered_lines)
     log(f"Total answer text: {total_chars} characters, {len(numbered_lines)} lines")
     
@@ -1621,9 +1600,8 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
         user_prompt = _build_answer_map_user_prompt(chunk, questions)
         
-        # Check if this chunk is too large
         estimated_tokens = _estimate_tokens(user_prompt) + _estimate_tokens(ANSWER_MAP_SYSTEM_PROMPT) + 500
-        if estimated_tokens > 7000:  # Leave safety margin for 8000 TPM
+        if estimated_tokens > 7000:
             log(f"WARNING: Chunk {i+1} estimated at {estimated_tokens} tokens, close to limit. Attempting anyway...")
         
         try:
@@ -1725,7 +1703,6 @@ def is_noise(line: str) -> bool:
 
 # =========================================================
 # FIND QUESTION BOUNDARIES IN ANSWER PAGES -- similarity based
-# (Kept for backward compatibility)
 # =========================================================
 
 def normalize(text: str) -> str:
