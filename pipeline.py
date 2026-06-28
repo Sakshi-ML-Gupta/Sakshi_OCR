@@ -783,7 +783,7 @@ def _merge_chunk_results(chunk_results: list) -> tuple:
 
 
 # =========================================================
-# ENHANCED QUESTION EXTRACTION
+# FIXED: ENHANCED QUESTION EXTRACTION
 # =========================================================
 
 QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are reading the OFFICIAL question paper pages of a student exam assignment booklet. You are given the complete, exact text of these pages, in order.
@@ -815,77 +815,87 @@ Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape
 If you cannot find ANY questions, return {"questions": []} - but ONLY if there is truly no numbered content."""
 
 
-def _fallback_extract_questions(text: str) -> list:
+def _extract_questions_from_text(text: str) -> list:
     """
-    Fallback method to extract questions using regex patterns if LLM fails.
+    Simple but effective question extraction from text.
+    Works with any numbering format.
     """
     questions = []
-    
-    # Pattern for numbered questions with marks: "1. Question text (10)" or "1. Question text 10"
-    pattern1 = re.compile(r'^(\d+)\.\s+(.*?)(?:\s*\((\d+)\)|\s+(\d+))?\s*$', re.MULTILINE)
-    
-    # Pattern for Hindi numbered questions
-    hindi_numbers = {'१': '1', '२': '2', '३': '3', '४': '4', '५': '5', 
-                     '६': '6', '७': '7', '८': '8', '९': '9', '०': '0'}
-    
-    pattern2 = re.compile(r'^([१-९][०-९]*)\.\s+(.*?)(?:\s*\((\d+)\)|\s+(\d+))?\s*$', re.MULTILINE)
-    
-    # Pattern for questions with prefixes
-    pattern3 = re.compile(r'^(?:प्र\.?|Q\.?|प्रश्न\.?)\s*(\d+)\.?\s+(.*?)(?:\s*\((\d+)\)|\s+(\d+))?\s*$', re.MULTILINE)
-    
-    # Try each pattern
-    for pattern in [pattern1, pattern2, pattern3]:
-        matches = list(pattern.finditer(text))
-        if matches:
-            for match in matches:
-                if len(match.groups()) >= 2:
-                    question_num = match.group(1)
-                    question_text = match.group(2).strip()
-                    marks = match.group(3) or match.group(4) or ""
-                    
-                    if question_text:
-                        if marks:
-                            questions.append(f"{question_num}. {question_text} ({marks})")
-                        else:
-                            questions.append(f"{question_num}. {question_text}")
-            
-            if questions:
-                return questions
-    
-    # If no questions found with patterns, try line-based extraction
     lines = text.split('\n')
-    current_question = ""
-    question_num = None
+    
+    # Patterns for different numbering formats
+    number_pattern = re.compile(r'^(\d+)\.\s+(.*)')
+    hindi_pattern = re.compile(r'^([१-९][०-९]*)\.\s+(.*)')
+    subpart_pattern = re.compile(r'^[\(（]([क-घa-d])[\)）]\s+(.*)')
+    prefix_pattern = re.compile(r'^(?:Q\.|प्र\.|प्रश्न\.?)\s*(\d+)[\.\)]?\s+(.*)')
+    
+    current_question = None
+    current_number = None
+    is_subpart = False
     
     for line in lines:
         line = line.strip()
-        if not line:
+        if not line or len(line) < 3:
             continue
             
-        # Check if line starts with a number
-        num_match = re.match(r'^(\d+)\.\s+(.*)', line)
-        if num_match:
-            if current_question and question_num:
-                questions.append(current_question.strip())
-            question_num = num_match.group(1)
-            current_question = line
-        else:
-            # Check if it's a sub-part
-            sub_match = re.match(r'^[\(（]([क-घa-d])[\)）]\s+(.*)', line)
-            if sub_match and current_question:
+        # Try each pattern
+        match = number_pattern.match(line)
+        if match:
+            if current_question and current_number:
+                questions.append(f"{current_number}. {current_question}")
+            current_number = match.group(1)
+            current_question = match.group(2).strip()
+            is_subpart = False
+            continue
+            
+        match = hindi_pattern.match(line)
+        if match:
+            if current_question and current_number:
+                questions.append(f"{current_number}. {current_question}")
+            current_number = match.group(1)
+            current_question = match.group(2).strip()
+            is_subpart = False
+            continue
+            
+        match = prefix_pattern.match(line)
+        if match:
+            if current_question and current_number:
+                questions.append(f"{current_number}. {current_question}")
+            current_number = match.group(1)
+            current_question = match.group(2).strip()
+            is_subpart = False
+            continue
+            
+        match = subpart_pattern.match(line)
+        if match:
+            if current_question:
                 current_question += " " + line
-            elif current_question:
+            else:
+                current_number = "9"
+                current_question = f"({match.group(1)}) {match.group(2).strip()}"
+            is_subpart = True
+            continue
+            
+        # If line continues previous question
+        if current_question and not is_subpart:
+            if re.match(r'^\d+\s', line):
+                if current_question:
+                    questions.append(f"{current_number}. {current_question}")
+                current_number = re.match(r'^(\d+)', line).group(1)
+                current_question = re.sub(r'^\d+\s+', '', line).strip()
+            else:
                 current_question += " " + line
     
-    if current_question and question_num:
-        questions.append(current_question.strip())
+    # Add last question
+    if current_question and current_number:
+        questions.append(f"{current_number}. {current_question}")
     
     return questions
 
 
 def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
     """
-    Enhanced question extraction with fallback methods.
+    FIXED: Simple and reliable question extraction with multiple fallbacks.
     """
     def log(msg):
         print(msg)
@@ -895,77 +905,74 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
     if not qp_pages:
         return []
 
-    from groq import Groq
-
-    api_key = get_api_key("GROQ_API_KEY")
-    if not api_key:
-        raise Exception("GROQ_API_KEY not found in secrets or environment")
-
-    # First, try LLM-based extraction
-    client = Groq(api_key=api_key)
-    budget = _TokenBudgetTracker()
-
-    user_prompt = _build_canonical_questions_prompt(qp_pages)
-    log(f"Extracting canonical question list from {len(qp_pages)} question-paper page(s) in a single pass...")
-
-    try:
-        questions = _call_groq_with_retries(
-            client, QUESTION_PAPER_ONLY_SYSTEM_PROMPT, user_prompt,
-            _parse_canonical_questions_response, budget, log
-        )
-        
-        if questions:
-            log(f"LLM extracted {len(questions)} questions successfully")
-            return questions
-            
-    except Exception as e:
-        log(f"WARNING: LLM question extraction failed: {e}")
-
-    # If LLM extraction failed or returned empty, try fallback methods
-    log("Attempting fallback question extraction using regex patterns...")
-    
+    # Combine all question paper pages
     all_text = ""
     for page in qp_pages:
         all_text += page["raw_text"] + "\n\n"
     
-    fallback_questions = _fallback_extract_questions(all_text)
+    log(f"Extracting questions from {len(qp_pages)} page(s)...")
     
-    if fallback_questions:
-        log(f"Fallback extraction found {len(fallback_questions)} questions")
-        
-        # Clean up the questions
-        cleaned_questions = []
-        for q in fallback_questions:
-            # Remove extra whitespace
-            q = re.sub(r'\s+', ' ', q).strip()
-            # Remove duplicate numbering
-            q = re.sub(r'^(\d+)\.\s+\d+\.', r'\1.', q)
-            cleaned_questions.append(q)
-        
-        return cleaned_questions
+    # Try LLM first
+    from groq import Groq
+    api_key = get_api_key("GROQ_API_KEY")
     
-    # If still no questions, try extracting from raw text line by line
-    log("Attempting final fallback: line-by-line extraction...")
+    if api_key:
+        try:
+            client = Groq(api_key=api_key)
+            budget = _TokenBudgetTracker()
+            
+            user_prompt = f"""Extract ALL questions from this text. Return ONLY JSON with "questions" array.
+Each question should include its number and full text.
+
+Text:
+{all_text[:8000]}
+
+Return format: {{"questions": ["1. Question text", "2. Question text"]}}"""
+            
+            questions = _call_groq_with_retries(
+                client,
+                "Extract all numbered questions from the text. Return only JSON.",
+                user_prompt,
+                _parse_canonical_questions_response,
+                budget,
+                log,
+                max_retries=2
+            )
+            
+            if questions:
+                log(f"LLM extracted {len(questions)} questions")
+                return questions
+        except Exception as e:
+            log(f"LLM extraction failed: {e}")
+    
+    # Fallback: extract using regex
+    log("Using fallback extraction...")
+    questions = _extract_questions_from_text(all_text)
+    
+    if questions:
+        log(f"Extracted {len(questions)} questions using fallback")
+        return questions
+    
+    # Final fallback: just get all lines with numbers
+    log("Using final fallback...")
     lines = all_text.split('\n')
-    extracted = []
-    
     for line in lines:
         line = line.strip()
-        if not line:
-            continue
-            
-        # Check for any numbered pattern
-        if re.match(r'^\d+[\.\)]\s+', line) or re.match(r'^[\(（][क-घa-d][\)）]\s+', line):
-            if len(line) > 15:  # Avoid very short lines that might be page numbers
-                extracted.append(line)
+        if re.match(r'^\d+[\.\)]\s+', line) and len(line) > 10:
+            questions.append(line)
+        elif re.match(r'^[\(（][क-घa-d][\)）]\s+', line) and len(line) > 10:
+            if questions:
+                parent_num = re.match(r'^(\d+)', questions[-1]).group(1) if questions else "9"
+                questions.append(f"{parent_num}. {line}")
+            else:
+                questions.append(line)
     
-    if extracted:
-        log(f"Line-by-line extraction found {len(extracted)} potential questions")
-        return extracted
+    if questions:
+        log(f"Final fallback extracted {len(questions)} questions")
+        return questions
     
-    log("WARNING: No questions could be extracted from the question paper pages")
-    log(f"Page content preview: {all_text[:500]}")
-    
+    log("ERROR: No questions could be extracted")
+    log(f"Text preview: {all_text[:500]}")
     return []
 
 
@@ -1124,17 +1131,13 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
 def _extract_clean_subpart_question(question_text: str) -> tuple:
     """
-    Extracts clean sub-part from a question like:
-    "9. निम्नलिखित पर टिप्पणी लिखिए।\n\n4×5 = 20\n\n(क) सूचना प्रौद्योगिकी और हिंदी भाषा"
-    Returns: (parent_num, subpart_label, clean_text)
+    Extracts clean sub-part from a question.
     """
-    # Pattern for sub-part with full parent context
     subpart_pattern = re.compile(
         r'^(\d+)\.\s*.*?(?:\(([क-घa-d])\)|\(([ivx]+)\))\s*(.*?)$',
         re.DOTALL | re.IGNORECASE
     )
     
-    # Clean the text first - remove common noise
     cleaned = question_text.strip()
     cleaned = re.sub(r'\n+', ' ', cleaned)
     cleaned = re.sub(r'\s+', ' ', cleaned)
@@ -1142,20 +1145,18 @@ def _extract_clean_subpart_question(question_text: str) -> tuple:
     match = subpart_pattern.search(cleaned)
     if match:
         parent_num = match.group(1)
-        # Check which subpart pattern matched
-        if match.group(2):  # क-घ or a-d
+        if match.group(2):
             subpart = match.group(2)
             clean_text = match.group(4).strip()
-        elif match.group(3):  # i, ii, iii, iv
+        elif match.group(3):
             subpart = match.group(3)
             clean_text = match.group(4).strip()
         else:
             return None, None, None
         
-        # Remove any remaining parent instruction noise
         clean_text = re.sub(r'^\s*[\.\s]+', '', clean_text)
-        clean_text = re.sub(r'\s*\d+\s*$', '', clean_text)  # Remove trailing numbers
-        clean_text = re.sub(r'^\s*[\(\）]', '', clean_text)  # Remove stray parentheses
+        clean_text = re.sub(r'\s*\d+\s*$', '', clean_text)
+        clean_text = re.sub(r'^\s*[\(\）]', '', clean_text)
         
         return parent_num, subpart, clean_text
     
@@ -1163,7 +1164,7 @@ def _extract_clean_subpart_question(question_text: str) -> tuple:
 
 
 # =========================================================
-# LLM-BASED ANSWER MAPPING (Groq)
+# FIXED: LLM-BASED ANSWER MAPPING WITH LARGER CHUNKS
 # =========================================================
 
 ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
@@ -1174,10 +1175,11 @@ Your task: for EACH official question, find WHERE in the answer text the student
 
 Important guidance for finding boundaries correctly:
 - A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
-- CRITICAL -- introductory lines before the first numbered point: a student's answer frequently opens with 2-4 lines of general, introductory prose BEFORE reaching their first specific numbered point, sub-heading, or detailed argument. Do NOT mistake the first numbered point for the TRUE start of the answer -- look BACKWARD.
+- CRITICAL -- introductory lines before the first numbered point: a student's answer frequently opens with 2-4 lines of general, introductory prose BEFORE reaching their first specific numbered point.
 - An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins.
-- CRITICAL -- ambiguous boundaries between adjacent sub-parts (e.g. (क)/(ख)/(ग)/(घ) or (i)/(ii)/(iii)): look for a CONTENT-level shift. A new sentence that introduces a different specific concept, term, or sub-topic than what was just being discussed is a more reliable boundary.
-- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely.
+- For multi-page answers (7-10 pages), the answer spans across multiple pages - include ALL lines from start to end.
+- CRITICAL -- ambiguous boundaries between adjacent sub-parts: look for a CONTENT-level shift.
+- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range.
 - Each REF's range must NOT overlap with another REF's range.
 - Use the line numbers EXACTLY as given in [brackets].
 - Use the EXACT REF label (e.g. "REF-A") to identify each question.
@@ -1191,24 +1193,26 @@ Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape
   ]
 }
 
-If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result."""
+If NONE of the official questions' answers appear in the text shown, return {"answers": []}."""
+
+
+# INCREASED CHUNK SIZES FOR MULTI-PAGE ANSWERS
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 25000  # Increased from 11000 to handle 7-8 pages
+ANSWER_MAP_ABSOLUTE_MAX_CHARS = 80000   # Increased from 60000
 
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
     """
     Enhanced to handle sub-part questions with clean labels.
     """
-    # First, clean up sub-part questions for better mapping
     cleaned_questions = []
     for i, q in enumerate(questions):
         parent_num, subpart, clean_text = _extract_clean_subpart_question(q)
         if parent_num and subpart:
-            # This is a sub-part - use clean text
             cleaned_questions.append((i, f"{parent_num}.({subpart}) {clean_text}"))
         else:
             cleaned_questions.append((i, q))
     
-    # Build the prompt with clean questions
     questions_block_parts = []
     for idx, q_text in cleaned_questions:
         ref_label = f"REF-{chr(65+idx)}"
@@ -1221,8 +1225,8 @@ def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
         f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label):\n{questions_block}\n\n"
         f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}\n\n"
         f"IMPORTANT: For multi-part questions like 9.(क), 9.(ख), 9.(ग), 9.(घ), "
-        f"each sub-part has its own REF label. Map each sub-part's answer separately "
-        f"based on the specific content of that sub-part."
+        f"each sub-part has its own REF label. Map each sub-part's answer separately. "
+        f"For long answers spanning multiple pages, include ALL lines from start to end."
     )
 
 
@@ -1266,9 +1270,6 @@ def _parse_answer_map_llm_response(content: str) -> list:
     return result
 
 
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 11000
-ANSWER_MAP_ABSOLUTE_MAX_CHARS = 60000
-
 _ANSWER_START_RE = re.compile(
     r'^\s*(?:Ans(?:wer)?\s*\d+\s*[.:\-]?\s*'
     r'|Ans(?:wer)?\s*[.:\-]\s*'
@@ -1308,18 +1309,15 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
     """
     Enhanced to better detect sub-part answer starts with fuzzy matching.
     """
-    # First check for explicit label matches
     label_match = _ANSWER_START_RE.match(line)
     if label_match:
         num_match = re.search(r'\d+', label_match.group(0))
         if num_match:
             label_num = num_match.group(0)
-            # Check for sub-part pattern in the line
             sub_match = re.search(r'[\(（]([क-घa-d])[\)）]', line, re.IGNORECASE)
             sub_label = sub_match.group(1).lower() if sub_match else None
             
             for i, q in enumerate(questions):
-                # Extract clean sub-part info
                 parent_num, q_subpart, _ = _extract_clean_subpart_question(q)
                 
                 if parent_num == label_num:
@@ -1331,19 +1329,16 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
             return -1
         return -1
 
-    # Content-based matching with lower threshold for sub-parts
     line_words = sorted(set(re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(line))[:25]))
     if not line_words:
         return None
 
-    # Check if the line contains sub-part indicators
     has_sub_part = bool(re.search(r'[\(（]([क-घa-d])[\)）]', line, re.IGNORECASE))
     
     best_match = None
     best_score = 0
     
     for i, q in enumerate(questions):
-        # Use cleaned text for comparison
         _, _, clean_q = _extract_clean_subpart_question(q)
         if clean_q:
             q_text = clean_q
@@ -1359,10 +1354,8 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
             if any(_words_nearly_match(w, lw) for lw in line_words)
         )
         
-        # Check if this question is a sub-part
         q_has_sub_part = bool(re.search(r'[\(（]([क-घa-d])[\)）]', q, re.IGNORECASE))
         
-        # If both have sub-parts, check if they match
         if has_sub_part and q_has_sub_part:
             q_sub = re.search(r'[\(（]([क-घa-d])[\)）]', q, re.IGNORECASE)
             line_sub = re.search(r'[\(（]([क-घa-d])[\)）]', line, re.IGNORECASE)
@@ -1371,7 +1364,7 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
         
         def _required_matches(n_distinctive, fraction=min_fraction):
             if n_distinctive <= 2:
-                return 1  # More lenient for sub-parts
+                return 1
             return max(2, round(n_distinctive * fraction))
 
         required = _required_matches(len(q_distinctive))
@@ -1386,12 +1379,11 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
                                   absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS) -> list:
     """
-    Enhanced chunking that respects sub-part structure.
+    FIXED: Enhanced chunking that handles multi-page answers (7-10 pages).
     """
     if not numbered_lines:
         return []
 
-    # Build a map of which questions are sub-parts of the same parent
     question_groups = {}
     sub_part_pattern = re.compile(r'^(\d+)\.\s*\(([क-घa-d])\)')
     
@@ -1401,7 +1393,6 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
             parent_num = match.group(1)
             question_groups.setdefault(parent_num, []).append(i)
     
-    # Create a priority map: sub-parts of the same question should stay together
     chunk_priority = {}
     for parent, indices in question_groups.items():
         for idx in indices:
@@ -1412,8 +1403,6 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
     current_chars = 0
     past_target = False
     current_question_idx = None
-    current_question_group = None
-    
     pending_new_start_idx = None
 
     for idx, text in numbered_lines:
@@ -1429,7 +1418,6 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
             matched_q_idx == -1 or matched_q_idx != current_question_idx
         )
 
-        # Check if we're transitioning between sub-parts of the same parent
         is_same_group = False
         if matched_q_idx is not None and current_question_idx is not None:
             if matched_q_idx in chunk_priority and current_question_idx in chunk_priority:
@@ -1463,7 +1451,6 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
 
         if is_genuine_new_start and matched_q_idx != -1:
             current_question_idx = matched_q_idx
-            current_question_group = chunk_priority.get(matched_q_idx)
 
         current_chunk.append((idx, text))
         current_chars += line_chars
@@ -1500,26 +1487,19 @@ QUESTION_PREFIX_RE = re.compile(
 
 
 def strip_question_restatement(answer_text: str) -> str:
-    """
-    Enhanced to handle sub-part question restatements.
-    """
     text = answer_text
     
-    # Pattern for sub-part labels like "9.(क)", "9.(ख)", etc.
     sub_part_pattern = re.compile(
         r'^\s*(?:प्र\.?\s*)?\s*\d+\s*\.\s*[\(（][क-घa-d][\)）]\s*[:\-]?\s*',
         re.IGNORECASE
     )
     
-    # Strip up to 3 times to handle nested labels
     for _ in range(3):
-        # Try to strip sub-part label first
         new_text = sub_part_pattern.sub('', text, count=1).strip()
         if new_text != text:
             text = new_text
             continue
             
-        # Try the original patterns
         new_text = QUESTION_PREFIX_RE.sub('', text, count=1).strip()
         if new_text == text:
             break
@@ -1537,54 +1517,38 @@ _PARENT_INSTRUCTION_PREFIX_RE = re.compile(
 
 
 def _extract_answer_for_subpart(answer_text: str, question_text: str) -> str:
-    """
-    Extracts clean answer for a sub-part question.
-    """
     if not answer_text:
         return ""
     
-    # Extract sub-part info from question
     parent_num, subpart, clean_q = _extract_clean_subpart_question(question_text)
     
     if not clean_q:
         return answer_text
     
-    # Look for the sub-part label in the answer
     subpart_pattern = re.compile(
         rf'[\(（]{re.escape(subpart)}[\)）]',
         re.IGNORECASE
     )
     
-    # If subpart label found, extract content after it
     match = subpart_pattern.search(answer_text)
     if match:
-        # Extract from the subpart label to the next subpart or end
         remaining = answer_text[match.end():].strip()
         
-        # Check if there's another subpart
         next_subpart = re.search(r'[\(（]([क-घa-d])[\)）]', remaining)
         if next_subpart:
             remaining = remaining[:next_subpart.start()].strip()
         
-        # Clean up
         remaining = strip_question_restatement(remaining)
         remaining = strip_full_question_echo(remaining, clean_q)
         
         return remaining
     
-    # If no subpart label found, try content-based extraction
-    # Use the clean question to find the answer
     return strip_full_question_echo(answer_text, clean_q)
 
 
 def strip_full_question_echo(answer_text: str, question_text: str) -> str:
-    """
-    Enhanced to better handle sub-part question echoes.
-    """
-    # Extract the core of the sub-part question (remove parent prefix)
     question_core = question_text
     
-    # For sub-parts, extract the actual sub-part text
     sub_part_match = re.match(
         r'^\d+\.\s*[\(（]([क-घa-d])[\)）]\s*(.*?)(?:\s*\d+\s*)?$',
         question_text.strip(),
@@ -1592,12 +1556,10 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
     )
     
     if sub_part_match:
-        # The sub-part is the actual content after the label
         question_core = sub_part_match.group(2).strip()
         if not question_core:
             question_core = question_text
     
-    # Remove parent instruction prefixes
     question_core = _PARENT_INSTRUCTION_PREFIX_RE.sub('', question_core).strip()
     
     if not question_core:
@@ -1623,7 +1585,6 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
         prefix_norm = _normalize_for_overlap_match(prefix)
         ratio = difflib.SequenceMatcher(None, prefix_norm, q_norm).ratio()
         
-        # Slightly lower threshold for sub-parts
         threshold = 0.70 if sub_part_match else 0.75
         
         if ratio >= threshold and ratio > best_ratio:
@@ -1721,8 +1682,7 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
                 f"Answer mapping found ZERO matches across all {len(chunks)} chunk(s), "
                 f"even though the LLM calls themselves succeeded. This usually means "
                 f"the 'answer pages' passed in do NOT actually contain the student's "
-                f"answers -- most likely the question-paper/answer-page page split "
-                f"upstream misclassified pages. Sample of the answer text actually searched: "
+                f"answers. Sample of the answer text actually searched: "
                 f"{sample_lines}"
             )
 
@@ -1736,7 +1696,6 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         original_question = ref_to_question[r["ref"]]
         answer_text = " ".join(verbatim_lines).strip()
         
-        # Use enhanced extraction for sub-parts
         parent_num, subpart, _ = _extract_clean_subpart_question(original_question)
         if parent_num and subpart:
             answer_text = _extract_answer_for_subpart(answer_text, original_question)
@@ -1882,16 +1841,9 @@ def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> lis
 
 
 def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print) -> bool:
-    """
-    Enhanced to handle sub-part questions properly.
-    """
     total_chars = sum(len(l) for l in answer_lines)
-    
-    # Count actual answer content (exclude noise and extremely short lines)
     meaningful_lines = [l for l in answer_lines if len(l.strip()) > 20 and not is_noise(l)]
     meaningful_chars = sum(len(l) for l in meaningful_lines)
-    
-    # For sub-part questions, we need less text per "question"
     min_plausible_chars_per_question = 100
     
     avg_chars_per_question = meaningful_chars / max(num_questions, 1)
@@ -1937,13 +1889,11 @@ def process_pdf(file_input, status_callback=None):
         )
 
     if not official_questions:
-        # Try one more time with aggressive fallback
         log("CRITICAL: No questions extracted. Attempting aggressive extraction...")
         all_text = ""
         for idx in qp_page_indices:
             all_text += pages[idx]["raw_text"] + "\n\n"
         
-        # Try to extract ANY numbered content
         lines = all_text.split('\n')
         potential_questions = []
         for line in lines:
@@ -2003,12 +1953,6 @@ def process_pdf(file_input, status_callback=None):
 
 def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
                   base_name: str = "document") -> tuple:
-    """
-    Convenience helper: writes the two requested output files to disk
-    and returns their paths.
-    - {base_name}_ocr.json: the complete raw OCR of the whole PDF
-    - {base_name}_qa_pairs.json: the mapped question -> answer pairs
-    """
     ocr_path = os.path.join(output_dir, f"{base_name}_ocr.json")
     qa_path = os.path.join(output_dir, f"{base_name}_qa_pairs.json")
 
