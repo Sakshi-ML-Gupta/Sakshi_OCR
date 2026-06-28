@@ -1728,6 +1728,9 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
     current_question_idx = None  # which question's answer we believe
                                    # we're currently accumulating
 
+    pending_new_start_idx = None  # content-match seen on the PREVIOUS
+                                    # line, awaiting corroboration
+
     for idx, text in numbered_lines:
         line_chars = len(text)
 
@@ -1735,14 +1738,47 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
             past_target = True
 
         matched_q_idx = _line_starts_new_answer_for_question(text, questions)
-        # -1 means "ambiguous formal label, couldn't resolve to a known
-        # question" -- treated cautiously as a genuine fresh start,
-        # since we can't positively confirm it's the same question.
-        # A resolved index only counts as a genuinely NEW start if it
-        # differs from the question we believe we're already inside.
-        is_genuine_new_start = matched_q_idx is not None and (
+
+        # FIX (this round): real usage confirmed a genuinely long answer
+        # (10 pages) still occasionally got cut, even with the 2+-word
+        # same-question suppression from the previous round. A SINGLE
+        # line's content-based match against a different question can
+        # still be incidental over a long enough span (e.g. one
+        # sentence that happens to reference another topic in passing).
+        # A FORMAL LABEL match (-1 or a resolved index from an explicit
+        # "Ans-"/"उत्तर-"-style marker) is a deliberate, designed signal
+        # and is trusted immediately, same as before. But a CONTENT-
+        # based match (matched_q_idx is a real index AND the line had
+        # no formal label) now requires the SAME question to also
+        # appear to start on the VERY NEXT line before being accepted --
+        # a real new answer's opening reliably continues being "about"
+        # that question for more than one line, while an incidental
+        # mid-answer reference to another topic typically does not
+        # repeat on the immediately following line too. This adds a
+        # second, independent corroboration signal without needing any
+        # length-based heuristic that could behave differently for
+        # short vs. long answers.
+        has_formal_label = bool(_ANSWER_START_RE.match(text))
+        is_new_index = matched_q_idx is not None and (
             matched_q_idx == -1 or matched_q_idx != current_question_idx
         )
+
+        if has_formal_label and is_new_index:
+            is_genuine_new_start = True
+            pending_new_start_idx = None
+        elif is_new_index:
+            # Content-only match -- require corroboration from the
+            # PREVIOUS line having flagged the SAME question index
+            # before trusting it.
+            if pending_new_start_idx == matched_q_idx:
+                is_genuine_new_start = True
+                pending_new_start_idx = None
+            else:
+                is_genuine_new_start = False
+                pending_new_start_idx = matched_q_idx
+        else:
+            is_genuine_new_start = False
+            pending_new_start_idx = None
 
         should_break_at_answer_start = past_target and is_genuine_new_start
         should_force_break_absolute = (
