@@ -123,29 +123,30 @@ def _diagnose_tuple_errors(func):
 
 
 # =========================================================
-# CONCURRENCY NOTE
+# CONCURRENCY GUARD
 #
-# An earlier version of this module used a process-wide
-# threading.Lock() around every Groq call, intended to make two
-# concurrent runs of the SAME document share the TPM budget
-# sequentially instead of racing for it (the original symptom: two
-# interleaved pipeline runs both hitting 429s at once). That lock was
-# REMOVED -- it had an unintended side effect of serializing EVERY
-# Groq call in the whole process, including calls from genuinely
-# independent, different PDFs being processed concurrently (e.g.
-# multiple test runs or browser sessions at once), turning legitimate
-# parallel multi-document processing into strict one-at-a-time
-# processing.
+# FIX: the real log showed TWO complete pipeline runs interleaved --
+# "Submitting document..." fired twice, OCR ran twice, chunk logs from
+# both runs were mixed together line by line. This is almost certainly
+# the calling app (e.g. Streamlit) invoking process_pdf() a second time
+# while the first call is still in flight (a common Streamlit rerun
+# behavior). Both runs then compete for the SAME shared 8000 TPM org
+# budget at once, which is the direct cause of the constant 429s seen
+# in that log -- it wasn't one document needing too many tokens, it was
+# two concurrent runs each burning the same shared budget simultaneously.
 #
-# The underlying TPM-budget concern is still handled correctly --
-# _TokenBudgetTracker proactively paces requests based on real tracked
-# usage (see wait_if_needed below), which solves "don't exceed the
-# shared rate limit" without needing to block unrelated concurrent
-# calls. If you are still seeing duplicate runs of the SAME document
-# (not multiple different documents), that is a calling-app issue (see
-# the Streamlit session_state guard pattern discussed elsewhere), not
-# something this module should solve via a global lock.
+# This module cannot prevent the calling app from invoking it twice,
+# but a process-wide lock around the Groq-calling section ensures that
+# IF it is called concurrently in the same process, the calls serialize
+# instead of racing for the same token budget. This turns "two runs
+# fighting over 8000 TPM" into "two runs sharing 8000 TPM one after
+# the other," which is strictly better and removes one whole class of
+# the 429 storm seen in the log. If your app calls this from separate
+# processes (e.g. multiple server workers), you'd need a cross-process
+# lock (e.g. a file lock or Redis) instead -- ask if that's your setup.
 # =========================================================
+
+_groq_call_lock = threading.Lock()
 
 
 # =========================================================
@@ -264,32 +265,6 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         },
         timeout=120
     )
-
-    if resp.status_code == 403:
-        # FIX: Datalab returns 403 with a JSON {"detail": "..."} body
-        # when the free monthly OCR allowance is used up -- this is a
-        # BILLING wall, not a code bug, and will NEVER succeed on
-        # retry (there is no rate-limit window to wait out, unlike
-        # Groq's TPM/TPD errors). Give a clear, actionable message
-        # instead of dumping the raw response text, and flag the same
-        # duplicate-call risk documented for Groq's TPD case -- if
-        # process_pdf() is being invoked more than once per document
-        # (e.g. a Streamlit rerun), the free allowance gets burned
-        # twice as fast as necessary.
-        try:
-            detail = resp.json().get("detail", resp.text)
-        except Exception:
-            detail = resp.text
-        raise Exception(
-            f"Datalab OCR quota exhausted (403): {detail}\n"
-            f"This is a Datalab BILLING limit, not a code bug -- retrying will not "
-            f"help. Either add a payment method in your Datalab account to continue "
-            f"on pay-as-you-go pricing, or wait for next month's free allowance to "
-            f"reset. (If you're processing the same document more than once per "
-            f"click/run -- e.g. due to a Streamlit rerun -- check for duplicate "
-            f"calls, since that burns through the free allowance twice as fast as "
-            f"necessary.)"
-        )
 
     if resp.status_code != 200:
         raise Exception(f"Datalab submit error {resp.status_code}: {resp.text}")
@@ -439,9 +414,8 @@ Critical rules for telling question-paper pages apart from answer pages that hap
 - A genuine question paper question is a PROMPT directed at the student ("explain", "discuss", "describe", "write notes on", "compare", a question mark, etc.) -- it asks the student to DO something.
 - A numbered point inside a long answer is typically a STATEMENT or FACT that is part of an explanation the student is giving -- it does not ask the reader to do anything; it's content, not an instruction.
 - If a page's numbered items closely follow words like "उत्तर" (answer), "Ans", "Ans-", or come after a long paragraph of explanatory prose in the same block, that page is almost certainly an ANSWER page, not a question paper page -- exclude it from question_paper_pages even if it has multiple numbered lines.
-- A real question paper question is typically a self-contained instruction (a prompt, maybe a mark allocation) -- this is a helpful general pattern, but NOT a hard rule on its own, since a real question can legitimately be long (multiple sub-parts, detailed multi-clause prompts).
-- A student's answer commonly OPENS by restating the question itself before writing their real response (e.g. "Examine the theme of concealment in X. Discuss with reference to Y." followed by their own original explanation). Do NOT classify such a page as a question paper page just because its first sentence contains prompt-style verbs ("Examine", "Discuss") -- look at what comes AFTER that first sentence: if it continues into the student's own developing argument or analysis (not further instructions to the reader), it is an ANSWER page. This is a CONTENT signal, not a length signal -- do not use page length by itself to decide.
-- If the SAME question text appears on two different pages, and one page is part of a concise, structured list of several distinct questions while the other page contains only that one question's wording followed by extended original prose, the latter is the student's answer-opening restatement -- exclude it.
+- A real question paper is usually self-contained and concise per question (a question, maybe a mark allocation) -- not a long flowing essay with numbered sub-points woven into running prose.
+- CRITICAL TRAP TO AVOID: students very commonly RESTATE the question itself as the FIRST SENTENCE of their answer, before writing their actual response (e.g. an answer's opening page reads "Examine the theme of concealment in X. Discuss with reference to Y. The theme of concealment is central to..." where everything after the first sentence is the student's OWN original explanation, not more instructions). Such a page can superficially look like a question-paper page because it contains prompt-style verbs ("Examine", "Discuss") -- but it is the FIRST page of a long, multi-page ANSWER, not a question paper page. Signals that this is really an answer's opening page, not a real question paper page: (a) the page has noticeably MORE text than a typical printed question would need, especially if it keeps going well past where a concise instruction would end; (b) the prose quality looks like a developing argument/explanation rather than a terse instruction; (c) the SAME or very similar question text already appears verbatim on a page you are more confident is the genuine, concise question paper (in which case this longer, messier page is almost certainly the student's restatement -- exclude it). When uncertain whether a page is the real question paper or a student's restatement-then-answer, treat brevity and conciseness as the deciding signal: genuine question papers are short per question; answer pages (including their opening restatement) run much longer.
 - When genuinely uncertain whether a page is a question paper page, prefer NOT including it as one, and prefer NOT extracting its numbered items as separate questions.
 - If NONE of the pages shown in this chunk are question paper pages, return empty lists for both fields -- that is a valid and expected result for chunks that only contain answer/admin pages.
 - Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate.
@@ -802,32 +776,16 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             budget.wait_if_needed(estimated_tokens, log=log)
 
         try:
-            # FIX: removed the process-wide _groq_call_lock that
-            # previously wrapped this call. That lock was added earlier
-            # to make concurrent runs of the SAME document share the
-            # TPM budget sequentially instead of racing for it -- but
-            # it had an unintended side effect: it serialized EVERY
-            # Groq call across the WHOLE PROCESS, including genuinely
-            # independent calls from MULTIPLE DIFFERENT PDFs being
-            # processed at the same time (e.g. concurrent test runs,
-            # multiple browser tabs/sessions). This turned legitimate
-            # parallel multi-PDF processing into strict one-at-a-time
-            # processing -- confirmed as a real regression ("previously
-            # it was working good, now only 1 PDF at a time").
-            # _TokenBudgetTracker already handles the shared-budget
-            # problem correctly via proactive pacing based on actual
-            # tracked usage -- it doesn't need a hard mutex to do that,
-            # since it's just bookkeeping that naturally serializes
-            # PACING decisions without blocking unrelated calls.
-            response = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            )
+            with _groq_call_lock:
+                response = client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                )
             budget.record_usage(estimated_tokens)
             content = response.choices[0].message.content
             return response_parser(content)
@@ -979,104 +937,28 @@ def _is_near_duplicate_question(q1: str, q2: str) -> bool:
         return True
 
     ratio = difflib.SequenceMatcher(None, k1, k2).ratio()
+    if ratio < 0.90:
+        return False
 
-    # FIX (this round): the ratio-based check below ONLY catches
-    # OCR-noise-level duplicates (high overall character similarity).
-    # It must NOT early-return False when ratio < 0.90 -- a real,
-    # confirmed bug had exactly that early return, which meant the
-    # containment-based check further down (designed to catch a
-    # DIFFERENT kind of duplicate -- same sub-part, very different
-    # surface wording) was unreachable dead code whenever the
-    # ratio-based path didn't already match. This silently disabled
-    # the entire containment-based fix despite it testing correctly in
-    # isolation. Now both checks are independent OR paths: a pair is a
-    # duplicate if EITHER the ratio+word-overlap check matches OR the
-    # containment check (further below) matches.
-    ratio_based_match = False
-    if ratio >= 0.90:
-        # FIX: minimum word length is 3, not 4. A 4+ letter cutoff was
-        # filtering out short-but-significant distinguishing words like
-        # spelled-out numbers ("one" vs "two"), which caused two
-        # genuinely DIFFERENT questions ("Real question one." / "Real
-        # question two.") to be wrongly merged -- everything else in
-        # the sentence matched, and the one word that actually differed
-        # was too short to be counted, leaving a perfect (but wrong)
-        # word-overlap score. 3 letters still excludes pure function-
-        # word noise ("a", "of", "in", "to") that would otherwise
-        # inflate apparent overlap without carrying real distinguishing
-        # content.
-        words1 = sorted(set(re.findall(r'[a-z]{3,}', k1)))
-        words2 = sorted(set(re.findall(r'[a-z]{3,}', k2)))
-        if not words1 or not words2:
-            ratio_based_match = ratio >= 0.92
-        else:
-            matched = sum(1 for w1 in words1 if any(_words_nearly_match(w1, w2) for w2 in words2))
-            overlap = matched / max(len(words1), len(words2))
-            ratio_based_match = overlap >= 0.92
+    # FIX: minimum word length is 3, not 4. A 4+ letter cutoff was
+    # filtering out short-but-significant distinguishing words like
+    # spelled-out numbers ("one" vs "two"), which caused two genuinely
+    # DIFFERENT questions ("Real question one." / "Real question two.")
+    # to be wrongly merged -- everything else in the sentence matched,
+    # and the one word that actually differed was too short to be
+    # counted, leaving a perfect (but wrong) word-overlap score. 3
+    # letters still excludes pure function-word noise ("a", "of", "in",
+    # "to") that would otherwise inflate apparent overlap without
+    # carrying real distinguishing content.
+    words1 = sorted(set(re.findall(r'[a-z]{3,}', k1)))
+    words2 = sorted(set(re.findall(r'[a-z]{3,}', k2)))
+    if not words1 or not words2:
+        return ratio >= 0.92
 
-    if ratio_based_match:
-        return True
+    matched = sum(1 for w1 in words1 if any(_words_nearly_match(w1, w2) for w2 in words2))
+    overlap = matched / max(len(words1), len(words2))
 
-    # FIX (this round): a SECOND, structurally different kind of
-    # duplicate confirmed in real usage -- the canonical question
-    # extraction can emit the SAME sub-part twice with genuinely
-    # different SURFACE TEXT (e.g. one includes the full quote, the
-    # other only captures a truncated version; one includes the parent
-    # instruction prefix, the other doesn't). These have a LOW overall
-    # character-similarity ratio (the check above correctly rejects
-    # them) because the actual wording differs substantially, not just
-    # by noise -- but they describe the exact same underlying
-    # question. Each phantom duplicate then gets its own independent
-    # answer-mapping pass, and since both are "about" the same real
-    # content, the SAME real answer ends up fragmented/duplicated
-    # across two question entries in the final output -- confirmed as
-    # the cause of a real "answer is repeated, half from start" report.
-    #
-    # This is detected via CONTAINMENT rather than overall similarity:
-    # if one question's distinctive vocabulary is almost entirely
-    # contained within the other's (one is a subset -- a truncated or
-    # less-detailed rendering of the same content), they are treated
-    # as duplicates even with low overall string similarity. This is
-    # different from the akam/puram case (two genuinely different
-    # questions sharing a template), where NEITHER side's distinctive
-    # words are contained in the other -- each has its own defining
-    # word the other entirely lacks.
-    def _word_in_other(w, other_words):
-        return any(_words_nearly_match(w, ow) for ow in other_words)
-
-    # Uses _distinctive_words (stopword-filtered) rather than the raw
-    # 3-letter word sets above -- generic instructional words shared by
-    # almost every question/sub-part ("identify", "following",
-    # "explain") would otherwise dilute the containment signal in
-    # exactly the cases this check needs to catch.
-    dwords1 = _distinctive_words(q1, max_words=30)
-    dwords2 = _distinctive_words(q2, max_words=30)
-    if dwords1 and dwords2:
-        missing_from_2 = [w for w in dwords1 if not _word_in_other(w, dwords2)]
-        missing_from_1 = [w for w in dwords2 if not _word_in_other(w, dwords1)]
-        shorter_len = min(len(dwords1), len(dwords2))
-
-        # FIX: with a SHORT distinctive-word list (confirmed boundary
-        # case: "akam thinai...landscapes" vs "puram thinai...
-        # landscapes" each have only 4 distinctive words), a percentage
-        # threshold is statistically unreliable -- one missing word out
-        # of 4 is 25%, easily clearing an 80% containment bar despite
-        # being a genuinely different topic word (akam vs puram). Short
-        # lists require PERFECT containment (zero missing words) on at
-        # least one side, since even a single mismatch in a short list
-        # is too large a fraction to safely ignore. Longer lists (6+
-        # words) can tolerate a percentage threshold, since one
-        # mismatched word among many genuinely is just noise.
-        if shorter_len < 6:
-            if len(missing_from_2) == 0 or len(missing_from_1) == 0:
-                return True
-        else:
-            contained_in_2 = (len(dwords1) - len(missing_from_2)) / len(dwords1)
-            contained_in_1 = (len(dwords2) - len(missing_from_1)) / len(dwords2)
-            if contained_in_2 >= 0.85 or contained_in_1 >= 0.85:
-                return True
-
-    return False
+    return ratio >= 0.90 and overlap >= 0.92
 
 
 def _dedup_questions(questions: list) -> list:
@@ -1325,35 +1207,17 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         qp_page_lengths = [
             (i, len(pages[i]["raw_text"])) for i in qp_page_indices_0based
         ]
-
-        def _true_median(values):
-            s = sorted(values)
-            n = len(s)
-            mid = n // 2
-            return (s[mid - 1] + s[mid]) / 2 if n % 2 == 0 else s[mid]
-
+        lengths_only = [length for _, length in qp_page_lengths]
+        median_length = sorted(lengths_only)[len(lengths_only) // 2]
         for page_idx, length in qp_page_lengths:
-            # FIX: the baseline must be computed from the OTHER pages
-            # only (leave-one-out), not from all pages including the
-            # candidate itself -- the original version included the
-            # candidate in its own median, which with an even page
-            # count could make the outlier page BECOME the median,
-            # making the threshold mathematically impossible to exceed
-            # (confirmed bug: a 1185-char misclassified page against a
-            # 61-char real page produced a "median" of 1185 -- itself).
-            other_lengths = [l for i, l in qp_page_lengths if i != page_idx]
-            if not other_lengths:
-                continue
-            baseline = _true_median(other_lengths)
-            # 800 chars is a realistic absolute floor: real question-
-            # paper text per page is typically well under this even
-            # with several sub-parts, while an answer's restated-
-            # question-plus-opening-paragraph reliably exceeds it.
-            if length > max(baseline * 3, 800):
+            # An outlier page 3x+ longer than the median AND absolutely
+            # long enough to plausibly be an essay opening (not just a
+            # naturally longer but still-concise question) is flagged.
+            if length > max(median_length * 3, 1500):
                 log(
                     f"WARNING: page {page_idx + 1} was classified as a question "
                     f"paper page but is {length} chars long -- much longer than "
-                    f"the typical {baseline:.0f} chars for this document's other "
+                    f"the typical {median_length} chars for this document's other "
                     f"question paper pages. This commonly means the page is "
                     f"actually the OPENING of a student's answer (where they "
                     f"restated the question before writing their real response), "
@@ -1417,9 +1281,7 @@ Your task: for EACH official question, find WHERE in the answer text the student
 
 Important guidance for finding boundaries correctly:
 - A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
-- CRITICAL -- introductory lines before the first numbered point: a student's answer frequently opens with 2-4 lines of general, introductory prose BEFORE reaching their first specific numbered point, sub-heading, or detailed argument (e.g. defining a general concept before listing specific examples). This introduction often does NOT explicitly restate the question's exact topic words. Do NOT mistake the first numbered point (e.g. "1.") or first detailed sub-heading for the TRUE start of the answer -- look BACKWARD from that point to check whether the immediately preceding lines are still part of the SAME train of thought (general scene-setting that leads into it), rather than belonging to a different, earlier question. If the preceding lines do not look like they belong to a different question (no restatement of a different topic, no different question's distinctive content), include them as part of THIS answer's start, even though they don't contain an obvious "start marker" themselves.
 - An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins (whether or not the next answer is in your list of official questions).
-- CRITICAL -- ambiguous boundaries between adjacent sub-parts (e.g. (क)/(ख)/(ग)/(घ) or (i)/(ii)/(iii)): when you cannot find a clear marker for where one labeled sub-part's answer ends and the next begins, do NOT default to including everything up to the next REF's start line as a fallback -- this routinely causes one sub-part's content to "bleed" into the next, mixing genuinely distinct paragraphs that belong to different sub-answers. Instead, look for a CONTENT-level shift: a new sentence that introduces a different specific concept, term, or sub-topic than what was just being discussed is a much more reliable boundary than line proximity alone. If you truly cannot distinguish where one sub-part ends and the next begins even by content, it is better to end the range slightly EARLIER (a shorter but cleanly correct answer) than to extend it through content that may belong to the next sub-part.
 - If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely from your output. It may appear in a different chunk of the document.
 - Each REF's range must NOT overlap with another REF's range. If you are unsure exactly where one answer ends and the next begins, prefer ending the EARLIER answer sooner rather than letting it swallow content that belongs to a later answer -- a short correct answer is far more useful than a long answer that incorrectly absorbed unrelated content.
 - Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
@@ -1521,23 +1383,17 @@ ANSWER_MAP_MAX_CHARS_PER_CHUNK = 11000  # FIX (this round): increased
 # appearing at all) -- so this is very close to the real ceiling on
 # the current Groq free tier, not an arbitrary number.
 
-ANSWER_MAP_ABSOLUTE_MAX_CHARS = 90000  # FIX (this round): raised further
-# from 60000, per explicit request for extra safety margin on long
-# answers (7-8+ pages). NOTE: the actual reported failure (a 7-8 page
-# answer mapped only halfway) was traced to the sub-part label
-# resolution gap fixed above (_build_subpart_index /
-# _extract_subpart_label) -- a long answer was very likely being cut
-# mid-way because a label/content match was misattributed to a
-# DIFFERENT question, not because 60000 chars was too small a ceiling
-# (12 pages at a generous 3000 chars/page is only ~36000 chars, well
-# under even the old ceiling). This is raised anyway since it costs
-# nothing and adds real headroom: 90000 chars comfortably covers
-# 20+ pages of dense handwritten OCR text before this ceiling could
-# ever be the actual constraint. If a chunk does grow past the TPM-
-# safe target because a single long answer needed the room, the
-# existing 413/429 retry-with-backoff logic (see
-# _call_groq_with_retries) handles it by retrying with backoff --
-# slower, but never loses real answer content.
+ANSWER_MAP_ABSOLUTE_MAX_CHARS = 60000  # FIX (this round): replaces the
+# old 2x-multiplier hard cap (~22000 chars), which could still force a
+# break mid-answer purely on SIZE with no regard for safety. Real usage
+# confirmed single answers can legitimately span 5-6 pages of OCR'd
+# text. This is now a true last-resort ceiling, deliberately generous
+# (roughly 10-12 pages worth of text) so it should never be reached in
+# ordinary use -- a real single answer reaching even half this size
+# would be extraordinary. If a chunk does grow past the TPM-safe target
+# because a single long answer needed the room, the existing 413/429
+# retry-with-backoff logic (see _call_groq_with_retries) handles it by
+# retrying with backoff -- slower, but never loses real answer content.
 
 # FIX (this round): detects a line that STARTS a new answer. The
 # previous version ONLY matched formal label patterns (Ans-, उत्तर-,
@@ -1557,66 +1413,6 @@ _ANSWER_START_RE = re.compile(
     r'^\s*(?:Ans(?:wer)?[.\s:-]+\d*|उत्तर\s*\d*\s*[\-\:]?|प्र[०.\s]*\d*|Q\.?\s*\d+[.\s:-])',
     re.IGNORECASE
 )
-
-
-# FIX (this round): a real document confirmed a structural gap with no
-# relation to chunk size or content overlap at all. The previous label
-# resolver only extracted ASCII DIGITS from a label (e.g. "5" from
-# "Ans 5-") to match it against a question's own leading number. This
-# has no way to handle the extremely common pattern of LETTERED
-# sub-parts under one shared parent question number -- e.g. a question
-# paper with "9.(क)", "9.(ख)", "9.(ग)", "9.(घ)" all sharing the digit
-# "9". Every sub-part's label then resolves to the SAME ambiguous
-# match (since they all contain "9"), giving the resolver no way to
-# tell them apart. This is especially damaging when a student answers
-# sub-parts OUT OF ORDER (confirmed in real usage: a student answered
-# (क), (ख), (घ), then (ग) LAST, far from where it "should" appear) --
-# with no per-letter resolution, the only remaining signal is generic
-# content overlap, which is far weaker for a short sub-topic label and
-# can fail to find the answer at all, leaving it completely unmapped.
-#
-# This is intentionally GENERIC, not hardcoded to Devanagari or to
-# this document: it recognizes whichever sub-part labeling style
-# (Devanagari क-घ, roman numerals, or Latin letters) the ACTUAL
-# question paper happens to use, by reading the labels directly out of
-# the canonical question text itself. A document with no lettered
-# sub-parts at all builds an empty index here and is completely
-# unaffected.
-_SUBPART_LABEL_PATTERNS = [
-    (re.compile(r'\(([क-घ])\)'), 'deva'),
-    (re.compile(r'\(([ivx]+)\)', re.IGNORECASE), 'roman'),
-    (re.compile(r'\(([a-j])\)', re.IGNORECASE), 'latin'),
-]
-
-
-def _extract_subpart_label(text: str):
-    """Returns (label, style) for the first recognized sub-part label
-    found in text, or (None, None) if none is present."""
-    for pattern, style in _SUBPART_LABEL_PATTERNS:
-        m = pattern.search(text)
-        if m:
-            label = m.group(1)
-            return (label if style == 'deva' else label.lower()), style
-    return None, None
-
-
-def _build_subpart_index(questions: list) -> dict:
-    """
-    Builds a {(label, style): question_index} lookup from the
-    canonical question list's OWN labels -- e.g. if question[2]'s text
-    contains "(ग)", this maps ('ग', 'deva') -> 2. Used to resolve a
-    student's handwritten sub-part header (however it's phrased --
-    "खण्ड (ग)", "(ग) राजभाषा", etc.) DIRECTLY to the right question by
-    its letter, independent of where that sub-part physically appears
-    in the student's answer -- this is what makes out-of-order
-    sub-part answering work correctly.
-    """
-    index = {}
-    for i, q in enumerate(questions):
-        label, style = _extract_subpart_label(q)
-        if label and (label, style) not in index:
-            index[(label, style)] = i
-    return index
 
 
 def _normalize_for_overlap_match(text: str) -> str:
@@ -1644,7 +1440,6 @@ _QUESTION_STOPWORDS = {
     'analyze', 'critically', 'briefly', 'elaborate', 'illustrate', 'for',
     'from', 'this', 'that', 'these', 'those', 'into', 'about', 'role',
     'significance', 'importance', 'short', 'long', 'play', 'text',
-    'identify', 'following', 'with', 'reference', 'comment',
 }
 
 
@@ -1657,8 +1452,7 @@ def _distinctive_words(text: str, max_words: int = 20) -> list:
     return sorted(set(w for w in words if w not in _QUESTION_STOPWORDS))
 
 
-def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.5,
-                                           subpart_index: dict = None):
+def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.5):
     """
     FIX (this round): returns the INDEX of the question this line
     appears to start a fresh answer for, or None if it doesn't look
@@ -1683,30 +1477,7 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
     the label's number can't be resolved to any known question, -1 is
     returned, signaling "ambiguous formal label -- treat cautiously as
     a fresh start since we can't rule that out."
-
-    FIX (this round, second issue): a lettered sub-part marker (e.g.
-    "खण्ड (ग)", "(घ) संपर्क भाषा") is checked FIRST, before the numeric
-    label path -- this is the strongest possible signal (an explicit,
-    unambiguous sub-part identifier), and critically it resolves
-    correctly EVEN WHEN MULTIPLE SUB-PARTS SHARE THE SAME PARENT
-    NUMBER (e.g. "9.(क)" through "9.(घ)" all sharing "9", which the
-    numeric-only path below cannot tell apart at all) and EVEN WHEN THE
-    STUDENT ANSWERS SUB-PARTS OUT OF ORDER (confirmed in real usage),
-    since subpart_index is a direct label->index lookup built from the
-    canonical questions themselves, not a sequential/positional guess.
     """
-    if subpart_index:
-        line_label, line_style = _extract_subpart_label(line)
-        if line_label is not None:
-            resolved = subpart_index.get((line_label, line_style))
-            if resolved is not None:
-                return resolved
-            # A sub-part label WAS found but doesn't match any known
-            # question -- still treat as an ambiguous fresh start
-            # rather than falling through, since this is clearly some
-            # kind of section marker even if we can't place it exactly.
-            return -1
-
     label_match = _ANSWER_START_RE.match(line)
     if label_match:
         num_match = re.search(r'\d+', label_match.group(0))
@@ -1730,32 +1501,8 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
             1 for w in q_distinctive
             if any(_words_nearly_match(w, lw) for lw in line_words)
         )
-        # FIX (this round): a genuinely long (e.g. 7-page) answer is
-        # statistically much more likely to organically reference
-        # ANOTHER question's topic in passing somewhere within its own
-        # span -- confirmed in testing with realistic comparative
-        # sentences ("This mirrors the jealousy Duryodhana felt toward
-        # the Pandavas...", appearing INSIDE a different question's
-        # long answer). The previous formula (round(n * 0.5), with no
-        # floor above 1) let such passing mentions through as if they
-        # were a genuine new-answer start, incorrectly splitting one
-        # long answer into two broken pieces wherever it happened to
-        # mention another question's vocabulary.
-        #
-        # required_matches() now requires AT LEAST 2 distinctive words
-        # to match whenever a question has 2 or more distinctive words
-        # at all (only single-distinctive-word questions, e.g. just
-        # "Mrichchhkatika", fall back to requiring that one word) --
-        # a single shared topic word is common in passing references,
-        # but two or more matching is a much stronger, rarer signal
-        # that genuinely correlates with an actual restatement opening
-        # rather than an incidental mention.
-        def _required_matches(n_distinctive, fraction=min_fraction):
-            if n_distinctive <= 1:
-                return n_distinctive
-            return max(2, round(n_distinctive * fraction))
-
-        if matched >= _required_matches(len(q_distinctive)):
+        required = max(1, round(len(q_distinctive) * min_fraction))
+        if matched >= required:
             return i
 
     return None
@@ -1811,12 +1558,6 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
     if not numbered_lines:
         return []
 
-    # Built ONCE per chunking call (not per-line) from the canonical
-    # questions' own labels -- empty dict (and therefore a complete
-    # no-op) for any document that doesn't use lettered sub-parts at
-    # all, so this has zero effect on the common case.
-    subpart_index = _build_subpart_index(questions)
-
     chunks = []
     current_chunk = []
     current_chars = 0
@@ -1824,59 +1565,21 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
     current_question_idx = None  # which question's answer we believe
                                    # we're currently accumulating
 
-    pending_new_start_idx = None  # content-match seen on the PREVIOUS
-                                    # line, awaiting corroboration
-
     for idx, text in numbered_lines:
         line_chars = len(text)
 
         if current_chunk and current_chars + line_chars > max_chars:
             past_target = True
 
-        matched_q_idx = _line_starts_new_answer_for_question(
-            text, questions, subpart_index=subpart_index
-        )
-
-        # FIX (this round): real usage confirmed a genuinely long answer
-        # (10 pages) still occasionally got cut, even with the 2+-word
-        # same-question suppression from the previous round. A SINGLE
-        # line's content-based match against a different question can
-        # still be incidental over a long enough span (e.g. one
-        # sentence that happens to reference another topic in passing).
-        # A FORMAL LABEL match (-1 or a resolved index from an explicit
-        # "Ans-"/"उत्तर-"-style marker) is a deliberate, designed signal
-        # and is trusted immediately, same as before. But a CONTENT-
-        # based match (matched_q_idx is a real index AND the line had
-        # no formal label) now requires the SAME question to also
-        # appear to start on the VERY NEXT line before being accepted --
-        # a real new answer's opening reliably continues being "about"
-        # that question for more than one line, while an incidental
-        # mid-answer reference to another topic typically does not
-        # repeat on the immediately following line too. This adds a
-        # second, independent corroboration signal without needing any
-        # length-based heuristic that could behave differently for
-        # short vs. long answers.
-        has_formal_label = bool(_ANSWER_START_RE.match(text))
-        is_new_index = matched_q_idx is not None and (
+        matched_q_idx = _line_starts_new_answer_for_question(text, questions)
+        # -1 means "ambiguous formal label, couldn't resolve to a known
+        # question" -- treated cautiously as a genuine fresh start,
+        # since we can't positively confirm it's the same question.
+        # A resolved index only counts as a genuinely NEW start if it
+        # differs from the question we believe we're already inside.
+        is_genuine_new_start = matched_q_idx is not None and (
             matched_q_idx == -1 or matched_q_idx != current_question_idx
         )
-
-        if has_formal_label and is_new_index:
-            is_genuine_new_start = True
-            pending_new_start_idx = None
-        elif is_new_index:
-            # Content-only match -- require corroboration from the
-            # PREVIOUS line having flagged the SAME question index
-            # before trusting it.
-            if pending_new_start_idx == matched_q_idx:
-                is_genuine_new_start = True
-                pending_new_start_idx = None
-            else:
-                is_genuine_new_start = False
-                pending_new_start_idx = matched_q_idx
-        else:
-            is_genuine_new_start = False
-            pending_new_start_idx = None
 
         should_break_at_answer_start = past_target and is_genuine_new_start
         should_force_break_absolute = (
@@ -1942,16 +1645,7 @@ QUESTION_PREFIX_RE = re.compile(
     r'|उत्तर\s*\d*\s*[\-\:]\s*'                # "उत्तर-", "उत्तर 5-" (dash/colon required)
     r'|प्र[०.\s]+\d+[.\s:-]*'                   # "प्र. 8." (number required)
     r'|प्रश्न[.\s]+\d+[.\s:-]*'                 # "प्रश्न. 2." (number required)
-    r'|Q\.?\s*\d+\s*[.:\-]\s*'                  # FIX: "Q.8-", "Q5:" now require
-    # explicit trailing punctuation, matching every other branch above.
-    # The previous version ("Q\.?\s*\d+[.\s:-]*", trailing punctuation
-    # OPTIONAL via "*") matched legitimate answer content like "Q.8
-    # marks allocated suggest this requires..." -- the student
-    # discussing the question's own mark allocation as part of their
-    # REAL answer, not restating a label -- silently eating "Q.8 "
-    # from genuine content. A real label always has a dash/colon/period
-    # right after the number ("Q.8-", "Q.8:"); ordinary prose mentioning
-    # a question number does not.
+    r'|Q\.?\s*\d+[.\s:-]*'                      # "Q.8", "Q5-"
     r')',
     re.IGNORECASE
 )
