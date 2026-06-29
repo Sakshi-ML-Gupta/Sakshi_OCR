@@ -1085,6 +1085,178 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
 
 # =========================================================
+# QUESTION-PAPER RECONCILIATION (Groq)
+#
+# FIX: chunk-level dedup inside identify_questions_with_llm (see
+# _is_near_duplicate_question) only catches NEAR-IDENTICAL text -- a
+# fuzzy match on the whole string. It cannot catch a different bug
+# confirmed in real usage: the SAME official question getting
+# extracted TWICE at different GRANULARITIES -- once as a single
+# compound multi-part question (a number with sub-parts (i), (ii),
+# (iii), (iv) all under it), and again as several separate candidates,
+# one per sub-part. A sub-part's text is a genuine SUBSET of the
+# compound block's text, not a near-match of the whole thing, so the
+# character-similarity ratio between them is low and dedup never
+# merges them. The visible symptom: several extra questions in the
+# final output whose "answer" is just "(no answer text matched)",
+# because their real answer was already captured inside the compound
+# question's answer, not on its own.
+#
+# This adds a final reconciliation pass after chunk-merging: the LLM
+# is shown the ACTUAL, unmodified question-paper text directly (ground
+# truth), alongside the current candidate list, and asked to pick
+# exactly ONE winning candidate per TRUE distinct question -- in the
+# paper's own printed order. This both removes the granularity-level
+# duplicates the earlier fuzzy dedup can't catch, and guarantees the
+# final question order always follows how the questions actually
+# appear in the original paper (monotonic by official numbering),
+# rather than whatever order chunk-by-chunk extraction happened to
+# emit them in.
+#
+# Like the answer-mapping call, candidates are identified by an
+# unambiguous CAND-A/CAND-B/... label assigned by US (not retyped by
+# the model), so picking a "winner" is a deterministic Python list
+# lookup with zero text-matching ambiguity.
+# =========================================================
+
+QP_RECONCILE_SYSTEM_PROMPT = """You are given:
+1. The ACTUAL, COMPLETE, UNMODIFIED OCR text of the question paper pages from an exam assignment booklet.
+2. A list of CANDIDATE question strings that were previously extracted from this same question paper by an earlier automated pass. The candidates may contain duplicates, or may break a single multi-part question (one official question number with sub-parts like (i), (ii), (iii), (iv)...) into several separate candidates instead of one combined item.
+
+Each candidate is tagged with a label like [CAND-A], [CAND-B], etc.
+
+Your task: read the ACTUAL question paper text and determine the TRUE, FINAL list of distinct exam questions, in the EXACT ORDER they appear in the original question paper -- following the paper's own printed sequence (by official question number), never reordered, never repeated.
+
+For each true distinct question:
+- Pick the SINGLE candidate label whose text is the MOST COMPLETE and FAITHFUL match to that question as it actually appears in the question paper. If the question paper presents a question as ONE numbered item with multiple sub-parts under it, prefer the candidate containing the FULL multi-part block over any candidate containing only ONE of its sub-parts in isolation.
+- Each true question must be represented by EXACTLY ONE winning candidate label. Any other candidate that is really just a fragment or duplicate of an already-chosen question must be DROPPED entirely, not included again under a different position.
+- If a true question genuinely has no matching candidate at all, omit it from the output (never invent text that isn't in the candidates).
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{
+  "final_order": ["CAND-C", "CAND-A", "CAND-E"]
+}
+
+Use ONLY the exact CAND labels given above. Do not retype, paraphrase, or merge candidate text yourself -- the label is all that's needed."""
+
+
+def _build_qp_reconcile_user_prompt(qp_text: str, candidates: list) -> str:
+    cand_block = "\n".join(
+        f"[CAND-{chr(65+i)}] {q}" for i, q in enumerate(candidates)
+    )
+    return (
+        f"ACTUAL QUESTION PAPER TEXT (verbatim OCR of the official question "
+        f"paper pages):\n{qp_text}\n\n"
+        f"CANDIDATE QUESTIONS (previously extracted -- may contain "
+        f"duplicates or sub-part fragments of the same question):\n{cand_block}"
+    )
+
+
+def _parse_qp_reconcile_response(content: str) -> list:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"LLM did not return valid JSON: {e}\nRaw content (first 500 chars): {content[:500]!r}"
+        )
+
+    if not isinstance(data, dict) or "final_order" not in data:
+        raise ValueError(
+            f"LLM response missing 'final_order' key. Got: "
+            f"{list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
+        )
+
+    order = data["final_order"]
+    if not isinstance(order, list):
+        raise ValueError(f"'final_order' must be a list, got: {type(order).__name__}")
+
+    return [str(x).strip().upper() for x in order]
+
+
+def reconcile_questions_with_paper(qp_text: str, candidate_questions: list,
+                                     status_callback=None) -> list:
+    """
+    Final ground-truth reconciliation pass -- see the module-level FIX
+    comment above for the full rationale. Compares the candidate
+    question list against the actual question-paper text and returns
+    a deduplicated, canonically-ordered (monotonic, matching the
+    paper's own printed sequence) final list.
+
+    This is a refinement pass, not a required step: if it fails for
+    any reason (network issue, malformed LLM output, missing API key),
+    it logs a warning and falls back to the original candidate list
+    rather than aborting an otherwise-successful run.
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    if not candidate_questions:
+        return []
+
+    if len(candidate_questions) == 1:
+        return candidate_questions
+
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
+        log("WARNING: GROQ_API_KEY not found, skipping question-paper reconciliation")
+        return candidate_questions
+
+    client = Groq(api_key=api_key)
+    budget = _TokenBudgetTracker()
+
+    cand_to_question = {f"CAND-{chr(65+i)}": q for i, q in enumerate(candidate_questions)}
+
+    log(
+        f"Reconciling {len(candidate_questions)} candidate question(s) against "
+        f"the actual question paper text..."
+    )
+
+    user_prompt = _build_qp_reconcile_user_prompt(qp_text, candidate_questions)
+
+    try:
+        final_order = _call_groq_with_retries(
+            client, QP_RECONCILE_SYSTEM_PROMPT, user_prompt,
+            _parse_qp_reconcile_response, budget, log
+        )
+    except Exception as e:
+        log(f"WARNING: question-paper reconciliation failed, keeping original candidate list: {e}")
+        return candidate_questions
+
+    reconciled = []
+    seen_labels = set()
+    for label in final_order:
+        if label in seen_labels:
+            continue  # defend against the LLM repeating a label
+        seen_labels.add(label)
+        q = cand_to_question.get(label)
+        if q is None:
+            log(f"WARNING: reconciliation returned unknown label {label!r}, ignoring")
+            continue
+        reconciled.append(q)
+
+    if not reconciled:
+        log("WARNING: reconciliation returned no valid questions, keeping original candidate list")
+        return candidate_questions
+
+    log(
+        f"Reconciliation complete -- {len(reconciled)} final question(s), "
+        f"reordered to match the question paper"
+    )
+    return reconciled
+
+
+# =========================================================
 # LLM-BASED ANSWER MAPPING (Groq)
 #
 # FIX: the previous approach (find_question_boundaries_by_similarity +
@@ -1116,10 +1288,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 # into territory a later-starting question's range claims.
 # =========================================================
 
-# =========================================================
-# LLM-BASED ANSWER MAPPING (Groq)
-# =========================================================
-
 ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
 1. A numbered list of the OFFICIAL exam questions, each tagged with a reference label like [REF-A], [REF-B], etc.
 2. The student's answer text, with each line prefixed by its line number in [brackets].
@@ -1147,6 +1315,17 @@ If NONE of the official questions' answers appear in the text shown, return {"an
 
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
+    # FIX: previously this prepended "1.", "2.", etc. directly in front
+    # of each question, e.g. "1. 5. प्रत्ययों...". Since most real
+    # questions ALREADY contain their own original numbering ("5.",
+    # "Q.8", "प्र. 6", etc.), this created confusing double-numbering
+    # that risked the LLM echoing back the WRONG (prompt-added) number,
+    # or the whole "1. 5. ..." string, neither of which would exactly
+    # match the canonical question text downstream. Using "REF-A",
+    # "REF-B" style reference labels instead avoids any visual or
+    # semantic collision with the question's own real numbering, making
+    # it unambiguous that these are just our own internal reference
+    # tags, not part of the question itself.
     questions_block = "\n".join(
         f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
     )
@@ -1200,15 +1379,34 @@ def _parse_answer_map_llm_response(content: str) -> list:
     return result
 
 
-# =========================================================
-# FIX: INCREASED CHUNK SIZES FOR LONG ANSWERS (5-6 PAGES)
-# =========================================================
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 11000  # FIX: bumped up from 8000.
+# Real-world output showed essay answers (e.g. the "concealment" and
+# "akam/puram thinai" answers) still getting cut off mid-sentence --
+# the answer's true end simply fell outside the chunk that contained
+# its start, even with overlap. A bigger per-chunk window means fewer
+# answers straddle a boundary at all. NOTE: this is intentionally NOT
+# pushed much higher than this -- estimated_tokens for a chunk this
+# size (~11000 chars + prompt overhead) sits close to the entire
+# 8000-token TPM ceiling (see TPM_LIMIT above) for a SINGLE request.
+# Past that point, no amount of pacing/waiting helps, because Groq
+# would reject one oversized request outright regardless of how much
+# of the per-minute budget is free. The structural fix for answers
+# that are STILL longer than one chunk is the cross-chunk range-merge
+# below, not chunk size alone.
 
-# INCREASED from 8000 to 25000 - handles 5-6 page answers completely
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 25000
-
-# INCREASED from 3500 to 8000 - ensures enough overlap between chunks
-ANSWER_MAP_OVERLAP_CHARS = 8000
+ANSWER_MAP_OVERLAP_CHARS = 5000  # FIX: bumped up alongside the chunk
+# size above, for the same reason (a fixed LINE-COUNT overlap is
+# unreliable because OCR'd answer lines vary wildly in length -- 5
+# lines might cover a full paragraph or just a few words, depending on
+# how the page wrapped). A long essay answer (confirmed in real usage
+# to run 1500-3000+ characters) could easily exceed a small line-count
+# overlap entirely, meaning NEITHER chunk that saw a piece of it ever
+# saw the WHOLE thing -- which is exactly why answers were coming back
+# cut off mid-sentence. Character-based overlap, sized generously
+# above most realistic single answers, guarantees the complete answer
+# usually appears intact in at least one chunk's view -- and for the
+# rare answer still longer than that, the range-merge logic below
+# stitches the pieces back together instead of just picking one.
 
 
 def _chunk_lines_by_char_budget(numbered_lines: list,
@@ -1316,6 +1514,100 @@ def strip_question_restatement(answer_text: str) -> str:
     return text
 
 
+def strip_leading_question_echo(answer_text: str, question_text: str,
+                                  max_echo_chars: int = 500,
+                                  similarity_threshold: float = 0.55,
+                                  word_overlap_threshold: float = 0.6) -> str:
+    """
+    FIX: strip_question_restatement above only strips short LABELED
+    prefixes ("Ans 5-", "उत्तर-", etc.). Confirmed in real usage, a
+    different and very common pattern slips straight through that: the
+    student simply RETYPES the question itself -- with no label at all,
+    sometimes with minor OCR/spelling drift -- as the opening sentence
+    of the answer, then starts the real explanation right after. E.g.:
+
+        "Examine the theme of Concealment in Abhignana Shakuntalam /
+        The Loom of Time. The theme of Concealment is central to ..."
+
+    Everything up to the first period there is just the question
+    restated, not the answer. Once shown next to the official question
+    field, this redundant echo makes the question appear twice.
+
+    This walks forward through sentence-ending boundaries near the
+    start of the answer, and for each one checks whether the text UP
+    TO that point is still substantially similar to the question
+    (character-level ratio OR shared-word overlap -- the same two-part
+    check the rest of this module already uses for question
+    deduplication, since it likewise needs to tolerate small
+    OCR/spelling drift without false-matching two genuinely different
+    sentences). The boundary stops advancing as soon as a sentence no
+    longer looks like part of the echo -- everything from there on is
+    treated as the real answer and kept.
+
+    Only operates on a bounded leading window (max_echo_chars), so a
+    long answer that happens to share some vocabulary with the
+    question deep into its body is never at risk of being cut.
+    """
+    q_norm = normalize(strip_leading_label(question_text))
+    if not q_norm:
+        return answer_text
+
+    window = answer_text[:max_echo_chars]
+    # FIX: a plain [.!?]\s pattern misses the extremely common case in
+    # these quote-and-explain answers where the sentence-ending
+    # punctuation sits INSIDE a closing quote mark, e.g. `streets." This
+    # passage...` -- the period there is followed by a quote character,
+    # not whitespace, so the old pattern never found a boundary there at
+    # all and treated the entire quoted answer as a single "sentence",
+    # which (being mostly identical to the quoted question) then either
+    # matched as one giant echo or failed to match at all depending on
+    # length. Allowing an optional closing quote/bracket character
+    # between the punctuation and the whitespace fixes this.
+    boundaries = [m.end() for m in re.finditer(r'[.!?][\"\'\u2019\u201d\)]?(?:\s|$)', window)]
+    if not boundaries:
+        return answer_text
+
+    q_words = set(re.findall(r'\w{3,}', q_norm))
+
+    best_cut = 0
+    prev_end = 0
+    for b in boundaries:
+        # FIX: compare each NEW sentence on its own (the slice between
+        # the previous boundary and this one), not the cumulative
+        # growing prefix from the start. The cumulative version had a
+        # real bug: cand_words only ever GROWS as more text gets
+        # appended, so the overlap score (matched-question-words /
+        # total-question-words) can never decrease once the genuine
+        # echo sentence is included -- it stays at or near 1.0 forever,
+        # even many unrelated sentences later, because all the
+        # question's words are still present somewhere in the
+        # ever-growing prefix. That silently kept extending best_cut
+        # deep into genuine answer content instead of stopping right
+        # after the echo. Scoring each sentence independently means an
+        # unrelated sentence's own word set is what gets compared, so
+        # the score correctly drops once the echo ends.
+        sentence = answer_text[prev_end:b]
+        sent_norm = normalize(strip_leading_label(sentence))
+        ratio = difflib.SequenceMatcher(None, sent_norm, q_norm).ratio()
+
+        sent_words = set(re.findall(r'\w{3,}', sent_norm))
+        overlap = (len(sent_words & q_words) / len(q_words)) if q_words else 0.0
+
+        if ratio >= similarity_threshold or overlap >= word_overlap_threshold:
+            best_cut = b
+            prev_end = b
+        else:
+            # Stop extending once a sentence boundary no longer looks
+            # like part of the echoed question -- everything from here
+            # on is the real answer beginning, not more echo.
+            break
+
+    if best_cut:
+        remainder = answer_text[best_cut:].strip()
+        return remainder if remainder else answer_text
+    return answer_text
+
+
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
     """
     Maps each official question to its verbatim answer text, extracted
@@ -1402,17 +1694,51 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
         log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
 
-    # Deduplicate: if overlapping chunks both found the same REF
-    # (possible due to line overlap between chunks), keep the one with
-    # the longer range (more complete capture). This is now a trivial
-    # exact-match on the ref label -- no text fuzziness involved at all.
-    best_by_ref = {}
-    for r in all_ranges:
-        existing = best_by_ref.get(r["ref"])
-        if existing is None or (r["end_line"] - r["start_line"]) > (existing["end_line"] - existing["start_line"]):
-            best_by_ref[r["ref"]] = r
+    # FIX: a long essay answer can span MORE than two chunks (chunk
+    # boundary -> overlap -> chunk boundary again), and the previous
+    # "keep the longer single range" dedup only ever kept ONE chunk's
+    # view of a ref -- even when that view was itself truncated by ITS
+    # OWN chunk boundary. Confirmed in real usage: answers ending
+    # mid-sentence right at a chunk boundary even though a generous
+    # overlap existed, because the overlap makes the SAME ref visible
+    # in two (or more) chunks, but each chunk's LLM call can only ever
+    # report line numbers within ITS OWN chunk -- so no single chunk's
+    # range alone covers the full answer if the answer itself outgrows
+    # one chunk's view.
+    #
+    # Fix: instead of keeping a single winning range per ref, MERGE all
+    # ranges found for the same ref across every chunk using standard
+    # interval-merge logic. Two ranges for the same ref that overlap
+    # (guaranteed whenever an answer spans a chunk boundary, since the
+    # overlap region is shared between the two chunks) or sit within a
+    # small gap of each other (defends against the overlap window not
+    # perfectly bisecting wherever the LLM happened to place its
+    # boundary) get combined into one continuous span covering their
+    # union. If a ref ends up with multiple genuinely separate
+    # (non-adjacent) merged spans -- unusual, but possible if the same
+    # ref is mistakenly matched in two unrelated places -- the largest
+    # span is kept, preserving the previous behavior's intent for that
+    # edge case.
+    MERGE_GAP_TOLERANCE_LINES = 5
 
-    deduped_ranges = list(best_by_ref.values())
+    ranges_by_ref = {}
+    for r in all_ranges:
+        ranges_by_ref.setdefault(r["ref"], []).append(r)
+
+    deduped_ranges = []
+    for ref, ref_ranges in ranges_by_ref.items():
+        ref_ranges = sorted(ref_ranges, key=lambda r: r["start_line"])
+        merged = [dict(ref_ranges[0])]
+        for r in ref_ranges[1:]:
+            last = merged[-1]
+            if r["start_line"] <= last["end_line"] + MERGE_GAP_TOLERANCE_LINES:
+                last["start_line"] = min(last["start_line"], r["start_line"])
+                last["end_line"] = max(last["end_line"], r["end_line"])
+            else:
+                merged.append(dict(r))
+
+        best = max(merged, key=lambda r: r["end_line"] - r["start_line"])
+        deduped_ranges.append(best)
 
     # HARD SAFETY NET: resolve any remaining overlaps so no answer can
     # ever swallow another's content, regardless of LLM output quality.
@@ -1435,7 +1761,9 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         ]
         original_question = ref_to_question[r["ref"]]
         answer_text = " ".join(verbatim_lines).strip()
-        qa_map[original_question] = strip_question_restatement(answer_text)
+        answer_text = strip_question_restatement(answer_text)
+        answer_text = strip_leading_question_echo(answer_text, original_question)
+        qa_map[original_question] = answer_text
 
     return qa_map
 
@@ -1607,6 +1935,18 @@ def process_pdf(file_input, status_callback=None):
             "Question paper pages were identified, but no questions were extracted.\n"
             f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
+
+    # FIX: reconcile the extracted candidate questions against the
+    # ACTUAL question-paper text itself. This both removes the
+    # granularity-duplicates (e.g. one compound multi-part question
+    # plus separate candidates for each of its sub-parts) that the
+    # earlier fuzzy chunk-dedup can't catch, and guarantees the final
+    # question order matches how the questions actually appear in the
+    # original paper (monotonic by official numbering) rather than
+    # whatever order chunk-by-chunk extraction happened to emit them in.
+    qp_text = "\n\n".join(pages[i]["raw_text"] for i in qp_page_indices)
+    official_questions = reconcile_questions_with_paper(qp_text, official_questions, status_callback)
+    log(f"Questions after reconciliation with actual question paper: {len(official_questions)}")
 
     answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
     answer_pages = [pages[i] for i in answer_page_indices]
