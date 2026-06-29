@@ -1457,6 +1457,81 @@ def _chunk_lines_by_char_budget(numbered_lines: list,
     return chunks
 
 
+def _close_gaps_between_consecutive_answers(ranges: list, log=print,
+                                              gap_fill_max_lines: int = 80) -> list:
+    """
+    FIX: confirmed in real usage -- some answers were missing their
+    OPENING lines (the line where the student writes "Ans 6-" / "उत्तर"
+    or otherwise restates the question), even though the cross-chunk
+    merge above already fixes truncated ENDINGS. The cause here is
+    different: the chunk whose view actually contained that opening
+    line simply failed to recognize/report it as the start of a NEW
+    answer (a plain LLM recall miss for that specific ref, not a
+    chunk-boundary issue) -- so the only range that DID get reported
+    for that ref came from a LATER chunk, whose own view started well
+    after the true opening, and which therefore reported its own
+    (too-late) starting point as the start, since that's the earliest
+    point IT personally could see.
+
+    In a real sequential answer booklet, one answer's content runs
+    straight into the next one's opening -- there is essentially never
+    a genuine gap between them (administrative/noise lines in between
+    are already filtered out of answer_lines before this point ever
+    runs). So any leftover gap between the end of one matched answer
+    and the start of the next is, in practice, almost always that
+    missed opening -- not real unrelated content.
+
+    This closes any such gap up to `gap_fill_max_lines` lines by
+    pulling the NEXT range's start backward to right after the
+    previous range's end, recovering the missing opening. Gaps LARGER
+    than that are deliberately left untouched and logged instead of
+    auto-closed -- a big gap more likely means a genuinely unmapped
+    stretch (e.g. an answer to a question outside our official list),
+    and blindly absorbing it would risk the exact swallowing bug the
+    overlap-resolution safety net elsewhere in this module exists to
+    prevent. The very first range is also left untouched (there's no
+    earlier boundary to anchor it to) -- if ITS opening was also
+    missed, that's logged separately so it's visible rather than
+    silently guessed at.
+    """
+    if not ranges:
+        return ranges
+
+    sorted_ranges = sorted(ranges, key=lambda r: r["start_line"])
+    closed = [dict(sorted_ranges[0])]
+
+    if sorted_ranges[0]["start_line"] > 0:
+        log(
+            f"NOTE: the first matched answer (ref {sorted_ranges[0]['ref']}) starts "
+            f"at line {sorted_ranges[0]['start_line']}, not line 0 -- if its opening "
+            f"was also missed, there's no earlier matched answer to anchor a fix to, "
+            f"so this one was left as-is."
+        )
+
+    for r in sorted_ranges[1:]:
+        r = dict(r)
+        prev_end = closed[-1]["end_line"]
+        gap = r["start_line"] - prev_end - 1
+        if 0 < gap <= gap_fill_max_lines:
+            log(
+                f"Closing a {gap}-line gap before ref {r['ref']}'s reported start "
+                f"(line {r['start_line']}) -- pulling its start back to line "
+                f"{prev_end + 1} to recover what was very likely a missed opening."
+            )
+            r["start_line"] = prev_end + 1
+        elif gap > gap_fill_max_lines:
+            log(
+                f"WARNING: a {gap}-line gap exists before ref {r['ref']}'s reported "
+                f"start (line {r['start_line']}) -- left UNCLOSED since it's larger "
+                f"than the {gap_fill_max_lines}-line auto-fix threshold; this may be "
+                f"a genuinely unmapped stretch of answer text rather than a missed "
+                f"opening, worth checking manually."
+            )
+        closed.append(r)
+
+    return closed
+
+
 def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
     """
     HARD SAFETY NET against the answer-swallowing bug: sorts ranges by
@@ -1740,9 +1815,17 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         best = max(merged, key=lambda r: r["end_line"] - r["start_line"])
         deduped_ranges.append(best)
 
+    # FIX: recover answers whose OPENING lines were missed by whichever
+    # chunk actually contained them -- see _close_gaps_between_consecutive_answers
+    # above for the full rationale. Runs AFTER the cross-chunk merge
+    # (so it works on each ref's best-known full range) and BEFORE the
+    # overlap-resolution safety net (so if gap-closing ever did create
+    # a new overlap, that net still catches it).
+    gap_closed_ranges = _close_gaps_between_consecutive_answers(deduped_ranges, log=log)
+
     # HARD SAFETY NET: resolve any remaining overlaps so no answer can
     # ever swallow another's content, regardless of LLM output quality.
-    resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
+    resolved_ranges = _resolve_overlapping_answer_ranges(gap_closed_ranges)
 
     log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
 
