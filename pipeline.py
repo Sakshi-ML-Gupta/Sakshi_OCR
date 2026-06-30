@@ -1640,7 +1640,7 @@ def _parse_boundary_llm_response(content: str) -> tuple:
 
 def refine_answer_boundaries(ranges: list, ref_to_question: dict, answer_lines: list,
                                client, budget: "_TokenBudgetTracker", log,
-                               pad_lines: int = 25, max_window_lines: int = 220) -> list:
+                               pad_lines: int = 80, max_window_lines: int = 400) -> list:
     """
     Runs a precise LLM boundary check between every pair of adjacent
     matched answers (sorted by document order), and corrects
@@ -2054,6 +2054,53 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         answer_text = strip_leading_question_echo(answer_text, original_question)
         qa_map[original_question] = answer_text
 
+    # FIX: last-resort recovery for any question that's STILL completely
+    # unmatched after all of the above -- confirmed in real usage, this
+    # happens when none of the per-chunk calls ever reported a range for
+    # that ref at all (not a boundary precision issue, a full recall
+    # miss). Since this is now down to a small number of leftover
+    # questions, it's cheap to give each one its own dedicated,
+    # focused LLM call across the FULL answer text (no chunking) asking
+    # specifically and only for that one question -- a much easier task
+    # than finding all questions in one chunked pass, so it often
+    # recovers what the chunked pass missed.
+    unmatched = [q for q in ref_to_question.values() if q not in qa_map]
+    if unmatched:
+        log(f"Attempting last-resort recovery for {len(unmatched)} still-unmatched question(s)...")
+        all_numbered_lines = list(enumerate(answer_lines))
+        for q in unmatched:
+            single_ref = {"REF-A": q}
+            user_prompt = _build_answer_map_user_prompt(all_numbered_lines, [q])
+            try:
+                result = _call_groq_with_retries(
+                    client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
+                    _parse_answer_map_llm_response, budget, log
+                )
+            except Exception as e:
+                log(f"WARNING: last-resort recovery failed for question {q[:60]!r}: {e}")
+                continue
+
+            match = next((r for r in result if r["ref"] == "REF-A"), None)
+            if not match:
+                log(f"WARNING: last-resort recovery found nothing for question {q[:60]!r}")
+                continue
+
+            start, end = match["start_line"], match["end_line"]
+            if not (0 <= start <= end < len(answer_lines)):
+                log(f"WARNING: last-resort recovery returned out-of-range lines for {q[:60]!r}, skipping")
+                continue
+
+            verbatim_lines = [
+                answer_lines[j] for j in range(start, end + 1)
+                if answer_lines[j].strip() and not is_noise(answer_lines[j])
+            ]
+            answer_text = " ".join(verbatim_lines).strip()
+            answer_text = strip_question_restatement(answer_text)
+            answer_text = strip_leading_question_echo(answer_text, q)
+            if answer_text:
+                qa_map[q] = answer_text
+                log(f"Last-resort recovery succeeded for question {q[:60]!r}")
+
     return qa_map
 
 
@@ -2075,6 +2122,25 @@ NOISE_RE = re.compile(
 
 def is_noise(line: str) -> bool:
     return bool(NOISE_RE.search(line))
+
+
+CLEANUP_TOKENS_RE = re.compile(
+    r'#+|विभाग|प्रश्न',
+    re.IGNORECASE
+)
+
+
+def clean_stray_tokens(text: str) -> str:
+    """Strips stray '#', 'विभाग' (section), and 'प्रश्न' (question)
+    tokens from final output text, then collapses any resulting double
+    spaces left behind."""
+    if not text:
+        return text
+    text = CLEANUP_TOKENS_RE.sub('', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n[ \t]+', '\n', text)
+    text = re.sub(r'[ \t]+\n', '\n', text)
+    return text.strip()
 
 
 # =========================================================
@@ -2325,9 +2391,11 @@ def process_pdf(file_input, status_callback=None):
     qa_pairs = []
     for q in official_questions:
         raw_answer = qa_map.get(q, "")
+        formatted_q = clean_stray_tokens(format_subparts_on_new_lines(q))
+        formatted_a = clean_stray_tokens(format_subparts_on_new_lines(raw_answer)) if raw_answer else raw_answer
         qa_pairs.append({
-            "question": format_subparts_on_new_lines(q),
-            "answer": format_subparts_on_new_lines(raw_answer) if raw_answer else raw_answer,
+            "question": formatted_q,
+            "answer": formatted_a,
             "matched": q in qa_map,
         })
 
