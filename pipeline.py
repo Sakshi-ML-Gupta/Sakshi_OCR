@@ -116,35 +116,14 @@ def preprocess_pdf(file_bytes: bytes, dpi: int = 250) -> bytes:
 
 
 # =========================================================
-# TEXT CLEANING - AGGRESSIVE
+# TEXT CLEANING - MINIMAL (ONLY REMOVE OBVIOUS NOISE)
 # =========================================================
 
 def clean_ocr_text(text: str) -> str:
-    """Aggressive cleaning of OCR text."""
-    # Remove common headers/footers
-    patterns = [
-        r'^\s*Page\s*\d+\s*of\s*\d+\s*$',
-        r'^\s*Page\s*\d+\s*$',
-        r'^\s*-\s*\d+\s*-\s*$',
-        r'^\s*\[Page\s*\d+\]\s*$',
-        r'^\s*P\.?\s*No\.?\s*\d+\s*$',
-        r'^\s*प्र\.\s*नं\.?\s*\d+\s*$',
-        r'^\s*प्रश्न\s*नं\.?\s*\d+\s*$',
-        r'^\s*Q\.?\s*No\.?\s*\d+\s*$',
-        r'^\s*Question\s*No\.?\s*\d+\s*$',
-        r'^\s*#\s*.*$',
-        r'^\s*प्रश्नोत्तर\s*.*$',
-        r'^\s*prashan\s*.*$',
-        r'^\s*[Pp]rashan\s*.*$',
-        r'^\s*Answer\s*No\.?\s*\d+\s*$',
-        r'^\s*उत्तर\s*नं\.?\s*\d+\s*$',
-        r'^\s*Roll\s*No\.?\s*\d+\s*$',
-        r'^\s*Enrolment\s*No\.?\s*\d+\s*$',
-        r'^\s*[A-Z]{2,}\s*\d+\s*$',
-        r'^\s*[A-Z]+\s*-\s*\d+\s*$',
-        r'^\s*[A-Z]+\s*/\s*\d+\s*$',
-    ]
-    
+    """
+    MINIMAL cleaning - only remove obvious page numbers and headers.
+    CRITICAL: Don't remove content that looks like part of answers!
+    """
     lines = text.split('\n')
     cleaned_lines = []
     
@@ -152,24 +131,28 @@ def clean_ocr_text(text: str) -> str:
         line = line.strip()
         if not line:
             continue
-            
+        
+        # ONLY remove these exact patterns - VERY conservative
         is_noise = False
-        for pattern in patterns:
-            if re.search(pattern, line, re.IGNORECASE):
-                is_noise = True
-                break
-                
-        if len(line) < 3 and not any(c.isalpha() for c in line):
+        
+        # Page numbers only (exact matches)
+        if re.match(r'^Page\s+\d+\s*$', line, re.IGNORECASE):
             is_noise = True
-            
+        elif re.match(r'^-\s*\d+\s*-\s*$', line):
+            is_noise = True
+        elif re.match(r'^\[\s*Page\s+\d+\s*\]\s*$', line, re.IGNORECASE):
+            is_noise = True
+        elif re.match(r'^P\.?\s*No\.?\s*\d+\s*$', line, re.IGNORECASE):
+            is_noise = True
+        
+        # Keep everything else, including lines with #, प्रश्नोत्तर, etc.
+        # because they might be part of the answer text!
         if not is_noise:
             cleaned_lines.append(line)
     
-    text = ' '.join(cleaned_lines)
-    text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'[ \t]+', ' ', text)
-    
-    return text.strip()
+    # Join back
+    text = '\n'.join(cleaned_lines)
+    return text
 
 
 # =========================================================
@@ -293,6 +276,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None) -> List[D
     if not markdown.strip():
         raise Exception("Empty markdown output")
 
+    # Minimal cleaning - only page numbers
     markdown = clean_ocr_text(markdown)
 
     page_count_hint = result.get("page_count")
@@ -344,8 +328,8 @@ def process_reference(file_input, status_callback=None):
 TPM_LIMIT = 8000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
-MAX_CHARS_PER_CHUNK = 15000  # DRAMATICALLY INCREASED for long answers
-CHUNK_OVERLAP_PAGES = 1
+MAX_CHARS_PER_CHUNK = 20000  # MAXIMUM for large documents
+CHUNK_OVERLAP_PAGES = 2
 
 class _TokenBudgetTracker:
     def __init__(self, tpm_limit=TPM_LIMIT, safety_fraction=TPM_SAFETY_FRACTION):
@@ -437,9 +421,6 @@ RULES:
 2. ANSWER pages contain student responses (longer text with explanations)
 3. ADMIN pages contain enrolment numbers, programme codes, etc.
 
-CRITICAL: If a page looks like it could be a question but is VERY LONG (>3x median length), 
-it's likely an ANSWER page where the student restated the question.
-
 Return ONLY valid JSON:
 {
   "question_paper_pages": [14, 16, 18],
@@ -464,10 +445,6 @@ Return ONLY valid JSON:
 }"""
 
 
-# =========================================================
-# CRITICAL FIX: ANSWER MAPPING - COMPLETE REWRITE
-# =========================================================
-
 ANSWER_MAP_SYSTEM_PROMPT = """You are matching answers to questions from a student's exam.
 
 You are given:
@@ -483,6 +460,7 @@ CRITICAL RULES:
 4. An answer ends when the student starts the NEXT question's answer
 5. If you're unsure about a boundary, BE GENEROUS - include more lines rather than fewer
 6. Each answer MUST be continuous - no gaps in the middle of an answer
+7. The FIRST line of an answer is very important - DO NOT skip it!
 
 Return ONLY valid JSON:
 {
@@ -495,28 +473,14 @@ Return ONLY valid JSON:
 If an answer isn't present, OMIT it from the output."""
 
 
-def _line_starts_answer(line: str) -> Tuple[bool, Optional[str]]:
-    """Detect if line starts a new answer and extract question number."""
-    patterns = [
-        (r'^\s*Ans(?:wer)?\s*[:.-]?\s*(\d+)', 'Ans'),
-        (r'^\s*उत्तर\s*[:.-]?\s*(\d+)', 'उत्तर'),
-        (r'^\s*प्रश्न\s*[.:]?\s*(\d+)', 'प्रश्न'),
-        (r'^\s*प्र\.\s*(\d+)', 'प्र.'),
-        (r'^\s*Q\.?\s*[:.-]?\s*(\d+)', 'Q'),
-    ]
-    
-    for pattern, _ in patterns:
-        match = re.search(pattern, line, re.IGNORECASE)
-        if match:
-            return True, match.group(1)
-    
-    return False, None
-
+# =========================================================
+# ANSWER MAPPING - COMPLETE REWRITE (NO SKIPPING)
+# =========================================================
 
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
     """
     Map questions to answers using the ENTIRE answer text at once.
-    FIX: Process ALL answer lines in ONE chunk to avoid splitting answers.
+    CRITICAL FIX: Preserves ALL content including first paragraph.
     """
     def log(msg):
         print(msg)
@@ -535,8 +499,9 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
-    # Clean answer lines
-    answer_lines = [clean_ocr_text(line) for line in answer_lines if line.strip()]
+    # DON'T clean aggressively - keep all content
+    # Only remove completely empty lines
+    answer_lines = [line for line in answer_lines if line.strip()]
     
     if not answer_lines:
         log("No answer lines found")
@@ -590,28 +555,58 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
     log(f"Resolved {len(resolved)} answer ranges")
 
-    # Extract answers
+    # Extract answers - PRESERVE EVERYTHING
     qa_map = {}
     for r in resolved:
         start, end = r["start_line"], r["end_line"]
+        
         # Include ALL lines from start to end
         verbatim_lines = []
         for j in range(start, end + 1):
-            if 0 <= j < len(answer_lines) and answer_lines[j].strip():
-                verbatim_lines.append(answer_lines[j])
+            if 0 <= j < len(answer_lines):
+                line = answer_lines[j].strip()
+                if line:  # Only skip completely empty lines
+                    verbatim_lines.append(line)
         
         original_question = ref_to_question[r["ref"]]
-        answer_text = " ".join(verbatim_lines).strip()
         
-        # Clean but preserve content
-        answer_text = strip_question_restatement(answer_text)
-        answer_text = strip_full_question_echo(answer_text, original_question)
+        # Join with newlines to preserve structure
+        answer_text = "\n".join(verbatim_lines).strip()
+        
+        # ONLY remove exact answer labels like "Ans 5-" but NOT content after it
+        answer_text = strip_question_label_only(answer_text)
         
         if answer_text:
             qa_map[original_question] = answer_text
 
-    log(f"Extracted {len(qa_map)} complete answers")
+    log(f"Extracted {len(qa_map)} complete answers with all content preserved")
     return qa_map
+
+
+def strip_question_label_only(answer_text: str) -> str:
+    """
+    ONLY remove the answer label like "Ans 5-", "उत्तर 6-" etc.
+    BUT keep EVERYTHING after that including the first paragraph.
+    """
+    # Patterns for answer labels - these are the ONLY things we remove
+    patterns = [
+        r'^(\s*Ans(?:wer)?\s*\d*\s*[.:\-]\s*)',
+        r'^(\s*उत्तर\s*\d*\s*[\-\:]\s*)',
+        r'^(\s*प्र[०.\s]+\d+[.\s:-]*)',
+        r'^(\s*प्रश्न[.\s]+\d+[.\s:-]*)',
+        r'^(\s*Q\.?\s*\d+[.\s:-]*)',
+        r'^(\s*प्र\.\s*नं\.?\s*\d+\s*)',
+        r'^(\s*प्रश्नोत्तर\s*नं\.?\s*\d+\s*)',
+        r'^(\s*★\s*ोत्तर\s*नं\.?\s*\d+\s*,?\s*भाग\s*-\s*\d+\s*)',  # For ★ ोत्तर नं. 4 ,भाग - 2
+    ]
+    
+    text = answer_text
+    for pattern in patterns:
+        # Remove ONLY the label, keep everything after it
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE, count=1)
+        text = text.lstrip()  # Remove leading whitespace only
+    
+    return text
 
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
@@ -626,7 +621,8 @@ def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
     return (
         f"OFFICIAL QUESTIONS (use REF labels):\n{questions_block}\n\n"
         f"STUDENT'S COMPLETE ANSWER TEXT (ALL lines numbered):\n{lines_block}\n\n"
-        f"FIND THE LINE RANGE FOR EACH QUESTION'S ANSWER. Include ALL content for each answer."
+        f"FIND THE LINE RANGE FOR EACH QUESTION'S ANSWER.\n"
+        f"IMPORTANT: Include the FIRST LINE of each answer - it's very important!"
     )
 
 
@@ -663,53 +659,6 @@ def _parse_answer_map_llm_response(content: str) -> list:
                 continue
 
     return result
-
-
-def strip_question_restatement(answer_text: str) -> str:
-    """Strip leading question restatement labels."""
-    patterns = [
-        r'^\s*Ans(?:wer)?\s*\d*\s*[.:\-]\s*',
-        r'^\s*उत्तर\s*\d*\s*[\-\:]\s*',
-        r'^\s*प्र[०.\s]+\d+[.\s:-]*',
-        r'^\s*प्रश्न[.\s]+\d+[.\s:-]*',
-        r'^\s*Q\.?\s*\d+[.\s:-]*',
-    ]
-    
-    text = answer_text
-    for _ in range(2):
-        for pattern in patterns:
-            text = re.sub(pattern, '', text, flags=re.IGNORECASE, count=1)
-        text = text.strip()
-        if text == answer_text:
-            break
-    
-    return text
-
-
-def strip_full_question_echo(answer_text: str, question_text: str) -> str:
-    """Strip full question echo from answer start."""
-    q_norm = re.sub(r'[^\w\s]', ' ', question_text.lower())
-    q_norm = re.sub(r'\s+', ' ', q_norm).strip()
-    q_words = q_norm.split()
-    
-    if len(q_words) < 3:
-        return answer_text
-    
-    answer_words = answer_text.split()
-    if len(answer_words) < len(q_words):
-        return answer_text
-    
-    prefix = " ".join(answer_words[:len(q_words)])
-    prefix_norm = re.sub(r'[^\w\s]', ' ', prefix.lower())
-    prefix_norm = re.sub(r'\s+', ' ', prefix_norm).strip()
-    
-    similarity = difflib.SequenceMatcher(None, prefix_norm, q_norm).ratio()
-    
-    if similarity >= 0.5:  # Lowered threshold to catch more echoes
-        remaining = " ".join(answer_words[len(q_words):])
-        return remaining.strip()
-    
-    return answer_text
 
 
 # =========================================================
@@ -810,6 +759,7 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
+    # Don't aggressively clean question pages either
     for page in pages:
         page["raw_text"] = clean_ocr_text(page["raw_text"])
 
@@ -998,7 +948,7 @@ def _parse_canonical_questions_response(content: str) -> list:
 
 @_diagnose_tuple_errors
 def process_pdf(file_input, status_callback=None):
-    """Complete PDF processing pipeline with FIX for long answers."""
+    """Complete PDF processing pipeline with FIX for all skipping issues."""
     def log(msg):
         print(msg)
         if status_callback:
@@ -1035,21 +985,18 @@ def process_pdf(file_input, status_callback=None):
     for page in answer_pages:
         lines = page["raw_text"].split("\n")
         for line in lines:
-            line = clean_ocr_text(line)
-            if line:  # Keep all non-empty lines
+            line = line.strip()
+            # Only skip completely empty lines
+            if line:
                 answer_lines.append(line)
     
     log(f"Flattened {len(answer_lines)} answer lines")
     
-    # Step 8: Validate answer pages
-    if not _sanity_check_answer_pages(answer_lines, len(official_questions), log):
-        log("WARNING: Answer pages seem too short. Continuing anyway...")
-    
-    # Step 9: Map answers - USING COMPLETE TEXT
+    # Step 8: Map answers - USING COMPLETE TEXT
     log("Mapping answers to questions (processing ALL text at once)...")
     qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
     
-    # Step 10: Build QA pairs
+    # Step 9: Build QA pairs
     qa_pairs = []
     matched_count = 0
     total_answer_chars = 0
@@ -1074,18 +1021,6 @@ def process_pdf(file_input, status_callback=None):
     return ocr_json, qa_pairs
 
 
-def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print) -> bool:
-    total_chars = sum(len(line) for line in answer_lines)
-    avg_chars_per_question = total_chars / max(num_questions, 1)
-    
-    # Very conservative - only warn if truly empty
-    if avg_chars_per_question < 50 and total_chars < 500:
-        log(f"WARNING: Only {total_chars} chars for {num_questions} questions.")
-        return False
-    
-    return True
-
-
 def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
                   base_name: str = "document") -> tuple:
     """Save outputs to JSON files."""
@@ -1108,8 +1043,7 @@ def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
 NOISE_RE = re.compile(
     r'(?:Teacher\'?s?\s*Signature'
     r'|Tancher\'?s?\s*Signature'
-    r'|PAGE\s*NO'
-    r'|^\s*DATE\b)',
+    r'|PAGE\s*NO)',
     re.IGNORECASE
 )
 
@@ -1141,12 +1075,15 @@ if __name__ == "__main__":
             print(f"  - Questions: {len(qa_pairs)}")
             print(f"  - Matched: {sum(1 for p in qa_pairs if p['matched'])}")
             
-            # Show sample
-            print("\n📝 Sample Output:")
-            for i, pair in enumerate(qa_pairs[:3]):
+            # Show sample with full first answer
+            print("\n📝 Sample First Answer:")
+            for pair in qa_pairs:
                 if pair['matched']:
-                    print(f"\nQ{i+1}: {pair['question'][:100]}...")
-                    print(f"A{i+1}: {pair['answer'][:150]}...")
+                    print(f"\nQuestion: {pair['question'][:100]}...")
+                    print(f"Answer length: {len(pair['answer'])} characters")
+                    print(f"Answer preview (first 500 chars):\n{pair['answer'][:500]}")
+                    break
+                    
         except Exception as e:
             print(f"\n❌ Error: {e}")
             import traceback
