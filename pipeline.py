@@ -16,7 +16,6 @@ import collections
 # =========================================================
 
 def get_api_key(name: str) -> Optional[str]:
-    """Get API key from Streamlit secrets or environment variables."""
     try:
         import streamlit as st
         return st.secrets[name]
@@ -31,7 +30,6 @@ def get_api_key(name: str) -> Optional[str]:
 # =========================================================
 
 def _normalize_file_input(file_input: Any, default_name: str = "document.pdf") -> Tuple[bytes, str]:
-    """Normalize various input types to (bytes, filename)."""
     if isinstance(file_input, tuple):
         if len(file_input) < 2:
             raise ValueError(f"Tuple must have at least (filename, bytes), got {len(file_input)} items")
@@ -58,7 +56,6 @@ def _normalize_file_input(file_input: Any, default_name: str = "document.pdf") -
 
 
 def _coerce_name(name: Any, default_name: str = "document.pdf") -> str:
-    """Extract filename from various types."""
     if isinstance(name, (tuple, list)):
         return default_name
     if not name:
@@ -98,16 +95,14 @@ _groq_call_lock = threading.Lock()
 
 
 # =========================================================
-# PREPROCESS PDF - IMPROVED
+# PREPROCESS PDF
 # =========================================================
 
 def preprocess_pdf(file_bytes: bytes, dpi: int = 250) -> bytes:
-    """Preprocess PDF with improved cleaning."""
     src_doc = fitz.open(stream=file_bytes, filetype="pdf")
     out_doc = fitz.open()
     
     for page in src_doc:
-        # Clean page content first
         pix = page.get_pixmap(dpi=dpi)
         new_page = out_doc.new_page(width=pix.width, height=pix.height)
         new_page.insert_image(new_page.rect, pixmap=pix)
@@ -121,39 +116,33 @@ def preprocess_pdf(file_bytes: bytes, dpi: int = 250) -> bytes:
 
 
 # =========================================================
-# TEXT CLEANING - NEW & IMPROVED
+# TEXT CLEANING - AGGRESSIVE
 # =========================================================
 
 def clean_ocr_text(text: str) -> str:
-    """
-    Comprehensive text cleaning for OCR output.
-    Removes: page numbers, headers, footers, garbage markers,
-    question numbering artifacts, and common OCR noise.
-    """
+    """Aggressive cleaning of OCR text."""
     # Remove common headers/footers
     patterns = [
-        r'^\s*Page\s*\d+\s*of\s*\d+\s*$',  # Page X of Y
-        r'^\s*Page\s*\d+\s*$',              # Page X
-        r'^\s*-\s*\d+\s*-\s*$',             # - X -
-        r'^\s*\[Page\s*\d+\]\s*$',          # [Page X]
-        r'^\s*P\.?\s*No\.?\s*\d+\s*$',      # P.No. X
-        r'^\s*प्र\.\s*नं\.?\s*\d+\s*$',     # प्र. नं. X
-        r'^\s*प्रश्न\s*नं\.?\s*\d+\s*$',   # प्रश्न नं. X
-        r'^\s*Q\.?\s*No\.?\s*\d+\s*$',      # Q.No. X
-        r'^\s*Question\s*No\.?\s*\d+\s*$',  # Question No. X
-        r'^\s*#\s*.*$',                      # Lines starting with #
-        r'^\s*प्रश्नोत्तर\s*.*$',           # प्रश्नोत्तर
-        r'^\s*prashan\s*.*$',               # prashan
-        r'^\s*[Pp]rashan\s*.*$',            # Prashan
-        r'^\s*Answer\s*No\.?\s*\d+\s*$',    # Answer No. X
-        r'^\s*उत्तर\s*नं\.?\s*\d+\s*$',     # उत्तर नं. X
-        r'^\s*Roll\s*No\.?\s*\d+\s*$',      # Roll No. X
-        r'^\s*Enrolment\s*No\.?\s*\d+\s*$', # Enrolment No. X
-        r'^\s*[A-Z]{2,}\s*\d+\s*$',          # IGNOU123 etc.
-        r'^\s*[A-Z]+\s*-\s*\d+\s*$',         # IGNOU - 123
-        r'^\s*[A-Z]+\s*/\s*\d+\s*$',         # IGNOU/123
-        r'^\s*[A-Z]+\s*\d+\s*/\s*\d+\s*$',   # IGNOU123/456
-        r'^\s*[A-Z]+\s*\(\d+\)\s*$',         # IGNOU(123)
+        r'^\s*Page\s*\d+\s*of\s*\d+\s*$',
+        r'^\s*Page\s*\d+\s*$',
+        r'^\s*-\s*\d+\s*-\s*$',
+        r'^\s*\[Page\s*\d+\]\s*$',
+        r'^\s*P\.?\s*No\.?\s*\d+\s*$',
+        r'^\s*प्र\.\s*नं\.?\s*\d+\s*$',
+        r'^\s*प्रश्न\s*नं\.?\s*\d+\s*$',
+        r'^\s*Q\.?\s*No\.?\s*\d+\s*$',
+        r'^\s*Question\s*No\.?\s*\d+\s*$',
+        r'^\s*#\s*.*$',
+        r'^\s*प्रश्नोत्तर\s*.*$',
+        r'^\s*prashan\s*.*$',
+        r'^\s*[Pp]rashan\s*.*$',
+        r'^\s*Answer\s*No\.?\s*\d+\s*$',
+        r'^\s*उत्तर\s*नं\.?\s*\d+\s*$',
+        r'^\s*Roll\s*No\.?\s*\d+\s*$',
+        r'^\s*Enrolment\s*No\.?\s*\d+\s*$',
+        r'^\s*[A-Z]{2,}\s*\d+\s*$',
+        r'^\s*[A-Z]+\s*-\s*\d+\s*$',
+        r'^\s*[A-Z]+\s*/\s*\d+\s*$',
     ]
     
     lines = text.split('\n')
@@ -164,26 +153,18 @@ def clean_ocr_text(text: str) -> str:
         if not line:
             continue
             
-        # Check if line matches any pattern
         is_noise = False
         for pattern in patterns:
             if re.search(pattern, line, re.IGNORECASE):
                 is_noise = True
                 break
                 
-        # Check for very short lines that are likely noise
         if len(line) < 3 and not any(c.isalpha() for c in line):
-            is_noise = True
-            
-        # Check for lines with too many special characters
-        special_count = sum(1 for c in line if not c.isalnum() and not c.isspace())
-        if len(line) > 0 and special_count / len(line) > 0.5:
             is_noise = True
             
         if not is_noise:
             cleaned_lines.append(line)
     
-    # Join and clean extra whitespace
     text = ' '.join(cleaned_lines)
     text = re.sub(r'\s+', ' ', text)
     text = re.sub(r'[ \t]+', ' ', text)
@@ -192,7 +173,7 @@ def clean_ocr_text(text: str) -> str:
 
 
 # =========================================================
-# OCR -- Datalab (Chandra model)
+# OCR
 # =========================================================
 
 DATALAB_BASE_URL = "https://www.datalab.to"
@@ -208,7 +189,6 @@ PAGE_BREAK_PATTERNS = [
 
 
 def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=print) -> list:
-    """Split markdown into pages using various page break patterns."""
     best_parts = None
 
     for pattern in PAGE_BREAK_PATTERNS:
@@ -241,21 +221,16 @@ def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=pr
         if len(parts) > 1:
             return parts
 
-    log(f"WARNING: No page-break marker recognized. Treating as single page.")
     return [markdown.strip()]
 
 
 def run_ocr(file_content: bytes, file_name: str, status_callback=None) -> List[Dict]:
-    """Run OCR using Datalab's Chandra model."""
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
     file_name = _coerce_name(file_name, default_name="document.pdf")
-
-    if not isinstance(file_content, (bytes, bytearray)):
-        raise TypeError(f"run_ocr() expected bytes, got {type(file_content).__name__}")
 
     api_key = get_api_key("DATALAB_API_KEY")
     if not api_key:
@@ -318,7 +293,6 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None) -> List[D
     if not markdown.strip():
         raise Exception("Empty markdown output")
 
-    # Clean the markdown text
     markdown = clean_ocr_text(markdown)
 
     page_count_hint = result.get("page_count")
@@ -364,13 +338,13 @@ def process_reference(file_input, status_callback=None):
 
 
 # =========================================================
-# TOKEN BUDGET TRACKER - IMPROVED
+# TOKEN BUDGET TRACKER
 # =========================================================
 
 TPM_LIMIT = 8000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
-MAX_CHARS_PER_CHUNK = 8000  # Increased for long answers
+MAX_CHARS_PER_CHUNK = 15000  # DRAMATICALLY INCREASED for long answers
 CHUNK_OVERLAP_PAGES = 1
 
 class _TokenBudgetTracker:
@@ -407,8 +381,7 @@ class _TokenBudgetTracker:
                 break
 
         wait_s = max(0.0, wait_s) + 0.5
-        log(f"Pacing requests: {used:.0f} tokens used, +{upcoming_tokens} upcoming. "
-            f"Waiting {wait_s:.1f}s...")
+        log(f"Pacing requests: waiting {wait_s:.1f}s...")
         time.sleep(wait_s)
 
     def record_usage(self, tokens: int):
@@ -452,19 +425,20 @@ def _parse_rate_limit_detail(message: str):
 
 
 # =========================================================
-# LLM PROMPTS - IMPROVED
+# LLM PROMPTS
 # =========================================================
 
 QP_SYSTEM_PROMPT = """You are analyzing OCR text from a student exam assignment booklet.
 
-Your task: Identify which pages are the official question paper pages and extract the complete question list.
+Your task: Identify which pages are the official question paper pages.
 
-Rules:
-1. QUESTION PAPER pages contain official exam questions (instructions/prompts directed at students)
+RULES:
+1. QUESTION PAPER pages contain official exam questions (instructions/prompts)
 2. ANSWER pages contain student responses (longer text with explanations)
 3. ADMIN pages contain enrolment numbers, programme codes, etc.
 
-CRITICAL: A page that looks like a question but is very long (>3x median length) is likely an ANSWER page where the student restated the question.
+CRITICAL: If a page looks like it could be a question but is VERY LONG (>3x median length), 
+it's likely an ANSWER page where the student restated the question.
 
 Return ONLY valid JSON:
 {
@@ -477,7 +451,7 @@ If no question pages found, return {"question_paper_pages": [], "questions": []}
 
 QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are extracting questions from the official question paper.
 
-Rules:
+RULES:
 1. Extract EVERY distinct question/sub-part
 2. For multi-part questions (i), (ii), (iii), split each into separate entries
 3. Preserve EXACT original text
@@ -490,31 +464,256 @@ Return ONLY valid JSON:
 }"""
 
 
-ANSWER_MAP_SYSTEM_PROMPT = """You are mapping answers to questions.
+# =========================================================
+# CRITICAL FIX: ANSWER MAPPING - COMPLETE REWRITE
+# =========================================================
 
-Given:
+ANSWER_MAP_SYSTEM_PROMPT = """You are matching answers to questions from a student's exam.
+
+You are given:
 1. Questions with REF labels (REF-A, REF-B, etc.)
-2. Line-numbered answer text
+2. The COMPLETE student answer text with line numbers
 
-For EACH question, find the line range [start_line, end_line] where its answer appears.
+Your task: For EACH question, find the EXACT line range where its answer appears.
 
-IMPORTANT: 
-- Answers can be LONG (5-10+ pages). Don't truncate!
-- Include ALL lines that belong to that answer
-- A new answer starts when the student references the next question
-- If an answer isn't present, omit it
+CRITICAL RULES:
+1. Answers can be VERY LONG (10+ pages). DO NOT TRUNCATE!
+2. Include ALL lines that belong to each answer
+3. An answer starts when the student begins responding to that question
+4. An answer ends when the student starts the NEXT question's answer
+5. If you're unsure about a boundary, BE GENEROUS - include more lines rather than fewer
+6. Each answer MUST be continuous - no gaps in the middle of an answer
 
 Return ONLY valid JSON:
 {
   "answers": [
-    {"ref": "REF-A", "start_line": 12, "end_line": 48},
-    {"ref": "REF-B", "start_line": 49, "end_line": 95}
+    {"ref": "REF-A", "start_line": 0, "end_line": 45},
+    {"ref": "REF-B", "start_line": 46, "end_line": 92}
   ]
-}"""
+}
+
+If an answer isn't present, OMIT it from the output."""
+
+
+def _line_starts_answer(line: str) -> Tuple[bool, Optional[str]]:
+    """Detect if line starts a new answer and extract question number."""
+    patterns = [
+        (r'^\s*Ans(?:wer)?\s*[:.-]?\s*(\d+)', 'Ans'),
+        (r'^\s*उत्तर\s*[:.-]?\s*(\d+)', 'उत्तर'),
+        (r'^\s*प्रश्न\s*[.:]?\s*(\d+)', 'प्रश्न'),
+        (r'^\s*प्र\.\s*(\d+)', 'प्र.'),
+        (r'^\s*Q\.?\s*[:.-]?\s*(\d+)', 'Q'),
+    ]
+    
+    for pattern, _ in patterns:
+        match = re.search(pattern, line, re.IGNORECASE)
+        if match:
+            return True, match.group(1)
+    
+    return False, None
+
+
+def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
+    """
+    Map questions to answers using the ENTIRE answer text at once.
+    FIX: Process ALL answer lines in ONE chunk to avoid splitting answers.
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    if not answer_lines or not questions:
+        return {}
+
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
+        raise Exception("GROQ_API_KEY not found")
+
+    client = Groq(api_key=api_key)
+    budget = _TokenBudgetTracker()
+
+    # Clean answer lines
+    answer_lines = [clean_ocr_text(line) for line in answer_lines if line.strip()]
+    
+    if not answer_lines:
+        log("No answer lines found")
+        return {}
+
+    log(f"Processing {len(answer_lines)} answer lines as a SINGLE chunk...")
+    
+    # Build REF mapping
+    ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
+    
+    # Create numbered lines
+    numbered_lines = list(enumerate(answer_lines))
+    
+    # Build prompt with ALL lines
+    user_prompt = _build_answer_map_user_prompt(numbered_lines, questions)
+    
+    try:
+        # Call LLM once with ALL answer text
+        chunk_ranges = _call_groq_with_retries(
+            client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
+            _parse_answer_map_llm_response, budget, log
+        )
+    except Exception as e:
+        log(f"WARNING: Answer mapping failed: {e}")
+        return {}
+
+    # Validate and resolve ranges
+    valid_ranges = []
+    for r in chunk_ranges:
+        if r["ref"] in ref_to_question:
+            # Ensure ranges are within bounds
+            start = max(0, min(r["start_line"], len(answer_lines) - 1))
+            end = max(start, min(r["end_line"], len(answer_lines) - 1))
+            valid_ranges.append({
+                "ref": r["ref"],
+                "start_line": start,
+                "end_line": end
+            })
+
+    # Sort and resolve overlaps
+    valid_ranges.sort(key=lambda x: x["start_line"])
+    resolved = []
+    
+    for i, r in enumerate(valid_ranges):
+        if i + 1 < len(valid_ranges):
+            next_start = valid_ranges[i + 1]["start_line"]
+            if r["end_line"] >= next_start:
+                r["end_line"] = next_start - 1
+        if r["end_line"] >= r["start_line"]:
+            resolved.append(r)
+
+    log(f"Resolved {len(resolved)} answer ranges")
+
+    # Extract answers
+    qa_map = {}
+    for r in resolved:
+        start, end = r["start_line"], r["end_line"]
+        # Include ALL lines from start to end
+        verbatim_lines = []
+        for j in range(start, end + 1):
+            if 0 <= j < len(answer_lines) and answer_lines[j].strip():
+                verbatim_lines.append(answer_lines[j])
+        
+        original_question = ref_to_question[r["ref"]]
+        answer_text = " ".join(verbatim_lines).strip()
+        
+        # Clean but preserve content
+        answer_text = strip_question_restatement(answer_text)
+        answer_text = strip_full_question_echo(answer_text, original_question)
+        
+        if answer_text:
+            qa_map[original_question] = answer_text
+
+    log(f"Extracted {len(qa_map)} complete answers")
+    return qa_map
+
+
+def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
+    """Build user prompt with ALL answer lines."""
+    questions_block = "\n".join(
+        f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
+    )
+    
+    # Include ALL lines
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
+    
+    return (
+        f"OFFICIAL QUESTIONS (use REF labels):\n{questions_block}\n\n"
+        f"STUDENT'S COMPLETE ANSWER TEXT (ALL lines numbered):\n{lines_block}\n\n"
+        f"FIND THE LINE RANGE FOR EACH QUESTION'S ANSWER. Include ALL content for each answer."
+    )
+
+
+def _parse_answer_map_llm_response(content: str) -> list:
+    """Parse LLM response for answer mapping."""
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e}")
+
+    if not isinstance(data, dict) or "answers" not in data:
+        raise ValueError(f"Missing 'answers' key")
+
+    answers = data["answers"]
+    if not isinstance(answers, list):
+        raise ValueError(f"'answers' must be a list")
+
+    result = []
+    for item in answers:
+        if isinstance(item, dict) and "ref" in item and "start_line" in item and "end_line" in item:
+            try:
+                result.append({
+                    "ref": str(item["ref"]).strip().upper(),
+                    "start_line": int(item["start_line"]),
+                    "end_line": int(item["end_line"]),
+                })
+            except (ValueError, TypeError):
+                continue
+
+    return result
+
+
+def strip_question_restatement(answer_text: str) -> str:
+    """Strip leading question restatement labels."""
+    patterns = [
+        r'^\s*Ans(?:wer)?\s*\d*\s*[.:\-]\s*',
+        r'^\s*उत्तर\s*\d*\s*[\-\:]\s*',
+        r'^\s*प्र[०.\s]+\d+[.\s:-]*',
+        r'^\s*प्रश्न[.\s]+\d+[.\s:-]*',
+        r'^\s*Q\.?\s*\d+[.\s:-]*',
+    ]
+    
+    text = answer_text
+    for _ in range(2):
+        for pattern in patterns:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE, count=1)
+        text = text.strip()
+        if text == answer_text:
+            break
+    
+    return text
+
+
+def strip_full_question_echo(answer_text: str, question_text: str) -> str:
+    """Strip full question echo from answer start."""
+    q_norm = re.sub(r'[^\w\s]', ' ', question_text.lower())
+    q_norm = re.sub(r'\s+', ' ', q_norm).strip()
+    q_words = q_norm.split()
+    
+    if len(q_words) < 3:
+        return answer_text
+    
+    answer_words = answer_text.split()
+    if len(answer_words) < len(q_words):
+        return answer_text
+    
+    prefix = " ".join(answer_words[:len(q_words)])
+    prefix_norm = re.sub(r'[^\w\s]', ' ', prefix.lower())
+    prefix_norm = re.sub(r'\s+', ' ', prefix_norm).strip()
+    
+    similarity = difflib.SequenceMatcher(None, prefix_norm, q_norm).ratio()
+    
+    if similarity >= 0.5:  # Lowered threshold to catch more echoes
+        remaining = " ".join(answer_words[len(q_words):])
+        return remaining.strip()
+    
+    return answer_text
 
 
 # =========================================================
-# LLM CALL WITH RETRIES - IMPROVED
+# LLM CALL WITH RETRIES
 # =========================================================
 
 def _estimate_tokens(text: str) -> int:
@@ -524,7 +723,6 @@ def _estimate_tokens(text: str) -> int:
 def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                              response_parser, budget: _TokenBudgetTracker,
                              log, max_retries: int = 4):
-    """Generic Groq call with retry and rate-limit handling."""
     estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
     last_error = None
     skip_next_proactive_check = False
@@ -545,7 +743,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                     ],
                     response_format={"type": "json_object"},
                     temperature=0.0,
-                    max_tokens=4096,  # Increased for long answers
+                    max_tokens=8192,  # MAXIMUM for long answers
                 )
             budget.record_usage(estimated_tokens)
             content = response.choices[0].message.content
@@ -556,12 +754,11 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             detail = _parse_rate_limit_detail(str(e))
             
             if detail and detail["limit_type"] == "TPD":
-                raise Exception(f"Daily quota exhausted: {detail['used']}/{detail['limit']}. "
-                              f"Resets in {detail['wait_seconds']/60:.0f} min.") from e
+                raise Exception(f"Daily quota exhausted. Resets in {detail['wait_seconds']/60:.0f} min.") from e
             
             if detail:
                 budget.record_actual_from_error(detail["used"], detail["limit"])
-                log(f"Rate limit (attempt {attempt}): waiting {detail['wait_seconds']+0.5:.1f}s")
+                log(f"Rate limit: waiting {detail['wait_seconds']+0.5:.1f}s")
                 time.sleep(detail["wait_seconds"] + 0.5)
                 budget.reset_window()
                 skip_next_proactive_check = True
@@ -574,7 +771,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 
 
 # =========================================================
-# QUESTION IDENTIFICATION - IMPROVED
+# QUESTION IDENTIFICATION
 # =========================================================
 
 def _parse_qp_llm_response(content: str) -> tuple:
@@ -587,10 +784,10 @@ def _parse_qp_llm_response(content: str) -> tuple:
     try:
         data = json.loads(content)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON: {e}\nContent: {content[:500]}")
+        raise ValueError(f"Invalid JSON: {e}")
 
     if not isinstance(data, dict) or "question_paper_pages" not in data or "questions" not in data:
-        raise ValueError(f"Missing required keys. Got: {list(data.keys())}")
+        raise ValueError(f"Missing required keys")
 
     qp_pages = [int(x) for x in data["question_paper_pages"]]
     questions = [str(x).strip() for x in data["questions"] if str(x).strip()]
@@ -598,46 +795,7 @@ def _parse_qp_llm_response(content: str) -> tuple:
     return qp_pages, questions
 
 
-def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_page: int) -> list:
-    """Recover concatenated page numbers."""
-    if n in valid_page_numbers:
-        return []
-
-    s = str(n)
-    max_digits = len(str(max_page))
-    
-    def split_attempt(s, widths):
-        result = []
-        i = 0
-        for w in widths:
-            if i + w > len(s):
-                return None
-            chunk = s[i:i+w]
-            if chunk.startswith('0') and len(chunk) > 1:
-                return None
-            num = int(chunk)
-            if num not in valid_page_numbers:
-                return None
-            result.append(num)
-            i += w
-        if i != len(s) or len(set(result)) != len(result):
-            return None
-        return result
-
-    candidates = []
-    for num_parts in range(2, min(len(s) + 1, 4)):
-        for widths in __import__('itertools').product(range(1, max_digits + 1), repeat=num_parts):
-            if sum(widths) != len(s):
-                continue
-            result = split_attempt(s, widths)
-            if result:
-                candidates.append(result)
-
-    return candidates[0] if candidates else []
-
-
 def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
-    """Identify question paper pages and extract questions."""
     def log(msg):
         print(msg)
         if status_callback:
@@ -652,7 +810,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
-    # Clean pages before processing
     for page in pages:
         page["raw_text"] = clean_ocr_text(page["raw_text"])
 
@@ -691,7 +848,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
         chunk_results.append((sorted(set(recovered_pages)), []))
 
-    # Merge results
     all_qp_pages = set()
     for qp_pages, _ in chunk_results:
         all_qp_pages.update(qp_pages)
@@ -699,15 +855,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     qp_page_indices = sorted(p - 1 for p in all_qp_pages)
     log(f"Question paper pages: {[p+1 for p in qp_page_indices]}")
 
-    # Check for unusually long question pages (likely misclassified answers)
-    if len(qp_page_indices) >= 2:
-        qp_lengths = [len(pages[i]["raw_text"]) for i in qp_page_indices]
-        median = sorted(qp_lengths)[len(qp_lengths)//2]
-        for i, length in zip(qp_page_indices, qp_lengths):
-            if length > max(median * 3, 2000):
-                log(f"WARNING: Page {i+1} is very long ({length} chars) - likely an answer page")
-
-    # Extract canonical questions
     qp_pages = [pages[i] for i in qp_page_indices]
     questions = extract_canonical_questions(qp_pages, status_callback)
 
@@ -717,7 +864,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
 def _chunk_pages_by_char_budget(pages: list, max_chars: int = MAX_CHARS_PER_CHUNK,
                                  overlap_pages: int = CHUNK_OVERLAP_PAGES) -> list:
-    """Chunk pages by character budget with overlap."""
     if not pages:
         return []
 
@@ -748,8 +894,44 @@ def _build_qp_user_prompt(pages: list) -> str:
     return "Here are the OCR'd pages:\n\n" + "\n\n".join(blocks)
 
 
+def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_page: int) -> list:
+    if n in valid_page_numbers:
+        return []
+
+    s = str(n)
+    max_digits = len(str(max_page))
+    
+    def split_attempt(s, widths):
+        result = []
+        i = 0
+        for w in widths:
+            if i + w > len(s):
+                return None
+            chunk = s[i:i+w]
+            if chunk.startswith('0') and len(chunk) > 1:
+                return None
+            num = int(chunk)
+            if num not in valid_page_numbers:
+                return None
+            result.append(num)
+            i += w
+        if i != len(s) or len(set(result)) != len(result):
+            return None
+        return result
+
+    candidates = []
+    for num_parts in range(2, min(len(s) + 1, 4)):
+        for widths in __import__('itertools').product(range(1, max_digits + 1), repeat=num_parts):
+            if sum(widths) != len(s):
+                continue
+            result = split_attempt(s, widths)
+            if result:
+                candidates.append(result)
+
+    return candidates[0] if candidates else []
+
+
 def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
-    """Extract canonical question list from question paper pages."""
     def log(msg):
         print(msg)
         if status_callback:
@@ -811,296 +993,12 @@ def _parse_canonical_questions_response(content: str) -> list:
 
 
 # =========================================================
-# ANSWER MAPPING - COMPLETELY REWRITTEN FOR LONG ANSWERS
-# =========================================================
-
-def _line_starts_new_answer(line: str, questions: list) -> Optional[int]:
-    """Check if a line starts a new answer for a specific question."""
-    # Check for formal labels
-    label_patterns = [
-        r'^\s*Ans(?:wer)?\s*\d+\s*[.:\-]\s*',
-        r'^\s*Ans(?:wer)?\s*[.:\-]\s*',
-        r'^\s*उत्तर\s*\d*\s*[\-\:]\s*',
-        r'^\s*प्र[०.\s]+\d+[.\s:-]*',
-        r'^\s*प्रश्न[.\s]+\d+[.\s:-]*',
-        r'^\s*Q\.?\s*\d+[.\s:-]*',
-    ]
-    
-    for pattern in label_patterns:
-        match = re.search(pattern, line, re.IGNORECASE)
-        if match:
-            num_match = re.search(r'\d+', match.group(0))
-            if num_match:
-                label_num = num_match.group(0)
-                for i, q in enumerate(questions):
-                    q_num_match = re.match(r'\s*(\d+)', q)
-                    if q_num_match and q_num_match.group(1) == label_num:
-                        return i
-            return -1  # Ambiguous label - treat as new start
-
-    return None
-
-
-def _chunk_lines_by_answer_boundaries(numbered_lines: list, questions: list,
-                                       max_chars: int = 10000) -> list:
-    """
-    Chunk answer lines by answer boundaries.
-    FIX: Handles very long answers (9-10 pages) by keeping complete answers together.
-    """
-    if not numbered_lines:
-        return []
-
-    chunks = []
-    current_chunk = []
-    current_chars = 0
-    current_question_idx = None
-
-    for idx, text in numbered_lines:
-        line_chars = len(text)
-        matched_idx = _line_starts_new_answer(text, questions)
-        
-        # Check if this is a genuine new answer
-        is_new_answer = (matched_idx is not None and 
-                        (matched_idx == -1 or matched_idx != current_question_idx))
-        
-        # Start new chunk if:
-        # 1. We're past max_chars AND this is a new answer start
-        # 2. OR we're about to exceed absolute max (safety)
-        if (current_chunk and current_chars + line_chars > max_chars and is_new_answer) or \
-           (current_chunk and current_chars + line_chars > max_chars * 2):
-            chunks.append(current_chunk)
-            current_chunk = []
-            current_chars = 0
-
-        if is_new_answer and matched_idx != -1:
-            current_question_idx = matched_idx
-
-        current_chunk.append((idx, text))
-        current_chars += line_chars
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
-
-
-def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
-    """Map each question to its answer using LLM-based boundary detection."""
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
-
-    from groq import Groq
-
-    api_key = get_api_key("GROQ_API_KEY")
-    if not api_key:
-        raise Exception("GROQ_API_KEY not found")
-
-    client = Groq(api_key=api_key)
-    budget = _TokenBudgetTracker()
-
-    # Clean answer lines
-    answer_lines = [clean_ocr_text(line) for line in answer_lines if line.strip()]
-
-    if not answer_lines:
-        log("No answer lines found")
-        return {}
-
-    numbered_lines = list(enumerate(answer_lines))
-    ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
-    
-    # Chunk by answer boundaries to keep long answers intact
-    chunks = _chunk_lines_by_answer_boundaries(numbered_lines, questions)
-    log(f"Split {len(answer_lines)} lines into {len(chunks)} chunk(s)")
-
-    all_ranges = []
-    
-    for i, chunk in enumerate(chunks):
-        line_range = f"{chunk[0][0]}-{chunk[-1][0]}"
-        log(f"Mapping chunk {i+1}/{len(chunks)} (lines {line_range})...")
-
-        user_prompt = _build_answer_map_user_prompt(chunk, questions)
-        
-        try:
-            chunk_ranges = _call_groq_with_retries(
-                client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
-                _parse_answer_map_llm_response, budget, log
-            )
-        except Exception as e:
-            log(f"WARNING: chunk {i+1} failed: {e}")
-            continue
-
-        # Validate ranges
-        valid_indices = {idx for idx, _ in chunk}
-        min_idx, max_idx = min(valid_indices), max(valid_indices)
-        
-        for r in chunk_ranges:
-            if r["ref"] in ref_to_question and min_idx <= r["start_line"] <= max_idx:
-                # Extend end_line to include all content until next answer
-                if r["end_line"] < max_idx:
-                    # Check if next few lines might be part of this answer
-                    next_lines = [l for idx, l in numbered_lines[r["end_line"]+1:r["end_line"]+4] 
-                                 if idx <= max_idx]
-                    if next_lines and not any(_line_starts_new_answer(l, questions) is not None 
-                                             for l in next_lines):
-                        r["end_line"] = min(r["end_line"] + 3, max_idx)
-                
-                all_ranges.append(r)
-
-    # Deduplicate and resolve overlaps
-    best_by_ref = {}
-    for r in all_ranges:
-        existing = best_by_ref.get(r["ref"])
-        if existing is None or (r["end_line"] - r["start_line"]) > (existing["end_line"] - existing["start_line"]):
-            best_by_ref[r["ref"]] = r
-
-    resolved_ranges = _resolve_overlapping_answer_ranges(list(best_by_ref.values()))
-    
-    log(f"Final mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
-
-    # Extract answers
-    qa_map = {}
-    for r in resolved_ranges:
-        start, end = r["start_line"], r["end_line"]
-        # Include ALL lines, don't filter aggressively
-        verbatim_lines = [answer_lines[j] for j in range(start, end + 1) 
-                         if 0 <= j < len(answer_lines)]
-        
-        original_question = ref_to_question[r["ref"]]
-        answer_text = " ".join(verbatim_lines).strip()
-        
-        # Clean but don't truncate
-        answer_text = strip_question_restatement(answer_text)
-        answer_text = strip_full_question_echo(answer_text, original_question)
-        
-        if answer_text:
-            qa_map[original_question] = answer_text
-
-    return qa_map
-
-
-def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
-    """Build user prompt for answer mapping."""
-    questions_block = "\n".join(
-        f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
-    )
-    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
-    return (
-        f"OFFICIAL QUESTIONS (use REF labels):\n{questions_block}\n\n"
-        f"STUDENT'S ANSWERS (line-numbered):\n{lines_block}"
-    )
-
-
-def _parse_answer_map_llm_response(content: str) -> list:
-    """Parse LLM response for answer mapping."""
-    content = content.strip()
-    if content.startswith("```"):
-        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
-        content = re.sub(r'\n?```\s*$', '', content)
-        content = content.strip()
-
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON: {e}")
-
-    if not isinstance(data, dict) or "answers" not in data:
-        raise ValueError(f"Missing 'answers' key")
-
-    answers = data["answers"]
-    if not isinstance(answers, list):
-        raise ValueError(f"'answers' must be a list")
-
-    result = []
-    for item in answers:
-        if isinstance(item, dict) and "ref" in item and "start_line" in item and "end_line" in item:
-            try:
-                result.append({
-                    "ref": str(item["ref"]).strip().upper(),
-                    "start_line": int(item["start_line"]),
-                    "end_line": int(item["end_line"]),
-                })
-            except (ValueError, TypeError):
-                continue
-
-    return result
-
-
-def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
-    """Resolve overlapping answer ranges."""
-    sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
-    resolved = []
-    
-    for i, r in enumerate(sorted_ranges):
-        r = dict(r)
-        if i + 1 < len(sorted_ranges):
-            next_start = sorted_ranges[i + 1]["start_line"]
-            if r["end_line"] >= next_start:
-                r["end_line"] = next_start - 1
-        if r["end_line"] >= r["start_line"]:
-            resolved.append(r)
-    
-    return resolved
-
-
-def strip_question_restatement(answer_text: str) -> str:
-    """Strip leading question restatement labels."""
-    patterns = [
-        r'^\s*Ans(?:wer)?\s*\d*\s*[.:\-]\s*',
-        r'^\s*उत्तर\s*\d*\s*[\-\:]\s*',
-        r'^\s*प्र[०.\s]+\d+[.\s:-]*',
-        r'^\s*प्रश्न[.\s]+\d+[.\s:-]*',
-        r'^\s*Q\.?\s*\d+[.\s:-]*',
-    ]
-    
-    text = answer_text
-    for _ in range(2):
-        for pattern in patterns:
-            text = re.sub(pattern, '', text, flags=re.IGNORECASE, count=1)
-        text = text.strip()
-        if text == answer_text:
-            break
-    
-    return text
-
-
-def strip_full_question_echo(answer_text: str, question_text: str) -> str:
-    """Strip full question echo from answer start."""
-    # Normalize for comparison
-    q_norm = re.sub(r'[^\w\s]', ' ', question_text.lower())
-    q_norm = re.sub(r'\s+', ' ', q_norm).strip()
-    q_words = q_norm.split()
-    
-    if len(q_words) < 3:
-        return answer_text
-    
-    answer_words = answer_text.split()
-    if len(answer_words) < len(q_words):
-        return answer_text
-    
-    # Check if answer starts with question echo
-    prefix = " ".join(answer_words[:len(q_words)])
-    prefix_norm = re.sub(r'[^\w\s]', ' ', prefix.lower())
-    prefix_norm = re.sub(r'\s+', ' ', prefix_norm).strip()
-    
-    similarity = difflib.SequenceMatcher(None, prefix_norm, q_norm).ratio()
-    
-    if similarity >= 0.6:
-        # Strip the echo
-        remaining = " ".join(answer_words[len(q_words):])
-        return remaining.strip()
-    
-    return answer_text
-
-
-# =========================================================
-# COMPLETE PIPELINE - FINAL
+# COMPLETE PIPELINE
 # =========================================================
 
 @_diagnose_tuple_errors
 def process_pdf(file_input, status_callback=None):
-    """Complete PDF processing pipeline."""
+    """Complete PDF processing pipeline with FIX for long answers."""
     def log(msg):
         print(msg)
         if status_callback:
@@ -1132,35 +1030,35 @@ def process_pdf(file_input, status_callback=None):
     answer_pages = [pages[i] for i in answer_page_indices]
     log(f"Found {len(answer_pages)} answer page(s)")
     
-    # Step 7: Flatten answer lines
+    # Step 7: Flatten answer lines - KEEP EVERYTHING
     answer_lines = []
     for page in answer_pages:
         lines = page["raw_text"].split("\n")
         for line in lines:
             line = clean_ocr_text(line)
-            if line and len(line) > 5:  # Keep meaningful content
+            if line:  # Keep all non-empty lines
                 answer_lines.append(line)
     
     log(f"Flattened {len(answer_lines)} answer lines")
     
     # Step 8: Validate answer pages
     if not _sanity_check_answer_pages(answer_lines, len(official_questions), log):
-        raise Exception(
-            f"Answer pages seem too short ({len(answer_lines)} lines for "
-            f"{len(official_questions)} questions). Check page classification."
-        )
+        log("WARNING: Answer pages seem too short. Continuing anyway...")
     
-    # Step 9: Map answers
-    log("Mapping answers to questions...")
+    # Step 9: Map answers - USING COMPLETE TEXT
+    log("Mapping answers to questions (processing ALL text at once)...")
     qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
     
     # Step 10: Build QA pairs
     qa_pairs = []
     matched_count = 0
+    total_answer_chars = 0
+    
     for q in official_questions:
         answer = qa_map.get(q, "")
         if answer:
             matched_count += 1
+            total_answer_chars += len(answer)
         qa_pairs.append({
             "question": q,
             "answer": answer,
@@ -1168,6 +1066,7 @@ def process_pdf(file_input, status_callback=None):
         })
     
     log(f"Matched {matched_count} of {len(official_questions)} questions")
+    log(f"Total answer text length: {total_answer_chars} characters")
     
     if matched_count == 0:
         raise Exception("No answers could be matched to questions.")
@@ -1176,16 +1075,12 @@ def process_pdf(file_input, status_callback=None):
 
 
 def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print) -> bool:
-    """Check if answer pages contain enough content."""
     total_chars = sum(len(line) for line in answer_lines)
     avg_chars_per_question = total_chars / max(num_questions, 1)
     
-    # Very conservative threshold (50 chars per question means almost nothing)
-    MIN_PLAUSIBLE_CHARS_PER_QUESTION = 100
-    
-    if avg_chars_per_question < MIN_PLAUSIBLE_CHARS_PER_QUESTION:
-        log(f"WARNING: Only {total_chars} chars for {num_questions} questions. "
-            f"Looks like misclassified pages.")
+    # Very conservative - only warn if truly empty
+    if avg_chars_per_question < 50 and total_chars < 500:
+        log(f"WARNING: Only {total_chars} chars for {num_questions} questions.")
         return False
     
     return True
@@ -1207,45 +1102,54 @@ def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
 
 
 # =========================================================
-# NOISE DETECTION - SIMPLIFIED
+# NOISE DETECTION
 # =========================================================
 
 NOISE_RE = re.compile(
     r'(?:Teacher\'?s?\s*Signature'
     r'|Tancher\'?s?\s*Signature'
     r'|PAGE\s*NO'
-    r'|^\s*DATE\b'
-    r'|^\s*\d{1,3}\s*$)',
+    r'|^\s*DATE\b)',
     re.IGNORECASE
 )
 
 
 def is_noise(line: str) -> bool:
-    """Check if a line is noise."""
     return bool(NOISE_RE.search(line))
 
 
 # =========================================================
-# MAIN - FOR DIRECT USAGE
+# MAIN
 # =========================================================
 
 if __name__ == "__main__":
-    # Example usage
     import sys
     
     if len(sys.argv) > 1:
         pdf_path = sys.argv[1]
         print(f"Processing: {pdf_path}")
         
-        ocr_json, qa_pairs = process_pdf(pdf_path)
-        ocr_path, qa_path = save_outputs(ocr_json, qa_pairs, base_name="output")
-        
-        print(f"\n✅ Done! Outputs saved to:")
-        print(f"  - OCR: {ocr_path}")
-        print(f"  - QA Pairs: {qa_path}")
-        print(f"\n📊 Summary:")
-        print(f"  - Total pages: {ocr_json['total_pages']}")
-        print(f"  - Questions: {len(qa_pairs)}")
-        print(f"  - Matched: {sum(1 for p in qa_pairs if p['matched'])}")
+        try:
+            ocr_json, qa_pairs = process_pdf(pdf_path)
+            ocr_path, qa_path = save_outputs(ocr_json, qa_pairs, base_name="output")
+            
+            print(f"\n✅ Done! Outputs saved to:")
+            print(f"  - OCR: {ocr_path}")
+            print(f"  - QA Pairs: {qa_path}")
+            print(f"\n📊 Summary:")
+            print(f"  - Total pages: {ocr_json['total_pages']}")
+            print(f"  - Questions: {len(qa_pairs)}")
+            print(f"  - Matched: {sum(1 for p in qa_pairs if p['matched'])}")
+            
+            # Show sample
+            print("\n📝 Sample Output:")
+            for i, pair in enumerate(qa_pairs[:3]):
+                if pair['matched']:
+                    print(f"\nQ{i+1}: {pair['question'][:100]}...")
+                    print(f"A{i+1}: {pair['answer'][:150]}...")
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
     else:
         print("Usage: python script.py <path_to_pdf>")
