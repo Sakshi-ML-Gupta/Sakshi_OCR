@@ -1,11 +1,10 @@
-# In your Streamlit app or script
-ocr_json, qa_pairs = process_pdf("your_document.pdf")
+# Direct use
+ocr_json, qa_pairs = process_pdf("your_pdf.pdf")
 
-# Save outputs
-save_outputs(ocr_json, qa_pairs, base_name="result")
-
-# Or use directly
+# Check completeness
 for pair in qa_pairs:
-    print(f"Q: {pair['question']}")
-    print(f"A: {pair['answer'][:200]}...")
-    print("-" * 50)
+    if pair['matched']:
+        print(f"Question: {pair['question'][:50]}...")
+        print(f"Answer length: {len(pair['answer'])} characters")
+        print(f"Answer preview: {pair['answer'][:200]}...")
+        print("-" * 50)
