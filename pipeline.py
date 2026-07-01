@@ -220,7 +220,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None) -> List[D
         raise Exception("DATALAB_API_KEY not found")
 
     size_mb = len(file_content) / (1024 * 1024)
-    MAX_MB = 45
+    MAX_MB = 2000
     if size_mb > MAX_MB:
         raise Exception(f"File is {size_mb:.1f}MB, exceeds {MAX_MB}MB limit.")
 
