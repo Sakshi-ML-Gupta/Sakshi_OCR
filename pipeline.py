@@ -116,46 +116,13 @@ def preprocess_pdf(file_bytes: bytes, dpi: int = 250) -> bytes:
 
 
 # =========================================================
-# PDF COMPRESSION - NEW
-# =========================================================
-
-def compress_pdf(file_bytes: bytes, dpi: int = 150) -> bytes:
-    """
-    Compress PDF to under 45MB for Datalab upload.
-    """
-    src_doc = fitz.open(stream=file_bytes, filetype="pdf")
-    out_doc = fitz.open()
-    
-    for page in src_doc:
-        pix = page.get_pixmap(dpi=dpi)
-        new_page = out_doc.new_page(width=pix.width, height=pix.height)
-        new_page.insert_image(new_page.rect, pixmap=pix)
-    
-    buf = io.BytesIO()
-    out_doc.save(buf, garbage=4, deflate=True)
-    src_doc.close()
-    out_doc.close()
-    buf.seek(0)
-    
-    compressed = buf.read()
-    size_mb = len(compressed) / (1024 * 1024)
-    print(f"Compressed to: {size_mb:.1f}MB")
-    
-    # If still too large, try with lower DPI
-    if size_mb > 45:
-        print("Still too large - trying lower DPI (100)...")
-        return compress_pdf(file_bytes, dpi=100)
-    
-    return compressed
-
-
-# =========================================================
-# TEXT CLEANING - MINIMAL
+# TEXT CLEANING - MINIMAL (ONLY REMOVE OBVIOUS NOISE)
 # =========================================================
 
 def clean_ocr_text(text: str) -> str:
     """
     MINIMAL cleaning - only remove obvious page numbers and headers.
+    CRITICAL: Don't remove content that looks like part of answers!
     """
     lines = text.split('\n')
     cleaned_lines = []
@@ -165,8 +132,10 @@ def clean_ocr_text(text: str) -> str:
         if not line:
             continue
         
+        # ONLY remove these exact patterns - VERY conservative
         is_noise = False
         
+        # Page numbers only (exact matches)
         if re.match(r'^Page\s+\d+\s*$', line, re.IGNORECASE):
             is_noise = True
         elif re.match(r'^-\s*\d+\s*-\s*$', line):
@@ -176,36 +145,13 @@ def clean_ocr_text(text: str) -> str:
         elif re.match(r'^P\.?\s*No\.?\s*\d+\s*$', line, re.IGNORECASE):
             is_noise = True
         
+        # Keep everything else, including lines with #, प्रश्नोत्तर, etc.
+        # because they might be part of the answer text!
         if not is_noise:
             cleaned_lines.append(line)
     
+    # Join back
     text = '\n'.join(cleaned_lines)
-    return text
-
-
-def strip_question_label_only(answer_text: str) -> str:
-    """
-    ONLY remove answer labels like "Ans 5-", "उत्तर 6-" etc.
-    Keep everything after that.
-    """
-    patterns = [
-        r'^(\s*Ans(?:wer)?\s*\d*\s*[.:\-]\s*)',
-        r'^(\s*उत्तर\s*\d*\s*[\-\:]\s*)',
-        r'^(\s*प्र[०.\s]+\d+[.\s:-]*)',
-        r'^(\s*प्रश्न[.\s]+\d+[.\s:-]*)',
-        r'^(\s*Q\.?\s*\d+[.\s:-]*)',
-        r'^(\s*प्र\.\s*नं\.?\s*\d+\s*)',
-        r'^(\s*प्रश्नोत्तर\s*नं\.?\s*\d+\s*)',
-        r'^(\s*★\s*ोत्तर\s*नं\.?\s*\d+\s*,?\s*भाग\s*-\s*\d+\s*)',
-        r'^(\s*ोत्तर\s*नं\.?\s*\d+\s*,?\s*भाग\s*-\s*\d+\s*)',
-        r'^(\s*भाग\s*-\s*\d+\s*)',
-    ]
-    
-    text = answer_text
-    for pattern in patterns:
-        text = re.sub(pattern, '', text, flags=re.IGNORECASE, count=1)
-        text = text.lstrip()
-    
     return text
 
 
@@ -269,23 +215,11 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None) -> List[D
 
     file_name = _coerce_name(file_name, default_name="document.pdf")
 
-    # CHECK SIZE AND COMPRESS IF NEEDED
-    size_mb = len(file_content) / (1024 * 1024)
-    log(f"File size: {size_mb:.1f}MB")
-    
-    if size_mb > 45:
-        log(f"File too large ({size_mb:.1f}MB)! Compressing...")
-        file_content = compress_pdf(file_content)
-        size_mb = len(file_content) / (1024 * 1024)
-        log(f"After compression: {size_mb:.1f}MB")
-        
-        if size_mb > 45:
-            raise Exception(f"Even after compression, file is {size_mb:.1f}MB. Please reduce PDF size manually.")
-
     api_key = get_api_key("DATALAB_API_KEY")
     if not api_key:
         raise Exception("DATALAB_API_KEY not found")
 
+    size_mb = len(file_content) / (1024 * 1024)
     MAX_MB = 45
     if size_mb > MAX_MB:
         raise Exception(f"File is {size_mb:.1f}MB, exceeds {MAX_MB}MB limit.")
@@ -342,6 +276,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None) -> List[D
     if not markdown.strip():
         raise Exception("Empty markdown output")
 
+    # Minimal cleaning - only page numbers
     markdown = clean_ocr_text(markdown)
 
     page_count_hint = result.get("page_count")
@@ -393,7 +328,7 @@ def process_reference(file_input, status_callback=None):
 TPM_LIMIT = 8000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
-MAX_CHARS_PER_CHUNK = 20000
+MAX_CHARS_PER_CHUNK = 20000  # MAXIMUM for large documents
 CHUNK_OVERLAP_PAGES = 2
 
 class _TokenBudgetTracker:
@@ -474,7 +409,7 @@ def _parse_rate_limit_detail(message: str):
 
 
 # =========================================================
-# LLM PROMPTS - UPDATED FOR SUB-QUESTIONS
+# LLM PROMPTS
 # =========================================================
 
 QP_SYSTEM_PROMPT = """You are analyzing OCR text from a student exam assignment booklet.
@@ -497,12 +432,12 @@ If no question pages found, return {"question_paper_pages": [], "questions": []}
 
 QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are extracting questions from the official question paper.
 
-CRITICAL: For multi-part questions, split EACH sub-part into its own separate entry!
-Examples:
-- "3. (i) What is X? (ii) Explain Y? (iii) Describe Z?" 
-  -> ["3.(i) What is X?", "3.(ii) Explain Y?", "3.(iii) Describe Z?"]
-- "4. (a) Define A (b) Describe B" 
-  -> ["4.(a) Define A", "4.(b) Describe B"]
+RULES:
+1. Extract EVERY distinct question/sub-part
+2. For multi-part questions (i), (ii), (iii), split each into separate entries
+3. Preserve EXACT original text
+4. Keep original numbering
+5. Return in printed order
 
 Return ONLY valid JSON:
 {
@@ -520,13 +455,12 @@ Your task: For EACH question, find the EXACT line range where its answer appears
 
 CRITICAL RULES:
 1. Answers can be VERY LONG (10+ pages). DO NOT TRUNCATE!
-2. Include ALL lines that belong to each answer - from first line to last line!
+2. Include ALL lines that belong to each answer
 3. An answer starts when the student begins responding to that question
 4. An answer ends when the student starts the NEXT question's answer
 5. If you're unsure about a boundary, BE GENEROUS - include more lines rather than fewer
 6. Each answer MUST be continuous - no gaps in the middle of an answer
 7. The FIRST line of an answer is very important - DO NOT skip it!
-8. For sub-questions (i, ii, iii, iv), map each one SEPARATELY
 
 Return ONLY valid JSON:
 {
@@ -540,10 +474,14 @@ If an answer isn't present, OMIT it from the output."""
 
 
 # =========================================================
-# ANSWER MAPPING
+# ANSWER MAPPING - COMPLETE REWRITE (NO SKIPPING)
 # =========================================================
 
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
+    """
+    Map questions to answers using the ENTIRE answer text at once.
+    CRITICAL FIX: Preserves ALL content including first paragraph.
+    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -561,6 +499,8 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
+    # DON'T clean aggressively - keep all content
+    # Only remove completely empty lines
     answer_lines = [line for line in answer_lines if line.strip()]
     
     if not answer_lines:
@@ -569,11 +509,17 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
     log(f"Processing {len(answer_lines)} answer lines as a SINGLE chunk...")
     
+    # Build REF mapping
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
+    
+    # Create numbered lines
     numbered_lines = list(enumerate(answer_lines))
+    
+    # Build prompt with ALL lines
     user_prompt = _build_answer_map_user_prompt(numbered_lines, questions)
     
     try:
+        # Call LLM once with ALL answer text
         chunk_ranges = _call_groq_with_retries(
             client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
             _parse_answer_map_llm_response, budget, log
@@ -582,9 +528,11 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         log(f"WARNING: Answer mapping failed: {e}")
         return {}
 
+    # Validate and resolve ranges
     valid_ranges = []
     for r in chunk_ranges:
         if r["ref"] in ref_to_question:
+            # Ensure ranges are within bounds
             start = max(0, min(r["start_line"], len(answer_lines) - 1))
             end = max(start, min(r["end_line"], len(answer_lines) - 1))
             valid_ranges.append({
@@ -593,6 +541,7 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
                 "end_line": end
             })
 
+    # Sort and resolve overlaps
     valid_ranges.sort(key=lambda x: x["start_line"])
     resolved = []
     
@@ -606,44 +555,79 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
     log(f"Resolved {len(resolved)} answer ranges")
 
+    # Extract answers - PRESERVE EVERYTHING
     qa_map = {}
     for r in resolved:
         start, end = r["start_line"], r["end_line"]
         
+        # Include ALL lines from start to end
         verbatim_lines = []
         for j in range(start, end + 1):
             if 0 <= j < len(answer_lines):
                 line = answer_lines[j].strip()
-                if line:
+                if line:  # Only skip completely empty lines
                     verbatim_lines.append(line)
         
         original_question = ref_to_question[r["ref"]]
+        
+        # Join with newlines to preserve structure
         answer_text = "\n".join(verbatim_lines).strip()
+        
+        # ONLY remove exact answer labels like "Ans 5-" but NOT content after it
         answer_text = strip_question_label_only(answer_text)
         
         if answer_text:
             qa_map[original_question] = answer_text
 
-    log(f"Extracted {len(qa_map)} complete answers")
+    log(f"Extracted {len(qa_map)} complete answers with all content preserved")
     return qa_map
 
 
+def strip_question_label_only(answer_text: str) -> str:
+    """
+    ONLY remove the answer label like "Ans 5-", "उत्तर 6-" etc.
+    BUT keep EVERYTHING after that including the first paragraph.
+    """
+    # Patterns for answer labels - these are the ONLY things we remove
+    patterns = [
+        r'^(\s*Ans(?:wer)?\s*\d*\s*[.:\-]\s*)',
+        r'^(\s*उत्तर\s*\d*\s*[\-\:]\s*)',
+        r'^(\s*प्र[०.\s]+\d+[.\s:-]*)',
+        r'^(\s*प्रश्न[.\s]+\d+[.\s:-]*)',
+        r'^(\s*Q\.?\s*\d+[.\s:-]*)',
+        r'^(\s*प्र\.\s*नं\.?\s*\d+\s*)',
+        r'^(\s*प्रश्नोत्तर\s*नं\.?\s*\d+\s*)',
+        r'^(\s*★\s*ोत्तर\s*नं\.?\s*\d+\s*,?\s*भाग\s*-\s*\d+\s*)',  # For ★ ोत्तर नं. 4 ,भाग - 2
+    ]
+    
+    text = answer_text
+    for pattern in patterns:
+        # Remove ONLY the label, keep everything after it
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE, count=1)
+        text = text.lstrip()  # Remove leading whitespace only
+    
+    return text
+
+
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
+    """Build user prompt with ALL answer lines."""
     questions_block = "\n".join(
         f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
     )
+    
+    # Include ALL lines
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
     
     return (
         f"OFFICIAL QUESTIONS (use REF labels):\n{questions_block}\n\n"
         f"STUDENT'S COMPLETE ANSWER TEXT (ALL lines numbered):\n{lines_block}\n\n"
         f"FIND THE LINE RANGE FOR EACH QUESTION'S ANSWER.\n"
-        f"IMPORTANT: Include the FIRST LINE of each answer - it's very important!\n"
-        f"IMPORTANT: Include the LAST LINE of each answer - don't cut it off!"
+        f"IMPORTANT: Include the FIRST LINE of each answer - it's very important!"
     )
 
 
 def _parse_answer_map_llm_response(content: str) -> list:
+    """Parse LLM response for answer mapping."""
     content = content.strip()
     if content.startswith("```"):
         content = re.sub(r'^```(?:json)?\s*\n?', '', content)
@@ -708,7 +692,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                     ],
                     response_format={"type": "json_object"},
                     temperature=0.0,
-                    max_tokens=8192,
+                    max_tokens=8192,  # MAXIMUM for long answers
                 )
             budget.record_usage(estimated_tokens)
             content = response.choices[0].message.content
@@ -724,7 +708,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             if detail:
                 budget.record_actual_from_error(detail["used"], detail["limit"])
                 log(f"Rate limit: waiting {detail['wait_seconds']+0.5:.1f}s")
-                time.sleep(detail['wait_seconds'] + 0.5)
+                time.sleep(detail["wait_seconds"] + 0.5)
                 budget.reset_window()
                 skip_next_proactive_check = True
             else:
@@ -775,6 +759,7 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
+    # Don't aggressively clean question pages either
     for page in pages:
         page["raw_text"] = clean_ocr_text(page["raw_text"])
 
@@ -963,7 +948,7 @@ def _parse_canonical_questions_response(content: str) -> list:
 
 @_diagnose_tuple_errors
 def process_pdf(file_input, status_callback=None):
-    """Complete PDF processing pipeline with auto-compression and sub-question support."""
+    """Complete PDF processing pipeline with FIX for all skipping issues."""
     def log(msg):
         print(msg)
         if status_callback:
@@ -972,55 +957,46 @@ def process_pdf(file_input, status_callback=None):
     # Step 1: Normalize input
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
     
-    # Step 2: Check and compress if needed
-    size_mb = len(file_bytes) / (1024 * 1024)
-    log(f"Original file size: {size_mb:.1f}MB")
-    
-    if size_mb > 45:
-        log(f"File too large! Compressing...")
-        file_bytes = compress_pdf(file_bytes)
-        new_size = len(file_bytes) / (1024 * 1024)
-        log(f"Compressed to: {new_size:.1f}MB")
-    
-    # Step 3: Preprocess PDF
+    # Step 2: Preprocess PDF
     log("Preprocessing PDF...")
-    file_bytes = preprocess_pdf(file_bytes, dpi=200)
+    file_bytes = preprocess_pdf(file_bytes, dpi=250)
     
-    # Step 4: OCR
+    # Step 3: OCR
     pages = run_ocr(file_bytes, file_name, status_callback)
     
-    # Step 5: Build OCR JSON
+    # Step 4: Build OCR JSON
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     
-    # Step 6: Identify questions
+    # Step 5: Identify questions
     qp_page_indices, official_questions = identify_questions_with_llm(pages, status_callback)
     log(f"Found {len(official_questions)} questions on {len(qp_page_indices)} page(s)")
     
     if not official_questions:
         raise Exception("No questions extracted from the document.")
     
-    # Step 7: Extract answer pages
+    # Step 6: Extract answer pages
     answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
     answer_pages = [pages[i] for i in answer_page_indices]
     log(f"Found {len(answer_pages)} answer page(s)")
     
-    # Step 8: Flatten answer lines - KEEP EVERYTHING
+    # Step 7: Flatten answer lines - KEEP EVERYTHING
     answer_lines = []
     for page in answer_pages:
         lines = page["raw_text"].split("\n")
         for line in lines:
             line = line.strip()
+            # Only skip completely empty lines
             if line:
                 answer_lines.append(line)
     
     log(f"Flattened {len(answer_lines)} answer lines")
     
-    # Step 9: Map answers
-    log("Mapping answers to questions...")
+    # Step 8: Map answers - USING COMPLETE TEXT
+    log("Mapping answers to questions (processing ALL text at once)...")
     qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
     
-    # Step 10: Build QA pairs
+    # Step 9: Build QA pairs
     qa_pairs = []
     matched_count = 0
     total_answer_chars = 0
@@ -1099,17 +1075,18 @@ if __name__ == "__main__":
             print(f"  - Questions: {len(qa_pairs)}")
             print(f"  - Matched: {sum(1 for p in qa_pairs if p['matched'])}")
             
-            # Show sample
-            print("\n📝 Sample Output:")
-            for i, pair in enumerate(qa_pairs[:5]):
+            # Show sample with full first answer
+            print("\n📝 Sample First Answer:")
+            for pair in qa_pairs:
                 if pair['matched']:
-                    print(f"\nQ{i+1}: {pair['question'][:100]}...")
-                    print(f"A{i+1} (first 200 chars): {pair['answer'][:200]}...")
-                    print(f"Answer length: {len(pair['answer'])} chars")
+                    print(f"\nQuestion: {pair['question'][:100]}...")
+                    print(f"Answer length: {len(pair['answer'])} characters")
+                    print(f"Answer preview (first 500 chars):\n{pair['answer'][:500]}")
+                    break
                     
         except Exception as e:
             print(f"\n❌ Error: {e}")
             import traceback
             traceback.print_exc()
     else:
-        print("Usage: python script.py <path_to_pdf>")
+        print("Usage: python script.py <path_to_pdf>")     
