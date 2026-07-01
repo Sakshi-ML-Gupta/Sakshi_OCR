@@ -1,2 +1,6 @@
+#[server]
+#fileWatcherType = "none"
 [server]
-fileWatcherType = "none"
+maxUploadSize = 2000
+maxMessageSize = 2000
+enableWebsocketCompression = true
