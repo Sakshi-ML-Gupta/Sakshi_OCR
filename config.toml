@@ -1,7 +1,4 @@
 [server]
-fileWatcherType = "none"
-# .streamlit/config.toml
-[server]
 maxUploadSize = 2000
 maxMessageSize = 2000
 enableWebsocketCompression = true
