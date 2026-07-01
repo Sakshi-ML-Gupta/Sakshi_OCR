@@ -214,83 +214,70 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None) -> List[D
             status_callback(msg)
 
     file_name = _coerce_name(file_name, default_name="document.pdf")
-
     api_key = get_api_key("DATALAB_API_KEY")
     if not api_key:
         raise Exception("DATALAB_API_KEY not found")
 
-    size_mb = len(file_content) / (1024 * 1024)
-    MAX_MB = 2000
-    if size_mb > MAX_MB:
-        raise Exception(f"File is {size_mb:.1f}MB, exceeds {MAX_MB}MB limit.")
-
     headers = {"X-API-Key": api_key}
-    log(f"Submitting to Datalab (Chandra OCR)... ({size_mb:.1f}MB)")
+    
+    # 1. 743MB file ko memory mein open karein split karne ke liye
+    src_doc = fitz.open(stream=file_content, filetype="pdf")
+    total_pages = len(src_doc)
+    log(f"Total Pages found: {total_pages}. Splitting and processing in chunks...")
 
-    resp = httpx.post(
-        f"{DATALAB_BASE_URL}/api/v1/convert",
-        headers=headers,
-        files={"file": (file_name, file_content, "application/pdf")},
-        data={"output_format": "markdown", "mode": "accurate", "paginate": "true"},
-        timeout=120
-    )
+    all_results = []
+    chunk_size = 30 # Ek baar mein 30 pages bhejein taaki 45MB se kam size rahe
 
-    if resp.status_code != 200:
-        raise Exception(f"Datalab error {resp.status_code}: {resp.text}")
+    # 2. Loop chala kar PDF ko chote parts mein Datalab ko bhejein
+    for start_page in range(0, total_pages, chunk_size):
+        end_page = min(start_page + chunk_size, total_pages)
+        log(f"Processing pages {start_page + 1} to {end_page}...")
 
-    data = resp.json()
-    if not data.get("success", True):
-        raise Exception(f"Datalab failed: {data.get('error')}")
+        # Chota temporary PDF banayein
+        chunk_doc = fitz.open()
+        chunk_doc.insert_pdf(src_doc, from_page=start_page, to_page=end_page - 1)
+        
+        # Is chote part ko bytes mein convert karein
+        chunk_bytes = chunk_doc.tobytes()
+        chunk_doc.close()
 
-    check_url = data["request_check_url"]
-    log("Polling for OCR result...")
+        # Is chote part ka size check karein (Safe Zone)
+        chunk_size_mb = len(chunk_bytes) / (1024 * 1024)
+        log(f"Chunk size: {chunk_size_mb:.1f}MB. Sending to Cloudflare/Datalab...")
 
-    max_polls = 150
-    poll_interval = 2
-    result = None
+        # Datalab API Call
+        resp = httpx.post(
+            f"{DATALAB_BASE_URL}/api/v1/convert",
+            headers=headers,
+            files={"file": (f"chunk_{start_page}_{file_name}", chunk_bytes, "application/pdf")},
+            data={"output_format": "markdown", "mode": "accurate", "paginate": "true"},
+            timeout=180
+        )
 
-    for attempt in range(max_polls):
-        poll_resp = httpx.get(check_url, headers=headers, timeout=60)
-        if poll_resp.status_code != 200:
-            raise Exception(f"Poll error {poll_resp.status_code}: {poll_resp.text}")
+        if resp.status_code != 200:
+            raise Exception(f"Datalab error {resp.status_code}: {resp.text}")
 
-        result = poll_resp.json()
-        status = result.get("status")
+        data = resp.json()
+        check_url = data["request_check_url"]
 
-        if status == "complete":
-            log("OCR complete")
-            break
-        elif status == "failed" or result.get("error"):
-            raise Exception(f"Conversion failed: {result.get('error')}")
+        # Polling for this chunk
+        for attempt in range(100):
+            poll_resp = httpx.get(check_url, headers=headers, timeout=60)
+            if poll_resp.status_code != 200:
+                raise Exception(f"Poll error {poll_resp.status_code}: {poll_resp.text}")
 
-        if attempt % 5 == 0:
-            log(f"Still processing... ({attempt * poll_interval}s elapsed)")
-        time.sleep(poll_interval)
-    else:
-        raise Exception("OCR timed out after 5 minutes")
+            result = poll_resp.json()
+            if result.get("status") == "completed":
+                # Is chunk ka data save karein
+                all_results.append(result)
+                break
+            time.sleep(2)
 
-    if not result.get("success", True):
-        raise Exception(f"Conversion error: {result.get('error')}")
-
-    markdown = result.get("markdown") or ""
-    if not markdown.strip():
-        raise Exception("Empty markdown output")
-
-    # Minimal cleaning - only page numbers
-    markdown = clean_ocr_text(markdown)
-
-    page_count_hint = result.get("page_count")
-    page_texts = _split_paginated_markdown(markdown, page_count_hint, log=log)
-
-    pages = []
-    for idx, text in enumerate(page_texts):
-        pages.append({
-            "page_number": idx + 1,
-            "raw_text": text
-        })
-
-    log(f"OCR done -- {len(pages)} page(s)")
-    return pages
+    src_doc.close()
+    log("All chunks processed successfully!")
+    
+    # Sabhi chunks ke result ko combine karke return karein
+    return all_results
 
 
 # =========================================================
