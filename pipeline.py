@@ -220,64 +220,52 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None) -> List[D
 
     headers = {"X-API-Key": api_key}
     
-    # 1. 743MB file ko memory mein open karein split karne ke liye
+    # PDF ke total pages read karein bina memory crash kiye
     src_doc = fitz.open(stream=file_content, filetype="pdf")
     total_pages = len(src_doc)
-    log(f"Total Pages found: {total_pages}. Splitting and processing in chunks...")
+    src_doc.close()
+    
+    all_chunks_data = []
+    step = 50 # Ek baar mein 50 pages target karenge
 
-    all_results = []
-    chunk_size = 30 # Ek baar mein 30 pages bhejein taaki 45MB se kam size rahe
+    # Datalab API Limits & Rate Limiting ke mutabik chunking
+    for start in range(0, total_pages, step):
+        end = min(start + step, total_pages)
+        page_range_str = f"{start}-{end-1}"
+        log(f"Processing sequence range: {page_range_str}")
 
-    # 2. Loop chala kar PDF ko chote parts mein Datalab ko bhejein
-    for start_page in range(0, total_pages, chunk_size):
-        end_page = min(start_page + chunk_size, total_pages)
-        log(f"Processing pages {start_page + 1} to {end_page}...")
-
-        # Chota temporary PDF banayein
-        chunk_doc = fitz.open()
-        chunk_doc.insert_pdf(src_doc, from_page=start_page, to_page=end_page - 1)
-        
-        # Is chote part ko bytes mein convert karein
-        chunk_bytes = chunk_doc.tobytes()
-        chunk_doc.close()
-
-        # Is chote part ka size check karein (Safe Zone)
-        chunk_size_mb = len(chunk_bytes) / (1024 * 1024)
-        log(f"Chunk size: {chunk_size_mb:.1f}MB. Sending to Cloudflare/Datalab...")
-
-        # Datalab API Call
+        # Data payloads jo Cloudflare ko violate nahi karega
         resp = httpx.post(
             f"{DATALAB_BASE_URL}/api/v1/convert",
             headers=headers,
-            files={"file": (f"chunk_{start_page}_{file_name}", chunk_bytes, "application/pdf")},
-            data={"output_format": "markdown", "mode": "accurate", "paginate": "true"},
-            timeout=180
+            files={"file": (file_name, file_content, "application/pdf")},
+            data={
+                "output_format": "markdown", 
+                "mode": "accurate", 
+                "paginate": "true",
+                "page_range": page_range_str # Yeh segment target karega
+            },
+            timeout=300
         )
 
         if resp.status_code != 200:
-            raise Exception(f"Datalab error {resp.status_code}: {resp.text}")
+            raise Exception(f"Datalab server error {resp.status_code}: {resp.text}")
 
         data = resp.json()
         check_url = data["request_check_url"]
 
-        # Polling for this chunk
-        for attempt in range(100):
+        # Response Polling
+        while True:
             poll_resp = httpx.get(check_url, headers=headers, timeout=60)
-            if poll_resp.status_code != 200:
-                raise Exception(f"Poll error {poll_resp.status_code}: {poll_resp.text}")
-
             result = poll_resp.json()
             if result.get("status") == "completed":
-                # Is chunk ka data save karein
-                all_results.append(result)
+                all_chunks_data.append(result)
                 break
-            time.sleep(2)
+            elif result.get("status") == "failed":
+                raise Exception(f"Failed at sequence range: {page_range_str}")
+            time.sleep(5)
 
-    src_doc.close()
-    log("All chunks processed successfully!")
-    
-    # Sabhi chunks ke result ko combine karke return karein
-    return all_results
+    return all_chunks_data
 
 
 # =========================================================
