@@ -116,13 +116,13 @@ def preprocess_pdf(file_bytes: bytes, dpi: int = 250) -> bytes:
 
 
 # =========================================================
-# TEXT CLEANING - REMOVE LABELS BUT KEEP CONTENT
+# TEXT CLEANING - ULTRA MINIMAL
 # =========================================================
 
 def clean_ocr_text(text: str) -> str:
     """
-    Clean OCR text - remove page numbers and headers only.
-    Labels like भाग - 3, ोत्तर नं. 8 are handled separately.
+    ULTRA MINIMAL cleaning - ONLY remove page numbers.
+    EVERYTHING else is preserved!
     """
     lines = text.split('\n')
     cleaned_lines = []
@@ -132,15 +132,13 @@ def clean_ocr_text(text: str) -> str:
         if not line:
             continue
         
-        # ONLY remove these exact patterns (page numbers)
+        # ONLY remove page numbers
         is_noise = False
         if re.match(r'^Page\s+\d+\s*$', line, re.IGNORECASE):
             is_noise = True
         elif re.match(r'^-\s*\d+\s*-\s*$', line):
             is_noise = True
         elif re.match(r'^\[\s*Page\s+\d+\s*\]\s*$', line, re.IGNORECASE):
-            is_noise = True
-        elif re.match(r'^P\.?\s*No\.?\s*\d+\s*$', line, re.IGNORECASE):
             is_noise = True
         
         if not is_noise:
@@ -149,39 +147,45 @@ def clean_ocr_text(text: str) -> str:
     return '\n'.join(cleaned_lines)
 
 
-def remove_answer_labels(text: str) -> str:
+def remove_all_labels(text: str) -> str:
     """
-    REMOVE answer labels like:
+    REMOVE ALL answer labels but KEEP content:
+    - ★ ोत्तर नं. 4 ,भाग - 2
     - भाग - 3
     - ोत्तर नं. 8
     - Ans 5-
     - उत्तर 6-
     - Part - 2
     - Section B
-    etc.
-    But KEEP the actual answer content.
+    - etc.
     """
     patterns = [
-        # Hindi patterns
-        r'^(\s*★\s*ोत्तर\s*नं\.?\s*\d+\s*,?\s*भाग\s*[-–]\s*\d+\s*)',
-        r'^(\s*ोत्तर\s*नं\.?\s*\d+\s*,?\s*भाग\s*[-–]\s*\d+\s*)',
-        r'^(\s*उत्तर\s*नं\.?\s*\d+\s*,?\s*भाग\s*[-–]\s*\d+\s*)',
-        r'^(\s*प्रश्न\s*नं\.?\s*\d+\s*,?\s*भाग\s*[-–]\s*\d+\s*)',
-        r'^(\s*प्र\.\s*नं\.?\s*\d+\s*,?\s*भाग\s*[-–]\s*\d+\s*)',
-        r'^(\s*Ans(?:wer)?\s*No\.?\s*\d+\s*,?\s*Part\s*[-–]\s*\d+\s*)',
-        r'^(\s*Answer\s*No\.?\s*\d+\s*,?\s*Part\s*[-–]\s*\d+\s*)',
+        # Hindi complex patterns
+        r'^\s*★\s*ोत्तर\s*नं\.?\s*\d+\s*,?\s*भाग\s*[-–]\s*\d+\s*',
+        r'^\s*ोत्तर\s*नं\.?\s*\d+\s*,?\s*भाग\s*[-–]\s*\d+\s*',
+        r'^\s*उत्तर\s*नं\.?\s*\d+\s*,?\s*भाग\s*[-–]\s*\d+\s*',
+        r'^\s*प्रश्न\s*नं\.?\s*\d+\s*,?\s*भाग\s*[-–]\s*\d+\s*',
+        r'^\s*प्र\.\s*नं\.?\s*\d+\s*,?\s*भाग\s*[-–]\s*\d+\s*',
         
-        # Simple patterns
-        r'^(\s*भाग\s*[-–]\s*\d+\s*)',
-        r'^(\s*Part\s*[-–]\s*\d+\s*)',
-        r'^(\s*Section\s+[A-Z]+\s*)',
-        r'^(\s*Ans(?:wer)?\s*\d*\s*[.:\-]\s*)',
-        r'^(\s*उत्तर\s*\d*\s*[\-\:]\s*)',
-        r'^(\s*प्र[०.\s]+\d+[.\s:-]*)',
-        r'^(\s*प्रश्न[.\s]+\d+[.\s:-]*)',
-        r'^(\s*Q\.?\s*\d+[.\s:-]*)',
-        r'^(\s*ोत्तर\s*नं\.?\s*\d+\s*)',
-        r'^(\s*नं\.?\s*\d+\s*)',
+        # English complex patterns
+        r'^\s*Ans(?:wer)?\s*No\.?\s*\d+\s*,?\s*Part\s*[-–]\s*\d+\s*',
+        r'^\s*Answer\s*No\.?\s*\d+\s*,?\s*Part\s*[-–]\s*\d+\s*',
+        
+        # Simple Hindi patterns
+        r'^\s*भाग\s*[-–]\s*\d+\s*',
+        r'^\s*ोत्तर\s*नं\.?\s*\d+\s*',
+        r'^\s*उत्तर\s*\d*\s*[\-\:]\s*',
+        r'^\s*प्र[०.\s]+\d+[.\s:-]*',
+        r'^\s*प्रश्न[.\s]+\d+[.\s:-]*',
+        r'^\s*प्र\.\s*नं\.?\s*\d+\s*',
+        r'^\s*प्रश्नोत्तर\s*नं\.?\s*\d+\s*',
+        
+        # Simple English patterns
+        r'^\s*Part\s*[-–]\s*\d+\s*',
+        r'^\s*Section\s+[A-Z]+\s*',
+        r'^\s*Ans(?:wer)?\s*\d*\s*[.:\-]\s*',
+        r'^\s*Q\.?\s*\d+[.\s:-]*',
+        r'^\s*नं\.?\s*\d+\s*',
     ]
     
     text = text.strip()
@@ -364,7 +368,7 @@ def process_reference(file_input, status_callback=None):
 TPM_LIMIT = 8000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
-MAX_CHARS_PER_CHUNK = 20000
+MAX_CHARS_PER_CHUNK = 25000  # MAXIMUM for large documents
 CHUNK_OVERLAP_PAGES = 2
 
 class _TokenBudgetTracker:
@@ -468,16 +472,20 @@ If no question pages found, return {"question_paper_pages": [], "questions": []}
 
 QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are extracting questions from the official question paper.
 
-CRITICAL RULES:
-1. Extract EVERY distinct question/sub-part separately
+CRITICAL RULES FOR SUB-QUESTIONS:
+1. Extract EVERY distinct question/sub-part SEPARATELY
 2. For multi-part questions, split EACH sub-part into its own entry
 3. Keep the EXACT numbering as printed (e.g., "3.(i)", "3.(ii)", "4.(a)", "4.(b)")
-4. Preserve the EXACT original text
-5. Return in printed order
+4. If you see "(i)", "(ii)", "(iii)", "(iv)" - split them all!
+5. Preserve the EXACT original text
+6. Return in printed order
 
 Examples:
-- If you see "3. (i) What is X? (ii) Explain Y?" -> Extract as ["3.(i) What is X?", "3.(ii) Explain Y?"]
-- If you see "4. (a) Define A (b) Describe B" -> Extract as ["4.(a) Define A", "4.(b) Describe B"]
+- "3. (i) What is X? (ii) Explain Y? (iii) Describe Z?" 
+  -> ["3.(i) What is X?", "3.(ii) Explain Y?", "3.(iii) Describe Z?"]
+  
+- "4. (a) Define A (b) Describe B (c) Explain C"
+  -> ["4.(a) Define A", "4.(b) Describe B", "4.(c) Explain C"]
 
 Return ONLY valid JSON:
 {
@@ -485,44 +493,49 @@ Return ONLY valid JSON:
 }"""
 
 
-ANSWER_MAP_SYSTEM_PROMPT = """You are matching answers to sub-questions from a student's exam.
+ANSWER_MAP_SYSTEM_PROMPT = """You are matching answers to EACH sub-question from a student's exam.
 
 You are given:
-1. Sub-questions with REF labels (REF-A, REF-B, etc.)
+1. SUB-QUESTIONS with REF labels (REF-A, REF-B, REF-C, etc.)
 2. The COMPLETE student answer text with line numbers
 
 Your task: For EACH sub-question, find the EXACT line range where its answer appears.
 
 CRITICAL RULES:
-1. Each sub-question is SEPARATE - map them individually
-2. Answers can be LONG - include ALL lines
-3. A new answer starts when the student begins responding to the next sub-question
-4. BE GENEROUS - include more lines rather than fewer
-5. Include the FIRST LINE of each answer - it's very important!
+1. Each sub-question is SEPARATE - map them individually!
+2. If there are 4 sub-questions (i, ii, iii, iv), you must map ALL 4 separately
+3. Answers can be LONG - include ALL lines for each
+4. A new answer starts when the student begins the next sub-question
+5. BE GENEROUS - include more lines rather than fewer
+6. Include the FIRST LINE of each answer
 
 Example:
-- If you see "3.(i)" answer from line 10-25, and "3.(ii)" answer from line 26-40
-- Return both separately
+- REF-A = 3.(i), answer lines 10-25
+- REF-B = 3.(ii), answer lines 26-40
+- REF-C = 3.(iii), answer lines 41-55
+- REF-D = 3.(iv), answer lines 56-70
 
 Return ONLY valid JSON:
 {
   "answers": [
     {"ref": "REF-A", "start_line": 10, "end_line": 25},
-    {"ref": "REF-B", "start_line": 26, "end_line": 40}
+    {"ref": "REF-B", "start_line": 26, "end_line": 40},
+    {"ref": "REF-C", "start_line": 41, "end_line": 55},
+    {"ref": "REF-D", "start_line": 56, "end_line": 70}
   ]
 }
 
-If an answer isn't present, OMIT it."""
+If a sub-question's answer isn't present, OMIT it."""
 
 
 # =========================================================
-# ANSWER MAPPING - COMPLETE WITH SUB-QUESTION SUPPORT
+# ANSWER MAPPING - COMPLETE SUB-QUESTION SUPPORT
 # =========================================================
 
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
     """
-    Map questions (including sub-questions) to answers.
-    Each sub-question gets its own separate entry.
+    Map EACH sub-question to its answer separately.
+    Preserves ALL content including first and last paragraphs.
     """
     def log(msg):
         print(msg)
@@ -541,13 +554,13 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
-    # Clean answer lines - remove labels but keep content
+    # Clean answer lines - remove labels but KEEP content
     cleaned_lines = []
     for line in answer_lines:
         line = line.strip()
         if line:
-            # Remove answer labels from each line
-            line = remove_answer_labels(line)
+            # Remove labels from each line
+            line = remove_all_labels(line)
             if line:
                 cleaned_lines.append(line)
     
@@ -555,7 +568,7 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         log("No answer lines found after cleaning")
         return {}
 
-    log(f"Processing {len(cleaned_lines)} answer lines as a SINGLE chunk...")
+    log(f"Processing {len(cleaned_lines)} answer lines for {len(questions)} sub-questions...")
     
     # Build REF mapping
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
@@ -575,7 +588,7 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         log(f"WARNING: Answer mapping failed: {e}")
         return {}
 
-    # Validate and resolve ranges
+    # Validate ranges
     valid_ranges = []
     for r in chunk_ranges:
         if r["ref"] in ref_to_question:
@@ -587,10 +600,11 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
                 "end_line": end
             })
 
-    # Sort and resolve overlaps
+    # Sort by start line
     valid_ranges.sort(key=lambda x: x["start_line"])
-    resolved = []
     
+    # Resolve overlaps - each sub-question gets its own range
+    resolved = []
     for i, r in enumerate(valid_ranges):
         if i + 1 < len(valid_ranges):
             next_start = valid_ranges[i + 1]["start_line"]
@@ -599,13 +613,14 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         if r["end_line"] >= r["start_line"]:
             resolved.append(r)
 
-    log(f"Resolved {len(resolved)} answer ranges")
+    log(f"Resolved {len(resolved)} answer ranges for sub-questions")
 
     # Extract answers - PRESERVE EVERYTHING
     qa_map = {}
     for r in resolved:
         start, end = r["start_line"], r["end_line"]
         
+        # Include ALL lines from start to end
         verbatim_lines = []
         for j in range(start, end + 1):
             if 0 <= j < len(cleaned_lines):
@@ -614,10 +629,12 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
                     verbatim_lines.append(line)
         
         original_question = ref_to_question[r["ref"]]
+        
+        # Join with newlines to preserve structure
         answer_text = "\n".join(verbatim_lines).strip()
         
         # Final clean - remove any remaining labels
-        answer_text = remove_answer_labels(answer_text)
+        answer_text = remove_all_labels(answer_text)
         
         if answer_text:
             qa_map[original_question] = answer_text
@@ -638,7 +655,8 @@ def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
         f"SUB-QUESTIONS (each is SEPARATE, use REF labels):\n{questions_block}\n\n"
         f"STUDENT'S COMPLETE ANSWER TEXT (ALL lines numbered):\n{lines_block}\n\n"
         f"FIND THE LINE RANGE FOR EACH SUB-QUESTION'S ANSWER.\n"
-        f"Each sub-question gets its OWN separate range."
+        f"Each sub-question gets its OWN separate range.\n"
+        f"INCLUDE the FIRST LINE of each answer - it's very important!"
     )
 
 
@@ -708,7 +726,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                     ],
                     response_format={"type": "json_object"},
                     temperature=0.0,
-                    max_tokens=8192,
+                    max_tokens=8192,  # MAXIMUM for long answers
                 )
             budget.record_usage(estimated_tokens)
             content = response.choices[0].message.content
@@ -736,7 +754,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 
 
 # =========================================================
-# QUESTION IDENTIFICATION - UPDATED FOR SUB-QUESTIONS
+# QUESTION IDENTIFICATION - UPDATED
 # =========================================================
 
 def _parse_qp_llm_response(content: str) -> tuple:
@@ -823,7 +841,7 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     qp_pages = [pages[i] for i in qp_page_indices]
     questions = extract_canonical_questions(qp_pages, status_callback)
 
-    log(f"Extracted {len(questions)} canonical question(s) including sub-questions")
+    log(f"Extracted {len(questions)} canonical sub-questions")
     return qp_page_indices, questions
 
 
@@ -897,7 +915,7 @@ def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_pag
 
 
 def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
-    """Extract questions including sub-questions."""
+    """Extract ALL sub-questions separately."""
     def log(msg):
         print(msg)
         if status_callback:
@@ -916,7 +934,7 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
     budget = _TokenBudgetTracker()
 
     user_prompt = _build_canonical_questions_prompt(qp_pages)
-    log(f"Extracting canonical questions (including sub-questions) from {len(qp_pages)} page(s)...")
+    log(f"Extracting ALL sub-questions from {len(qp_pages)} page(s)...")
 
     try:
         questions = _call_groq_with_retries(
@@ -927,13 +945,13 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
         log(f"WARNING: canonical extraction failed: {e}")
         return []
 
-    log(f"Extracted {len(questions)} canonical question(s) including sub-questions")
+    log(f"Extracted {len(questions)} sub-questions")
     return questions
 
 
 def _build_canonical_questions_prompt(qp_pages: list) -> str:
     blocks = [f"--- PAGE {p['page_number']} ---\n{p['raw_text']}" for p in qp_pages]
-    return "Complete question paper text:\n\n" + "\n\n".join(blocks)
+    return "Complete question paper text - EXTRACT ALL SUB-QUESTIONS:\n\n" + "\n\n".join(blocks)
 
 
 def _parse_canonical_questions_response(content: str) -> list:
@@ -959,12 +977,12 @@ def _parse_canonical_questions_response(content: str) -> list:
 
 
 # =========================================================
-# COMPLETE PIPELINE
+# COMPLETE PIPELINE - FINAL
 # =========================================================
 
 @_diagnose_tuple_errors
 def process_pdf(file_input, status_callback=None):
-    """Complete PDF processing pipeline with sub-question support."""
+    """Complete PDF processing with sub-question support."""
     def log(msg):
         print(msg)
         if status_callback:
@@ -986,7 +1004,7 @@ def process_pdf(file_input, status_callback=None):
     
     # Step 5: Identify questions (including sub-questions)
     qp_page_indices, official_questions = identify_questions_with_llm(pages, status_callback)
-    log(f"Found {len(official_questions)} total questions/sub-questions")
+    log(f"Found {len(official_questions)} sub-questions on {len(qp_page_indices)} page(s)")
     
     if not official_questions:
         raise Exception("No questions extracted from the document.")
@@ -996,7 +1014,7 @@ def process_pdf(file_input, status_callback=None):
     answer_pages = [pages[i] for i in answer_page_indices]
     log(f"Found {len(answer_pages)} answer page(s)")
     
-    # Step 7: Flatten answer lines
+    # Step 7: Flatten answer lines - KEEP EVERYTHING
     answer_lines = []
     for page in answer_pages:
         lines = page["raw_text"].split("\n")
@@ -1008,7 +1026,7 @@ def process_pdf(file_input, status_callback=None):
     log(f"Flattened {len(answer_lines)} answer lines")
     
     # Step 8: Map answers (each sub-question separately)
-    log("Mapping each sub-question to its answer...")
+    log(f"Mapping {len(official_questions)} sub-questions to their answers...")
     qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
     
     # Step 9: Build QA pairs
@@ -1072,11 +1090,12 @@ if __name__ == "__main__":
             print(f"  - Matched: {sum(1 for p in qa_pairs if p['matched'])}")
             
             # Show sample
-            print("\n📝 Sample Output (showing sub-question mapping):")
-            for i, pair in enumerate(qa_pairs[:5]):
+            print("\n📝 Sub-Question Mapping Sample:")
+            for i, pair in enumerate(qa_pairs[:10]):  # Show first 10
                 if pair['matched']:
                     print(f"\nQ{i+1}: {pair['question']}")
-                    print(f"A{i+1} (first 200 chars): {pair['answer'][:200]}...")
+                    print(f"A{i+1} (first 150 chars): {pair['answer'][:150]}...")
+                    print(f"Answer length: {len(pair['answer'])} chars")
                     
         except Exception as e:
             print(f"\n❌ Error: {e}")
