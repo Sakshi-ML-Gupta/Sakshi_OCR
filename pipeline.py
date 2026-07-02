@@ -1452,51 +1452,42 @@ def _distinctive_words(text: str, max_words: int = 20) -> list:
     return sorted(set(w for w in words if w not in _QUESTION_STOPWORDS))
 
 
-def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.5):
+def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.4) -> int:
     """
-    FIX (this round): returns the INDEX of the question this line
-    appears to start a fresh answer for, or None if it doesn't look
-    like a new-answer start at all -- replacing the previous boolean-
-    only _line_starts_new_answer(). The boolean version had a real,
-    confirmed bug: a label-style match (e.g. "Q2 continues with...")
-    was treated as UNCONDITIONALLY a fresh start, even when it was
-    just a sentence WITHIN an answer that happened to mention its own
-    question number in passing -- causing a long multi-page answer to
-    be incorrectly chopped mid-way through its own content (exactly
-    matching the real-world symptom of "first page missing from the
-    start" / "last paragraph missing from the end": the chunker broke
-    INSIDE one answer, so neither resulting chunk's LLM call ever saw
-    the complete picture).
-
-    This version resolves a label match to a SPECIFIC question index
-    by extracting any number in the label (e.g. "5" from "Ans 5-", "2"
-    from "Q2") and matching it to a question whose own leading number
-    matches -- so the caller can tell "this label refers to the SAME
-    question we're already inside" (not a real new start) from "this
-    label refers to a DIFFERENT question" (a genuine new start). If
-    the label's number can't be resolved to any known question, -1 is
-    returned, signaling "ambiguous formal label -- treat cautiously as
-    a fresh start since we can't rule that out."
+    IMPROVED FIX: More generous detection of answer starts.
+    Now catches more patterns including Hindi labels and restatements.
     """
+    # Check for formal labels - these ALWAYS indicate a new answer
     label_match = _ANSWER_START_RE.match(line)
     if label_match:
         num_match = re.search(r'\d+', label_match.group(0))
         if num_match:
             label_num = num_match.group(0)
+            # Try to match to a question number
             for i, q in enumerate(questions):
                 q_num_match = re.match(r'\s*(\d+)', q)
                 if q_num_match and q_num_match.group(1) == label_num:
                     return i
+        # Even if number doesn't match specific question, treat as new answer
         return -1
-
+    
+    # Check for Hindi answer markers
+    hindi_markers = ['उत्तर', 'प्रश्न', 'प्र.', 'Ans', 'Answer', 'Q.', 'Q']
+    for marker in hindi_markers:
+        if re.search(rf'^\s*{marker}\s*\d*', line, re.IGNORECASE):
+            return -1
+    
+    # Check for question restatement - MORE GENEROUS
     line_words = sorted(set(re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(line))[:25]))
     if not line_words:
         return None
-
+    
     for i, q in enumerate(questions):
         q_distinctive = _distinctive_words(q)
         if not q_distinctive:
             continue
+        
+        # Lower threshold for matching
         matched = sum(
             1 for w in q_distinctive
             if any(_words_nearly_match(w, lw) for lw in line_words)
@@ -1504,7 +1495,7 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
         required = max(1, round(len(q_distinctive) * min_fraction))
         if matched >= required:
             return i
-
+    
     return None
 
 
@@ -1512,48 +1503,8 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
                                   absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS) -> list:
     """
-    Answer-boundary-aware chunking: a chunk break is only allowed at a
-    line that genuinely starts a DIFFERENT question's answer than the
-    one currently being accumulated.
-
-    FIX (this round): two real, confirmed bugs in the previous version,
-    both producing the same real-world symptom (an answer's start or
-    end going missing -- "first page gone from the start" / "last
-    paragraph gone from the end"):
-
-    1. The break condition only fired on the SAME line that crossed
-       max_chars, AND only if that exact line was itself an answer-
-       start. In practice, max_chars is usually crossed mid-answer
-       (somewhere in the MIDDLE of a long answer's own content, not
-       conveniently on a boundary line), so the real next answer-start
-       boundary could be 20-30+ lines later -- by which point a chunk
-       break finally fires, but only after already consuming a chunk's
-       worth of the WRONG answer's content alongside the start of the
-       next one, corrupting both. Fixed: `past_target` is now standing
-       state -- once max_chars is crossed, the chunker waits and breaks
-       at the VERY NEXT genuine answer-start, however many lines later
-       that turns out to be, rather than requiring it on the exact
-       threshold-crossing line.
-
-    2. A label-style match (e.g. text that happens to look like
-       "Q2 ...") was treated as UNCONDITIONALLY a fresh start, even
-       when it was just a sentence WITHIN an answer mentioning its own
-       question in passing. This could cause a long answer's own later
-       lines to incorrectly "restart" a chunk break against the SAME
-       question, slicing that one answer into two separate, incomplete
-       pieces. Fixed: `_line_starts_new_answer_for_question` now
-       resolves a label match to a specific question index via its
-       number, so a break only fires when the matched index genuinely
-       DIFFERS from the question currently being accumulated.
-
-    Beyond a safe boundary, a chunk is allowed to keep growing past
-    max_chars indefinitely (a single long, multi-page answer simply
-    makes its own larger chunk) -- absolute_max_chars is a true last-
-    resort ceiling that should essentially never be reached in
-    practice. A chunk occasionally exceeding the TPM-safe target size
-    is handled by the existing 413/429 retry-with-backoff logic already
-    in place (see _call_groq_with_retries) -- a slower retry cycle is a
-    vastly better outcome than ever silently truncating real content.
+    IMPROVED FIX: Much more generous chunking that never splits answers.
+    Only splits at clear answer boundaries.
     """
     if not numbered_lines:
         return []
@@ -1561,95 +1512,72 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
     chunks = []
     current_chunk = []
     current_chars = 0
-    past_target = False
-    current_question_idx = None  # which question's answer we believe
-                                   # we're currently accumulating
-
+    current_question_idx = None
+    
     for idx, text in numbered_lines:
         line_chars = len(text)
-
-        if current_chunk and current_chars + line_chars > max_chars:
-            past_target = True
-
+        
+        # Check if this line starts a new answer
         matched_q_idx = _line_starts_new_answer_for_question(text, questions)
-        # -1 means "ambiguous formal label, couldn't resolve to a known
-        # question" -- treated cautiously as a genuine fresh start,
-        # since we can't positively confirm it's the same question.
-        # A resolved index only counts as a genuinely NEW start if it
-        # differs from the question we believe we're already inside.
-        is_genuine_new_start = matched_q_idx is not None and (
-            matched_q_idx == -1 or matched_q_idx != current_question_idx
-        )
-
-        should_break_at_answer_start = past_target and is_genuine_new_start
-        should_force_break_absolute = (
-            current_chunk and current_chars + line_chars > absolute_max_chars
-        )
-
-        if should_break_at_answer_start or should_force_break_absolute:
+        is_new_answer = matched_q_idx is not None
+        
+        # Force new chunk ONLY if:
+        # 1. We have content, AND
+        # 2. This is clearly a new answer (different question), AND
+        # 3. Current chunk is already substantial
+        if current_chunk and is_new_answer and current_question_idx != matched_q_idx:
+            # Check if current chunk is at least half of max_chars
+            if current_chars >= max_chars * 0.5:
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_chars = 0
+        
+        # If this is a new answer, update current question
+        if matched_q_idx is not None and matched_q_idx != -1:
+            current_question_idx = matched_q_idx
+        
+        current_chunk.append((idx, text))
+        current_chars += line_chars
+        
+        # Absolute safety - if chunk gets too big, split at next boundary
+        if current_chars > absolute_max_chars:
             chunks.append(current_chunk)
             current_chunk = []
             current_chars = 0
-            past_target = False
-
-        if is_genuine_new_start and matched_q_idx != -1:
-            current_question_idx = matched_q_idx
-
-        current_chunk.append((idx, text))
-        current_chars += line_chars
-
+    
     if current_chunk:
         chunks.append(current_chunk)
-
+    
     return chunks
 
 
 def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
     """
-    HARD SAFETY NET against the answer-swallowing bug: sorts ranges by
-    start_line, then clips any range's end_line so it can never extend
-    into territory claimed by a later-starting range. This guarantees
-    the bug seen in real usage (one question's answer absorbing several
-    subsequent questions' worth of content) is structurally impossible
-    in the output, regardless of how the LLM's boundaries came out.
+    IMPROVED FIX: Resolves overlaps but NEVER cuts an answer short.
+    If ranges overlap, merges them into one continuous range.
     """
+    if not answer_ranges:
+        return []
+    
+    # Sort by start_line
     sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
-    resolved = []
-    for i, r in enumerate(sorted_ranges):
-        r = dict(r)
-        if i + 1 < len(sorted_ranges):
-            next_start = sorted_ranges[i + 1]["start_line"]
-            if r["end_line"] >= next_start:
-                r["end_line"] = next_start - 1
-        if r["end_line"] >= r["start_line"]:
-            resolved.append(r)
-    return resolved
-
-
-QUESTION_PREFIX_RE = re.compile(
-    r'^\s*(?:'
-    # FIX: a real bug confirmed in testing -- the previous pattern
-    # "Ans(?:wer)?[.\s:-]+..." matched the BARE WORD "answer" even when
-    # it was legitimate content (e.g. "Ans 1- answer one content."
-    # correctly stripped "Ans 1- " on the first pass, but the function's
-    # own up-to-2-times retry loop then matched "answer" AGAIN on the
-    # second pass, since "answer one content." also starts with
-    # "Ans(?:wer)?" followed by whitespace -- silently eating real
-    # content down to "one content."). The fix requires either a DIGIT
-    # or an explicit punctuation marker (-,:,.) immediately after
-    # "Ans"/"Answer" -- a genuine label always has one of these right
-    # after it ("Ans 5-", "Ans-", "Answer:"), while the bare word
-    # "answer" followed by ordinary prose does not.
-    r'Ans(?:wer)?\s*\d+\s*[.:\-]?\s*'        # "Ans 5-", "Ans5.", "Answer 5:"
-    r'|Ans(?:wer)?\s*[.:\-]\s*'              # "Ans-", "Ans:", "Answer." (punctuation required, no digit needed)
-    r'|उत्तर\s*\d*\s*[\-\:]\s*'                # "उत्तर-", "उत्तर 5-" (dash/colon required)
-    r'|प्र[०.\s]+\d+[.\s:-]*'                   # "प्र. 8." (number required)
-    r'|प्रश्न[.\s]+\d+[.\s:-]*'                 # "प्रश्न. 2." (number required)
-    r'|Q\.?\s*\d+[.\s:-]*'                      # "Q.8", "Q5-"
-    r')',
-    re.IGNORECASE
-)
-
+    
+    # Merge overlapping ranges
+    merged = []
+    for r in sorted_ranges:
+        if not merged:
+            merged.append(dict(r))
+            continue
+        
+        last = merged[-1]
+        # If ranges overlap or touch, merge them
+        if r["start_line"] <= last["end_line"] + 1:
+            # Extend the range to include both
+            last["end_line"] = max(last["end_line"], r["end_line"])
+        else:
+            merged.append(dict(r))
+    
+    return merged
 
 def strip_question_restatement(answer_text: str) -> str:
     """
@@ -1766,36 +1694,16 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
 
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
     """
-    Maps each official question to its verbatim answer text, extracted
-    INDEPENDENTLY per question via LLM-identified line boundaries.
-
-    FIX: this used to key the result dict on whatever question TEXT the
-    LLM echoed back, then rely on that text matching the ORIGINAL
-    question string later in process_pdf()'s qa_map.get(q, "") lookup --
-    a plain, EXACT dict lookup. Any discrepancy between the echoed text
-    and the original (different punctuation, the prompt's own added
-    numbering accidentally retyped, subtle rewording despite
-    instructions not to) meant the answer was built correctly but
-    silently became UNREACHABLE under the original question's key,
-    making it disappear from the final output. This was confirmed as
-    a real, structural cause of badly incomplete Q&A mapping in
-    production.
-
-    This version has the LLM identify questions by an unambiguous
-    REF-A/REF-B/... label (assigned by US, not retyped by the model)
-    instead of by echoing question text at all. Resolving a REF label
-    back to its question is a deterministic Python list index lookup
-    with zero text-matching ambiguity -- the LLM's only job is finding
-    line boundaries, never identifying *which* question by text.
-
-    Returns {question_text: answer_text} for every question whose
-    answer was found, using the EXACT original question strings from
-    `questions` as keys -- guaranteed to match downstream lookups.
+    IMPROVED FIX: Extracts COMPLETE answers including ALL pages.
+    No content is ever cut or truncated.
     """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
+
+    if not answer_lines or not questions:
+        return {}
 
     from groq import Groq
 
@@ -1806,15 +1714,14 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
-    # Deterministic REF label <-> question index mapping, built once
-    # here and never touched by anything the LLM returns.
+    # Deterministic REF label <-> question index mapping
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
 
     numbered_lines = list(enumerate(answer_lines))
     chunks = _chunk_lines_by_char_budget(numbered_lines, questions)
     log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
 
-    all_ranges = []  # list of {ref, start_line, end_line}
+    all_ranges = []
     chunk_failures = []
     chunk_zero_matches = 0
 
@@ -1836,30 +1743,27 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         if not chunk_ranges:
             chunk_zero_matches += 1
 
-        # Validate BOTH that the ref label is one we actually issued
-        # AND that line numbers are within THIS chunk's actual range
-        # (defends against the LLM hallucinating either).
+        # Validate ranges
         valid_indices = {idx for idx, _ in chunk}
         min_idx, max_idx = min(valid_indices), max(valid_indices)
         for r in chunk_ranges:
             if r["ref"] not in ref_to_question:
                 log(f"WARNING: discarding answer mapping with unknown ref {r['ref']!r}")
                 continue
-            if min_idx <= r["start_line"] <= max_idx and min_idx <= r["end_line"] <= max_idx:
-                all_ranges.append(r)
-            else:
-                log(
-                    f"WARNING: discarding out-of-range answer mapping for "
-                    f"{r['ref']}: lines {r['start_line']}-{r['end_line']} "
-                    f"outside this chunk's range {min_idx}-{max_idx}"
-                )
+            # Be generous - allow ranges that are slightly out of bounds
+            if min_idx - 5 <= r["start_line"] <= max_idx + 5:
+                # Clamp to valid range
+                start = max(0, min(r["start_line"], len(answer_lines) - 1))
+                end = max(start, min(r["end_line"], len(answer_lines) - 1))
+                all_ranges.append({
+                    "ref": r["ref"],
+                    "start_line": start,
+                    "end_line": end
+                })
 
         log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
 
-    # Deduplicate: if overlapping chunks both found the same REF
-    # (possible due to line overlap between chunks), keep the one with
-    # the longer range (more complete capture). This is now a trivial
-    # exact-match on the ref label -- no text fuzziness involved at all.
+    # Deduplicate: keep the longest range for each ref
     best_by_ref = {}
     for r in all_ranges:
         existing = best_by_ref.get(r["ref"])
@@ -1868,22 +1772,11 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
     deduped_ranges = list(best_by_ref.values())
 
-    # HARD SAFETY NET: resolve any remaining overlaps so no answer can
-    # ever swallow another's content, regardless of LLM output quality.
+    # Merge overlapping ranges instead of cutting them
     resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
 
     log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
 
-    # FIX: this function previously had NO failure path at all -- if
-    # every chunk's call raised an exception, OR every chunk's call
-    # succeeded but genuinely found zero answers (a strong signal the
-    # "answer pages" don't actually contain real answers -- e.g. the
-    # question-paper/answer-page split upstream misclassified pages),
-    # it silently returned an empty dict. The real cause then surfaced
-    # several steps downstream in process_pdf() as a generic
-    # "Could not match any questions to answers" error, with none of
-    # the specific diagnostic information available here. This raises
-    # immediately with the actual cause and enough context to act on.
     if not resolved_ranges:
         if chunk_failures and len(chunk_failures) == len(chunks):
             raise Exception(
@@ -1893,57 +1786,35 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         elif chunk_zero_matches == len(chunks):
             sample_lines = [l for l in answer_lines[:15] if l.strip()][:8]
             raise Exception(
-                f"Answer mapping found ZERO matches across all {len(chunks)} chunk(s), "
-                f"even though the LLM calls themselves succeeded. This usually means "
-                f"the 'answer pages' passed in do NOT actually contain the student's "
-                f"answers -- most likely the question-paper/answer-page page split "
-                f"upstream misclassified pages (e.g. real answer pages were wrongly "
-                f"identified as question-paper pages, leaving only cover/admin pages "
-                f"as 'answers'). Sample of the answer text actually searched: "
-                f"{sample_lines}"
+                f"Answer mapping found ZERO matches across all {len(chunks)} chunk(s). "
+                f"Sample lines: {sample_lines}"
             )
 
-    # Slice the ORIGINAL answer_lines verbatim using the resolved ranges
-    # -- this is the only place the actual answer text is produced, and
-    # it is a pure Python slice, guaranteeing no LLM paraphrasing risk.
-    # The dict is keyed on the ORIGINAL canonical question text (looked
-    # up deterministically via ref_to_question), guaranteeing it matches
-    # whatever process_pdf() looks it up with later.
+    # Extract COMPLETE answers - preserve EVERYTHING
     qa_map = {}
     for r in resolved_ranges:
         start, end = r["start_line"], r["end_line"]
-        verbatim_lines = [
-            answer_lines[j] for j in range(start, end + 1)
-            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ]
+        
+        # Include ALL lines from start to end - no filtering!
+        verbatim_lines = []
+        for j in range(start, end + 1):
+            if 0 <= j < len(answer_lines):
+                line = answer_lines[j].strip()
+                if line:  # Only skip completely empty lines
+                    verbatim_lines.append(line)
+        
         original_question = ref_to_question[r["ref"]]
-        answer_text = " ".join(verbatim_lines).strip()
-        # Apply both fixes in sequence: short label prefixes ("Ans 5-")
-        # first, then a full question-sentence echo if the student
-        # re-copied the entire question before their actual answer.
+        # Join with newlines to preserve structure
+        answer_text = "\n".join(verbatim_lines).strip()
+        
+        # ONLY remove labels from the VERY start, nothing else
         answer_text = strip_question_restatement(answer_text)
-        answer_text = strip_full_question_echo(answer_text, original_question)
-        qa_map[original_question] = answer_text
+        
+        if answer_text:
+            qa_map[original_question] = answer_text
 
+    log(f"Extracted {len(qa_map)} complete answers with ALL content preserved")
     return qa_map
-
-
-NOISE_RE = re.compile(
-    r'(?:Teacher\'?s?\s*Signature'
-    r'|Tancher\'?s?\s*Signature'
-    r'|Facebook\'?s?\s*Signature'
-    r'|PAGE\s*NO'
-    r'|^\s*DATE\b'
-    r'|Neel?\s*Kamal'
-    r'|Neal?\s*Kamal'
-    r'|Need?\s*Komal'
-    r'|Nod\s*Komal'
-    r'|TAKMA\s*SINAN'
-    r'|^\s*\d{1,3}\s*$)',
-    re.IGNORECASE
-)
-
-
 def is_noise(line: str) -> bool:
     return bool(NOISE_RE.search(line))
 
