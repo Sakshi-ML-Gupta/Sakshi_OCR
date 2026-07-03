@@ -74,7 +74,20 @@ def _coerce_name(name, default_name="document.pdf"):
     except Exception:
         return default_name
 
+from your_script import get_api_key, GROQ_MODEL
+from groq import Groq
 
+_client = Groq(api_key=get_api_key("GROQ_API_KEY"))
+
+def groq_adapter(system_prompt: str, user_prompt: str) -> str:
+    resp = _client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "system", "content": system_prompt},
+                  {"role": "user", "content": user_prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.0,
+    )
+    return resp.choices[0].message.content
 # =========================================================
 # DIAGNOSTIC GUARD
 #
