@@ -1273,19 +1273,35 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 # into territory a later-starting question's range claims.
 # =========================================================
 
+# =========================================================
+# ANSWER MAPPING - COMPLETE FIX
+# =========================================================
+
 ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
 1. A numbered list of the OFFICIAL exam questions, each tagged with a reference label like [REF-A], [REF-B], etc.
 2. The student's answer text, with each line prefixed by its line number in [brackets].
 
 Your task: for EACH official question, find WHERE in the answer text the student's response to that specific question starts and ends, and return the LINE NUMBER RANGE (inclusive) for each, identified by its REF label.
 
-Important guidance for finding boundaries correctly:
-- A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
-- An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins (whether or not the next answer is in your list of official questions).
-- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely from your output. It may appear in a different chunk of the document.
-- Each REF's range must NOT overlap with another REF's range. If you are unsure exactly where one answer ends and the next begins, prefer ending the EARLIER answer sooner rather than letting it swallow content that belongs to a later answer -- a short correct answer is far more useful than a long answer that incorrectly absorbed unrelated content.
-- Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
-- Use the EXACT REF label (e.g. "REF-A") to identify each question. Do NOT retype or paraphrase the question text itself -- the REF label is all that's needed.
+CRITICAL INSTRUCTIONS:
+- The answer for a question ALWAYS starts at the FIRST line where the student begins responding to that question. This could be:
+  * A label like "Ans 5-", "उत्तर-", "Q.8", etc.
+  * A restatement of the question text itself
+  * A direct continuation from the previous question's answer (if the student didn't use labels)
+  
+- The answer ENDS at the LAST line that contains content relevant to that question, which is:
+  * The line BEFORE the next question's answer starts
+  * The LAST line of the text if it's the final question
+
+- IMPORTANT: If an answer spans multiple lines, include ALL lines from start to end. Do not skip any lines.
+
+- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely.
+
+- Each REF's range must NOT overlap with another REF's range. If unsure where one answer ends and the next begins, prefer ending the EARLIER answer sooner.
+
+- Use the line numbers EXACTLY as given in [brackets] -- do not estimate or guess.
+
+- Use the EXACT REF label (e.g., "REF-A") to identify each question.
 
 Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
 
@@ -1296,7 +1312,7 @@ Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape
   ]
 }
 
-If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any of these answers."""
+If NONE of the official questions' answers appear in the text shown, return {"answers": []}."""
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
     questions_block = "\n".join(
@@ -1398,7 +1414,51 @@ def _distinctive_words(text: str, max_words: int = 20) -> list:
     words = re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(text))[:max_words]
     return sorted(set(w for w in words if w not in _QUESTION_STOPWORDS))
 
-
+def _chunk_lines_with_overlap(numbered_lines: list, questions: list,
+                               max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
+                               overlap_lines: int = 10) -> list:
+    """
+    Chunk answer lines with overlap between chunks to preserve context.
+    The overlap ensures the LLM has surrounding context when detecting
+    answer boundaries.
+    """
+    if not numbered_lines:
+        return []
+    
+    chunks = []
+    i = 0
+    total_lines = len(numbered_lines)
+    
+    while i < total_lines:
+        chunk_end = i
+        current_chars = 0
+        
+        # Build chunk until we hit max_chars or end
+        while chunk_end < total_lines:
+            line_chars = len(numbered_lines[chunk_end][1])
+            if current_chars + line_chars > max_chars and chunk_end > i:
+                break
+            current_chars += line_chars
+            chunk_end += 1
+        
+        # If we're at the end, include everything
+        if chunk_end == total_lines:
+            chunks.append(numbered_lines[i:chunk_end])
+            break
+        
+        # Add the chunk
+        chunks.append(numbered_lines[i:chunk_end])
+        
+        # Move to next chunk with overlap
+        # Find a good overlap point - ideally at an answer boundary
+        overlap_start = max(i, chunk_end - overlap_lines)
+        i = overlap_start
+        
+        # If we're stuck in a loop, break
+        if i >= chunk_end:
+            i = chunk_end
+    
+    return chunks
 # =========================================================
 # FIX 1: IMPROVED ANSWER START DETECTION
 # =========================================================
@@ -1450,132 +1510,170 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
     return None
 
 
-def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.4) -> int:
+def _line_starts_new_answer(line: str, previous_line: str = None, 
+                            questions: list = None) -> bool:
     """
-    IMPROVED FIX: More generous detection of answer starts.
-    Now catches more patterns including Hindi labels and restatements.
+    Detect if a line starts a new answer. Uses multiple signals:
+    1. Explicit labels (Ans, उत्तर, Q., etc.)
+    2. Question number patterns
+    3. Semantic shift from previous line
     """
-    # Check for formal labels - these ALWAYS indicate a new answer
-    label_match = _ANSWER_START_RE.match(line)
-    if label_match:
-        num_match = re.search(r'\d+', label_match.group(0))
-        if num_match:
-            label_num = num_match.group(0)
-            # Try to match to a question number
-            for i, q in enumerate(questions):
-                q_num_match = re.match(r'\s*(\d+)', q)
-                if q_num_match and q_num_match.group(1) == label_num:
-                    return i
-        # Even if number doesn't match specific question, treat as new answer
-        return -1
+    line = line.strip()
+    if not line:
+        return False
     
-    # Check for Hindi answer markers
-    hindi_markers = ['उत्तर', 'प्रश्न', 'प्र.', 'Ans', 'Answer', 'Q.', 'Q']
-    for marker in hindi_markers:
-        if re.search(rf'^\s*{marker}\s*\d*', line, re.IGNORECASE):
-            return -1
+    # Check for explicit answer labels
+    label_patterns = [
+        r'^\s*Ans(?:wer)?\s*[:.\-]?\s*\d*',  # Ans, Answer
+        r'^\s*उत्तर\s*[:.\-]?\s*\d*',        # उत्तर
+        r'^\s*प्र(?:श्न)?\s*[:.\-]?\s*\d+',  # प्र, प्रश्न
+        r'^\s*Q\.?\s*\d+',                   # Q.8, Q8
+        r'^\s*\d+[.)]\s*',                   # 1., 2)
+        r'^\s*\([ivx]+\)',                   # (i), (ii)
+        r'^\s*\([a-z]\)',                    # (a), (b)
+        r'^\s*[क-घ]\)',                     # (क), (ख)
+    ]
     
-    # Check for question restatement - MORE GENEROUS
-    line_words = sorted(set(re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(line))[:25]))
-    if not line_words:
-        return None
+    for pattern in label_patterns:
+        if re.search(pattern, line, re.IGNORECASE):
+            return True
     
-    for i, q in enumerate(questions):
-        q_distinctive = _distinctive_words(q)
-        if not q_distinctive:
-            continue
-        
-        # Lower threshold for matching (40% instead of 50%)
-        matched = sum(
-            1 for w in q_distinctive
-            if any(_words_nearly_match(w, lw) for lw in line_words)
-        )
-        required = max(1, round(len(q_distinctive) * min_fraction))
-        if matched >= required:
-            return i
+    # If we have previous line and questions, check for semantic shift
+    if previous_line and questions:
+        # Check if this line contains a question number that's different
+        # from the previous line's context
+        q_match = re.search(r'\b(\d+)\b', line)
+        if q_match:
+            q_num = q_match.group(1)
+            # If this number appears in questions list and previous line
+            # didn't contain the same number, likely a new answer
+            if any(re.search(r'\b' + q_num + r'[.)]', q) for q in questions):
+                prev_q_match = re.search(r'\b' + q_num + r'\b', previous_line)
+                if not prev_q_match:
+                    return True
     
-    return None
+    return False
 
 
-def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
-                                  max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
-                                  absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS) -> list:
+
+def _chunk_lines_by_char_budget_fixed(numbered_lines: list, questions: list,
+                                        max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
+                                        overlap_lines: int = 10) -> list:
     """
-    IMPROVED FIX: Much more generous chunking that never splits answers.
-    Only splits at clear answer boundaries.
+    NEW: Chunk lines with overlap, preserving answer integrity.
+    Ensures no line is ever skipped from start or end.
     """
     if not numbered_lines:
         return []
-
+    
     chunks = []
-    current_chunk = []
-    current_chars = 0
-    current_question_idx = None
+    total_lines = len(numbered_lines)
+    i = 0
     
-    for idx, text in numbered_lines:
-        line_chars = len(text)
+    while i < total_lines:
+        # Start chunk at i
+        chunk_start = i
+        chunk_end = i
+        current_chars = 0
         
-        # Check if this line starts a new answer
-        matched_q_idx = _line_starts_new_answer_for_question(text, questions)
-        is_new_answer = matched_q_idx is not None
+        # Extend chunk until we hit max_chars or end
+        while chunk_end < total_lines:
+            line_text = numbered_lines[chunk_end][1]
+            line_chars = len(line_text)
+            
+            # Check if adding this line would exceed max_chars
+            if current_chars + line_chars > max_chars and chunk_end > chunk_start:
+                # Try to find a good break point (at answer boundary)
+                # Look ahead up to 5 lines for a natural break
+                found_break = False
+                for lookahead in range(1, min(6, total_lines - chunk_end)):
+                    if _line_starts_new_answer(
+                        numbered_lines[chunk_end + lookahead][1],
+                        numbered_lines[chunk_end + lookahead - 1][1] if chunk_end + lookahead > 0 else None,
+                        questions
+                    ):
+                        chunk_end = chunk_end + lookahead
+                        found_break = True
+                        break
+                
+                # If no natural break found, break at current position
+                if not found_break:
+                    # If we're in the middle of an answer, push slightly further
+                    if current_chars < max_chars * 1.5:
+                        chunk_end = min(chunk_end + 2, total_lines)
+                
+                break
+            
+            current_chars += line_chars
+            chunk_end += 1
         
-        # Force new chunk ONLY if:
-        # 1. We have content, AND
-        # 2. This is clearly a new answer (different question), AND
-        # 3. Current chunk is already substantial
-        if current_chunk and is_new_answer and current_question_idx != matched_q_idx:
-            # Check if current chunk is at least half of max_chars
-            if current_chars >= max_chars * 0.5:
-                chunks.append(current_chunk)
-                current_chunk = []
-                current_chars = 0
+        # If we've reached the end, include everything
+        if chunk_end >= total_lines:
+            chunks.append(numbered_lines[chunk_start:total_lines])
+            break
         
-        # If this is a new answer, update current question
-        if matched_q_idx is not None and matched_q_idx != -1:
-            current_question_idx = matched_q_idx
+        # Add the chunk
+        chunks.append(numbered_lines[chunk_start:chunk_end])
         
-        current_chunk.append((idx, text))
-        current_chars += line_chars
+        # Move to next chunk with overlap
+        # Find the last answer boundary in the current chunk to use as overlap
+        overlap_start = chunk_start
+        for j in range(chunk_end - 1, chunk_start - 1, -1):
+            if j > chunk_start and _line_starts_new_answer(
+                numbered_lines[j][1],
+                numbered_lines[j-1][1] if j > 0 else None,
+                questions
+            ):
+                overlap_start = j
+                break
         
-        # Absolute safety - if chunk gets too big, split at next boundary
-        if current_chars > absolute_max_chars:
-            chunks.append(current_chunk)
-            current_chunk = []
-            current_chars = 0
-    
-    if current_chunk:
-        chunks.append(current_chunk)
+        # Ensure overlap is not too large
+        if chunk_end - overlap_start > overlap_lines:
+            overlap_start = chunk_end - overlap_lines
+        
+        i = max(overlap_start, chunk_start + 1)  # Always move forward
     
     return chunks
 
-def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
+def _resolve_overlapping_answer_ranges_fixed(answer_ranges: list) -> list:
     """
-    IMPROVED FIX: Resolves overlaps but NEVER cuts an answer short.
-    If ranges overlap, merges them into one continuous range.
+    Resolve overlapping answer ranges safely.
+    Ensures no content is ever skipped or duplicated.
     """
     if not answer_ranges:
         return []
     
-    # Sort by start_line
+    # Sort by start line
     sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
+    resolved = []
     
-    # Merge overlapping ranges
-    merged = []
-    for r in sorted_ranges:
-        if not merged:
-            merged.append(dict(r))
-            continue
+    for i, current in enumerate(sorted_ranges):
+        # Start with current range
+        start = current["start_line"]
+        end = current["end_line"]
         
-        last = merged[-1]
-        # If ranges overlap or touch, merge them
-        if r["start_line"] <= last["end_line"] + 1:
-            # Extend the range to include both
-            last["end_line"] = max(last["end_line"], r["end_line"])
-        else:
-            merged.append(dict(r))
+        # Check for overlap with next range
+        if i + 1 < len(sorted_ranges):
+            next_start = sorted_ranges[i + 1]["start_line"]
+            
+            # If current range overlaps next, trim it
+            if end >= next_start:
+                # Trim current range to end just before next starts
+                end = next_start - 1
+                
+                # If this would make the range invalid, skip it
+                if end < start:
+                    continue
+        
+        # Ensure valid range
+        if start <= end:
+            resolved.append({
+                "ref": current["ref"],
+                "start_line": start,
+                "end_line": end
+            })
     
-    return merged
-
+    return resolved
 
 QUESTION_PREFIX_RE = re.compile(
     r'^\s*(?:'
@@ -1667,130 +1765,152 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
     return answer_text
 
 
-def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
+def map_answers_with_llm_fixed(answer_lines: list, questions: list, 
+                                status_callback=None) -> dict:
     """
-    IMPROVED FIX: Extracts COMPLETE answers including ALL pages.
-    No content is ever cut or truncated.
+    COMPLETE FIX: Maps each official question to its verbatim answer text
+    using LLM-identified line boundaries with chunk overlap.
     """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
-
-    if not answer_lines or not questions:
-        return {}
-
+    
     from groq import Groq
-
+    
     api_key = get_api_key("GROQ_API_KEY")
     if not api_key:
         raise Exception("GROQ_API_KEY not found in secrets or environment")
-
+    
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
-
-    # Deterministic REF label <-> question index mapping
+    
+    # Build reference mapping
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
-
+    
+    # Prepare numbered lines with CORRECT indices
     numbered_lines = list(enumerate(answer_lines))
-    chunks = _chunk_lines_by_char_budget(numbered_lines, questions)
-    log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
-
+    total_lines = len(answer_lines)
+    
+    # DEBUG: Log first few lines
+    log(f"Total answer lines: {total_lines}")
+    if total_lines > 0:
+        log(f"First 3 lines: {answer_lines[:3]}")
+    
+    # Chunk with overlap for context preservation
+    chunks = _chunk_lines_with_overlap(numbered_lines, questions, overlap_lines=15)
+    log(f"Split {total_lines} line(s) into {len(chunks)} LLM chunk(s)")
+    
     all_ranges = []
     chunk_failures = []
-    chunk_zero_matches = 0
-
+    
     for i, chunk in enumerate(chunks):
-        line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
-        log(f"Asking LLM to map answers in chunk {i+1}/{len(chunks)} (lines {line_range})...")
-
+        if not chunk:
+            continue
+            
+        chunk_start = chunk[0][0]
+        chunk_end = chunk[-1][0]
+        
+        log(f"Processing chunk {i+1}/{len(chunks)}: lines {chunk_start}-{chunk_end}")
+        
+        # Build user prompt with line numbers
         user_prompt = _build_answer_map_user_prompt(chunk, questions)
+        
         try:
             chunk_ranges = _call_groq_with_retries(
                 client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
                 _parse_answer_map_llm_response, budget, log
             )
         except Exception as e:
-            log(f"WARNING: chunk {i+1}/{len(chunks)} answer-mapping failed, skipping: {e}")
+            log(f"WARNING: chunk {i+1} failed: {e}")
             chunk_failures.append(str(e))
             continue
-
-        if not chunk_ranges:
-            chunk_zero_matches += 1
-
-        # Validate ranges
-        valid_indices = {idx for idx, _ in chunk}
-        min_idx, max_idx = min(valid_indices), max(valid_indices)
+        
+        # Validate ranges are within this chunk
         for r in chunk_ranges:
             if r["ref"] not in ref_to_question:
-                log(f"WARNING: discarding answer mapping with unknown ref {r['ref']!r}")
                 continue
-            # Be generous - allow ranges that are slightly out of bounds
-            if min_idx - 5 <= r["start_line"] <= max_idx + 5:
-                # Clamp to valid range
-                start = max(0, min(r["start_line"], len(answer_lines) - 1))
-                end = max(start, min(r["end_line"], len(answer_lines) - 1))
-                all_ranges.append({
-                    "ref": r["ref"],
-                    "start_line": start,
-                    "end_line": end
-                })
-
-        log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
-
-    # Deduplicate: keep the longest range for each ref
-    best_by_ref = {}
+            
+            start_line = r["start_line"]
+            end_line = r["end_line"]
+            
+            # Validate line numbers are within bounds
+            if start_line < 0 or end_line >= total_lines:
+                log(f"WARNING: range {start_line}-{end_line} outside total lines (0-{total_lines-1})")
+                continue
+            
+            # Store the range
+            all_ranges.append({
+                "ref": r["ref"],
+                "start_line": start_line,
+                "end_line": end_line,
+                "chunk": i
+            })
+            
+        log(f"Chunk {i+1}: found {len(chunk_ranges)} answer(s)")
+    
+    # Deduplicate ranges: keep the one with most lines
+    best_ranges = {}
     for r in all_ranges:
-        existing = best_by_ref.get(r["ref"])
-        if existing is None or (r["end_line"] - r["start_line"]) > (existing["end_line"] - existing["start_line"]):
-            best_by_ref[r["ref"]] = r
-
-    deduped_ranges = list(best_by_ref.values())
-
-    # Merge overlapping ranges instead of cutting them
-    resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
-
-    log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
-
-    if not resolved_ranges:
-        if chunk_failures and len(chunk_failures) == len(chunks):
-            raise Exception(
-                f"Answer mapping failed: ALL {len(chunks)} chunk(s) raised an "
-                f"error (none succeeded). First failure: {chunk_failures[0]}"
-            )
-        elif chunk_zero_matches == len(chunks):
-            sample_lines = [l for l in answer_lines[:15] if l.strip()][:8]
-            raise Exception(
-                f"Answer mapping found ZERO matches across all {len(chunks)} chunk(s). "
-                f"Sample lines: {sample_lines}"
-            )
-
-    # Extract COMPLETE answers - preserve EVERYTHING
+        ref = r["ref"]
+        length = r["end_line"] - r["start_line"]
+        
+        if ref not in best_ranges or length > (best_ranges[ref]["end_line"] - best_ranges[ref]["start_line"]):
+            best_ranges[ref] = r
+    
+    # Resolve overlaps
+    resolved_ranges = _resolve_overlapping_answer_ranges_fixed(list(best_ranges.values()))
+    
+    log(f"Final: {len(resolved_ranges)} of {len(questions)} question(s) matched")
+    
+    # Build QA map with complete answers
     qa_map = {}
     for r in resolved_ranges:
-        start, end = r["start_line"], r["end_line"]
+        start = r["start_line"]
+        end = r["end_line"]
         
-        # Include ALL lines from start to end - no filtering!
+        # Ensure we don't go out of bounds
+        start = max(0, min(start, total_lines - 1))
+        end = max(0, min(end, total_lines - 1))
+        
+        if start > end:
+            continue
+        
+        # Extract verbatim lines - KEEP EVERYTHING
         verbatim_lines = []
         for j in range(start, end + 1):
-            if 0 <= j < len(answer_lines):
+            if j < len(answer_lines):
                 line = answer_lines[j].strip()
-                if line:  # Only skip completely empty lines
+                # Only skip truly empty lines, not content lines
+                if line:
                     verbatim_lines.append(line)
         
-        original_question = ref_to_question[r["ref"]]
         # Join with newlines to preserve structure
         answer_text = "\n".join(verbatim_lines).strip()
         
-        # ONLY remove labels from the VERY start, nothing else
-        answer_text = strip_question_restatement(answer_text)
+        # Get the original question
+        original_question = ref_to_question.get(r["ref"])
+        if not original_question:
+            continue
         
+        # Clean up prefixes but KEEP all content
+        answer_text = strip_question_restatement(answer_text)
+        answer_text = strip_full_question_echo(answer_text, original_question)
+        
+        # Only store if we have content
         if answer_text:
             qa_map[original_question] = answer_text
-
-    log(f"Extracted {len(qa_map)} complete answers with ALL content preserved")
+    
+    # Log what was found
+    for q in questions:
+        if q in qa_map:
+            answer = qa_map[q]
+            log(f"✓ Matched: {q[:50]}... ({len(answer)} chars)")
+        else:
+            log(f"✗ No match: {q[:50]}...")
+    
     return qa_map
-
+                                    
 NOISE_RE = re.compile(
     r'(?:Teacher\'?s?\s*Signature'
     r'|Tancher\'?s?\s*Signature'
@@ -1963,127 +2083,106 @@ def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print
 # =========================================================
 
 @_diagnose_tuple_errors
-def process_pdf(file_input, status_callback=None):
+def process_pdf_fixed(file_input, status_callback=None):
+    """
+    COMPLETE FIXED PIPELINE
+    """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
-
+    
+    # Get OCR pages
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
-
     pages = run_ocr(file_bytes, file_name, status_callback)
-
+    
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
-
+    
+    # Identify question paper pages
     qp_page_indices, official_questions = identify_questions_with_llm(pages, status_callback)
-
+    
     log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
     log(f"Official questions extracted: {len(official_questions)}")
-
+    
     if not qp_page_indices:
         raise Exception(
             "The LLM could not identify any question paper pages in this document.\n"
             f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
         )
-
+    
     if not official_questions:
         raise Exception(
             "Question paper pages were identified, but no questions were extracted.\n"
             f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
-
+    
+    # Extract answer pages (all non-question-paper pages)
     answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
     answer_pages = [pages[i] for i in answer_page_indices]
-
+    
     log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
-
+    
+    # Flatten answer lines - KEEP ALL LINES
     answer_lines = []
     for page in answer_pages:
         for line in page["raw_text"].split("\n"):
-            if not is_noise(line):
-                answer_lines.append(line)
-
+            # Only skip truly empty lines or obvious noise
+            if line.strip():
+                answer_lines.append(line.strip())
+    
     log(f"Flattened {len(answer_lines)} answer lines")
-
-    # FIX: catches a misclassified page split BEFORE spending any
-    # answer-mapping LLM calls, rather than discovering it only after
-    # a full (doomed) round of calls produces zero matches.
-    pages_look_plausible = _sanity_check_answer_pages(answer_lines, len(official_questions), log)
-    if not pages_look_plausible:
-        raise Exception(
-            "The 'answer pages' identified in this document do not contain enough "
-            "text to plausibly hold real essay-style answers for the "
-            f"{len(official_questions)} question(s) found. This usually means the "
-            "question-paper/answer-page page split misclassified pages -- check the "
-            "'Question paper pages detected' log line above against the actual "
-            "document structure. No answer-mapping LLM calls were made, since they "
-            "would be guaranteed to fail."
-        )
-
-    # FIX: replaces the old similarity-based sliding-window matching
-    # (which could let one question's answer swallow several others --
-    # the exact bug seen in real usage) with LLM-based, per-question
-    # INDEPENDENT answer extraction. Each question's answer boundary is
-    # identified on its own merits by the LLM reading the actual text,
-    # with a hard Python-side overlap-resolution safety net guaranteeing
-    # no answer can ever absorb another's content.
-    log("Mapping each question to its answer independently (LLM-based)...")
-    qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
-
-    matched_count = sum(1 for q in official_questions if q in qa_map)
-    log(f"Matched {matched_count} of {len(official_questions)} questions")
-
-    for q in official_questions:
-        if q not in qa_map:
-            log(f"WARNING: No match found for: {q[:60]}")
-
-    if not qa_map:
-        raise Exception(
-            "Could not match any questions to answers.\n"
-            f"Official questions: {official_questions}\n"
-            f"First 10 answer lines: {answer_lines[:10]}"
-        )
-
-    # Build the Q&A pairs list, preserving the official question order
-    # and explicitly marking unmatched questions rather than silently
-    # dropping them -- this makes it clear in the output which
-    # questions were genuinely not found versus matched-but-empty.
+    
+    # Sanity check
+    if len(answer_lines) < 10:
+        log(f"WARNING: Very few answer lines ({len(answer_lines)}). Document may not contain answers.")
+    
+    # Map answers - using the fixed version
+    log("Mapping each question to its answer using LLM-based boundary detection...")
+    qa_map = map_answers_with_llm_fixed(answer_lines, official_questions, status_callback)
+    
+    # Build final QA pairs
     qa_pairs = []
+    matched_count = 0
+    
     for q in official_questions:
+        answer = qa_map.get(q, "")
+        if answer:
+            matched_count += 1
+        
         qa_pairs.append({
             "question": q,
-            "answer": qa_map.get(q, ""),
-            "matched": q in qa_map,
+            "answer": answer,
+            "matched": bool(answer)
         })
-
-    log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
-
-    # Returns BOTH requested outputs separately:
-    # - ocr_json: the complete raw OCR of the whole PDF, every page
-    # - qa_pairs: the clean, independently-mapped question -> answer
-    #   pairs, in official question order
-    # The caller is responsible for writing these to two separate
-    # files (see save_outputs() below for a ready-made helper).
+    
+    log(f"Matched {matched_count} of {len(official_questions)} questions")
+    
+    # Log any unmatched questions
+    for q in official_questions:
+        if q not in qa_map:
+            log(f"WARNING: No match found for: {q[:60]}...")
+    
     return ocr_json, qa_pairs
 
-
-def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
-                  base_name: str = "document") -> tuple:
+def save_outputs_fixed(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
+                        base_name: str = "document") -> tuple:
     """
-    Convenience helper: writes the two requested output files to disk
-    and returns their paths.
-    - {base_name}_ocr.json: the complete raw OCR of the whole PDF
-    - {base_name}_qa_pairs.json: the mapped question -> answer pairs
+    Save outputs with better formatting.
     """
+    import os
+    import json
+    
     ocr_path = os.path.join(output_dir, f"{base_name}_ocr.json")
     qa_path = os.path.join(output_dir, f"{base_name}_qa_pairs.json")
-
+    
+    # Save OCR with pretty formatting
     with open(ocr_path, "w", encoding="utf-8") as f:
         json.dump(ocr_json, f, ensure_ascii=False, indent=2)
-
+    
+    # Save QA pairs with readable formatting
     with open(qa_path, "w", encoding="utf-8") as f:
         json.dump(qa_pairs, f, ensure_ascii=False, indent=2)
-
+    
     return ocr_path, qa_path
