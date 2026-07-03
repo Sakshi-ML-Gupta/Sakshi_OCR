@@ -1,0 +1,469 @@
+"""
+benchmark_answer_mapping.py
+
+A benchmark harness for the "question -> answer line-range mapping" task
+extracted from the OCR/answer-mapping pipeline.
+
+CORE DESIGN PRINCIPLE (non-negotiable, enforced in code, not just in the
+prompt): the LLM's ONLY allowed output is a set of integer line-number
+ranges tied to REF-labels. It is never allowed to emit answer text.
+Extraction of the actual answer content is ALWAYS done by Python slicing
+the original, ground-truth line array. This guarantees:
+  - No paraphrasing / hallucinated wording can ever reach the output.
+  - Scoring measures the thing that actually matters (boundary detection),
+    not text-generation quality.
+  - A model that tries to shortcut by writing the answer text directly
+    is automatically disqualified for that case (schema violation).
+
+Usage:
+    from benchmark_answer_mapping import (
+        SYSTEM_PROMPT, BenchmarkCase, GroundTruthRange,
+        run_case, run_benchmark, ModelAdapter
+    )
+
+Plug in a model by writing a ModelAdapter — a callable of the form:
+    (system_prompt: str, user_prompt: str) -> str   # raw LLM text output
+
+See the bottom of this file for a runnable mock-model demo.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import difflib
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+
+# =========================================================
+# 1. THE SYSTEM PROMPT THE MODEL UNDER TEST MUST FOLLOW
+#
+# This is intentionally strict about the ONE thing that must never
+# happen (emitting answer text), and otherwise mirrors the boundary-
+# detection guidance from the production pipeline so a model that is
+# good at this benchmark is good at the real task.
+# =========================================================
+
+SYSTEM_PROMPT = """You are a document-alignment assistant. You will be given:
+  1. A numbered list of official questions, each tagged with a REF label (REF-A, REF-B, ...).
+  2. A block of text with each line prefixed by its line number in [brackets].
+
+Your ONLY job is to find, for each question, the LINE-NUMBER RANGE (inclusive) in the
+text block where the response to that question appears.
+
+HARD RULES -- violating any of these is an automatic failure of this task:
+  - You MUST NOT copy, quote, paraphrase, summarize, or otherwise reproduce ANY of the
+    source text in your answer. Output line numbers ONLY. If you find yourself typing
+    more than a REF label and two integers for an entry, you are doing this wrong.
+  - Identify each question using its REF label ONLY. Never invent your own numbering,
+    never retype the question text.
+  - A range's start_line and end_line MUST be line numbers that literally appear in the
+    [bracketed] numbering shown to you. Do not estimate or invent numbers.
+  - Ranges for different REFs must NOT overlap. If uncertain exactly where one response
+    ends and the next begins, end the earlier one sooner rather than risk overlap.
+  - If a question's response is not present in the text shown, omit that REF entirely.
+    Do not guess a range just to have an answer for every REF.
+
+Return ONLY valid JSON, no markdown fences, no commentary, in exactly this shape:
+
+{
+  "ranges": [
+    {"ref": "REF-A", "start_line": 12, "end_line": 18},
+    {"ref": "REF-B", "start_line": 19, "end_line": 25}
+  ]
+}
+
+If none of the REFs have a response in the text shown, return {"ranges": []}."""
+
+
+def build_user_prompt(numbered_lines: list[tuple[int, str]], questions: list[str]) -> str:
+    questions_block = "\n".join(f"[REF-{chr(65 + i)}] {q}" for i, q in enumerate(questions))
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
+    return (
+        f"QUESTIONS:\n{questions_block}\n\n"
+        f"TEXT (line-numbered):\n{lines_block}"
+    )
+
+
+# =========================================================
+# 2. BENCHMARK CASE / GROUND TRUTH
+# =========================================================
+
+@dataclass
+class GroundTruthRange:
+    ref: str
+    start_line: int
+    end_line: int
+
+
+@dataclass
+class BenchmarkCase:
+    case_id: str
+    lines: list[str]                       # the ORIGINAL source lines (index == line number)
+    questions: list[str]                   # question text, order defines REF-A, REF-B, ...
+    ground_truth: list[GroundTruthRange]   # correct ranges, keyed by ref
+
+    def numbered_lines(self) -> list[tuple[int, str]]:
+        return list(enumerate(self.lines))
+
+    def ref_to_question(self) -> dict[str, str]:
+        return {f"REF-{chr(65 + i)}": q for i, q in enumerate(self.questions)}
+
+
+ModelAdapter = Callable[[str, str], str]  # (system_prompt, user_prompt) -> raw text
+
+
+# =========================================================
+# 3. STRICT SCHEMA VALIDATION
+#
+# This is where "the mapping must be python slicing, not LLM" is
+# actually enforced, not just requested. Any entry that isn't exactly
+# {ref: str, start_line: int, end_line: int} is rejected. A model that
+# tries to add an "answer_text" field, or stuff text into start/end
+# fields, gets those entries thrown out and penalized -- it can never
+# get free-form text into the scored output.
+# =========================================================
+
+class SchemaViolation(Exception):
+    pass
+
+
+def parse_and_validate(raw_output: str, valid_refs: set[str],
+                        min_line: int, max_line: int) -> tuple[list[dict], list[str]]:
+    """
+    Returns (valid_ranges, violations). valid_ranges contains only
+    entries that pass strict schema + bounds checks. violations is a
+    list of human-readable reasons entries were rejected (used for
+    scoring/reporting, e.g. schema_violation, unknown_ref, out_of_bounds).
+    """
+    text = raw_output.strip()
+    if text.startswith("```"):
+        text = re.sub(r'^```(?:json)?\s*\n?', '', text)
+        text = re.sub(r'\n?```\s*$', '', text)
+        text = text.strip()
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise SchemaViolation(f"Output is not valid JSON: {e}")
+
+    if not isinstance(data, dict) or "ranges" not in data:
+        raise SchemaViolation(f"Missing top-level 'ranges' key. Got keys: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    ranges = data["ranges"]
+    if not isinstance(ranges, list):
+        raise SchemaViolation(f"'ranges' must be a list, got {type(ranges).__name__}")
+
+    valid_ranges = []
+    violations = []
+
+    for item in ranges:
+        if not isinstance(item, dict):
+            violations.append(f"non-object entry: {item!r}")
+            continue
+
+        extra_keys = set(item.keys()) - {"ref", "start_line", "end_line"}
+        if extra_keys:
+            violations.append(
+                f"entry has disallowed extra field(s) {extra_keys} -- likely an attempt "
+                f"to smuggle text instead of indices: {item!r}"
+            )
+            continue
+
+        if not {"ref", "start_line", "end_line"} <= set(item.keys()):
+            violations.append(f"entry missing required keys: {item!r}")
+            continue
+
+        ref = item["ref"]
+        start, end = item["start_line"], item["end_line"]
+
+        if not isinstance(ref, str):
+            violations.append(f"'ref' must be a string label, got {type(ref).__name__}: {item!r}")
+            continue
+
+        # start_line / end_line must be genuine integers (or int-valued
+        # floats/strings of digits) -- not prose, not the answer text.
+        def _as_int(v):
+            if isinstance(v, bool):
+                return None
+            if isinstance(v, int):
+                return v
+            if isinstance(v, float) and v.is_integer():
+                return int(v)
+            if isinstance(v, str) and re.fullmatch(r'-?\d+', v.strip()):
+                return int(v)
+            return None
+
+        start_i, end_i = _as_int(start), _as_int(end)
+        if start_i is None or end_i is None:
+            violations.append(
+                f"start_line/end_line must be integers, got start={start!r} end={end!r} "
+                f"-- this looks like the model emitted text instead of line numbers"
+            )
+            continue
+
+        if ref not in valid_refs:
+            violations.append(f"unknown ref label {ref!r} (not one of the assigned REF labels)")
+            continue
+
+        if not (min_line <= start_i <= max_line and min_line <= end_i <= max_line):
+            violations.append(f"{ref}: range {start_i}-{end_i} out of document bounds [{min_line}, {max_line}]")
+            continue
+
+        if end_i < start_i:
+            violations.append(f"{ref}: end_line ({end_i}) < start_line ({start_i})")
+            continue
+
+        valid_ranges.append({"ref": ref, "start_line": start_i, "end_line": end_i})
+
+    return valid_ranges, violations
+
+
+def resolve_overlaps(ranges: list[dict]) -> tuple[list[dict], int]:
+    """Hard safety net (same policy as production): sort by start_line,
+    clip any range so it can never extend into a later-starting range's
+    territory. Returns (resolved_ranges, num_overlaps_detected)."""
+    sorted_ranges = sorted(ranges, key=lambda r: r["start_line"])
+    resolved = []
+    overlap_count = 0
+    for i, r in enumerate(sorted_ranges):
+        r = dict(r)
+        if i + 1 < len(sorted_ranges):
+            next_start = sorted_ranges[i + 1]["start_line"]
+            if r["end_line"] >= next_start:
+                overlap_count += 1
+                r["end_line"] = next_start - 1
+        if r["end_line"] >= r["start_line"]:
+            resolved.append(r)
+    return resolved, overlap_count
+
+
+# =========================================================
+# 4. EXTRACTION -- PYTHON SLICING ONLY
+#
+# This function is the entire reason the benchmark exists: it is the
+# ONLY place answer text is ever produced, and it is a pure slice of
+# the ORIGINAL ground-truth lines using indices. The LLM never sees
+# this function's output influence its own scoring input -- it only
+# ever supplies indices.
+# =========================================================
+
+def extract_verbatim(lines: list[str], ranges: list[dict]) -> dict[str, str]:
+    extracted = {}
+    for r in ranges:
+        s, e = r["start_line"], r["end_line"]
+        chunk = [lines[j] for j in range(s, e + 1) if 0 <= j < len(lines) and lines[j].strip()]
+        extracted[r["ref"]] = " ".join(chunk).strip()
+    return extracted
+
+
+# =========================================================
+# 5. SCORING
+# =========================================================
+
+def _iou(a_start, a_end, b_start, b_end) -> float:
+    inter = max(0, min(a_end, b_end) - max(a_start, b_start) + 1)
+    union = (a_end - a_start + 1) + (b_end - b_start + 1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+@dataclass
+class CaseResult:
+    case_id: str
+    schema_ok: bool = True
+    schema_error: Optional[str] = None
+    violations: list[str] = field(default_factory=list)
+    overlap_count: int = 0
+    precision: float = 0.0
+    recall: float = 0.0
+    f1: float = 0.0
+    mean_iou: float = 0.0                 # over matched refs only
+    exact_verbatim_match_rate: float = 0.0
+    predicted_ranges: list[dict] = field(default_factory=list)
+    extracted_text: dict[str, str] = field(default_factory=dict)
+
+
+def score_case(case: BenchmarkCase, raw_model_output: str,
+               iou_match_threshold: float = 0.5) -> CaseResult:
+    result = CaseResult(case_id=case.case_id)
+    ref_to_q = case.ref_to_question()
+    valid_refs = set(ref_to_q.keys())
+    min_line, max_line = 0, len(case.lines) - 1
+
+    try:
+        parsed, violations = parse_and_validate(raw_model_output, valid_refs, min_line, max_line)
+    except SchemaViolation as e:
+        result.schema_ok = False
+        result.schema_error = str(e)
+        return result  # zero score across the board -- disqualified
+
+    result.violations = violations
+    resolved, overlap_count = resolve_overlaps(parsed)
+    result.overlap_count = overlap_count
+    result.predicted_ranges = resolved
+
+    gt_by_ref = {g.ref: g for g in case.ground_truth}
+    pred_by_ref = {r["ref"]: r for r in resolved}
+
+    matched = 0
+    ious = []
+    for ref, gt in gt_by_ref.items():
+        pred = pred_by_ref.get(ref)
+        if pred is None:
+            continue
+        iou = _iou(pred["start_line"], pred["end_line"], gt.start_line, gt.end_line)
+        if iou >= iou_match_threshold:
+            matched += 1
+            ious.append(iou)
+
+    n_pred = len(pred_by_ref)
+    n_gt = len(gt_by_ref)
+    result.precision = matched / n_pred if n_pred else (1.0 if n_gt == 0 else 0.0)
+    result.recall = matched / n_gt if n_gt else 1.0
+    result.f1 = (
+        2 * result.precision * result.recall / (result.precision + result.recall)
+        if (result.precision + result.recall) > 0 else 0.0
+    )
+    result.mean_iou = sum(ious) / len(ious) if ious else 0.0
+
+    # Extraction is always via Python slicing of the ORIGINAL lines --
+    # never anything the model wrote.
+    result.extracted_text = extract_verbatim(case.lines, resolved)
+    gt_text = extract_verbatim(case.lines, [
+        {"ref": g.ref, "start_line": g.start_line, "end_line": g.end_line}
+        for g in case.ground_truth
+    ])
+    exact_matches = sum(
+        1 for ref in gt_text if result.extracted_text.get(ref) == gt_text[ref]
+    )
+    result.exact_verbatim_match_rate = exact_matches / len(gt_text) if gt_text else 1.0
+
+    return result
+
+
+# =========================================================
+# 6. RUNNING A CASE / A FULL BENCHMARK
+# =========================================================
+
+def run_case(model: ModelAdapter, case: BenchmarkCase) -> CaseResult:
+    user_prompt = build_user_prompt(case.numbered_lines(), case.questions)
+    raw_output = model(SYSTEM_PROMPT, user_prompt)
+    return score_case(case, raw_output)
+
+
+def run_benchmark(models: dict[str, ModelAdapter], cases: list[BenchmarkCase]) -> dict[str, list[CaseResult]]:
+    report: dict[str, list[CaseResult]] = {}
+    for model_name, adapter in models.items():
+        results = []
+        for case in cases:
+            try:
+                results.append(run_case(adapter, case))
+            except Exception as e:
+                r = CaseResult(case_id=case.case_id, schema_ok=False, schema_error=f"adapter raised: {e}")
+                results.append(r)
+        report[model_name] = results
+    return report
+
+
+def summarize(report: dict[str, list[CaseResult]]) -> str:
+    lines = []
+    header = f"{'model':<20}{'disqualified':<14}{'precision':<11}{'recall':<9}{'f1':<9}{'mean_iou':<10}{'verbatim%':<10}{'overlaps':<9}"
+    lines.append(header)
+    lines.append("-" * len(header))
+    for model_name, results in report.items():
+        n = len(results)
+        dq = sum(1 for r in results if not r.schema_ok)
+        scored = [r for r in results if r.schema_ok]
+        avg = lambda field_: sum(getattr(r, field_) for r in scored) / len(scored) if scored else 0.0
+        overlaps = sum(r.overlap_count for r in results)
+        lines.append(
+            f"{model_name:<20}{f'{dq}/{n}':<14}{avg('precision'):<11.3f}{avg('recall'):<9.3f}"
+            f"{avg('f1'):<9.3f}{avg('mean_iou'):<10.3f}{avg('exact_verbatim_match_rate')*100:<10.1f}{overlaps:<9}"
+        )
+    return "\n".join(lines)
+
+
+# =========================================================
+# 7. DEMO -- a mock "model" so this file runs standalone.
+# Replace mock_model with a real adapter, e.g.:
+#
+#   def groq_adapter(system_prompt, user_prompt):
+#       resp = groq_client.chat.completions.create(
+#           model="openai/gpt-oss-120b",
+#           messages=[{"role": "system", "content": system_prompt},
+#                     {"role": "user", "content": user_prompt}],
+#           response_format={"type": "json_object"},
+#           temperature=0.0,
+#       )
+#       return resp.choices[0].message.content
+# =========================================================
+
+def _demo_case() -> BenchmarkCase:
+    lines = [
+        "IGNOU Assignment Booklet",
+        "Enrolment No: 123456",
+        "",
+        "Ans 1- The theme of concealment is central to the play.",
+        "It appears through disguise and secrecy in several scenes.",
+        "The characters hide their true identities to survive.",
+        "",
+        "Ans 2- Akam poetry deals with the inner, personal life.",
+        "It focuses on love and domestic emotion rather than public affairs.",
+        "",
+        "Teacher's Signature",
+    ]
+    questions = [
+        "1. Examine the theme of concealment in the play. (10)",
+        "2. Write a short note on Akam poetry. (10)",
+    ]
+    ground_truth = [
+        GroundTruthRange(ref="REF-A", start_line=3, end_line=5),
+        GroundTruthRange(ref="REF-B", start_line=7, end_line=8),
+    ]
+    return BenchmarkCase(case_id="demo_1", lines=lines, questions=questions, ground_truth=ground_truth)
+
+
+def _mock_model_good(system_prompt: str, user_prompt: str) -> str:
+    return json.dumps({"ranges": [
+        {"ref": "REF-A", "start_line": 3, "end_line": 5},
+        {"ref": "REF-B", "start_line": 7, "end_line": 8},
+    ]})
+
+
+def _mock_model_cheats_with_text(system_prompt: str, user_prompt: str) -> str:
+    # Simulates a non-compliant model that tries to answer with text
+    # instead of indices -- this MUST be disqualified by the schema check.
+    return json.dumps({"ranges": [
+        {"ref": "REF-A", "start_line": "The theme of concealment...", "end_line": 5},
+    ]})
+
+
+def _mock_model_overlapping(system_prompt: str, user_prompt: str) -> str:
+    return json.dumps({"ranges": [
+        {"ref": "REF-A", "start_line": 3, "end_line": 8},   # swallows REF-B's lines too
+        {"ref": "REF-B", "start_line": 7, "end_line": 8},
+    ]})
+
+
+if __name__ == "__main__":
+    case = _demo_case()
+    models = {
+        "mock_good": _mock_model_good,
+        "mock_cheats_with_text": _mock_model_cheats_with_text,
+        "mock_overlapping": _mock_model_overlapping,
+    }
+    report = run_benchmark(models, [case])
+    print(summarize(report))
+    print()
+    for model_name, results in report.items():
+        for r in results:
+            print(f"--- {model_name} / {r.case_id} ---")
+            if not r.schema_ok:
+                print(f"  DISQUALIFIED: {r.schema_error}")
+                continue
+            print(f"  violations: {r.violations}")
+            print(f"  overlaps resolved: {r.overlap_count}")
+            print(f"  precision={r.precision:.2f} recall={r.recall:.2f} f1={r.f1:.2f} mean_iou={r.mean_iou:.2f}")
+            print(f"  extracted (python-sliced): {r.extracted_text}")
+            print()
