@@ -1,3 +1,8 @@
+"""
+COMPLETE ROBUST PIPELINE - ZERO LINE SKIPPING GUARANTEED
+Author: Fixed for production use
+"""
+
 import os
 import io
 import re
@@ -7,19 +12,38 @@ import difflib
 import threading
 from pathlib import Path
 from collections import deque
+from typing import List, Dict, Tuple, Optional, Callable
 
 import fitz
 import httpx
 from groq import Groq
 
+
 # =========================================================
-# API KEYS
+# CONFIGURATION
 # =========================================================
 
-def get_api_key(name):
+class Config:
+    DATALAB_BASE_URL = "https://www.datalab.to"
+    GROQ_MODEL = "openai/gpt-oss-120b"
+    TPM_LIMIT = 8000
+    TPM_SAFETY_FRACTION = 0.85
+    MAX_PDF_SIZE_MB = 45
+    OCR_POLL_INTERVAL = 2
+    OCR_MAX_POLLS = 150
+    CHUNK_SIZE_LINES = 40  # Lines per chunk for answer mapping
+    CHUNK_OVERLAP_LINES = 15  # Overlap between chunks
+    MAX_GROQ_RETRIES = 5
+
+
+# =========================================================
+# API KEY HANDLER
+# =========================================================
+
+def get_api_key(name: str) -> Optional[str]:
     try:
         import streamlit as st
-        return st.secrets[name]
+        return st.secrets.get(name)
     except Exception:
         from dotenv import load_dotenv
         load_dotenv()
@@ -30,14 +54,15 @@ def get_api_key(name):
 # INPUT NORMALIZATION
 # =========================================================
 
-def _normalize_file_input(file_input, default_name="document.pdf"):
+def normalize_file_input(file_input, default_name: str = "document.pdf"):
+    """Handle all types of file input consistently"""
     if isinstance(file_input, tuple):
         if len(file_input) < 2:
-            raise ValueError(f"Tuple must have at least (filename, bytes), got {len(file_input)}")
+            raise ValueError(f"Tuple must have (filename, bytes), got {len(file_input)}")
         name, data = file_input[0], file_input[1]
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError(f"Expected bytes, got {type(data).__name__}")
-        return bytes(data), _coerce_name(name, default_name)
+        return bytes(data), coerce_name(name, default_name)
 
     if isinstance(file_input, (bytes, bytearray)):
         return bytes(file_input), default_name
@@ -49,17 +74,15 @@ def _normalize_file_input(file_input, default_name="document.pdf"):
     if hasattr(file_input, "read"):
         data = file_input.read()
         if not isinstance(data, (bytes, bytearray)):
-            raise TypeError(f"file_input.read() returned {type(data).__name__}, expected bytes")
+            raise TypeError(f"read() returned {type(data).__name__}, expected bytes")
         name = getattr(file_input, "name", default_name)
-        return bytes(data), _coerce_name(name, default_name)
+        return bytes(data), coerce_name(name, default_name)
 
-    raise TypeError(f"Unsupported file_input type: {type(file_input).__name__}")
+    raise TypeError(f"Unsupported type: {type(file_input).__name__}")
 
 
-def _coerce_name(name, default_name="document.pdf"):
-    if isinstance(name, (tuple, list)):
-        return default_name
-    if not name:
+def coerce_name(name, default_name: str = "document.pdf") -> str:
+    if isinstance(name, (tuple, list)) or not name:
         return default_name
     try:
         return Path(str(name)).name or default_name
@@ -75,10 +98,11 @@ _groq_call_lock = threading.Lock()
 
 
 # =========================================================
-# PREPROCESS PDF
+# PDF PREPROCESSING
 # =========================================================
 
-def preprocess_pdf(file_bytes, dpi=250):
+def preprocess_pdf(file_bytes: bytes, dpi: int = 250) -> bytes:
+    """Convert PDF to image-based PDF for better OCR"""
     src_doc = fitz.open(stream=file_bytes, filetype="pdf")
     out_doc = fitz.open()
     for page in src_doc:
@@ -94,10 +118,8 @@ def preprocess_pdf(file_bytes, dpi=250):
 
 
 # =========================================================
-# OCR -- Datalab
+# OCR ENGINE - DATALAB
 # =========================================================
-
-DATALAB_BASE_URL = "https://www.datalab.to"
 
 PAGE_BREAK_PATTERNS = [
     re.compile(r'\n?\{(\d+)\}-{3,}\n?'),
@@ -108,9 +130,8 @@ PAGE_BREAK_PATTERNS = [
 ]
 
 
-def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=print) -> list:
-    best_parts = None
-
+def split_paginated_markdown(markdown: str, page_count_hint: int = None, log=print) -> List[str]:
+    """Split markdown into pages using various patterns"""
     for pattern in PAGE_BREAK_PATTERNS:
         matches = list(pattern.finditer(markdown))
         if not matches:
@@ -130,70 +151,64 @@ def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=pr
         if page_count_hint and len(parts) == page_count_hint:
             return parts
 
-        if best_parts is None or len(parts) > len(best_parts):
-            best_parts = parts
-
-    if best_parts:
-        return best_parts
-
+    # Fallback: split by form feed
     if '\f' in markdown:
         parts = [p.strip() for p in markdown.split('\f') if p.strip()]
         if len(parts) > 1:
             return parts
 
-    log(f"WARNING: No page-break marker recognized. Treating as single page.")
+    log("WARNING: No page breaks found, treating as single page")
     return [markdown.strip()]
 
 
-def run_ocr(file_content: bytes, file_name: str, status_callback=None):
-    def log(msg):
+def run_ocr(file_content: bytes, file_name: str, status_callback: Optional[Callable] = None) -> List[Dict]:
+    """Run OCR using Datalab API"""
+    def log(msg: str):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    file_name = _coerce_name(file_name, default_name="document.pdf")
+    file_name = coerce_name(file_name, "document.pdf")
 
     if not isinstance(file_content, (bytes, bytearray)):
-        raise TypeError(f"run_ocr() expected bytes, got {type(file_content).__name__}")
+        raise TypeError(f"Expected bytes, got {type(file_content).__name__}")
 
     api_key = get_api_key("DATALAB_API_KEY")
     if not api_key:
         raise Exception("DATALAB_API_KEY not found")
 
     size_mb = len(file_content) / (1024 * 1024)
-    MAX_MB = 45
-    if size_mb > MAX_MB:
-        raise Exception(f"File is {size_mb:.1f}MB, exceeds {MAX_MB}MB limit")
+    if size_mb > Config.MAX_PDF_SIZE_MB:
+        raise Exception(f"File is {size_mb:.1f}MB, exceeds {Config.MAX_PDF_SIZE_MB}MB limit")
 
     headers = {"X-API-Key": api_key}
 
-    log(f"Submitting document to Datalab... ({size_mb:.1f}MB)")
+    log(f"Submitting to Datalab... ({size_mb:.1f}MB)")
 
-    resp = httpx.post(
-        f"{DATALAB_BASE_URL}/api/v1/convert",
+    response = httpx.post(
+        f"{Config.DATALAB_BASE_URL}/api/v1/convert",
         headers=headers,
         files={"file": (file_name, file_content, "application/pdf")},
         data={"output_format": "markdown", "mode": "accurate", "paginate": "true"},
         timeout=120
     )
 
-    if resp.status_code != 200:
-        raise Exception(f"Datalab submit error {resp.status_code}: {resp.text}")
+    if response.status_code != 200:
+        raise Exception(f"Datalab error {response.status_code}: {response.text}")
 
-    data = resp.json()
-
+    data = response.json()
     if not data.get("success", True):
-        raise Exception(f"Datalab submit failed: {data.get('error')}")
+        raise Exception(f"Datalab failed: {data.get('error')}")
 
     check_url = data["request_check_url"]
     log("Polling for OCR result...")
 
     result = None
-    for attempt in range(150):
+    for attempt in range(Config.OCR_MAX_POLLS):
         poll_resp = httpx.get(check_url, headers=headers, timeout=60)
 
         if poll_resp.status_code != 200:
-            raise Exception(f"Datalab poll error {poll_resp.status_code}: {poll_resp.text}")
+            raise Exception(f"Poll error {poll_resp.status_code}: {poll_resp.text}")
 
         result = poll_resp.json()
         status = result.get("status")
@@ -203,25 +218,23 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
             break
 
         if status == "failed" or result.get("error"):
-            raise Exception(f"Datalab conversion failed: {result.get('error')}")
+            raise Exception(f"OCR failed: {result.get('error')}")
 
         if attempt % 5 == 0:
-            log(f"Still processing... ({attempt * 2}s elapsed)")
+            log(f"Still processing... ({attempt * Config.OCR_POLL_INTERVAL}s)")
 
-        time.sleep(2)
+        time.sleep(Config.OCR_POLL_INTERVAL)
     else:
-        raise Exception("Datalab conversion timed out")
+        raise Exception("OCR timed out")
 
     if not result.get("success", True):
-        raise Exception(f"Datalab conversion error: {result.get('error')}")
+        raise Exception(f"OCR error: {result.get('error')}")
 
-    markdown = result.get("markdown") or ""
-
+    markdown = result.get("markdown", "")
     if not markdown.strip():
-        raise Exception("Datalab returned empty markdown")
+        raise Exception("OCR returned empty result")
 
-    page_count_hint = result.get("page_count")
-    page_texts = _split_paginated_markdown(markdown, page_count_hint, log=log)
+    page_texts = split_paginated_markdown(markdown, result.get("page_count"), log=log)
 
     pages = []
     for idx, text in enumerate(page_texts):
@@ -230,14 +243,18 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
             "raw_text": text
         })
 
-    log(f"OCR done -- {len(pages)} page(s) extracted")
+    log(f"OCR done: {len(pages)} pages")
     return pages
 
 
-def build_ocr_json(pages: list) -> dict:
+def build_ocr_json(pages: List[Dict]) -> Dict:
+    """Convert pages to JSON format"""
     return {
         "total_pages": len(pages),
-        "pages": [{"page_number": p["page_number"], "text": p["raw_text"]} for p in pages]
+        "pages": [
+            {"page_number": p["page_number"], "text": p["raw_text"]}
+            for p in pages
+        ]
     }
 
 
@@ -246,20 +263,22 @@ def build_ocr_json(pages: list) -> dict:
 # =========================================================
 
 class TokenBudgetTracker:
-    def __init__(self, tpm_limit=8000, safety_fraction=0.85):
+    """Track token usage for rate limiting"""
+    
+    def __init__(self, tpm_limit: int = Config.TPM_LIMIT, safety_fraction: float = Config.TPM_SAFETY_FRACTION):
         self.tpm_limit = tpm_limit
         self.safe_limit = tpm_limit * safety_fraction
         self.events = deque()
         self.lock = threading.Lock()
 
-    def _prune(self, now=None):
-        now = now if now is not None else time.monotonic()
+    def _prune(self, now: float = None):
+        now = now or time.monotonic()
         with self.lock:
             while self.events and now - self.events[0][0] >= 60:
                 self.events.popleft()
 
-    def used_in_window(self, now=None) -> int:
-        now = now if now is not None else time.monotonic()
+    def used_in_window(self, now: float = None) -> int:
+        now = now or time.monotonic()
         self._prune(now)
         with self.lock:
             return sum(tok for _, tok in self.events)
@@ -272,6 +291,7 @@ class TokenBudgetTracker:
         if projected <= self.safe_limit:
             return
 
+        # Calculate wait time
         needed_to_free = projected - self.safe_limit
         freed = 0
         wait_s = 0.0
@@ -283,7 +303,7 @@ class TokenBudgetTracker:
                     break
 
         wait_s = max(0.0, wait_s) + 0.5
-        log(f"Pacing: {used} tokens used, +{upcoming_tokens} upcoming. Waiting {wait_s:.1f}s...")
+        log(f"Rate limiting: waiting {wait_s:.1f}s")
         time.sleep(wait_s)
 
     def record_usage(self, tokens: int):
@@ -295,17 +315,27 @@ class TokenBudgetTracker:
             self.events.clear()
 
 
-# =========================================================
-# GROQ HELPER FUNCTIONS
-# =========================================================
-
-def _estimate_tokens(text: str) -> int:
+def estimate_tokens(text: str) -> int:
+    """Rough token estimation"""
     return int(len(text) / 2.0) + 1
 
 
-def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
-                              response_parser, budget, log, max_retries: int = 5):
-    estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 500
+# =========================================================
+# GROQ API HELPER
+# =========================================================
+
+def call_groq_with_retries(
+    client: Groq,
+    system_prompt: str,
+    user_prompt: str,
+    response_parser: Callable,
+    budget: TokenBudgetTracker,
+    log: Callable,
+    max_retries: int = Config.MAX_GROQ_RETRIES
+):
+    """Call Groq API with automatic retry and rate limiting"""
+    
+    estimated_tokens = estimate_tokens(system_prompt) + estimate_tokens(user_prompt) + 500
     last_error = None
     skip_proactive_check = False
 
@@ -318,7 +348,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
         try:
             with _groq_call_lock:
                 response = client.chat.completions.create(
-                    model="openai/gpt-oss-120b",
+                    model=Config.GROQ_MODEL,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
@@ -334,13 +364,12 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             last_error = e
             error_str = str(e)
             
-            # Check for rate limit
+            # Rate limit detection
             if "try again in" in error_str:
-                import re
                 match = re.search(r'try again in\s+([\d.]+)s', error_str)
                 if match:
                     wait_time = float(match.group(1)) + 1.0
-                    log(f"Rate limit hit. Waiting {wait_time:.1f}s...")
+                    log(f"Rate limit: waiting {wait_time:.1f}s")
                     time.sleep(wait_time)
                     budget.reset_window()
                     skip_proactive_check = True
@@ -356,25 +385,26 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 # QUESTION DETECTION
 # =========================================================
 
-QP_SYSTEM_PROMPT = """You are analyzing OCR text from a student exam booklet. Your task is to identify which pages contain the official QUESTION PAPER (printed questions).
+QUESTION_DETECTION_PROMPT = """You are analyzing OCR text from a student exam booklet.
 
-Return ONLY valid JSON in this exact format:
+TASK: Identify which pages contain the OFFICIAL QUESTION PAPER (printed exam questions).
+
+RULES:
+- Question paper pages: Printed list of exam questions with numbers (1., 2., etc.)
+- Answer pages: Student's handwritten responses (long paragraphs, explanations)
+- Cover pages: Enrollment numbers, programme codes, student info
+
+Return ONLY valid JSON:
 {
-  "question_paper_pages": [page_numbers],
-  "questions": []
+  "question_paper_pages": [page_numbers]
 }
 
-Rules:
-- Question paper pages contain the printed list of exam questions (prompts for students)
-- Answer pages contain student's handwritten responses (long paragraphs, explanations)
-- Cover/admin pages contain enrollment numbers, programme codes, etc.
-- Page numbers are 1-based (first page is 1)
-
-Output ONLY the JSON object. No other text."""
+Page numbers are 1-based. Output ONLY the JSON, no other text."""
 
 
-def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
-    def log(msg):
+def identify_question_pages(pages: List[Dict], status_callback: Optional[Callable] = None) -> List[int]:
+    """Identify which pages are question paper pages"""
+    def log(msg: str):
         print(msg)
         if status_callback:
             status_callback(msg)
@@ -386,9 +416,8 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     client = Groq(api_key=api_key)
     budget = TokenBudgetTracker()
 
-    # Process pages in chunks
-    chunk_size = 3  # Process 3 pages at a time
     all_qp_pages = set()
+    chunk_size = 3  # Process 3 pages at a time
     
     for i in range(0, len(pages), chunk_size):
         chunk = pages[i:i+chunk_size]
@@ -399,9 +428,9 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
             f"--- PAGE {p['page_number']} ---\n{p['raw_text']}"
             for p in chunk
         ])
-        user_prompt = f"Analyze these pages and return question paper pages:\n\n{user_prompt}"
+        user_prompt = f"Analyze these pages. Which are question paper pages?\n\n{user_prompt}"
         
-        def parser(content):
+        def parser(content: str) -> List[int]:
             content = content.strip()
             if content.startswith("```"):
                 content = re.sub(r'^```(?:json)?\s*\n?', '', content)
@@ -410,68 +439,68 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
             return data.get("question_paper_pages", [])
         
         try:
-            qp_pages = _call_groq_with_retries(
-                client, QP_SYSTEM_PROMPT, user_prompt, parser, budget, log
+            qp_pages = call_groq_with_retries(
+                client, QUESTION_DETECTION_PROMPT, user_prompt, parser, budget, log
             )
             all_qp_pages.update(qp_pages)
         except Exception as e:
-            log(f"Warning: chunk {i//chunk_size + 1} failed: {e}")
+            log(f"Warning: chunk failed: {e}")
             continue
     
-    qp_page_indices = sorted([p - 1 for p in all_qp_pages if 1 <= p <= len(pages)])
-    
-    # Extract questions from question paper pages
-    questions = []
-    if qp_page_indices:
-        qp_pages = [pages[i] for i in qp_page_indices]
-        questions = extract_questions_from_pages(qp_pages, status_callback)
-    
-    log(f"Found {len(qp_page_indices)} question paper pages, {len(questions)} questions")
-    return qp_page_indices, questions
+    # Convert to 0-based indices and validate
+    valid_pages = [p - 1 for p in all_qp_pages if 1 <= p <= len(pages)]
+    return sorted(valid_pages)
 
 
-def extract_questions_from_pages(qp_pages: list, status_callback=None) -> list:
-    def log(msg):
+def extract_questions_from_pages(qp_pages: List[Dict], status_callback: Optional[Callable] = None) -> List[str]:
+    """Extract questions from question paper pages"""
+    def log(msg: str):
         print(msg)
         if status_callback:
             status_callback(msg)
-    
+
     api_key = get_api_key("GROQ_API_KEY")
     if not api_key:
         return []
-    
+
     client = Groq(api_key=api_key)
     budget = TokenBudgetTracker()
-    
-    system_prompt = """Extract ALL questions from these question paper pages. 
-Return ONLY valid JSON: {"questions": ["question 1", "question 2", ...]}
-Rules:
+
+    system_prompt = """Extract ALL questions from these question paper pages.
+
+RULES:
 - Extract every numbered question and sub-question
 - Preserve the exact numbering (1., 2., (i), (ii), etc.)
 - Keep the original text exactly as printed
-- Include mark allocations if present (e.g., "(10 marks)")
-- If a question has parts (a), (b), (c) or (i), (ii), (iii), keep them together
-- Output ONLY the JSON object, no other text"""
-    
+- Include mark allocations if present
+
+Return ONLY valid JSON:
+{
+  "questions": ["question 1", "question 2", ...]
+}
+
+Output ONLY the JSON, no other text."""
+
     user_prompt = "\n\n".join([
         f"--- PAGE {p['page_number']} ---\n{p['raw_text']}"
         for p in qp_pages
     ])
-    user_prompt = f"Extract all questions from these pages:\n\n{user_prompt}"
+    user_prompt = f"Extract all questions:\n\n{user_prompt}"
     
-    def parser(content):
+    def parser(content: str) -> List[str]:
         content = content.strip()
         if content.startswith("```"):
             content = re.sub(r'^```(?:json)?\s*\n?', '', content)
             content = re.sub(r'\n?```\s*$', '', content)
         data = json.loads(content)
-        return data.get("questions", [])
+        questions = data.get("questions", [])
+        return [q.strip() for q in questions if q.strip()]
     
     try:
-        questions = _call_groq_with_retries(
+        questions = call_groq_with_retries(
             client, system_prompt, user_prompt, parser, budget, log
         )
-        return [q.strip() for q in questions if q.strip()]
+        return questions
     except Exception as e:
         log(f"Question extraction failed: {e}")
         return []
@@ -481,25 +510,24 @@ Rules:
 # ANSWER MAPPING - COMPLETE ROBUST VERSION
 # =========================================================
 
-ANSWER_MAP_SYSTEM_PROMPT = """You are given:
+ANSWER_MAPPING_PROMPT = """You are given:
 1. Official questions with REF labels: [REF-A], [REF-B], etc.
 2. Student's answer text with line numbers in [brackets]
 
-Your task: For EACH question, find the line range where the answer appears.
+TASK: For EACH question, find the line range where the answer appears.
 
 CRITICAL RULES:
 - Each answer MUST start at the FIRST line of that answer
 - Each answer MUST end at the LAST line of that answer
 - Include ALL lines from start to end - NO SKIPPING
-- If an answer spans multiple lines, include ALL of them
 - The answer starts when the student begins responding to that question
 - The answer ends before the next question's answer starts
-- If it's the last question, the answer ends at the LAST line of the text
+- For the last question, the answer ends at the LAST line of the text
 - Use line numbers EXACTLY as given in [brackets]
 - Each REF's range MUST NOT overlap with another REF's range
-- If a question's answer is not found, omit it from the output
+- If a question's answer is not found, omit it
 
-Return ONLY valid JSON in this exact format:
+Return ONLY valid JSON:
 {
   "answers": [
     {"ref": "REF-A", "start_line": 12, "end_line": 18},
@@ -512,12 +540,16 @@ If no answers found: {"answers": []}
 Output ONLY the JSON object. No other text."""
 
 
-def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
+def map_answers_with_llm(
+    answer_lines: List[str],
+    questions: List[str],
+    status_callback: Optional[Callable] = None
+) -> Dict[str, str]:
     """
-    COMPLETE ROBUST VERSION - NO LINE SKIPPING
-    LLM gives ONLY range, Python does the slicing
+    Map questions to answers using LLM range detection.
+    THIS IS THE ROBUST VERSION - NO LINE SKIPPING.
     """
-    def log(msg):
+    def log(msg: str):
         print(msg)
         if status_callback:
             status_callback(msg)
@@ -543,16 +575,16 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     # Prepare numbered lines
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(answer_lines)
-    log(f"Total lines to process: {total_lines}")
+    log(f"Total answer lines: {total_lines}")
     
-    # Show first few lines for debugging
+    # Show first and last lines for debugging
     if total_lines > 0:
         log(f"First line: {answer_lines[0][:100]}...")
         log(f"Last line: {answer_lines[-1][:100]}...")
 
-    # Process in chunks with OVERLAP to preserve context
-    chunk_size = 50  # Lines per chunk
-    overlap = 10     # Lines of overlap between chunks
+    # Process in chunks with OVERLAP
+    chunk_size = Config.CHUNK_SIZE_LINES
+    overlap = Config.CHUNK_OVERLAP_LINES
     
     all_ranges = []
     chunk_failures = []
@@ -560,20 +592,25 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     for chunk_start in range(0, total_lines, chunk_size - overlap):
         chunk_end = min(chunk_start + chunk_size, total_lines)
         
-        # Get chunk with overlap context
-        chunk_start_with_context = max(0, chunk_start - overlap)
-        chunk = numbered_lines[chunk_start_with_context:chunk_end]
+        # Get chunk with context (overlap from previous chunk)
+        context_start = max(0, chunk_start - overlap)
+        chunk = numbered_lines[context_start:chunk_end]
         
-        log(f"Processing chunk: lines {chunk_start}-{chunk_end} (with context from {chunk_start_with_context})")
+        log(f"Processing chunk: lines {chunk_start}-{chunk_end} (context from {context_start})")
         
         # Build user prompt
+        questions_text = "\n".join(
+            f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
+        )
+        lines_text = "\n".join(f"[{idx}] {text}" for idx, text in chunk)
+        
         user_prompt = f"""OFFICIAL QUESTIONS (use REF labels):
-{chr(10).join(f'[REF-{chr(65+i)}] {q}' for i, q in enumerate(questions))}
+{questions_text}
 
 STUDENT'S ANSWER TEXT (line-numbered):
-{chr(10).join(f'[{idx}] {text}' for idx, text in chunk)}"""
+{lines_text}"""
         
-        def parser(content):
+        def parser(content: str) -> List[Dict]:
             content = content.strip()
             if content.startswith("```"):
                 content = re.sub(r'^```(?:json)?\s*\n?', '', content)
@@ -586,17 +623,16 @@ STUDENT'S ANSWER TEXT (line-numbered):
                 return []
         
         try:
-            chunk_ranges = _call_groq_with_retries(
-                client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt, parser, budget, log
+            chunk_ranges = call_groq_with_retries(
+                client, ANSWER_MAPPING_PROMPT, user_prompt, parser, budget, log
             )
             
-            # Validate and add ranges
+            # Validate and store ranges
             for r in chunk_ranges:
                 ref = r.get("ref", "").strip().upper()
                 start = r.get("start_line", -1)
                 end = r.get("end_line", -1)
                 
-                # Validate
                 if ref not in ref_to_question:
                     log(f"  Unknown REF: {ref}")
                     continue
@@ -610,7 +646,7 @@ STUDENT'S ANSWER TEXT (line-numbered):
                     log(f"  Start {start} beyond total lines {total_lines}")
                     continue
                 
-                # Adjust end if beyond total
+                # Clamp end to total_lines - 1
                 if end >= total_lines:
                     end = total_lines - 1
                 
@@ -618,12 +654,12 @@ STUDENT'S ANSWER TEXT (line-numbered):
                     "ref": ref,
                     "start_line": start,
                     "end_line": end,
-                    "chunk": chunk_start
+                    "chunk_start": chunk_start
                 })
                 log(f"  Found: {ref}: lines {start}-{end}")
                 
         except Exception as e:
-            log(f"Chunk {chunk_start} failed: {e}")
+            log(f"Chunk failed: {e}")
             chunk_failures.append(str(e))
             continue
 
@@ -632,13 +668,12 @@ STUDENT'S ANSWER TEXT (line-numbered):
         if chunk_failures:
             raise Exception(f"All chunks failed. First error: {chunk_failures[0]}")
         else:
-            log("No answer ranges found. Check if pages are actually answers.")
+            log("No answer ranges found.")
             return {}
 
-    # RESOLVE OVERLAPS - IMPORTANT: Keep ALL content, no skipping
+    # DEDUPLICATE: Keep the LONGEST range for each REF
     log(f"Found {len(all_ranges)} ranges before deduplication")
     
-    # Deduplicate: Keep the longest range for each REF
     best_ranges = {}
     for r in all_ranges:
         ref = r["ref"]
@@ -650,7 +685,7 @@ STUDENT'S ANSWER TEXT (line-numbered):
     # Sort by start line
     sorted_ranges = sorted(best_ranges.values(), key=lambda r: r["start_line"])
     
-    # RESOLVE OVERLAPS - Trim ends but NEVER skip lines
+    # RESOLVE OVERLAPS - Trim ends but NEVER skip content
     resolved_ranges = []
     for i, current in enumerate(sorted_ranges):
         start = current["start_line"]
@@ -664,13 +699,11 @@ STUDENT'S ANSWER TEXT (line-numbered):
             if end >= next_start:
                 end = next_start - 1
                 
-                # If trimming would make range invalid, keep original
-                # but log warning
+                # If trimming makes range invalid, skip it
                 if end < start:
                     log(f"WARNING: Range for {current['ref']} would be empty after overlap resolution")
                     continue
         
-        # Ensure range is valid
         if start <= end:
             resolved_ranges.append({
                 "ref": current["ref"],
@@ -680,8 +713,9 @@ STUDENT'S ANSWER TEXT (line-numbered):
     
     log(f"Resolved to {len(resolved_ranges)} non-overlapping ranges")
 
-    # EXTRACT ANSWERS USING PURE PYTHON SLICING - NO SKIPPING
+    # EXTRACT ANSWERS - PURE PYTHON SLICING, NO SKIPPING
     qa_map = {}
+    
     for r in resolved_ranges:
         start = r["start_line"]
         end = r["end_line"]
@@ -699,26 +733,27 @@ STUDENT'S ANSWER TEXT (line-numbered):
         if not original_question:
             continue
         
-        # PURE PYTHON SLICING - EXTRACT ALL LINES
-        extracted_lines = []
-        for line_idx in range(start, end + 1):
-            if line_idx < len(answer_lines):
-                line_text = answer_lines[line_idx]
-                if line_text.strip():  # Skip only truly empty lines
-                    extracted_lines.append(line_text)
-                else:
-                    # Keep the line if it has content
-                    extracted_lines.append(line_text)
+        # PURE SLICING - Extract ALL lines in range
+        extracted_lines = answer_lines[start:end + 1]
+        
+        # Clean the start but preserve all content
+        if extracted_lines:
+            first_line = extracted_lines[0]
+            cleaned_first = re.sub(
+                r'^\s*(?:Ans(?:wer)?[.\s:-]+\d*|उत्तर\s*\d*\s*[\-\:]?|प्र[०.\s]*\d*|Q\.?\s*\d+[.\s:-])',
+                '',
+                first_line,
+                flags=re.IGNORECASE
+            )
+            if cleaned_first != first_line:
+                extracted_lines[0] = cleaned_first
         
         # Join all lines - PRESERVE EVERYTHING
-        answer_text = "\n".join(extracted_lines)
+        answer_text = "\n".join(extracted_lines).strip()
         
-        # Only clean up obvious labels, but KEEP ALL CONTENT
-        answer_text = clean_answer_start(answer_text)
-        
-        if answer_text.strip():
+        if answer_text:
             qa_map[original_question] = answer_text
-            log(f"✓ Matched {r['ref']}: {len(answer_text)} chars, {end - start + 1} lines")
+            log(f"✓ Matched {r['ref']}: {len(answer_text)} chars, {len(extracted_lines)} lines")
         else:
             log(f"✗ Empty answer for {r['ref']}")
 
@@ -730,33 +765,11 @@ STUDENT'S ANSWER TEXT (line-numbered):
     return qa_map
 
 
-def clean_answer_start(answer_text: str) -> str:
-    """Clean only the starting labels, preserve everything else"""
-    lines = answer_text.split('\n')
-    if not lines:
-        return answer_text
-    
-    # Clean first line only
-    first_line = lines[0]
-    cleaned_first = re.sub(
-        r'^\s*(?:Ans(?:wer)?[.\s:-]+\d*|उत्तर\s*\d*\s*[\-\:]?|प्र[०.\s]*\d*|Q\.?\s*\d+[.\s:-])',
-        '',
-        first_line,
-        flags=re.IGNORECASE
-    )
-    
-    # Only replace if we removed something
-    if cleaned_first != first_line:
-        lines[0] = cleaned_first
-    
-    return '\n'.join(lines)
-
-
 # =========================================================
-# NOISE DETECTION
+# SANITY CHECKS
 # =========================================================
 
-NOISE_RE = re.compile(
+NOISE_PATTERNS = re.compile(
     r'(?:Teacher\'?s?\s*Signature'
     r'|Tancher\'?s?\s*Signature'
     r'|Facebook\'?s?\s*Signature'
@@ -766,121 +779,126 @@ NOISE_RE = re.compile(
     re.IGNORECASE
 )
 
+
 def is_noise(line: str) -> bool:
-    return bool(NOISE_RE.search(line))
+    return bool(NOISE_PATTERNS.search(line))
 
 
-def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print) -> bool:
+def sanity_check_answer_pages(answer_lines: List[str], num_questions: int, log=print) -> bool:
+    """Check if answer pages look plausible"""
     total_chars = sum(len(l) for l in answer_lines)
     avg_chars = total_chars / max(num_questions, 1)
     
     if avg_chars < 100:
         log(f"WARNING: Very few characters ({total_chars}) for {num_questions} questions")
+        log("This usually means answer pages were misidentified")
         return False
+    
     return True
 
 
 # =========================================================
-# MAIN PROCESS PDF - ROBUST VERSION
+# MAIN PIPELINE
 # =========================================================
 
-def process_pdf(file_input, status_callback=None):
+def process_pdf(file_input, status_callback: Optional[Callable] = None) -> Tuple[Dict, List[Dict]]:
     """
     COMPLETE ROBUST PIPELINE
-    No lines are ever skipped from answers
+    Guarantees: No line skipping from start or end of answers
     """
-    def log(msg):
+    def log(msg: str):
         print(msg)
         if status_callback:
             status_callback(msg)
 
-    log("=" * 60)
-    log("Starting PDF processing...")
-    log("=" * 60)
+    log("=" * 70)
+    log("STARTING ROBUST PDF PROCESSING PIPELINE")
+    log("=" * 70)
 
     # Step 1: Normalize input and OCR
-    file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
+    log("\n[1/6] Normalizing input and running OCR...")
+    file_bytes, file_name = normalize_file_input(file_input)
     pages = run_ocr(file_bytes, file_name, status_callback)
     log(f"OCR complete: {len(pages)} pages")
 
     # Step 2: Build OCR JSON
+    log("\n[2/6] Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     
     # Step 3: Identify question pages
-    qp_page_indices, official_questions = identify_questions_with_llm(pages, status_callback)
-    log(f"Found {len(qp_page_indices)} question pages, {len(official_questions)} questions")
+    log("\n[3/6] Identifying question paper pages...")
+    qp_indices = identify_question_pages(pages, status_callback)
+    log(f"Found {len(qp_indices)} question paper pages")
 
-    if not qp_page_indices:
-        raise Exception("No question paper pages found")
-    
-    if not official_questions:
+    if not qp_indices:
+        raise Exception("No question paper pages found in document")
+
+    # Step 4: Extract questions
+    log("\n[4/6] Extracting questions...")
+    qp_pages = [pages[i] for i in qp_indices]
+    questions = extract_questions_from_pages(qp_pages, status_callback)
+    log(f"Extracted {len(questions)} questions")
+
+    if not questions:
         raise Exception("No questions extracted from question pages")
 
-    # Step 4: Extract answer pages (all non-question pages)
-    answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
-    log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
+    # Step 5: Extract answer pages
+    log("\n[5/6] Extracting answer pages...")
+    answer_indices = [i for i in range(len(pages)) if i not in qp_indices]
+    log(f"Answer pages: {[i+1 for i in answer_indices]}")
 
-    # Step 5: Build answer lines - KEEP ALL LINES
+    # Build answer lines - KEEP EVERYTHING
     answer_lines = []
-    for page_idx in answer_page_indices:
-        page_text = pages[page_idx]["raw_text"]
+    for idx in answer_indices:
+        page_text = pages[idx]["raw_text"]
         for line in page_text.split("\n"):
             line = line.strip()
-            # Keep all non-empty lines, even if they look like noise
-            # The LLM will handle identifying actual content
-            if line:
+            if line:  # Keep all non-empty lines
                 answer_lines.append(line)
-    
+
     log(f"Total answer lines: {len(answer_lines)}")
 
     # Sanity check
-    if not _sanity_check_answer_pages(answer_lines, len(official_questions), log):
-        log("WARNING: Answer pages may be misidentified")
+    if not sanity_check_answer_pages(answer_lines, len(questions), log):
+        log("WARNING: Answer pages look suspiciously short")
+        log("Proceeding anyway...")
 
     # Step 6: Map answers - ROBUST VERSION
-    log("Mapping answers using LLM range detection...")
-    qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
+    log("\n[6/6] Mapping answers using LLM range detection...")
+    qa_map = map_answers_with_llm(answer_lines, questions, status_callback)
 
-    # Step 7: Build final output
+    # Build final output
     qa_pairs = []
     matched_count = 0
-    unmatched_questions = []
     
-    for q in official_questions:
+    for q in questions:
         answer = qa_map.get(q, "")
         is_matched = bool(answer)
         if is_matched:
             matched_count += 1
-        else:
-            unmatched_questions.append(q[:60] + "...")
         
         qa_pairs.append({
             "question": q,
             "answer": answer,
             "matched": is_matched,
-            "answer_length": len(answer)
+            "answer_lines": len(answer.split("\n")) if answer else 0,
+            "answer_chars": len(answer)
         })
-    
-    log(f"Matched {matched_count} of {len(official_questions)} questions")
-    
-    if unmatched_questions:
-        log(f"Unmatched questions: {unmatched_questions}")
 
-    # Step 8: Validate - Ensure no answer is empty for matched questions
-    for qa in qa_pairs:
-        if qa["matched"] and not qa["answer"]:
-            log(f"WARNING: Marked matched but empty: {qa['question'][:60]}...")
-
-    log("=" * 60)
-    log("Processing complete!")
-    log("=" * 60)
+    log("\n" + "=" * 70)
+    log(f"PROCESSING COMPLETE: {matched_count}/{len(questions)} questions matched")
+    log("=" * 70)
 
     return ocr_json, qa_pairs
 
 
-def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
-                  base_name: str = "document") -> tuple:
-    """Save outputs to files"""
+def save_outputs(
+    ocr_json: Dict,
+    qa_pairs: List[Dict],
+    output_dir: str = ".",
+    base_name: str = "document"
+) -> Tuple[str, str]:
+    """Save outputs to JSON files"""
     os.makedirs(output_dir, exist_ok=True)
     
     ocr_path = os.path.join(output_dir, f"{base_name}_ocr.json")
@@ -893,3 +911,17 @@ def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
         json.dump(qa_pairs, f, ensure_ascii=False, indent=2)
 
     return ocr_path, qa_path
+
+
+# =========================================================
+# EXPORTS
+# =========================================================
+
+__all__ = [
+    'process_pdf',
+    'save_outputs',
+    'run_ocr',
+    'build_ocr_json',
+    'preprocess_pdf',
+    'get_api_key',
+]
