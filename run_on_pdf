@@ -1,0 +1,87 @@
+"""
+run_on_pdf.py
+
+Runs the fixed pipeline.py end-to-end on ANY PDF you point it at, and
+prints a diagnostic report focused on the exact failure modes you asked
+to fix: answers missing their opening lines/page, and answers missing
+their closing lines/page.
+
+Usage:
+    python run_on_pdf.py /path/to/some_assignment.pdf
+
+Requires DATALAB_API_KEY and GROQ_API_KEY in your environment or a .env
+file (same as the Streamlit app) -- this calls the real OCR + LLM
+pipeline, it does not mock anything. Use it to sanity-check the fixes
+against real, messy documents (any student's booklet, not just the ones
+you already have ground truth for).
+"""
+
+import sys
+import json
+from pathlib import Path
+
+from pipeline import process_pdf, save_outputs
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python run_on_pdf.py /path/to/document.pdf [output_dir]")
+        sys.exit(1)
+
+    pdf_path = Path(sys.argv[1])
+    if not pdf_path.exists():
+        print(f"File not found: {pdf_path}")
+        sys.exit(1)
+
+    output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(".")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Processing {pdf_path.name} ...\n")
+
+    ocr_json, qa_pairs = process_pdf(str(pdf_path))
+
+    base_name = pdf_path.stem
+    ocr_path, qa_path = save_outputs(ocr_json, qa_pairs, str(output_dir), base_name)
+
+    print(f"\nWrote:\n  {ocr_path}\n  {qa_path}\n")
+
+    # ---- Diagnostic report -------------------------------------------
+    matched = [p for p in qa_pairs if p["matched"]]
+    unmatched = [p for p in qa_pairs if not p["matched"]]
+    lengths = sorted(len(p["answer"]) for p in matched if p["answer"].strip())
+    median_len = lengths[len(lengths) // 2] if lengths else 0
+
+    print("=" * 70)
+    print("DIAGNOSTIC REPORT")
+    print("=" * 70)
+    print(f"Total questions:        {len(qa_pairs)}")
+    print(f"Matched to an answer:   {len(matched)}")
+    print(f"Unmatched:              {len(unmatched)}")
+    print(f"Median answer length:   {median_len} chars")
+    print()
+
+    if unmatched:
+        print("-- UNMATCHED QUESTIONS (no answer found at all) --")
+        for p in unmatched:
+            print(f"  - {p['question'][:80]}")
+        print()
+
+    suspicious = [
+        p for p in matched
+        if p["answer"].strip() and len(p["answer"]) < max(median_len * 0.25, 1) and len(p["answer"]) < 300
+    ]
+    if suspicious:
+        print("-- SUSPICIOUSLY SHORT ANSWERS (possible truncated start/end) --")
+        for p in suspicious:
+            print(f"  - {p['question'][:80]}")
+            print(f"    -> only {len(p['answer'])} chars: {p['answer'][:150]!r}")
+        print()
+    else:
+        print("No suspiciously short answers detected relative to this document's median.\n")
+
+    print("Full Q/A pairs written to:", qa_path)
+    print("Spot-check the flagged items above against the OCR JSON if anything looks off.")
+
+
+if __name__ == "__main__":
+    main()
