@@ -1269,6 +1269,138 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
     return answer_text
 
 
+BOUNDARY_VERIFY_CONTEXT_LINES = 3
+
+BOUNDARY_VERIFY_SYSTEM_PROMPT = """You are double-checking CANDIDATE answer-start boundaries that were detected earlier in a student's exam answer booklet (OCR'd, handwritten). Each candidate claims "the student's answer to question REF-X starts at this line number."
+
+You are shown, for each candidate, a small window of lines around the claimed start line, plus the official question text it supposedly answers.
+
+Your job for EACH candidate:
+- If the claimed start line genuinely looks like the beginning of that specific answer (a restatement/reference to that question, or a clear topic shift into that question's subject matter, right at or very near that line) -- mark it "valid": true and keep the same start_line, OR give a corrected start_line if the true start is a line or two off within the window shown.
+- If the claimed line does NOT look like a genuine answer-start for that question (e.g. it's just a coincidental keyword match in the middle of an unrelated explanation, or it's actually a continuation of a DIFFERENT answer, or the topic doesn't match at all) -- mark it "valid": false. A false-positive boundary is worse than a missing one: it silently steals content from the real answer before/after it, so be strict.
+- You are NOT being asked to find NEW boundaries, only to confirm or reject the ones shown.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{
+  "boundaries": [
+    {"ref": "REF-A", "valid": true, "start_line": 12},
+    {"ref": "REF-B", "valid": false, "start_line": 19}
+  ]
+}"""
+
+
+def _build_boundary_verify_prompt(candidates: list, answer_lines: list, ref_to_question: dict,
+                                    context_lines: int = BOUNDARY_VERIFY_CONTEXT_LINES) -> str:
+    blocks = []
+    for ref, start_line in candidates:
+        window_start = max(0, start_line - context_lines)
+        window_end = min(len(answer_lines) - 1, start_line + context_lines)
+        lines_block = "\n".join(
+            f"[{j}] {answer_lines[j]}" for j in range(window_start, window_end + 1)
+        )
+        blocks.append(
+            f"CANDIDATE {ref} -- claimed start_line: {start_line}\n"
+            f"Question this should answer: {ref_to_question.get(ref, '?')}\n"
+            f"Context window (lines {window_start}-{window_end}):\n{lines_block}"
+        )
+    return "Here are the candidate boundaries to verify:\n\n" + "\n\n---\n\n".join(blocks)
+
+
+def _parse_boundary_verify_response(content: str) -> list:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM did not return valid JSON: {e}\nRaw (first 500 chars): {content[:500]!r}")
+
+    if not isinstance(data, dict) or "boundaries" not in data:
+        raise ValueError(f"Response missing 'boundaries' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    boundaries = data["boundaries"]
+    if not isinstance(boundaries, list):
+        raise ValueError(f"'boundaries' must be a list, got: {type(boundaries).__name__}")
+
+    result = []
+    for item in boundaries:
+        if not isinstance(item, dict):
+            continue
+        if "ref" not in item or "valid" not in item:
+            continue
+        try:
+            result.append({
+                "ref": str(item["ref"]).strip().upper(),
+                "valid": bool(item["valid"]),
+                "start_line": int(item["start_line"]) if "start_line" in item else None,
+            })
+        except (ValueError, TypeError):
+            continue
+
+    return result
+
+
+def _verify_boundaries(start_line_by_ref: dict, answer_lines: list, ref_to_question: dict,
+                        client, budget: "_TokenBudgetTracker", log) -> dict:
+    """
+    Takes the raw, possibly-noisy per-chunk candidate boundaries and runs
+    ONE consolidated verification call showing each candidate with its
+    surrounding context, so a false-positive detected in isolation (which
+    would otherwise silently steal content from the answer before/after
+    it -- see map_answers_with_llm docstring) gets a second, better-
+    informed look before it's trusted. Candidates rejected here are
+    dropped entirely (falls back to "no match found" for that question,
+    which is a far less harmful failure than corrupting two answers).
+    """
+    if not start_line_by_ref:
+        return {}
+
+    candidates = sorted(start_line_by_ref.items(), key=lambda kv: kv[1])
+    user_prompt = _build_boundary_verify_prompt(candidates, answer_lines, ref_to_question)
+
+    log(f"Verifying {len(candidates)} candidate answer-start boundary(ies) with full context in a single consolidated pass...")
+
+    try:
+        verified = _call_groq_with_retries(
+            client, BOUNDARY_VERIFY_SYSTEM_PROMPT, user_prompt,
+            _parse_boundary_verify_response, budget, log
+        )
+    except Exception as e:
+        log(f"WARNING: boundary verification pass failed ({e}) -- falling back to unverified candidates")
+        return start_line_by_ref
+
+    verified_by_ref = {v["ref"]: v for v in verified if v.get("ref") in start_line_by_ref}
+
+    final = {}
+    for ref, original_start in start_line_by_ref.items():
+        v = verified_by_ref.get(ref)
+        if v is None:
+            # LLM didn't address this candidate at all in its response --
+            # keep the original rather than silently dropping a question.
+            final[ref] = original_start
+            continue
+        if not v["valid"]:
+            log(
+                f"  REJECTED candidate {ref} at line {original_start}: verification pass "
+                f"determined this was NOT a genuine answer-start for '{ref_to_question.get(ref, '?')[:60]}...' "
+                f"(likely a coincidental keyword match). Question will show as unmatched unless "
+                f"a different valid boundary exists."
+            )
+            continue
+        corrected = v.get("start_line")
+        if corrected is not None and corrected != original_start:
+            log(f"  ADJUSTED {ref} start_line: {original_start} -> {corrected}")
+            final[ref] = corrected
+        else:
+            final[ref] = original_start
+
+    return final
+
+
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
     """
     Maps each official question to its verbatim answer text.
@@ -1405,7 +1537,10 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
         log(f"Chunk {i+1}/{len(chunks_with_carry)}: found {found_this_chunk} new answer-start boundary(ies)")
 
-    # Build contiguous, gap-free ranges purely from the sorted boundaries.
+    log(f"Collected {len(start_line_by_ref)} raw candidate boundary(ies) across all chunks -- verifying with context...")
+    start_line_by_ref = _verify_boundaries(start_line_by_ref, answer_lines, ref_to_question, client, budget, log)
+
+    # Build contiguous, gap-free ranges purely from the sorted, VERIFIED boundaries.
     # This single step is what fixes both the "missing first paragraph"
     # and "missing last paragraph" bugs: start is exactly the detected
     # boundary, and end is exactly one line before the NEXT boundary --
