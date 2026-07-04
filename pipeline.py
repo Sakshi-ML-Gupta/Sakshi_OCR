@@ -1000,6 +1000,244 @@ Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape
 If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any of these answers."""
 
 
+# =========================================================
+# SEQUENTIAL SINGLE-TARGET ANSWER MAPPING (recommended, default)
+#
+# This replaces the multi-answer-per-call chunking above with a much
+# simpler and more reliable design, built around three ideas:
+#
+#   1. Only ever ask the LLM to find ONE thing per call: "does REF-X's
+#      answer begin somewhere in this window of text, and if so, on
+#      which line?" A single yes/no + one integer is a task a model
+#      essentially cannot "give up halfway through" -- there is no
+#      halfway. This directly eliminates the "does 2-3 answers then
+#      stops" failure mode, because no call is ever asked to do more
+#      than one thing.
+#
+#   2. A question's answer START is always searched for beginning
+#      exactly where the PREVIOUS question's answer was confirmed to
+#      start (never independently re-guessed), so there's no gap where
+#      a page/paragraph could be silently skipped between two answers.
+#
+#   3. A question's answer END is NEVER asked of the LLM at all. It is
+#      always computed in plain Python as
+#      (next confirmed answer's start_line - 1), or end-of-document for
+#      the last question. This removes the entire class of bugs where
+#      the LLM invents a wrong or truncated end line -- there is
+#      structurally no way for one answer to swallow or lose part of
+#      another, because ranges are built by construction to be
+#      contiguous and non-overlapping.
+#
+# If a window doesn't contain the target start, the search simply moves
+# forward to the next window of text and asks again -- it keeps going
+# until it either finds the start or reaches the end of the document.
+# =========================================================
+
+SEQUENTIAL_SEARCH_SYSTEM_PROMPT = """You are searching for exactly ONE thing in a block of line-numbered OCR text from a student's exam answer booklet: the line where the response to ONE SPECIFIC question begins.
+
+You are given:
+1. The exact text of the target question.
+2. A window of the student's answer text, with each line prefixed by its line number in [brackets]. This window may be a small slice of a much larger document -- the answer you're looking for might not be in this window at all, and that is a normal, expected outcome.
+
+Decide: does the student's response to THIS EXACT question begin somewhere in the window shown?
+
+Guidance:
+- A response typically begins where the student restates or references the question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a matching question number) OR, if there's no such label, where the content clearly starts addressing this specific question's topic for the first time (matching its distinctive subject matter, not just generic instructional words).
+- Do not confuse this with a DIFFERENT question's answer, even if it appears earlier in the window -- you are looking for this one specific question only.
+- If the target question's answer does not begin anywhere in this window, say so plainly. It is very common and expected for a window to not contain it -- do not force a match.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly one of these two shapes:
+
+{"found": true, "start_line": 42}
+
+or
+
+{"found": false}
+
+If found, start_line MUST be one of the exact line numbers shown in [brackets] in this window -- never estimate or invent a number."""
+
+
+def _build_sequential_search_prompt(window_lines: list, question_text: str, ref_label: str) -> str:
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
+    return (
+        f"TARGET QUESTION ({ref_label}): {question_text}\n\n"
+        f"TEXT WINDOW (line-numbered):\n{lines_block}"
+    )
+
+
+def _parse_sequential_search_response(content: str) -> tuple:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM did not return valid JSON: {e}\nRaw (first 300 chars): {content[:300]!r}")
+
+    if not isinstance(data, dict) or "found" not in data:
+        raise ValueError(f"Response missing 'found' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    found = bool(data["found"])
+    if not found:
+        return False, None
+
+    if "start_line" not in data:
+        raise ValueError("Response has found=true but is missing 'start_line'")
+    try:
+        start_line = int(data["start_line"])
+    except (ValueError, TypeError):
+        raise ValueError(f"'start_line' must be an integer, got {data['start_line']!r}")
+
+    return True, start_line
+
+
+SEQUENTIAL_SEARCH_WINDOW_CHARS = 11000  # same safe-per-call char budget used elsewhere in this module
+SEQUENTIAL_SEARCH_MAX_WINDOWS = 200  # generous safety cap; a real document will exhaust far sooner
+
+
+def _find_answer_start_sequential(client, numbered_lines: list, question_text: str, ref_label: str,
+                                    search_from_idx: int, budget: "_TokenBudgetTracker", log,
+                                    window_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS,
+                                    max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS):
+    """
+    Slides forward through numbered_lines in non-overlapping windows,
+    starting at search_from_idx, asking a single yes/no+line-number
+    question per window, until the target's start is found or the
+    document is exhausted. Returns the found start_line, or None.
+    """
+    total_lines = len(numbered_lines)
+    pointer = search_from_idx
+    windows_tried = 0
+
+    while pointer < total_lines and windows_tried < max_windows:
+        window = []
+        chars = 0
+        idx = pointer
+        while idx < total_lines and (not window or chars + len(numbered_lines[idx][1]) <= window_chars):
+            window.append(numbered_lines[idx])
+            chars += len(numbered_lines[idx][1])
+            idx += 1
+
+        if not window:
+            break
+
+        user_prompt = _build_sequential_search_prompt(window, question_text, ref_label)
+        try:
+            found, start_line = _call_groq_with_retries(
+                client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
+                _parse_sequential_search_response, budget, log
+            )
+        except Exception as e:
+            log(f"WARNING: search call failed for {ref_label} (lines {window[0][0]}-{window[-1][0]}): {e}")
+            found, start_line = False, None
+
+        if found and start_line is not None:
+            valid_ids = {i for i, _ in window}
+            if start_line in valid_ids:
+                return start_line
+            log(
+                f"WARNING: {ref_label} reported start_line {start_line}, which is outside "
+                f"this window's actual range {window[0][0]}-{window[-1][0]} -- ignoring and "
+                f"treating this window as a non-match"
+            )
+
+        pointer = idx  # move forward to the next window, no overlap
+        windows_tried += 1
+
+    return None
+
+
+def map_answers_sequential(answer_lines: list, questions: list, status_callback=None) -> dict:
+    """
+    RECOMMENDED default answer-mapping strategy (see module docstring
+    above the SEQUENTIAL_SEARCH_SYSTEM_PROMPT for the full rationale).
+
+    For each question in order:
+      1. Search forward from wherever the previous question's answer was
+         confirmed to start, for a line where THIS question's answer
+         begins.
+      2. Once found, the previous question's END is computed as
+         (this start - 1) -- never asked of the LLM.
+    The very last question's answer runs to the end of the document.
+
+    If a question's start can't be found anywhere from the search
+    pointer to the end of the document, it's recorded as unmatched, and
+    the search for the NEXT question continues from the SAME pointer
+    (its answer wasn't necessarily lost -- it may simply not exist, e.g.
+    the student skipped it).
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
+        raise Exception("GROQ_API_KEY not found in secrets or environment")
+
+    client = Groq(api_key=api_key)
+    budget = _TokenBudgetTracker()
+
+    numbered_lines = list(enumerate(answer_lines))
+    total_lines = len(numbered_lines)
+
+    ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
+    found_starts = {}  # ref -> start_line
+    pointer = 0
+
+    for i, q in enumerate(questions):
+        ref = f"REF-{chr(65 + i)}"
+        log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
+
+        start_line = _find_answer_start_sequential(
+            client, numbered_lines, q, ref, pointer, budget, log
+        )
+
+        if start_line is not None:
+            found_starts[ref] = start_line
+            log(f"  found {ref} starting at line {start_line}")
+            pointer = start_line + 1
+        else:
+            log(
+                f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
+                f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
+                f"The search pointer is NOT advanced, so the next question is still searched "
+                f"for over this same remaining text."
+            )
+
+    # End of each answer = the next (in document order) confirmed
+    # answer's start, minus one. Computed purely in Python -- never
+    # asked of the LLM, so it can never be wrong in the way an
+    # LLM-guessed end line could be.
+    ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
+    ranges = []
+    for idx, (ref, start) in enumerate(ordered):
+        end = ordered[idx + 1][1] - 1 if idx + 1 < len(ordered) else total_lines - 1
+        ranges.append({"ref": ref, "start_line": start, "end_line": end})
+
+    log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
+
+    qa_map = {}
+    for r in ranges:
+        s, e = r["start_line"], r["end_line"]
+        verbatim_lines = [
+            answer_lines[j] for j in range(s, e + 1)
+            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
+        ]
+        original_question = ref_to_question[r["ref"]]
+        answer_text = " ".join(verbatim_lines).strip()
+        answer_text = strip_question_restatement(answer_text)
+        answer_text = strip_full_question_echo(answer_text, original_question)
+        qa_map[original_question] = answer_text
+
+    return qa_map
+
+
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
                                     carry_over_ref: str = None) -> str:
     questions_block = "\n".join(
@@ -1155,11 +1393,17 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
 # chunking alone doesn't prevent this: a chunk can be well under the char
 # cap while still containing 5+ short answers.
 #
-# The fix is to ALSO cap the number of distinct answers allowed in a
-# single chunk, independent of character count -- keeping each LLM call's
-# cognitive load small enough that "quitting early" stops being an issue
-# in practice. MAX_ANSWERS_PER_CHUNK=3 is deliberately conservative.
-MAX_ANSWERS_PER_CHUNK = 3
+# FIX (this round): set to 1 per explicit request -- every chunk now
+# contains AT MOST one distinct answer. The chunk still starts exactly
+# where the previous answer's chunk ended (no gap, so no risk of losing
+# a starting line/paragraph) and still extends all the way up to the
+# line right before the NEXT genuine question-start is detected (so no
+# risk of losing an ending line/paragraph) -- the only thing this
+# changes is that the model is now asked to find just ONE boundary per
+# call instead of up to three, which removes the "quits after 2-3
+# answers" failure mode almost entirely, at the cost of more total LLM
+# calls (proportional to the number of questions in the document).
+MAX_ANSWERS_PER_CHUNK = 1
 
 
 def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
@@ -1770,8 +2014,23 @@ def process_pdf(file_input, status_callback=None):
             "would be guaranteed to fail."
         )
 
-    log("Mapping each question to its answer independently (LLM-based)...")
-    qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
+    # FIX: switched to the sequential single-target search strategy --
+    # see map_answers_sequential()'s docstring for the full rationale.
+    # In short: each LLM call now does exactly ONE thing (find one
+    # answer's start line, searching forward from where the previous
+    # answer was confirmed to start), and every answer's END is computed
+    # in Python as (next answer's start - 1) rather than ever being
+    # asked of the LLM. This removes both the "LLM gives up after 2-3
+    # answers" failure mode (no call is ever asked to find more than one
+    # thing) and the "answer missing its start/end" failure mode (starts
+    # are always searched contiguously from the previous confirmed
+    # point, and ends are deterministic, never guessed).
+    #
+    # The previous chunk-based map_answers_with_llm() is left in the
+    # module, unused by default, in case you want to compare behavior
+    # or fall back to it.
+    log("Mapping each question to its answer (sequential single-target search)...")
+    qa_map = map_answers_sequential(answer_lines, official_questions, status_callback)
 
     matched_count = sum(1 for q in official_questions if q in qa_map)
     log(f"Matched {matched_count} of {len(official_questions)} questions")
