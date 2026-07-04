@@ -175,7 +175,96 @@ def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=pr
     return [markdown.strip()]
 
 
-def run_ocr(file_content: bytes, file_name: str, status_callback=None):
+# =========================================================
+# OCR QUALITY GATE
+# =========================================================
+
+# Fraction of characters across the document that are "suspect" (Unicode
+# replacement char, control chars, or other signs of a failed OCR read).
+# Blurry/low-DPI scans typically produce a visibly elevated rate of these
+# vs. a clean scan, which normally sits near 0%.
+OCR_GARBLED_WARN_THRESHOLD = 0.03   # 3%  -> warn, but keep going
+OCR_GARBLED_FAIL_THRESHOLD = 0.12   # 12% -> too unreliable to proceed
+
+_SUSPECT_CHAR_RE = re.compile(r'[\ufffd\x00-\x08\x0b\x0c\x0e-\x1f]')
+# Lines that are almost entirely punctuation/symbols with barely any
+# letters or digits are another strong OCR-failure signal (garbled glyphs
+# frequently get OCR'd as random symbol soup rather than replacement chars).
+_MOSTLY_SYMBOLS_LINE_RE = re.compile(r'^[\W_]{6,}$', re.UNICODE)
+
+
+def compute_ocr_garbled_ratio(pages: list) -> dict:
+    total_chars = 0
+    suspect_chars = 0
+    total_lines = 0
+    symbol_soup_lines = 0
+
+    for page in pages:
+        text = page.get("raw_text", "")
+        total_chars += len(text)
+        suspect_chars += len(_SUSPECT_CHAR_RE.findall(text))
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            total_lines += 1
+            if _MOSTLY_SYMBOLS_LINE_RE.match(line):
+                symbol_soup_lines += 1
+
+    char_ratio = (suspect_chars / total_chars) if total_chars else 0.0
+    line_ratio = (symbol_soup_lines / total_lines) if total_lines else 0.0
+    # combined signal: whichever looks worse drives the decision
+    combined_ratio = max(char_ratio, line_ratio)
+
+    return {
+        "char_ratio": char_ratio,
+        "line_ratio": line_ratio,
+        "combined_ratio": combined_ratio,
+        "total_chars": total_chars,
+        "total_lines": total_lines,
+    }
+
+
+def check_ocr_quality(pages: list, log=print, raise_on_fail: bool = True) -> dict:
+    """
+    Universal, PDF-agnostic OCR quality gate. Runs right after OCR,
+    before any Groq/LLM calls, so a blurry/low-resolution scan fails
+    fast with a clear, actionable message instead of silently burning
+    LLM calls on garbage text and producing a confusing, wrong Q-A
+    mapping downstream (the failure mode reported for "blurry" PDFs).
+    """
+    stats = compute_ocr_garbled_ratio(pages)
+    ratio = stats["combined_ratio"]
+
+    if ratio >= OCR_GARBLED_FAIL_THRESHOLD:
+        msg = (
+            f"OCR quality check failed: ~{ratio*100:.1f}% of the extracted text looks "
+            f"garbled (suspect/replacement characters or symbol-soup lines), which is "
+            f"far above the {OCR_GARBLED_FAIL_THRESHOLD*100:.0f}% threshold for reliable "
+            f"question/answer mapping. This almost always means the source scan is too "
+            f"blurry, too low-resolution, or too skewed for OCR to read reliably. "
+            f"Q-A mapping was skipped because it would be guaranteed to produce unreliable "
+            f"results on text this garbled. Try rescanning the document at a higher "
+            f"resolution (300+ DPI), improving lighting/focus, or straightening skewed "
+            f"pages before re-uploading."
+        )
+        log(f"ERROR: {msg}")
+        if raise_on_fail:
+            raise Exception(msg)
+    elif ratio >= OCR_GARBLED_WARN_THRESHOLD:
+        log(
+            f"WARNING: OCR output looks somewhat noisy (~{ratio*100:.1f}% suspect "
+            f"characters/lines). This is below the hard failure threshold so processing "
+            f"will continue, but if the final Q-A mapping looks off, a blurry/low-quality "
+            f"scan is a likely cause -- consider rescanning at a higher resolution."
+        )
+    else:
+        log(f"OCR quality check passed (~{ratio*100:.2f}% suspect characters).")
+
+    return stats
+
+
+
     def log(msg):
         print(msg)
         if status_callback:
@@ -1548,6 +1637,34 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     # between two consecutive answers can be silently dropped.
     boundaries = sorted(start_line_by_ref.items(), key=lambda kv: kv[1])
 
+    # The very first boundary is a special case: every OTHER answer's
+    # start is automatically "backed up" by construction (its start is
+    # exactly where the previous answer's range ends), so a slightly-late
+    # detection for answer N+1 never loses content -- it just makes
+    # answer N's range longer than ideal, which still keeps the text
+    # somewhere. But the FIRST answer has no "previous answer" to fall
+    # back on: if its detected start_line is even a couple of lines late,
+    # that opening content is gone forever, unrecoverable by any later
+    # step. Since answer_lines[0:first_start] is either (a) genuinely part
+    # of the first answer that the LLM under-shot, or (b) leftover
+    # noise/cover-page remnants that is_noise()/strip_* already filter out
+    # downstream, it is strictly safer to always include it than to risk
+    # losing real content -- UNLESS the gap is implausibly large, which
+    # would suggest real unrelated content (e.g. a misclassified page)
+    # sits there instead.
+    FIRST_ANSWER_MAX_LOOKBACK_LINES = 25
+    if boundaries:
+        first_ref, first_start = boundaries[0]
+        if 0 < first_start <= FIRST_ANSWER_MAX_LOOKBACK_LINES:
+            log(f"Extending first answer ({first_ref}) start back from line {first_start} to line 0 "
+                f"to guarantee its opening lines aren't lost")
+            boundaries[0] = (first_ref, 0)
+        elif first_start > FIRST_ANSWER_MAX_LOOKBACK_LINES:
+            log(f"WARNING: first detected answer-start ({first_ref}) is at line {first_start}, "
+                f"{first_start} lines into the document -- too far to safely assume everything "
+                f"before it belongs to this answer, so it is NOT auto-extended to line 0. If "
+                f"{first_ref}'s answer is missing its opening paragraph, check lines 0-{first_start} manually.")
+
     resolved_ranges = []
     for idx, (ref, start_line) in enumerate(boundaries):
         if idx + 1 < len(boundaries):
@@ -1776,6 +1893,9 @@ def process_pdf(file_input, status_callback=None):
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
 
     pages = run_ocr(file_bytes, file_name, status_callback)
+
+    log("Checking OCR quality before proceeding to LLM stages...")
+    check_ocr_quality(pages, log=log)
 
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
