@@ -329,10 +329,10 @@ CHARS_PER_TOKEN_ESTIMATE = 2.0
 MAX_CHARS_PER_CHUNK = 6000
 CHUNK_OVERLAP_PAGES = 1
 
-QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet (e.g. IGNOU-style, India). The booklet mixes pages of different kinds, in no guaranteed order:
+QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam/assignment answer booklet. This could be from ANY institution, ANY subject, and ANY language (or a mix of languages/scripts) -- do not assume a specific country, university, or language. The booklet mixes pages of different kinds, in no guaranteed order:
 
-1. ADMINISTRATIVE/COVER pages: enrolment number, programme code, learner name, registration details, regional centre info. NEVER question paper pages.
-2. QUESTION PAPER pages: the official printed list of numbered exam questions the student must answer. These read as instructions/prompts DIRECTED AT the student (e.g. "Discuss X", "Explain Y with examples", "Write notes on the following:"). Mark allocations may appear (e.g. "10", "20").
+1. ADMINISTRATIVE/COVER pages: roll number/enrolment number, programme/course code, student name, registration details, institution letterhead, blank cover sheets. These contain NO exam question text and NO student answer content -- just identifying/bureaucratic information.
+2. QUESTION PAPER pages: the official printed list of numbered exam questions the student must answer. These read as instructions/prompts DIRECTED AT the student (e.g. "Discuss X", "Explain Y with examples", "Write notes on the following:", or the equivalent phrasing in whatever language this document uses). Mark allocations may appear (e.g. "10", "20").
 3. ANSWER pages: the student's own (handwritten, OCR'd) answers. These are typically long, restate or reference a question briefly then write an extended response, and may themselves contain numbered or bulleted sub-points as part of the student's OWN explanation. These numbered sub-points inside a long answer are NOT separate exam questions, even though superficially they look similar (number, period, text) -- they are part of the answer to ONE question.
 
 You are being shown only a PORTION of the document's pages at a time (a chunk), not the whole document. Some pages you see may be partial context carried over from a previous chunk -- still classify them normally based on their own content.
@@ -341,19 +341,21 @@ Your task: read the pages shown and return ONLY valid JSON (no markdown fences, 
 
 {
   "question_paper_pages": [14, 16, 18],
+  "admin_pages": [1, 2],
   "questions": ["1. Example question text. (10)", "2. Another example question. (10)"]
 }
 
-IMPORTANT formatting requirement: "question_paper_pages" must be a JSON array where EACH page number is a SEPARATE element separated by commas, like [14, 16, 18] -- NEVER merge multiple page numbers into one number like [141618]. Each integer in that array must be a single, individually valid page number from the pages shown.
+IMPORTANT formatting requirement: "question_paper_pages" and "admin_pages" must be JSON arrays where EACH page number is a SEPARATE element separated by commas, like [14, 16, 18] -- NEVER merge multiple page numbers into one number like [141618]. Each integer must be a single, individually valid page number from the pages shown. A page must never appear in both lists.
 
 Critical rules for telling question-paper pages apart from answer pages that happen to contain numbered content:
-- A genuine question paper question is a PROMPT directed at the student ("explain", "discuss", "describe", "write notes on", "compare", a question mark, etc.) -- it asks the student to DO something.
+- A genuine question paper question is a PROMPT directed at the student ("explain", "discuss", "describe", "write notes on", "compare", a question mark, etc., in whatever language is used) -- it asks the student to DO something.
 - A numbered point inside a long answer is typically a STATEMENT or FACT that is part of an explanation the student is giving -- it does not ask the reader to do anything; it's content, not an instruction.
-- If a page's numbered items closely follow words like "उत्तर" (answer), "Ans", "Ans-", or come after a long paragraph of explanatory prose in the same block, that page is almost certainly an ANSWER page, not a question paper page -- exclude it from question_paper_pages even if it has multiple numbered lines.
+- If a page's numbered items closely follow a label meaning "answer" (in whatever language/script the document uses -- e.g. "Ans", "Ans-", or its equivalent), or come after a long paragraph of explanatory prose in the same block, that page is almost certainly an ANSWER page, not a question paper page -- exclude it from question_paper_pages even if it has multiple numbered lines.
 - A real question paper is usually self-contained and concise per question (a question, maybe a mark allocation) -- not a long flowing essay with numbered sub-points woven into running prose.
 - CRITICAL TRAP TO AVOID: students very commonly RESTATE the question itself as the FIRST SENTENCE of their answer, before writing their actual response (e.g. an answer's opening page reads "Examine the theme of concealment in X. Discuss with reference to Y. The theme of concealment is central to..." where everything after the first sentence is the student's OWN original explanation, not more instructions). Such a page can superficially look like a question-paper page because it contains prompt-style verbs ("Examine", "Discuss") -- but it is the FIRST page of a long, multi-page ANSWER, not a question paper page. Signals that this is really an answer's opening page, not a real question paper page: (a) the page has noticeably MORE text than a typical printed question would need, especially if it keeps going well past where a concise instruction would end; (b) the prose quality looks like a developing argument/explanation rather than a terse instruction; (c) the SAME or very similar question text already appears verbatim on a page you are more confident is the genuine, concise question paper (in which case this longer, messier page is almost certainly the student's restatement -- exclude it). When uncertain whether a page is the real question paper or a student's restatement-then-answer, treat brevity and conciseness as the deciding signal: genuine question papers are short per question; answer pages (including their opening restatement) run much longer.
 - When genuinely uncertain whether a page is a question paper page, prefer NOT including it as one, and prefer NOT extracting its numbered items as separate questions.
-- If NONE of the pages shown in this chunk are question paper pages, return empty lists for both fields -- that is a valid and expected result for chunks that only contain answer/admin pages.
+- If a page is a cover/administrative page (roll number, letterhead, blank sheet with no question or answer content), put it in "admin_pages" so it is excluded from BOTH the question paper AND the student's answer text -- it should never be treated as answer content.
+- If NONE of the pages shown in this chunk are question paper pages, return an empty list for that field -- that is a valid and expected result for chunks that only contain answer/admin pages.
 - Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate.
 - Output ONLY the JSON object described above. No prose before or after it. No markdown code fences."""
 
@@ -520,16 +522,21 @@ def _parse_qp_llm_response(content: str) -> tuple:
 
     qp_pages = data["question_paper_pages"]
     questions = data["questions"]
+    admin_pages = data.get("admin_pages", [])  # optional, backward-compatible
 
     if not isinstance(qp_pages, list):
         raise ValueError(f"question_paper_pages must be a list, got: {type(qp_pages).__name__}")
     qp_pages = [int(x) for x in qp_pages]
 
+    if not isinstance(admin_pages, list):
+        raise ValueError(f"admin_pages must be a list, got: {type(admin_pages).__name__}")
+    admin_pages = [int(x) for x in admin_pages]
+
     if not isinstance(questions, list):
         raise ValueError(f"questions must be a list, got: {type(questions).__name__}")
     questions = [str(x).strip() for x in questions if str(x).strip()]
 
-    return qp_pages, questions
+    return qp_pages, questions, admin_pages
 
 
 def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_page: int) -> list:
@@ -728,14 +735,16 @@ def _dedup_questions(questions: list) -> list:
 
 def _merge_chunk_results(chunk_results: list) -> tuple:
     all_qp_pages = set()
+    all_admin_pages = set()
     all_questions = []
 
-    for qp_pages, questions in chunk_results:
+    for qp_pages, questions, admin_pages in chunk_results:
         all_qp_pages.update(qp_pages)
+        all_admin_pages.update(admin_pages)
         all_questions.extend(questions)
 
     deduped_questions = _dedup_questions(all_questions)
-    return sorted(all_qp_pages), deduped_questions
+    return sorted(all_qp_pages), deduped_questions, sorted(all_admin_pages)
 
 
 QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are reading the OFFICIAL question paper pages of a student exam assignment booklet (the printed list of questions, NOT the student's answers). You are given the complete, exact text of these pages, in order.
@@ -850,37 +859,45 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         log(f"Asking LLM to analyze chunk {i+1}/{len(chunks)} (pages {page_nums_in_chunk})...")
 
         try:
-            qp_pages_1based, questions = _call_groq_for_chunk(client, chunk, budget, log)
+            qp_pages_1based, questions, admin_pages_1based = _call_groq_for_chunk(client, chunk, budget, log)
         except Exception as e:
             log(f"WARNING: chunk {i+1}/{len(chunks)} question-identification failed, skipping: {e}")
             chunk_failures.append(str(e))
             continue
 
-        recovered_pages = []
-        truly_invalid = []
-        for pn in qp_pages_1based:
-            if pn in valid_page_numbers:
-                recovered_pages.append(pn)
-                continue
-            split_result = _try_split_concatenated_page_number(
-                pn, valid_page_numbers, max_page_number
-            )
-            if split_result:
-                log(f"Recovered concatenated page numbers: {pn} -> {split_result}")
-                recovered_pages.extend(split_result)
-            else:
-                truly_invalid.append(pn)
+        def _recover_pages(pages_1based, label):
+            recovered = []
+            truly_invalid = []
+            for pn in pages_1based:
+                if pn in valid_page_numbers:
+                    recovered.append(pn)
+                    continue
+                split_result = _try_split_concatenated_page_number(
+                    pn, valid_page_numbers, max_page_number
+                )
+                if split_result:
+                    log(f"Recovered concatenated {label} page numbers: {pn} -> {split_result}")
+                    recovered.extend(split_result)
+                else:
+                    truly_invalid.append(pn)
+            if truly_invalid:
+                log(f"WARNING: LLM returned out-of-range {label} page numbers, ignoring: {truly_invalid}")
+            return sorted(set(recovered))
 
-        if truly_invalid:
-            log(f"WARNING: LLM returned out-of-range page numbers, ignoring: {truly_invalid}")
+        qp_pages_1based = _recover_pages(qp_pages_1based, "question-paper")
+        admin_pages_1based = _recover_pages(admin_pages_1based, "admin")
 
-        qp_pages_1based = sorted(set(recovered_pages))
+        # A page can't legitimately be both -- if the model contradicted
+        # itself, keep it as a question-paper page (the more consequential
+        # classification to get right) and drop it from admin.
+        admin_pages_1based = [p for p in admin_pages_1based if p not in qp_pages_1based]
 
         log(
             f"Chunk {i+1}/{len(chunks)}: identified {len(qp_pages_1based)} question paper "
-            f"page(s) (questions from this stage are discarded -- see stage 2 below)"
+            f"page(s), {len(admin_pages_1based)} admin/cover page(s) "
+            f"(questions from this stage are discarded -- see stage 2 below)"
         )
-        chunk_results.append((qp_pages_1based, []))
+        chunk_results.append((qp_pages_1based, [], admin_pages_1based))
 
     if chunk_failures and not chunk_results:
         raise Exception(
@@ -893,10 +910,13 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
             f"skipped -- question PAGE detection below is PARTIAL."
         )
 
-    qp_pages_1based_merged, _ = _merge_chunk_results(chunk_results)
+    qp_pages_1based_merged, _, admin_pages_1based_merged = _merge_chunk_results(chunk_results)
     qp_page_indices_0based = sorted(pn - 1 for pn in qp_pages_1based_merged)
+    admin_page_indices_0based = sorted(pn - 1 for pn in admin_pages_1based_merged)
 
     log(f"Question paper pages identified: {len(qp_page_indices_0based)} page(s)")
+    log(f"Admin/cover pages identified: {len(admin_page_indices_0based)} page(s) "
+        f"(these will be excluded from BOTH question and answer text)")
 
     # =====================================================================
     # FIX (this round): PREVIOUSLY this block only LOGGED a warning when an
@@ -962,10 +982,11 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
     log(
         f"Final result: {len(qp_page_indices_0based)} question paper "
-        f"page(s), {len(questions)} canonical question(s)"
+        f"page(s), {len(questions)} canonical question(s), "
+        f"{len(admin_page_indices_0based)} admin/cover page(s)"
     )
 
-    return qp_page_indices_0based, questions
+    return qp_page_indices_0based, questions, admin_page_indices_0based
 
 
 # =========================================================
@@ -1150,7 +1171,8 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
     return None
 
 
-def map_answers_sequential(answer_lines: list, questions: list, status_callback=None) -> dict:
+def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
+                             answer_line_pages: list = None) -> list:
     """
     RECOMMENDED default answer-mapping strategy (see module docstring
     above the SEQUENTIAL_SEARCH_SYSTEM_PROMPT for the full rationale).
@@ -1168,6 +1190,27 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     the search for the NEXT question continues from the SAME pointer
     (its answer wasn't necessarily lost -- it may simply not exist, e.g.
     the student skipped it).
+
+    FIX (this round): previously returned only a plain {question: text}
+    dict, giving you no way to see WHERE each answer actually came from
+    -- which is exactly the trust problem you flagged ("I don't know
+    from where the Q-A is paired"). This now returns a LIST of dicts,
+    one per question, each carrying:
+      - start_line / end_line: the exact 0-based indices into
+        answer_lines this answer was sliced from (so you can look them
+        up directly)
+      - start_page / end_page: the OCR page number(s) the answer spans,
+        if answer_line_pages was provided (lets you flip straight to the
+        right page(s) of the source PDF to eyeball it)
+      - answer_raw: the UNMODIFIED verbatim join of the sliced lines --
+        exactly what the OCR produced, before any cleanup
+      - answer: the same text after the (optional) restatement-stripping
+        cleanup -- so you can directly compare "raw" vs "cleaned" and
+        see precisely what, if anything, was removed and why. Nothing
+        is ever ADDED to answer_raw at this stage -- it is a plain
+        Python slice of the OCR text, never LLM-generated -- so if
+        answer_raw itself looks embellished/"enhanced", that happened
+        upstream in the OCR step (see notes in run_ocr), not here.
     """
     def log(msg):
         print(msg)
@@ -1222,20 +1265,51 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
     log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
 
-    qa_map = {}
-    for r in ranges:
+    ranges_by_ref = {r["ref"]: r for r in ranges}
+    results = []
+    for i, q in enumerate(questions):
+        ref = f"REF-{chr(65 + i)}"
+        r = ranges_by_ref.get(ref)
+
+        if r is None:
+            results.append({
+                "ref": ref,
+                "question": q,
+                "matched": False,
+                "start_line": None,
+                "end_line": None,
+                "start_page": None,
+                "end_page": None,
+                "answer": "",
+                "answer_raw": "",
+            })
+            continue
+
         s, e = r["start_line"], r["end_line"]
         verbatim_lines = [
             answer_lines[j] for j in range(s, e + 1)
             if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
         ]
-        original_question = ref_to_question[r["ref"]]
-        answer_text = " ".join(verbatim_lines).strip()
-        answer_text = strip_question_restatement(answer_text)
-        answer_text = strip_full_question_echo(answer_text, original_question)
-        qa_map[original_question] = answer_text
+        answer_raw = " ".join(verbatim_lines).strip()
+        answer_clean = strip_question_restatement(answer_raw)
+        answer_clean = strip_full_question_echo(answer_clean, q)
 
-    return qa_map
+        start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
+        end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
+
+        results.append({
+            "ref": ref,
+            "question": q,
+            "matched": True,
+            "start_line": s,
+            "end_line": e,
+            "start_page": start_page,
+            "end_page": end_page,
+            "answer": answer_clean,
+            "answer_raw": answer_raw,
+        })
+
+    return results
 
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
@@ -1780,23 +1854,32 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
 
 NOISE_RE = re.compile(
-    r'(?:Teacher\'?s?\s*Signature'
-    r'|Tancher\'?s?\s*Signature'
-    r'|Facebook\'?s?\s*Signature'
+    r'(?:signature'
     r'|PAGE\s*NO'
     r'|^\s*DATE\b'
-    r'|Neel?\s*Kamal'
-    r'|Neal?\s*Kamal'
-    r'|Need?\s*Komal'
-    r'|Nod\s*Komal'
-    r'|TAKMA\s*SINAN'
     r'|^\s*\d{1,3}\s*$)',
     re.IGNORECASE
 )
 
+# A line is only treated as administrative noise if it's SHORT (a bare
+# label like "Teacher's Signature" or "Date: __") -- not if "signature"/
+# "date"/"page" merely appears as a word inside a much longer genuine
+# sentence (e.g. a computer-science answer discussing "digital
+# signature" is real content, not a label to strip). This length guard
+# is what makes the generic keyword match safe to use across ANY
+# document/subject instead of needing document-specific hardcoded names.
+NOISE_LINE_MAX_CHARS = 40
+
 
 def is_noise(line: str) -> bool:
-    return bool(NOISE_RE.search(line))
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if re.match(r'^\s*\d{1,3}\s*$', stripped):
+        return True  # bare page-number line -- always noise regardless of length
+    if len(stripped) > NOISE_LINE_MAX_CHARS:
+        return False
+    return bool(NOISE_RE.search(stripped))
 
 
 def normalize(text: str) -> str:
@@ -1972,9 +2055,10 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    qp_page_indices, official_questions = identify_questions_with_llm(pages, status_callback)
+    qp_page_indices, official_questions, admin_page_indices = identify_questions_with_llm(pages, status_callback)
 
     log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
+    log(f"Admin/cover pages detected: {[p+1 for p in admin_page_indices] if admin_page_indices else 'none'}")
     log(f"Official questions extracted: {len(official_questions)}")
 
     if not qp_page_indices:
@@ -1989,16 +2073,30 @@ def process_pdf(file_input, status_callback=None):
             f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
 
-    answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
+    # FIX: admin/cover pages (roll number, letterhead, etc.) are now
+    # explicitly excluded here too, not just question-paper pages. Before
+    # this, ANY page that wasn't classified as a question-paper page fell
+    # into "answer pages" by elimination -- including cover sheets -- so
+    # their content (names, roll numbers, institution letterhead text)
+    # could leak into an answer's range (most commonly absorbed into
+    # whichever answer's range happened to run up against that page).
+    excluded_indices = set(qp_page_indices) | set(admin_page_indices)
+    answer_page_indices = [i for i in range(len(pages)) if i not in excluded_indices]
     answer_pages = [pages[i] for i in answer_page_indices]
 
     log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
 
+    # answer_line_pages[i] records which OCR page answer_lines[i] came
+    # from -- kept in lockstep with answer_lines so every mapped answer
+    # can report exactly which page(s) of the source PDF it was sliced
+    # from, for direct manual verification against the scanned document.
     answer_lines = []
+    answer_line_pages = []
     for page in answer_pages:
         for line in page["raw_text"].split("\n"):
             if not is_noise(line):
                 answer_lines.append(line)
+                answer_line_pages.append(page["page_number"])
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
@@ -2014,45 +2112,61 @@ def process_pdf(file_input, status_callback=None):
             "would be guaranteed to fail."
         )
 
-    # FIX: switched to the sequential single-target search strategy --
-    # see map_answers_sequential()'s docstring for the full rationale.
-    # In short: each LLM call now does exactly ONE thing (find one
-    # answer's start line, searching forward from where the previous
-    # answer was confirmed to start), and every answer's END is computed
-    # in Python as (next answer's start - 1) rather than ever being
-    # asked of the LLM. This removes both the "LLM gives up after 2-3
-    # answers" failure mode (no call is ever asked to find more than one
-    # thing) and the "answer missing its start/end" failure mode (starts
-    # are always searched contiguously from the previous confirmed
-    # point, and ends are deterministic, never guessed).
-    #
-    # The previous chunk-based map_answers_with_llm() is left in the
-    # module, unused by default, in case you want to compare behavior
-    # or fall back to it.
+    # Sequential single-target search strategy -- see map_answers_sequential()'s
+    # docstring for the full rationale. Every LLM call does exactly ONE
+    # thing (find one answer's start line), and every answer's END is
+    # computed in Python as (next answer's start - 1), never asked of the
+    # LLM. The returned list already carries full source traceability
+    # (start_line/end_line/start_page/end_page) plus both the raw
+    # (unmodified) and cleaned answer text -- see field docs in
+    # map_answers_sequential().
     log("Mapping each question to its answer (sequential single-target search)...")
-    qa_map = map_answers_sequential(answer_lines, official_questions, status_callback)
+    qa_pairs = map_answers_sequential(
+        answer_lines, official_questions, status_callback,
+        answer_line_pages=answer_line_pages
+    )
 
-    matched_count = sum(1 for q in official_questions if q in qa_map)
+    matched_count = sum(1 for p in qa_pairs if p["matched"])
     log(f"Matched {matched_count} of {len(official_questions)} questions")
 
-    for q in official_questions:
-        if q not in qa_map:
-            log(f"WARNING: No match found for: {q[:60]}")
+    for p in qa_pairs:
+        if not p["matched"]:
+            log(f"WARNING: No match found for: {p['question'][:60]}")
 
-    if not qa_map:
+    if matched_count == 0:
         raise Exception(
             "Could not match any questions to answers.\n"
             f"Official questions: {official_questions}\n"
             f"First 10 answer lines: {answer_lines[:10]}"
         )
 
-    qa_pairs = []
-    for q in official_questions:
-        qa_pairs.append({
-            "question": q,
-            "answer": qa_map.get(q, ""),
-            "matched": q in qa_map,
-        })
+    # =====================================================================
+    # INTEGRITY CHECK: every answer_raw field above was built by a plain
+    # Python slice of answer_lines (see map_answers_sequential) -- the LLM
+    # is never given the opportunity to write or rephrase answer text, it
+    # only ever returns a single line-number. This assertion makes that
+    # guarantee mechanically verifiable rather than just a design claim:
+    # it reconstructs each matched answer's raw text directly from
+    # answer_lines using the reported start_line/end_line and confirms it
+    # is byte-for-byte identical to answer_raw. If this ever fails, that
+    # is a real bug in the slicing logic (not the LLM "enhancing" text)
+    # and is surfaced loudly rather than silently shipped.
+    # =====================================================================
+    for p in qa_pairs:
+        if not p["matched"]:
+            continue
+        s, e = p["start_line"], p["end_line"]
+        expected_raw = " ".join(
+            answer_lines[j] for j in range(s, e + 1)
+            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
+        ).strip()
+        if expected_raw != p["answer_raw"]:
+            log(
+                f"CRITICAL: verbatim-integrity check FAILED for '{p['question'][:60]}...' -- "
+                f"the reported answer_raw does not match a fresh re-slice of answer_lines "
+                f"[{s}:{e}]. This indicates a real bug in the extraction code, not an LLM "
+                f"hallucination -- please report this."
+            )
 
     _flag_suspiciously_short_answers(qa_pairs, log)
 
