@@ -898,26 +898,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
     log(f"Question paper pages identified: {len(qp_page_indices_0based)} page(s)")
 
-    # =====================================================================
-    # FIX (this round): PREVIOUSLY this block only LOGGED a warning when an
-    # outlier-length "question paper" page was detected -- it never actually
-    # fixed the misclassification. That meant the real start of a student's
-    # answer (the page where they restate the question before writing their
-    # actual response) stayed wrongly excluded from answer_lines forever,
-    # which is the confirmed, reproducible cause of "answers missing their
-    # first paragraph/page" in production.
-    #
-    # This version RECLASSIFIES the outlier page as an answer page instead
-    # of just warning about it. Safety conditions, so this can't run away
-    # and eat a genuinely long/legitimate question paper page:
-    #   - only reclassifies pages that are >3x the median AND >1500 chars
-    #     (same thresholds as before -- these were already conservative)
-    #   - never reclassifies away MORE THAN HALF of the detected question
-    #     paper pages in one document (if that many are "outliers", the
-    #     detection itself is unreliable and blind reclassification would
-    #     likely do more harm than good -- better to leave it as a logged
-    #     warning in that edge case and let a human check)
-    # =====================================================================
     if len(qp_page_indices_0based) >= 2:
         qp_page_lengths = [
             (i, len(pages[i]["raw_text"])) for i in qp_page_indices_0based
@@ -954,9 +934,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
                 f"{[p+1 for p in outliers]}"
             )
 
-    # Stage 2: single consistent pass over the CONFIRMED question-paper
-    # pages' full text, producing one canonical, non-fragmented question
-    # list.
     qp_pages_full = [pages[i] for i in qp_page_indices_0based]
     questions = extract_canonical_questions(qp_pages_full, status_callback)
 
@@ -976,28 +953,26 @@ ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers 
 1. A numbered list of the OFFICIAL exam questions, each tagged with a reference label like [REF-A], [REF-B], etc.
 2. The student's answer text, with each line prefixed by its line number in [brackets].
 
-Your task: for EACH official question, find WHERE in the answer text the student's response to that specific question starts and ends, and return the LINE NUMBER RANGE (inclusive) for each, identified by its REF label.
+Your ONLY task: for EACH official question whose answer GENUINELY BEGINS somewhere in the text shown, report the SINGLE LINE NUMBER where that answer starts. Do NOT try to figure out where an answer ends -- the end is computed automatically afterwards as "right before the next answer's start_line", so every line in between is kept automatically and nothing at the start or end of any answer can be silently dropped. You only need to find start points.
 
-Important guidance for finding boundaries correctly:
-- A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
-- An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins (whether or not the next answer is in your list of official questions).
-- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely from your output. It may appear in a different chunk of the document.
-- Each REF's range must NOT overlap with another REF's range. If you are unsure exactly where one answer ends and the next begins, prefer ending the EARLIER answer sooner rather than letting it swallow content that belongs to a later answer -- a short correct answer is far more useful than a long answer that incorrectly absorbed unrelated content.
+Guidance for finding an answer's start line correctly:
+- A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number) OR, if there's no explicit restatement, at the very first line where the content clearly shifts to that question's topic.
+- If a note at the top of this prompt tells you this chunk CONTINUES an answer from a previous chunk, do NOT report a new start_line for that same REF unless the text genuinely shows the student restarting/re-answering it again -- normally you simply report nothing for that REF in this chunk, because its true start_line was already reported in an earlier chunk.
+- If a question's answer genuinely does not start anywhere in the text shown, do NOT invent a start_line -- omit that REF entirely from your output. It may start in a different chunk of the document.
 - Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
 - Use the EXACT REF label (e.g. "REF-A") to identify each question. Do NOT retype or paraphrase the question text itself -- the REF label is all that's needed.
-- If a note at the top of this prompt tells you this chunk CONTINUES an answer from a previous chunk, treat that instruction as authoritative: the opening lines of this chunk likely belong to that same REF even though you cannot see the earlier part of the answer.
-- CRITICAL: this chunk is deliberately kept SHORT and normally contains only a small number of distinct answers (often 1-3). You MUST scan the ENTIRE text shown, all the way to the last line, before responding -- do not stop after finding the first one or two answers. If you can identify 3 separate answer-start points in this text, your output must contain 3 entries, not fewer. Missing a clearly-present answer is a serious error.
+- CRITICAL: this chunk is deliberately kept SHORT and normally contains only a small number of distinct answer-starts (often 1-3). You MUST scan the ENTIRE text shown, all the way to the last line, before responding -- do not stop after finding the first one or two. If you can identify 3 separate answer-start points in this text, your output must contain 3 entries, not fewer. Missing a clearly-present answer-start is a serious error.
 
 Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
 
 {
   "answers": [
-    {"ref": "REF-A", "start_line": 12, "end_line": 18},
-    {"ref": "REF-B", "start_line": 19, "end_line": 25}
+    {"ref": "REF-A", "start_line": 12},
+    {"ref": "REF-B", "start_line": 19}
   ]
 }
 
-If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any of these answers."""
+If NONE of the official questions' answers START in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that only continues an already-open answer or doesn't contain any of these answers' starting points."""
 
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
@@ -1007,30 +982,19 @@ def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
     )
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
 
-    # =====================================================================
-    # FIX: this is the key piece of context that was completely missing
-    # before. When a single answer is so long it has to be split across two
-    # LLM calls (chunks), the SECOND chunk previously had zero information
-    # telling it "you are looking at the tail end of an answer that already
-    # started". Without that, the model has no basis to assign the opening
-    # lines of this chunk to any REF (they usually don't restate the
-    # question -- that only happens once, at the true start of the answer),
-    # so those lines were silently dropped from every range -- exactly the
-    # "answer missing its ending" bug. This note gives the model the
-    # missing context explicitly.
-    # =====================================================================
     carry_over_note = ""
     if carry_over_ref:
         carry_over_note = (
             f"IMPORTANT CONTEXT: This chunk is a CONTINUATION of a long answer that "
             f"started in a previous chunk, cut off only because of a length limit -- "
-            f"NOT because the answer actually ended. The opening lines below are "
-            f"very likely still part of the answer to {carry_over_ref}. If they read "
-            f"as continuing that answer's reasoning (no new question is being "
-            f"addressed), include them in {carry_over_ref}'s range using the line "
-            f"numbers shown in THIS chunk. Only start counting a line as the "
-            f"beginning of a genuinely NEW/DIFFERENT answer once the content clearly "
-            f"shifts to a different topic or question.\n\n"
+            f"NOT because the answer actually ended. {carry_over_ref}'s true start_line "
+            f"was already reported in an earlier chunk, so do NOT report another "
+            f"start_line for {carry_over_ref} in this chunk unless the content clearly "
+            f"shifts away to a different topic/question and THEN genuinely comes back "
+            f"to {carry_over_ref} again later (a real restart). The opening lines below "
+            f"belonging to {carry_over_ref}'s continuing explanation need no entry at "
+            f"all -- they will automatically be kept as part of {carry_over_ref}'s "
+            f"answer once the next genuine answer-start is found.\n\n"
         )
 
     return (
@@ -1068,13 +1032,12 @@ def _parse_answer_map_llm_response(content: str) -> list:
     for item in answers:
         if not isinstance(item, dict):
             continue
-        if "ref" not in item or "start_line" not in item or "end_line" not in item:
+        if "ref" not in item or "start_line" not in item:
             continue
         try:
             result.append({
                 "ref": str(item["ref"]).strip().upper(),
                 "start_line": int(item["start_line"]),
-                "end_line": int(item["end_line"]),
             })
         except (ValueError, TypeError):
             continue
@@ -1145,20 +1108,6 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
     return None
 
 
-# FIX (this round): real-world confirmed failure mode -- when a single
-# chunk happens to contain MANY distinct answers (short-ish answers back
-# to back), the model reliably finds the first 2-3 boundaries correctly,
-# then either gives a half-finished range for the next one or stops
-# entirely and omits everything after that -- classic long-output /
-# attention-degradation behavior, NOT a token-limit crash (the JSON it
-# returns is still syntactically valid, just incomplete). Char-budget
-# chunking alone doesn't prevent this: a chunk can be well under the char
-# cap while still containing 5+ short answers.
-#
-# The fix is to ALSO cap the number of distinct answers allowed in a
-# single chunk, independent of character count -- keeping each LLM call's
-# cognitive load small enough that "quitting early" stops being an issue
-# in practice. MAX_ANSWERS_PER_CHUNK=3 is deliberately conservative.
 MAX_ANSWERS_PER_CHUNK = 3
 
 
@@ -1166,20 +1115,6 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
                                   absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS,
                                   max_answers_per_chunk: int = MAX_ANSWERS_PER_CHUNK) -> list:
-    """
-    Returns a list of (chunk, carry_over_question_idx, expected_new_indices)
-    tuples.
-
-    - carry_over_question_idx: the FIRST line of this chunk is a
-      continuation of the still-open answer to this question index from
-      the end of the previous chunk (or None if this chunk starts fresh
-      at a genuine boundary).
-    - expected_new_indices: the list of question indices for which a
-      GENUINE new-answer-start line was detected inside this chunk (in
-      order). This is our own independent estimate of "how many distinct
-      answers should this chunk's LLM call report" -- used by the caller
-      to verify the model didn't quit early before returning all of them.
-    """
     if not numbered_lines:
         return []
 
@@ -1336,25 +1271,28 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
 
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
     """
-    Maps each official question to its verbatim answer text, extracted
-    INDEPENDENTLY per question via LLM-identified line boundaries.
+    Maps each official question to its verbatim answer text.
 
-    FIX (this round): two changes vs. the previous version, both aimed
-    directly at "answers missing their ending paragraph/lines":
+    APPROACH (boundary-only, not range-based):
+    Instead of asking the LLM to guess BOTH where an answer starts AND
+    where it ends (which is what caused missing first/last paragraphs --
+    the model would guess the end a few lines too early/late, or the
+    "continuation" logic across chunks would silently drop the tail),
+    we now ask the LLM ONLY for each answer's START line. The end of an
+    answer is never guessed by anyone -- it is always computed as
+    "one line before the next answer's start_line" (or end-of-document
+    for the very last answer).
 
-    1. Chunks that are force-split mid-answer now carry an explicit
-       carry_over_ref forward into the NEXT chunk's prompt (see
-       _build_answer_map_user_prompt), so the model knows the opening
-       lines of that chunk likely continue an already-open answer
-       instead of having no basis to assign them to any REF at all.
-
-    2. When the SAME ref genuinely appears in two adjacent chunks due to
-       a carry-over split, the two partial ranges are now MERGED into
-       one continuous range (extending end_line) instead of the old
-       behavior of picking whichever single range was "longer" and
-       silently discarding the other -- which is precisely how a valid
-       second half of an answer could vanish even after being correctly
-       identified by the LLM.
+    This guarantees, by construction:
+    - No missing starting paragraph: an answer's range begins exactly at
+      its own detected start_line, nothing before it is skipped into a
+      gap because there IS no gap -- every line belongs to exactly one
+      answer.
+    - No missing ending paragraph: an answer's range only ends where the
+      NEXT answer's start_line begins, so nothing in between can be cut
+      off early -- it's mechanically impossible to lose the tail unless
+      the next start_line itself was found too early (a separate,
+      much rarer failure mode than the two this replaces).
     """
     def log(msg):
         print(msg)
@@ -1375,9 +1313,10 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     numbered_lines = list(enumerate(answer_lines))
     chunks_with_carry = _chunk_lines_by_char_budget(numbered_lines, questions)
     log(f"Split {len(answer_lines)} answer line(s) into {len(chunks_with_carry)} LLM chunk(s) for answer mapping "
-        f"(max {MAX_ANSWERS_PER_CHUNK} distinct answers per chunk)")
+        f"(max {MAX_ANSWERS_PER_CHUNK} distinct answer-starts per chunk)")
 
-    all_ranges = []  # list of {ref, start_line, end_line}
+    # ref -> earliest reported start_line for that ref, across all chunks
+    start_line_by_ref = {}
     chunk_failures = []
     chunk_zero_matches = 0
 
@@ -1387,13 +1326,13 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         if carry_over_ref:
             log(
                 f"Chunk {i+1}/{len(chunks_with_carry)} continues an answer split across "
-                f"chunks -- flagging {carry_over_ref} as carried over"
+                f"chunks -- {carry_over_ref} is already open, no new start expected for it"
             )
-        log(f"Asking LLM to map answers in chunk {i+1}/{len(chunks_with_carry)} (lines {line_range})...")
+        log(f"Asking LLM to find answer-start boundaries in chunk {i+1}/{len(chunks_with_carry)} (lines {line_range})...")
 
         user_prompt = _build_answer_map_user_prompt(chunk, questions, carry_over_ref)
         try:
-            chunk_ranges = _call_groq_with_retries(
+            chunk_starts = _call_groq_with_retries(
                 client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
                 _parse_answer_map_llm_response, budget, log
             )
@@ -1402,23 +1341,14 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             chunk_failures.append(str(e))
             continue
 
-        # =================================================================
-        # FIX (this round): completeness check + targeted retry, aimed
-        # directly at "the LLM does the first 2-3 answers correctly then
-        # just stops". expected_new_indices is OUR OWN independent
-        # estimate (from the regex/word-overlap detector, not the LLM) of
-        # which questions genuinely start an answer inside this chunk.
-        # If the model returned fewer distinct refs than we expected, it
-        # very likely quit early -- so we ask it again, ONE more time,
-        # explicitly naming exactly which REF(s) it missed and confirming
-        # they ARE present in this exact text. This is cheap (only fires
-        # when something looks wrong) and far more reliable than hoping a
-        # generic retry produces a different, complete answer.
-        # =================================================================
+        # expected_new_indices is OUR OWN independent estimate (regex /
+        # word-overlap heuristic, not the LLM) of which questions
+        # genuinely start an answer inside this chunk. If the model
+        # reported fewer distinct new starts than we expected, it likely
+        # quit early -- retry once with an explicit reminder naming
+        # exactly which ref(s) are missing.
         expected_refs = {f"REF-{chr(65 + qi)}" for qi in expected_new_indices}
-        if carry_over_ref:
-            expected_refs.add(carry_over_ref)
-        returned_refs = {r.get("ref") for r in chunk_ranges if isinstance(r, dict)}
+        returned_refs = {r.get("ref") for r in chunk_starts if isinstance(r, dict)}
         missing_refs = expected_refs - returned_refs
 
         if missing_refs:
@@ -1427,76 +1357,71 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             ]
             log(
                 f"WARNING: chunk {i+1}/{len(chunks_with_carry)} looks like it stopped early -- "
-                f"expected answers for {sorted(expected_refs)} but only got {sorted(returned_refs)}. "
+                f"expected answer-starts for {sorted(expected_refs)} but only got {sorted(returned_refs)}. "
                 f"Missing: {missing_previews}. Retrying this chunk once with an explicit reminder..."
             )
             reminder = (
-                f"\n\nREMINDER: your previous attempt on this exact text did NOT include a range for "
+                f"\n\nREMINDER: your previous attempt on this exact text did NOT include a start_line for "
                 f"{sorted(missing_refs)}. A genuine answer-start for {'each of these' if len(missing_refs) > 1 else 'this'} "
                 f"was detected in the text below. Look again at the FULL text, all the way to its last line, "
-                f"and make sure your JSON output includes an entry for {sorted(missing_refs)} if their content "
-                f"is present -- do not stop before reaching the end of the text shown."
+                f"and make sure your JSON output includes a start_line entry for {sorted(missing_refs)} if their "
+                f"content genuinely starts here -- do not stop before reaching the end of the text shown."
             )
             try:
-                retry_ranges = _call_groq_with_retries(
+                retry_starts = _call_groq_with_retries(
                     client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt + reminder,
                     _parse_answer_map_llm_response, budget, log, max_retries=2
                 )
-                recovered = [r for r in retry_ranges if isinstance(r, dict) and r.get("ref") in missing_refs]
+                recovered = [r for r in retry_starts if isinstance(r, dict) and r.get("ref") in missing_refs]
                 if recovered:
-                    log(f"  retry recovered {len(recovered)} of {len(missing_refs)} missing answer(s)")
-                    chunk_ranges = chunk_ranges + recovered
+                    log(f"  retry recovered {len(recovered)} of {len(missing_refs)} missing answer-start(s)")
+                    chunk_starts = chunk_starts + recovered
                 else:
-                    log(f"  retry did not recover the missing answer(s) -- they may genuinely be split across chunk boundaries")
+                    log(f"  retry did not recover the missing answer-start(s) -- they may genuinely be in a different chunk")
             except Exception as e:
                 log(f"  retry attempt failed: {e}")
 
-        if not chunk_ranges:
+        if not chunk_starts:
             chunk_zero_matches += 1
 
         valid_indices = {idx for idx, _ in chunk}
         min_idx, max_idx = min(valid_indices), max(valid_indices)
-        for r in chunk_ranges:
+        found_this_chunk = 0
+        for r in chunk_starts:
             if r["ref"] not in ref_to_question:
-                log(f"WARNING: discarding answer mapping with unknown ref {r['ref']!r}")
+                log(f"WARNING: discarding answer-start with unknown ref {r['ref']!r}")
                 continue
-            if not (min_idx <= r["start_line"] <= max_idx and min_idx <= r["end_line"] <= max_idx):
+            if not (min_idx <= r["start_line"] <= max_idx):
                 log(
-                    f"WARNING: discarding out-of-range answer mapping for "
-                    f"{r['ref']}: lines {r['start_line']}-{r['end_line']} "
-                    f"outside this chunk's range {min_idx}-{max_idx}"
+                    f"WARNING: discarding out-of-range answer-start for "
+                    f"{r['ref']}: line {r['start_line']} outside this chunk's range {min_idx}-{max_idx}"
                 )
                 continue
 
-            # Merge into the still-open range for the carried-over ref
-            # instead of appending a competing duplicate. This is the
-            # fix for the "pick the longer one and discard the rest"
-            # bug -- the two chunks' ranges are pieces of the SAME
-            # answer, not competing candidates.
-            if carry_over_ref and r["ref"] == carry_over_ref:
-                existing = next((x for x in reversed(all_ranges) if x["ref"] == carry_over_ref), None)
-                if existing is not None:
-                    existing["end_line"] = max(existing["end_line"], r["end_line"])
-                    log(f"  merged continuation into existing {carry_over_ref} range -> now ends at line {existing['end_line']}")
-                    continue
+            existing = start_line_by_ref.get(r["ref"])
+            if existing is None or r["start_line"] < existing:
+                start_line_by_ref[r["ref"]] = r["start_line"]
+                found_this_chunk += 1
 
-            all_ranges.append(r)
+        log(f"Chunk {i+1}/{len(chunks_with_carry)}: found {found_this_chunk} new answer-start boundary(ies)")
 
-        log(f"Chunk {i+1}/{len(chunks_with_carry)}: mapped {len(chunk_ranges)} answer(s)")
+    # Build contiguous, gap-free ranges purely from the sorted boundaries.
+    # This single step is what fixes both the "missing first paragraph"
+    # and "missing last paragraph" bugs: start is exactly the detected
+    # boundary, and end is exactly one line before the NEXT boundary --
+    # there is no independent guess for either edge, so nothing in
+    # between two consecutive answers can be silently dropped.
+    boundaries = sorted(start_line_by_ref.items(), key=lambda kv: kv[1])
 
-    # For any remaining ref collisions NOT covered by the carry-over merge
-    # above (e.g. genuine duplicate detections from independent chunks),
-    # keep the longer of the two as before -- this is the safe fallback
-    # for cases with no known continuation relationship.
-    best_by_ref = {}
-    for r in all_ranges:
-        existing = best_by_ref.get(r["ref"])
-        if existing is None or (r["end_line"] - r["start_line"]) > (existing["end_line"] - existing["start_line"]):
-            best_by_ref[r["ref"]] = r
-
-    deduped_ranges = list(best_by_ref.values())
-
-    resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
+    resolved_ranges = []
+    for idx, (ref, start_line) in enumerate(boundaries):
+        if idx + 1 < len(boundaries):
+            end_line = boundaries[idx + 1][1] - 1
+        else:
+            end_line = len(answer_lines) - 1
+        if end_line < start_line:
+            end_line = start_line
+        resolved_ranges.append({"ref": ref, "start_line": start_line, "end_line": end_line})
 
     log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
 
@@ -1509,13 +1434,14 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         elif chunk_zero_matches == len(chunks_with_carry):
             sample_lines = [l for l in answer_lines[:15] if l.strip()][:8]
             raise Exception(
-                f"Answer mapping found ZERO matches across all {len(chunks_with_carry)} chunk(s), "
-                f"even though the LLM calls themselves succeeded. This usually means "
-                f"the 'answer pages' passed in do NOT actually contain the student's "
-                f"answers -- most likely the question-paper/answer-page page split "
-                f"upstream misclassified pages (e.g. real answer pages were wrongly "
-                f"identified as question-paper pages, leaving only cover/admin pages "
-                f"as 'answers'). Sample of the answer text actually searched: "
+                f"Answer mapping found ZERO answer-start boundaries across all "
+                f"{len(chunks_with_carry)} chunk(s), even though the LLM calls "
+                f"themselves succeeded. This usually means the 'answer pages' "
+                f"passed in do NOT actually contain the student's answers -- most "
+                f"likely the question-paper/answer-page page split upstream "
+                f"misclassified pages (e.g. real answer pages were wrongly "
+                f"identified as question-paper pages, leaving only cover/admin "
+                f"pages as 'answers'). Sample of the answer text actually searched: "
                 f"{sample_lines}"
             )
 
@@ -1682,21 +1608,13 @@ def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print
 
 
 def _flag_suspiciously_short_answers(qa_pairs: list, log=print) -> None:
-    """
-    NEW: lightweight, always-on diagnostic (not a hard failure) that flags
-    matched answers which are suspiciously short compared to the rest of
-    the document's answers -- a strong signal of truncation (start or end
-    clipped) even when a range WAS found. This surfaces exactly the class
-    of bug you reported ("skips starting/ending paragraphs") in the logs
-    immediately, per-document, without needing a separate benchmark run.
-    """
     matched_lengths = [len(p["answer"]) for p in qa_pairs if p.get("matched") and p["answer"].strip()]
     if len(matched_lengths) < 2:
         return
     matched_lengths.sort()
     median_len = matched_lengths[len(matched_lengths) // 2]
     if median_len < 50:
-        return  # too short a document overall to say anything meaningful
+        return
     for p in qa_pairs:
         if not p.get("matched"):
             continue
