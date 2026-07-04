@@ -986,6 +986,7 @@ Important guidance for finding boundaries correctly:
 - Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
 - Use the EXACT REF label (e.g. "REF-A") to identify each question. Do NOT retype or paraphrase the question text itself -- the REF label is all that's needed.
 - If a note at the top of this prompt tells you this chunk CONTINUES an answer from a previous chunk, treat that instruction as authoritative: the opening lines of this chunk likely belong to that same REF even though you cannot see the earlier part of the answer.
+- CRITICAL: this chunk is deliberately kept SHORT and normally contains only a small number of distinct answers (often 1-3). You MUST scan the ENTIRE text shown, all the way to the last line, before responding -- do not stop after finding the first one or two answers. If you can identify 3 separate answer-start points in this text, your output must contain 3 entries, not fewer. Missing a clearly-present answer is a serious error.
 
 Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
 
@@ -1144,33 +1145,55 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
     return None
 
 
+# FIX (this round): real-world confirmed failure mode -- when a single
+# chunk happens to contain MANY distinct answers (short-ish answers back
+# to back), the model reliably finds the first 2-3 boundaries correctly,
+# then either gives a half-finished range for the next one or stops
+# entirely and omits everything after that -- classic long-output /
+# attention-degradation behavior, NOT a token-limit crash (the JSON it
+# returns is still syntactically valid, just incomplete). Char-budget
+# chunking alone doesn't prevent this: a chunk can be well under the char
+# cap while still containing 5+ short answers.
+#
+# The fix is to ALSO cap the number of distinct answers allowed in a
+# single chunk, independent of character count -- keeping each LLM call's
+# cognitive load small enough that "quitting early" stops being an issue
+# in practice. MAX_ANSWERS_PER_CHUNK=3 is deliberately conservative.
+MAX_ANSWERS_PER_CHUNK = 3
+
+
 def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
-                                  absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS) -> list:
+                                  absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS,
+                                  max_answers_per_chunk: int = MAX_ANSWERS_PER_CHUNK) -> list:
     """
-    Returns a list of (chunk, carry_over_question_idx) tuples.
+    Returns a list of (chunk, carry_over_question_idx, expected_new_indices)
+    tuples.
 
-    FIX (this round): the previous version returned only a flat list of
-    chunks, with NO way for the caller to know that a chunk boundary was
-    forced mid-answer (by the absolute char cap) rather than at a genuine
-    answer-start. carry_over_question_idx tells the caller "the FIRST
-    line of this chunk is a continuation of the still-open answer to
-    question index N from the end of the previous chunk" (or None if this
-    chunk starts fresh / at a genuine boundary). The caller uses this to
-    both (a) tell the LLM about the continuation in the prompt, and (b)
-    merge the resulting range back into the earlier chunk's range for the
-    same REF instead of losing or overwriting it.
+    - carry_over_question_idx: the FIRST line of this chunk is a
+      continuation of the still-open answer to this question index from
+      the end of the previous chunk (or None if this chunk starts fresh
+      at a genuine boundary).
+    - expected_new_indices: the list of question indices for which a
+      GENUINE new-answer-start line was detected inside this chunk (in
+      order). This is our own independent estimate of "how many distinct
+      answers should this chunk's LLM call report" -- used by the caller
+      to verify the model didn't quit early before returning all of them.
     """
     if not numbered_lines:
         return []
 
     chunks = []
     carry_overs = []
+    expected_new_indices_per_chunk = []
+
     current_chunk = []
     current_chars = 0
     past_target = False
     current_question_idx = None
     carry_over_for_current_chunk = None
+    answers_seen_in_current_chunk = 0
+    expected_new_indices_current = []
 
     for idx, text in numbered_lines:
         line_chars = len(text)
@@ -1183,7 +1206,10 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
             matched_q_idx == -1 or matched_q_idx != current_question_idx
         )
 
-        should_break_at_answer_start = past_target and is_genuine_new_start
+        should_break_at_answer_start = (
+            is_genuine_new_start and
+            (past_target or answers_seen_in_current_chunk >= max_answers_per_chunk)
+        )
         should_force_break_absolute = (
             current_chunk and current_chars + line_chars > absolute_max_chars
         )
@@ -1191,13 +1217,14 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
         if should_break_at_answer_start or should_force_break_absolute:
             chunks.append(current_chunk)
             carry_overs.append(carry_over_for_current_chunk)
+            expected_new_indices_per_chunk.append(expected_new_indices_current)
+
             current_chunk = []
             current_chars = 0
             past_target = False
+            answers_seen_in_current_chunk = 0
+            expected_new_indices_current = []
 
-            # A forced break that did NOT land on a genuine new-answer
-            # start means we just cut a single answer in half -- the
-            # NEXT chunk needs to know it's continuing current_question_idx.
             if should_force_break_absolute and not should_break_at_answer_start:
                 carry_over_for_current_chunk = current_question_idx
             else:
@@ -1205,6 +1232,8 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
 
         if is_genuine_new_start and matched_q_idx != -1:
             current_question_idx = matched_q_idx
+            answers_seen_in_current_chunk += 1
+            expected_new_indices_current.append(matched_q_idx)
 
         current_chunk.append((idx, text))
         current_chars += line_chars
@@ -1212,8 +1241,9 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
     if current_chunk:
         chunks.append(current_chunk)
         carry_overs.append(carry_over_for_current_chunk)
+        expected_new_indices_per_chunk.append(expected_new_indices_current)
 
-    return list(zip(chunks, carry_overs))
+    return list(zip(chunks, carry_overs, expected_new_indices_per_chunk))
 
 
 def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
@@ -1344,13 +1374,14 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
     numbered_lines = list(enumerate(answer_lines))
     chunks_with_carry = _chunk_lines_by_char_budget(numbered_lines, questions)
-    log(f"Split {len(answer_lines)} answer line(s) into {len(chunks_with_carry)} LLM chunk(s) for answer mapping")
+    log(f"Split {len(answer_lines)} answer line(s) into {len(chunks_with_carry)} LLM chunk(s) for answer mapping "
+        f"(max {MAX_ANSWERS_PER_CHUNK} distinct answers per chunk)")
 
     all_ranges = []  # list of {ref, start_line, end_line}
     chunk_failures = []
     chunk_zero_matches = 0
 
-    for i, (chunk, carry_over_idx) in enumerate(chunks_with_carry):
+    for i, (chunk, carry_over_idx, expected_new_indices) in enumerate(chunks_with_carry):
         line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
         carry_over_ref = f"REF-{chr(65 + carry_over_idx)}" if carry_over_idx is not None else None
         if carry_over_ref:
@@ -1370,6 +1401,55 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             log(f"WARNING: chunk {i+1}/{len(chunks_with_carry)} answer-mapping failed, skipping: {e}")
             chunk_failures.append(str(e))
             continue
+
+        # =================================================================
+        # FIX (this round): completeness check + targeted retry, aimed
+        # directly at "the LLM does the first 2-3 answers correctly then
+        # just stops". expected_new_indices is OUR OWN independent
+        # estimate (from the regex/word-overlap detector, not the LLM) of
+        # which questions genuinely start an answer inside this chunk.
+        # If the model returned fewer distinct refs than we expected, it
+        # very likely quit early -- so we ask it again, ONE more time,
+        # explicitly naming exactly which REF(s) it missed and confirming
+        # they ARE present in this exact text. This is cheap (only fires
+        # when something looks wrong) and far more reliable than hoping a
+        # generic retry produces a different, complete answer.
+        # =================================================================
+        expected_refs = {f"REF-{chr(65 + qi)}" for qi in expected_new_indices}
+        if carry_over_ref:
+            expected_refs.add(carry_over_ref)
+        returned_refs = {r.get("ref") for r in chunk_ranges if isinstance(r, dict)}
+        missing_refs = expected_refs - returned_refs
+
+        if missing_refs:
+            missing_previews = [
+                f"{ref} ({ref_to_question.get(ref, '?')[:50]}...)" for ref in sorted(missing_refs)
+            ]
+            log(
+                f"WARNING: chunk {i+1}/{len(chunks_with_carry)} looks like it stopped early -- "
+                f"expected answers for {sorted(expected_refs)} but only got {sorted(returned_refs)}. "
+                f"Missing: {missing_previews}. Retrying this chunk once with an explicit reminder..."
+            )
+            reminder = (
+                f"\n\nREMINDER: your previous attempt on this exact text did NOT include a range for "
+                f"{sorted(missing_refs)}. A genuine answer-start for {'each of these' if len(missing_refs) > 1 else 'this'} "
+                f"was detected in the text below. Look again at the FULL text, all the way to its last line, "
+                f"and make sure your JSON output includes an entry for {sorted(missing_refs)} if their content "
+                f"is present -- do not stop before reaching the end of the text shown."
+            )
+            try:
+                retry_ranges = _call_groq_with_retries(
+                    client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt + reminder,
+                    _parse_answer_map_llm_response, budget, log, max_retries=2
+                )
+                recovered = [r for r in retry_ranges if isinstance(r, dict) and r.get("ref") in missing_refs]
+                if recovered:
+                    log(f"  retry recovered {len(recovered)} of {len(missing_refs)} missing answer(s)")
+                    chunk_ranges = chunk_ranges + recovered
+                else:
+                    log(f"  retry did not recover the missing answer(s) -- they may genuinely be split across chunk boundaries")
+            except Exception as e:
+                log(f"  retry attempt failed: {e}")
 
         if not chunk_ranges:
             chunk_zero_matches += 1
