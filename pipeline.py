@@ -1123,6 +1123,17 @@ def _parse_sequential_search_response(content: str) -> tuple:
 SEQUENTIAL_SEARCH_WINDOW_CHARS = 11000  # same safe-per-call char budget used elsewhere in this module
 SEQUENTIAL_SEARCH_MAX_WINDOWS = 200  # generous safety cap; a real document will exhaust far sooner
 
+# FIX: windows previously slid forward with ZERO overlap. If an answer's
+# true start line happened to fall right at the boundary between two
+# windows -- e.g. a short intro sentence is the very LAST line of window
+# N, and the model (seeing it in isolation, with no following context to
+# confirm it's really the start of a new answer) doesn't recognize it as
+# such, then window N+1 begins on the NEXT line and never gets a chance
+# to see that intro sentence at all. A small overlap means a
+# boundary-straddling start almost always appears with enough surrounding
+# context in at least one window to be recognized.
+SEQUENTIAL_SEARCH_OVERLAP_LINES = 5
+
 
 def _find_answer_start_sequential(client, numbered_lines: list, question_text: str, ref_label: str,
                                     search_from_idx: int, budget: "_TokenBudgetTracker", log,
@@ -1130,7 +1141,7 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                                     max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS,
                                     extra_reminder: str = None):
     """
-    Slides forward through numbered_lines in non-overlapping windows,
+    Slides forward through numbered_lines in overlapping windows,
     starting at search_from_idx, asking a single yes/no+line-number
     question per window, until the target's start is found or the
     document is exhausted. Returns the found start_line, or None.
@@ -1171,10 +1182,135 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                 f"treating this window as a non-match"
             )
 
-        pointer = idx  # move forward to the next window, no overlap
+        if idx >= total_lines:
+            break  # reached the end of the document -- nothing left to overlap into
+
+        # Advance with a small overlap instead of jumping straight past
+        # this window's last few lines -- guarantees forward progress
+        # (idx always > pointer) while still catching boundary-straddling
+        # starts on the next call.
+        pointer = max(pointer + 1, idx - SEQUENTIAL_SEARCH_OVERLAP_LINES)
         windows_tried += 1
 
     return None
+
+
+# =========================================================
+# SUB-PART LABEL AWARENESS
+#
+# FIX: multi-part questions (e.g. "1.(i) ... (ii) ... (iii) ...") produce
+# several sibling questions that share almost all their context (the same
+# parent instruction/topic), differing only in their own small label. This
+# makes them the hardest case for the sequential search: a sibling
+# sub-part's answer can look "close enough" topically that the model
+# attributes it to the wrong sibling. Detecting that a target question IS
+# a labeled sub-part, and explicitly naming its siblings in the prompt,
+# gives the model a concrete thing to check for (the exact label) instead
+# of relying purely on topical similarity.
+# =========================================================
+
+_LEADING_NUMBER_RE = re.compile(r'^\s*(\d+)[\.\)]')
+_SUB_PART_LABEL_RE = re.compile(r'\(([ivxlcdm]{1,5}|[a-zA-Z]|[\u0900-\u097F])\)', re.IGNORECASE)
+
+
+def _extract_leading_number(text: str):
+    m = _LEADING_NUMBER_RE.match(text)
+    return m.group(1) if m else None
+
+
+def _extract_sub_part_label(text: str):
+    m = _SUB_PART_LABEL_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _build_sub_part_hint(questions: list, i: int) -> str:
+    current_label = _extract_sub_part_label(questions[i])
+    if not current_label:
+        return None
+
+    current_num = _extract_leading_number(questions[i])
+    siblings = []
+    for j, q in enumerate(questions):
+        if j == i:
+            continue
+        if current_num and _extract_leading_number(q) == current_num:
+            lbl = _extract_sub_part_label(q)
+            if lbl:
+                siblings.append(lbl)
+
+    if not siblings:
+        return None
+
+    return (
+        f"NOTE: this target question is sub-part {current_label} of a larger multi-part "
+        f"question (question {current_num}). The OTHER sub-parts of this SAME parent "
+        f"question are: {', '.join(siblings)}. Find the response to sub-part {current_label} "
+        f"SPECIFICALLY. Sibling sub-parts of one question are often similar in subject matter "
+        f"(they share the same overall topic) but are still separate, distinct responses -- do "
+        f"not match content that is actually the student's response to a DIFFERENT sibling "
+        f"sub-part just because it discusses a closely related aspect of the same topic."
+    )
+
+
+def _verify_earliest_start(client, numbered_lines: list, question_text: str, ref_label: str,
+                             search_from_idx: int, found_start: int, budget: "_TokenBudgetTracker",
+                             log, max_gap: int = 20) -> int:
+    """
+    FIX: cheap backward double-check for the "answer is missing its first
+    line/paragraph" failure mode. The main search call sees a large window
+    and is asked to report the earliest start -- but models can still miss
+    a short intro line, especially when there's a lot of other text in the
+    same window competing for attention. This looks at ONLY the short,
+    already-narrowed gap between where we started searching and the
+    reported start, and asks the model to re-check specifically for an
+    even earlier line within that small range. Skipped entirely when the
+    gap is 0 (nothing to check) or unusually large (>max_gap lines) --
+    in that case a large gap is normal (the previous answer was just
+    long), not a sign of a missed line, and re-checking the whole thing
+    would be wasteful.
+    """
+    gap = found_start - search_from_idx
+    if gap <= 0 or gap > max_gap:
+        return found_start
+
+    window = [nl for nl in numbered_lines if search_from_idx <= nl[0] <= found_start]
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window)
+    verify_prompt = (
+        f"TARGET QUESTION ({ref_label}): {question_text}\n\n"
+        f"You previously identified line {found_start} as where this answer begins. Here are "
+        f"the exact lines from {search_from_idx} to {found_start} again, in order:\n\n{lines_block}\n\n"
+        f"Re-examine ONLY this short range: is there an EARLIER line among these (a line number "
+        f"smaller than {found_start}) where this answer actually begins -- e.g. a short "
+        f"introductory or transitional sentence that was skipped? If so, return that earlier "
+        f"line number. If line {found_start} is indeed the correct, earliest start, return it "
+        f"unchanged.\n\nReturn ONLY valid JSON: {{\"start_line\": <int>}}"
+    )
+
+    def _parse_verify(content: str) -> int:
+        content = content.strip()
+        if content.startswith("```"):
+            content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+            content = re.sub(r'\n?```\s*$', '', content)
+            content = content.strip()
+        data = json.loads(content)
+        return int(data["start_line"])
+
+    try:
+        corrected = _call_groq_with_retries(
+            client,
+            "You are double-checking the exact starting line of a student's answer within a "
+            "short, already-narrowed range of text. Respond with ONLY valid JSON.",
+            verify_prompt, _parse_verify, budget, log, max_retries=1
+        )
+        valid_ids = {idx for idx, _ in window}
+        if corrected in valid_ids and corrected <= found_start:
+            if corrected != found_start:
+                log(f"  backward-check moved {ref_label}'s start earlier: {found_start} -> {corrected}")
+            return corrected
+    except Exception as e:
+        log(f"  backward-check failed for {ref_label} (keeping original start {found_start}): {e}")
+
+    return found_start
 
 
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
@@ -1243,24 +1379,36 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         ref = f"REF-{chr(65 + i)}"
         log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
 
+        # If this question is a labeled sub-part of a larger multi-part
+        # question (e.g. "1.(ii)"), build an explicit hint naming its
+        # siblings so the model doesn't confuse this sub-part's answer
+        # with a closely-related sibling sub-part's answer -- the main
+        # failure mode reported for multi-part questions.
+        sub_part_hint = _build_sub_part_hint(questions, i)
+        search_from_idx = pointer
+
         start_line = _find_answer_start_sequential(
-            client, numbered_lines, q, ref, pointer, budget, log
+            client, numbered_lines, q, ref, pointer, budget, log,
+            extra_reminder=sub_part_hint
         )
 
         # =================================================================
-        # FIX: retry once with an explicit reminder before giving up.
-        # Real failure pattern reported: the same definition/explanation
-        # can legitimately appear more than once across different answers
-        # (e.g. two related questions both require explaining the same
-        # concept). A model can be biased to read a repeated definition as
-        # "already covered, not a new start" and wrongly report found=false
-        # even though this occurrence genuinely IS a new answer. Since this
-        # retry happens BEFORE pointer is advanced, it's safe -- it can only
-        # recover a genuine match, never corrupt an already-confirmed range.
+        # FIX: up to TWO retries with escalating, more explicit reminders
+        # before giving up (previously only one). Real failure patterns
+        # reported:
+        #   1. the same definition/explanation legitimately appearing more
+        #      than once across different answers gets read as "already
+        #      covered, not a new start";
+        #   2. a sub-part's answer gets confused with a sibling sub-part's
+        #      answer in multi-part questions.
+        # Both retries happen BEFORE pointer is advanced, so they can only
+        # recover a genuine match -- never corrupt an already-confirmed
+        # range.
         # =================================================================
-        if start_line is None:
-            log(f"  first pass found nothing for {ref} -- retrying once with an explicit reminder...")
-            retry_reminder = (
+        attempt = 1
+        while start_line is None and attempt <= 2:
+            log(f"  pass {attempt} found nothing for {ref} -- retrying with a stronger reminder...")
+            reminder_parts = [
                 "REMINDER: a previous search pass over this exact text did not find this "
                 "question's answer. One common reason for a missed match: the same "
                 "definition/explanation legitimately appears more than once in this document "
@@ -1270,13 +1418,31 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 "separate answer to THIS target question -- look again with that in mind, and "
                 "also double-check you are not missing a short introductory/transitional line "
                 "right at the true start of the answer."
-            )
+            ]
+            if sub_part_hint:
+                reminder_parts.append(sub_part_hint)
+            if attempt == 2:
+                reminder_parts.append(
+                    "This is a SECOND retry -- scan very carefully, line by line, from the "
+                    "start of this window. If the answer genuinely is not present, that is a "
+                    "valid conclusion, but make sure you have not dismissed a real match."
+                )
             start_line = _find_answer_start_sequential(
                 client, numbered_lines, q, ref, pointer, budget, log,
-                extra_reminder=retry_reminder
+                extra_reminder="\n\n".join(reminder_parts)
             )
             if start_line is not None:
-                log(f"  retry recovered {ref} starting at line {start_line}")
+                log(f"  retry (pass {attempt + 1}) recovered {ref} starting at line {start_line}")
+            attempt += 1
+
+        # Cheap backward double-check: if there's a small gap between where
+        # we started searching and the reported start, re-verify that an
+        # even earlier line in that specific gap isn't the true beginning
+        # (catches short intro lines the main pass skipped over).
+        if start_line is not None:
+            start_line = _verify_earliest_start(
+                client, numbered_lines, q, ref, search_from_idx, start_line, budget, log
+            )
 
         if start_line is not None:
             found_starts[ref] = start_line
