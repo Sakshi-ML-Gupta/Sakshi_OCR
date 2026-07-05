@@ -1139,14 +1139,20 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                                     search_from_idx: int, budget: "_TokenBudgetTracker", log,
                                     window_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS,
                                     max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS,
-                                    extra_reminder: str = None):
+                                    extra_reminder: str = None,
+                                    end_idx: int = None):
     """
     Slides forward through numbered_lines in overlapping windows,
     starting at search_from_idx, asking a single yes/no+line-number
     question per window, until the target's start is found or the
-    document is exhausted. Returns the found start_line, or None.
+    search region is exhausted. Returns the found start_line, or None.
+
+    end_idx (exclusive) optionally bounds how far forward the search is
+    allowed to go -- used by the fallback pass in map_answers_sequential
+    to scope a leftover question's search to the specific gap between its
+    already-found neighbors, instead of scanning the whole document.
     """
-    total_lines = len(numbered_lines)
+    total_lines = len(numbered_lines) if end_idx is None else min(len(numbered_lines), end_idx)
     pointer = search_from_idx
     windows_tried = 0
 
@@ -1183,7 +1189,7 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
             )
 
         if idx >= total_lines:
-            break  # reached the end of the document -- nothing left to overlap into
+            break  # reached the end of the search region -- nothing left to overlap into
 
         # Advance with a small overlap instead of jumping straight past
         # this window's last few lines -- guarantees forward progress
@@ -1313,6 +1319,261 @@ def _verify_earliest_start(client, numbered_lines: list, question_text: str, ref
     return found_start
 
 
+# =========================================================
+# WINDOWED MULTI-TARGET SCAN
+#
+# FIX: the pure one-question-at-a-time sequential search, in practice,
+# still had a serious failure mode on multi-part questions: searching for
+# sibling sub-parts INDEPENDENTLY, one at a time, with each call seeing
+# only ONE target question, meant a call for sub-part (ii) had NO idea
+# that (iii) and (iv) also needed their own start lines nearby -- so if
+# the model found (ii)'s content, it had no signal to stop before it ran
+# into what was actually (iii)'s or (iv)'s content, and (given how the
+# deterministic end = next-start-1 rule works) whichever sibling was
+# found LAST ended up as the only one with a start at all, silently
+# absorbing everything after it that actually belonged to its siblings.
+#
+# This scan fixes that by showing the model ALL still-unmatched
+# questions (with explicit sibling-group notes) in EVERY window call, so
+# it can allocate boundaries between several candidates holistically
+# instead of one at a time in isolation. It also naturally helps recover
+# a whole skipped answer/page: since this scan doesn't depend on a
+# moving "pointer" tied to one question's own success, an earlier
+# question failing to be found doesn't block or mis-anchor the search
+# for a LATER one.
+#
+# Ends are still NEVER asked of the LLM -- exactly as before, they are
+# computed by Python from a global sort of all discovered starts, after
+# this scan (and the sequential fallback below) have run.
+# =========================================================
+
+WINDOWED_MULTI_TARGET_SYSTEM_PROMPT = """You are scanning a window of line-numbered OCR text from a student's exam answer booklet, looking for the STARTING lines of any of SEVERAL candidate questions' answers at once.
+
+You are given:
+1. A list of candidate questions, each tagged with a REF label (REF-A, REF-B, ...). Some may be sibling sub-parts of the same larger multi-part question -- when that's the case, it is noted explicitly below the candidate list.
+2. A window of the student's answer text, with each line prefixed by its line number in [brackets]. This window may be a small slice of a much larger document.
+
+For EACH candidate question, decide independently: does the student's response to THAT specific question begin somewhere in this window? Most candidates will NOT begin in any given window -- that is normal and expected. Only report the ones that genuinely do.
+
+Critical guidance:
+- A response typically begins where the student restates or references the question (an explicit label or number) OR, if there's no such label, where the content clearly starts addressing that specific question's topic.
+- SIBLING SUB-PARTS: when multiple candidates are noted as sibling sub-parts of the same parent question, do NOT let one sibling's answer "swallow" the others. Each sibling that has its own distinct response visible in this window must get its OWN start_line -- even though all siblings share very similar subject matter (they're part of the same overall question), look for the specific transition point where the student moves from one sub-part's content to the next (a new label, a sub-part identifier like (ii)/(iii)/(iv), or a clear shift in exactly what is being addressed). Reporting only ONE sibling's start and leaving the others unreported when their content is genuinely also present in this window is a serious error.
+- Content, definitions, or explanations CAN legitimately repeat across different answers (including between siblings) -- do not reject a genuine match just because similar wording appeared earlier.
+- Always report the EARLIEST line at which each matched answer begins, including any short introductory/transitional sentence -- never a later line just because it states the topic more explicitly.
+- If NONE of the candidates begin in this window, return an empty list -- that is a valid, common result.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{"starts": [{"ref": "REF-B", "start_line": 42}, {"ref": "REF-E", "start_line": 58}]}
+
+Every start_line MUST be an exact line number shown in [brackets] in this window."""
+
+
+def _build_windowed_multi_target_prompt(window_lines: list, open_questions: list,
+                                          sibling_note: str = None) -> str:
+    questions_block = "\n".join(f"[{ref}] {q}" for ref, q in open_questions)
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
+    note_block = f"{sibling_note}\n\n" if sibling_note else ""
+    return (
+        f"{note_block}"
+        f"CANDIDATE QUESTIONS:\n{questions_block}\n\n"
+        f"TEXT WINDOW (line-numbered):\n{lines_block}"
+    )
+
+
+def _parse_windowed_multi_target_response(content: str) -> list:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM did not return valid JSON: {e}\nRaw (first 300 chars): {content[:300]!r}")
+
+    if not isinstance(data, dict) or "starts" not in data:
+        raise ValueError(f"Response missing 'starts' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    starts = data["starts"]
+    if not isinstance(starts, list):
+        raise ValueError(f"'starts' must be a list, got {type(starts).__name__}")
+
+    result = []
+    for item in starts:
+        if not isinstance(item, dict) or "ref" not in item or "start_line" not in item:
+            continue
+        try:
+            result.append({"ref": str(item["ref"]).strip().upper(), "start_line": int(item["start_line"])})
+        except (ValueError, TypeError):
+            continue
+    return result
+
+
+def _build_group_sibling_note(open_questions: list) -> str:
+    groups = {}
+    for ref, q in open_questions:
+        num = _extract_leading_number(q)
+        label = _extract_sub_part_label(q)
+        if num and label:
+            groups.setdefault(num, []).append((ref, label))
+
+    notes = [
+        f"- Question {num} has sibling sub-parts among the candidates: "
+        f"{', '.join(f'{ref}={label}' for ref, label in members)}. Each needs its OWN "
+        f"separate start_line if its content is present -- do not let one absorb the others."
+        for num, members in groups.items() if len(members) >= 2
+    ]
+    if not notes:
+        return None
+    return "SIBLING SUB-PART GROUPS PRESENT IN THIS CANDIDATE LIST:\n" + "\n".join(notes)
+
+
+def _estimate_expected_refs_in_window(window_lines: list, open_questions: list) -> set:
+    """Independent (non-LLM) estimate of which open questions look like
+    they genuinely start within this window, reusing the same
+    regex/word-overlap heuristic used elsewhere in this module. Used only
+    to detect when the model's response looks incomplete, to trigger a
+    targeted retry -- not used as ground truth itself."""
+    q_texts = [q for _, q in open_questions]
+    found_indices = set()
+    current_idx = None
+    for _, text in window_lines:
+        idx = _line_starts_new_answer_for_question(text, q_texts)
+        if idx is not None and idx != -1 and idx != current_idx:
+            found_indices.add(idx)
+            current_idx = idx
+    return {open_questions[i][0] for i in found_indices}
+
+
+WINDOWED_SCAN_WINDOW_CHARS = 11000
+WINDOWED_SCAN_OVERLAP_LINES = 5
+WINDOWED_SCAN_MAX_WINDOWS = 300
+
+
+def _scan_windowed_multi_target(client, numbered_lines: list, open_questions: list,
+                                  budget: "_TokenBudgetTracker", log,
+                                  window_chars: int = WINDOWED_SCAN_WINDOW_CHARS,
+                                  overlap_lines: int = WINDOWED_SCAN_OVERLAP_LINES,
+                                  max_windows: int = WINDOWED_SCAN_MAX_WINDOWS) -> dict:
+    """
+    Single pass through the whole document in overlapping windows, asking
+    about ALL still-unmatched questions in every window call. Returns a
+    dict {ref: start_line} for everything found. Any question not found
+    by the end of this scan is left for the sequential fallback search in
+    map_answers_sequential.
+    """
+    total_lines = len(numbered_lines)
+    pointer = 0
+    windows_tried = 0
+    found = {}
+    remaining = list(open_questions)
+
+    while pointer < total_lines and remaining and windows_tried < max_windows:
+        window = []
+        chars = 0
+        idx = pointer
+        while idx < total_lines and (not window or chars + len(numbered_lines[idx][1]) <= window_chars):
+            window.append(numbered_lines[idx])
+            chars += len(numbered_lines[idx][1])
+            idx += 1
+
+        if not window:
+            break
+
+        sibling_note = _build_group_sibling_note(remaining)
+        user_prompt = _build_windowed_multi_target_prompt(window, remaining, sibling_note)
+
+        try:
+            starts = _call_groq_with_retries(
+                client, WINDOWED_MULTI_TARGET_SYSTEM_PROMPT, user_prompt,
+                _parse_windowed_multi_target_response, budget, log
+            )
+        except Exception as e:
+            log(f"WARNING: windowed scan call failed for lines {window[0][0]}-{window[-1][0]}: {e}")
+            starts = []
+
+        valid_ids = {i for i, _ in window}
+        remaining_refs = {ref for ref, _ in remaining}
+        newly_found = {}
+        for item in starts:
+            ref, sl = item["ref"], item["start_line"]
+            if ref not in remaining_refs:
+                continue
+            if sl not in valid_ids:
+                log(f"WARNING: discarding out-of-range start {sl} for {ref} (window {window[0][0]}-{window[-1][0]})")
+                continue
+            newly_found[ref] = min(newly_found[ref], sl) if ref in newly_found else sl
+
+        # Completeness check + one retry, same philosophy as the earlier
+        # chunk-based safety net: compare against our own independent
+        # estimate of what should have been found in this window.
+        expected_refs = _estimate_expected_refs_in_window(window, remaining)
+        missing = expected_refs - set(newly_found.keys())
+        if missing:
+            log(
+                f"WARNING: window (lines {window[0][0]}-{window[-1][0]}) may have missed "
+                f"{sorted(missing)} -- retrying with a reminder..."
+            )
+            reminder = (
+                f"REMINDER: your previous attempt on this exact window did not report a start "
+                f"for {sorted(missing)}, but signals suggesting their answers begin here were "
+                f"detected independently. Look again -- remember sibling sub-parts must each "
+                f"get their own start_line, and repeated/similar content is not disqualifying."
+            )
+            retry_prompt = user_prompt + "\n\n" + reminder
+            try:
+                retry_starts = _call_groq_with_retries(
+                    client, WINDOWED_MULTI_TARGET_SYSTEM_PROMPT, retry_prompt,
+                    _parse_windowed_multi_target_response, budget, log, max_retries=2
+                )
+                for item in retry_starts:
+                    ref, sl = item["ref"], item["start_line"]
+                    if ref in missing and sl in valid_ids:
+                        newly_found[ref] = min(newly_found.get(ref, sl), sl)
+                        log(f"  retry recovered {ref} at line {sl}")
+            except Exception as e:
+                log(f"  retry failed: {e}")
+
+        for ref, sl in newly_found.items():
+            found[ref] = sl
+            log(f"  found {ref} starting at line {sl}")
+
+        remaining = [(ref, q) for ref, q in remaining if ref not in found]
+
+        if idx >= total_lines:
+            break
+        pointer = max(pointer + 1, idx - overlap_lines)
+        windows_tried += 1
+
+    return found
+
+
+def _bounded_search_range(i: int, questions: list, found_starts: dict, total_lines: int) -> tuple:
+    """
+    For a still-unmatched question at index i, bounds its fallback search
+    to the gap between its nearest already-found NEIGHBORS in document
+    order (assuming `questions` is in printed/document order, which
+    extract_canonical_questions guarantees) -- cheaper and safer than
+    re-scanning the whole document, since a match outside this gap would
+    contradict the surrounding confirmed answers' positions anyway.
+    """
+    lower = 0
+    for j in range(i - 1, -1, -1):
+        ref_j = f"REF-{chr(65 + j)}"
+        if ref_j in found_starts:
+            lower = found_starts[ref_j] + 1
+            break
+    upper = total_lines - 1
+    for j in range(i + 1, len(questions)):
+        ref_j = f"REF-{chr(65 + j)}"
+        if ref_j in found_starts:
+            upper = found_starts[ref_j] - 1
+            break
+    return lower, upper
+
+
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
     """
@@ -1372,39 +1633,47 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     total_lines = len(numbered_lines)
 
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
-    found_starts = {}  # ref -> start_line
-    pointer = 0
+    open_questions = [(f"REF-{chr(65+i)}", q) for i, q in enumerate(questions)]
 
+    # =====================================================================
+    # PRIMARY PASS: windowed multi-target scan. Sees ALL still-unmatched
+    # questions in every window call (with explicit sibling-group notes),
+    # so it can allocate boundaries between several candidates at once
+    # instead of one at a time in isolation -- this is what fixes the
+    # "one sibling sub-part's answer swallows all its siblings" failure
+    # mode, and doesn't let one question failing to be found block or
+    # mis-anchor the search for a later, unrelated one.
+    # =====================================================================
+    log(f"Scanning document once for all {len(questions)} question(s) (windowed multi-target search)...")
+    found_starts = _scan_windowed_multi_target(client, numbered_lines, open_questions, budget, log)
+
+    # =====================================================================
+    # FALLBACK PASS: anything still missing after the primary scan gets
+    # the single-target sequential search (with its retries + backward
+    # earliest-start check), bounded to the gap between its nearest
+    # already-found NEIGHBORS in document order -- cheaper and safer than
+    # re-scanning the whole document, and a genuinely different search
+    # strategy/prompt than the primary pass, so it can recover cases the
+    # primary pass's approach happens to struggle with.
+    # =====================================================================
     for i, q in enumerate(questions):
         ref = f"REF-{chr(65 + i)}"
-        log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
+        if ref in found_starts:
+            continue
 
-        # If this question is a labeled sub-part of a larger multi-part
-        # question (e.g. "1.(ii)"), build an explicit hint naming its
-        # siblings so the model doesn't confuse this sub-part's answer
-        # with a closely-related sibling sub-part's answer -- the main
-        # failure mode reported for multi-part questions.
+        lower, upper = _bounded_search_range(i, questions, found_starts, total_lines)
+        if lower > upper:
+            log(f"WARNING: no room left to search for {ref} (bounded range {lower}-{upper} is empty) -- marking as unmatched.")
+            continue
+
+        log(f"Fallback single-target search for {ref} ({q[:60]}...) in lines {lower}-{upper}...")
         sub_part_hint = _build_sub_part_hint(questions, i)
-        search_from_idx = pointer
 
         start_line = _find_answer_start_sequential(
-            client, numbered_lines, q, ref, pointer, budget, log,
-            extra_reminder=sub_part_hint
+            client, numbered_lines, q, ref, lower, budget, log,
+            extra_reminder=sub_part_hint, end_idx=upper + 1
         )
 
-        # =================================================================
-        # FIX: up to TWO retries with escalating, more explicit reminders
-        # before giving up (previously only one). Real failure patterns
-        # reported:
-        #   1. the same definition/explanation legitimately appearing more
-        #      than once across different answers gets read as "already
-        #      covered, not a new start";
-        #   2. a sub-part's answer gets confused with a sibling sub-part's
-        #      answer in multi-part questions.
-        # Both retries happen BEFORE pointer is advanced, so they can only
-        # recover a genuine match -- never corrupt an already-confirmed
-        # range.
-        # =================================================================
         attempt = 1
         while start_line is None and attempt <= 2:
             log(f"  pass {attempt} found nothing for {ref} -- retrying with a stronger reminder...")
@@ -1428,32 +1697,25 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                     "valid conclusion, but make sure you have not dismissed a real match."
                 )
             start_line = _find_answer_start_sequential(
-                client, numbered_lines, q, ref, pointer, budget, log,
-                extra_reminder="\n\n".join(reminder_parts)
+                client, numbered_lines, q, ref, lower, budget, log,
+                extra_reminder="\n\n".join(reminder_parts), end_idx=upper + 1
             )
             if start_line is not None:
                 log(f"  retry (pass {attempt + 1}) recovered {ref} starting at line {start_line}")
             attempt += 1
 
-        # Cheap backward double-check: if there's a small gap between where
-        # we started searching and the reported start, re-verify that an
-        # even earlier line in that specific gap isn't the true beginning
-        # (catches short intro lines the main pass skipped over).
         if start_line is not None:
             start_line = _verify_earliest_start(
-                client, numbered_lines, q, ref, search_from_idx, start_line, budget, log
+                client, numbered_lines, q, ref, lower, start_line, budget, log
             )
 
         if start_line is not None:
             found_starts[ref] = start_line
-            log(f"  found {ref} starting at line {start_line}")
-            pointer = start_line + 1
+            log(f"  fallback found {ref} starting at line {start_line}")
         else:
             log(
-                f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
-                f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
-                f"The search pointer is NOT advanced, so the next question is still searched "
-                f"for over this same remaining text."
+                f"WARNING: could not find the start of {ref} anywhere in its bounded search "
+                f"range (lines {lower}-{upper}) -- marking as unmatched."
             )
 
     # End of each answer = the next (in document order) confirmed
