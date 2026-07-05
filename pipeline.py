@@ -1063,8 +1063,10 @@ You are given:
 Decide: does the student's response to THIS EXACT question begin somewhere in the window shown?
 
 Guidance:
-- A response typically begins where the student restates or references the question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a matching question number) OR, if there's no such label, where the content clearly starts addressing this specific question's topic for the first time (matching its distinctive subject matter, not just generic instructional words).
+- A response typically begins where the student restates or references the question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a matching question number) OR, if there's no such label, where the content clearly starts addressing this specific question's topic (matching its distinctive subject matter).
 - Do not confuse this with a DIFFERENT question's answer, even if it appears earlier in the window -- you are looking for this one specific question only.
+- CRITICAL -- do not skip the true beginning of the answer: if the answer opens with a short introductory or transitional sentence before it clearly states the topic (e.g. a lead-in sentence, a brief restatement, a general opening remark), that introductory line IS part of this answer and must be reported as start_line -- NOT a later, more obviously on-topic line. Always report the EARLIEST line at which this answer begins, never a later line just because it states the topic more explicitly. Skipping a genuine opening line/paragraph is a serious error.
+- CRITICAL -- content, definitions, or explanations CAN legitimately be repeated more than once across the document: the SAME fact or definition may correctly appear in more than one answer (e.g. two different questions both require explaining the same underlying concept), or a student may restate a definition again later as a recap within a long answer. Seeing similar wording earlier in the document does NOT disqualify a later occurrence from being a genuine, separate answer start for the target question -- judge each occurrence on whether IT is addressing the target question at that point in the document, not on whether the wording is "new."
 - If the target question's answer does not begin anywhere in this window, say so plainly. It is very common and expected for a window to not contain it -- do not force a match.
 
 Return ONLY valid JSON (no markdown fences, no commentary) in exactly one of these two shapes:
@@ -1075,12 +1077,15 @@ or
 
 {"found": false}
 
-If found, start_line MUST be one of the exact line numbers shown in [brackets] in this window -- never estimate or invent a number."""
+If found, start_line MUST be one of the exact line numbers shown in [brackets] in this window -- never estimate or invent a number, and always prefer the earliest correct line over a later one."""
 
 
-def _build_sequential_search_prompt(window_lines: list, question_text: str, ref_label: str) -> str:
+def _build_sequential_search_prompt(window_lines: list, question_text: str, ref_label: str,
+                                      extra_reminder: str = None) -> str:
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
+    reminder_block = f"{extra_reminder}\n\n" if extra_reminder else ""
     return (
+        f"{reminder_block}"
         f"TARGET QUESTION ({ref_label}): {question_text}\n\n"
         f"TEXT WINDOW (line-numbered):\n{lines_block}"
     )
@@ -1122,7 +1127,8 @@ SEQUENTIAL_SEARCH_MAX_WINDOWS = 200  # generous safety cap; a real document will
 def _find_answer_start_sequential(client, numbered_lines: list, question_text: str, ref_label: str,
                                     search_from_idx: int, budget: "_TokenBudgetTracker", log,
                                     window_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS,
-                                    max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS):
+                                    max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS,
+                                    extra_reminder: str = None):
     """
     Slides forward through numbered_lines in non-overlapping windows,
     starting at search_from_idx, asking a single yes/no+line-number
@@ -1145,7 +1151,7 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
         if not window:
             break
 
-        user_prompt = _build_sequential_search_prompt(window, question_text, ref_label)
+        user_prompt = _build_sequential_search_prompt(window, question_text, ref_label, extra_reminder)
         try:
             found, start_line = _call_groq_with_retries(
                 client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
@@ -1240,6 +1246,37 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         start_line = _find_answer_start_sequential(
             client, numbered_lines, q, ref, pointer, budget, log
         )
+
+        # =================================================================
+        # FIX: retry once with an explicit reminder before giving up.
+        # Real failure pattern reported: the same definition/explanation
+        # can legitimately appear more than once across different answers
+        # (e.g. two related questions both require explaining the same
+        # concept). A model can be biased to read a repeated definition as
+        # "already covered, not a new start" and wrongly report found=false
+        # even though this occurrence genuinely IS a new answer. Since this
+        # retry happens BEFORE pointer is advanced, it's safe -- it can only
+        # recover a genuine match, never corrupt an already-confirmed range.
+        # =================================================================
+        if start_line is None:
+            log(f"  first pass found nothing for {ref} -- retrying once with an explicit reminder...")
+            retry_reminder = (
+                "REMINDER: a previous search pass over this exact text did not find this "
+                "question's answer. One common reason for a missed match: the same "
+                "definition/explanation legitimately appears more than once in this document "
+                "(e.g. two different questions both touch on the same underlying concept, or "
+                "the student restates something they already explained elsewhere). Seeing "
+                "similar-looking content earlier does NOT mean this occurrence isn't a genuine, "
+                "separate answer to THIS target question -- look again with that in mind, and "
+                "also double-check you are not missing a short introductory/transitional line "
+                "right at the true start of the answer."
+            )
+            start_line = _find_answer_start_sequential(
+                client, numbered_lines, q, ref, pointer, budget, log,
+                extra_reminder=retry_reminder
+            )
+            if start_line is not None:
+                log(f"  retry recovered {ref} starting at line {start_line}")
 
         if start_line is not None:
             found_starts[ref] = start_line
