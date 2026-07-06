@@ -974,11 +974,69 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
                 f"{[p+1 for p in outliers]}"
             )
 
-    # Stage 2: single consistent pass over the CONFIRMED question-paper
-    # pages' full text, producing one canonical, non-fragmented question
-    # list.
+    # =====================================================================
+    # FIX: real failure confirmed in production -- QP-page detection can
+    # identify page clusters that are FAR APART (e.g. page 3, then pages
+    # 29-34, with a 26-page gap between them). A gap that large is a
+    # strong signal one of the clusters was misclassified (most likely a
+    # stretch of ANSWER pages that superficially reads like a list of
+    # questions). Previously, ALL detected question-paper pages -- both
+    # clusters combined -- were sent to extract_canonical_questions() in
+    # ONE call. If the garbled/misclassified cluster confused that single
+    # call enough, it returned an EMPTY question list for the WHOLE
+    # document, including the genuinely correct questions from the good
+    # cluster -- exactly the "Question paper pages were identified, but
+    # no questions were extracted" crash.
+    #
+    # Fix: split into contiguous clusters (a gap in page numbers starts a
+    # new cluster) and run canonical extraction SEPARATELY per cluster.
+    # A cluster that returns zero questions is treated as misclassified
+    # and its pages are moved into the answer-page pool instead of being
+    # silently discarded -- so a bad cluster can neither wipe out a good
+    # cluster's real questions, nor lose its own content entirely (it
+    # just becomes answer text instead, which is more likely correct
+    # anyway if it wasn't really a question paper).
+    # =====================================================================
     qp_pages_full = [pages[i] for i in qp_page_indices_0based]
-    questions = extract_canonical_questions(qp_pages_full, status_callback)
+    page_clusters = []
+    for p in qp_pages_full:
+        if page_clusters and p["page_number"] == page_clusters[-1][-1]["page_number"] + 1:
+            page_clusters[-1].append(p)
+        else:
+            page_clusters.append([p])
+
+    if len(page_clusters) > 1:
+        log(
+            f"WARNING: question-paper pages form {len(page_clusters)} separate, "
+            f"non-contiguous cluster(s): "
+            f"{[[p['page_number'] for p in c] for c in page_clusters]}. A large gap between "
+            f"clusters often means one of them was misclassified (e.g. an answer page that "
+            f"superficially reads like a question list). Extracting each cluster's questions "
+            f"SEPARATELY so a bad cluster can't wipe out a good one."
+        )
+
+    questions = []
+    reclassified_as_answer_pages = []
+    for cluster in page_clusters:
+        cluster_page_nums = [p["page_number"] for p in cluster]
+        cluster_questions = extract_canonical_questions(cluster, status_callback)
+        if cluster_questions:
+            questions.extend(cluster_questions)
+            log(f"Cluster (pages {cluster_page_nums}): extracted {len(cluster_questions)} question(s)")
+        else:
+            log(
+                f"WARNING: cluster (pages {cluster_page_nums}) produced ZERO questions -- "
+                f"treating it as misclassified and moving these page(s) to the answer-page "
+                f"pool instead of discarding them."
+            )
+            reclassified_as_answer_pages.extend(p["page_number"] - 1 for p in cluster)  # back to 0-based
+
+    if reclassified_as_answer_pages:
+        qp_page_indices_0based = [i for i in qp_page_indices_0based if i not in reclassified_as_answer_pages]
+        log(
+            f"Reclassified {len(reclassified_as_answer_pages)} page(s) as answer pages "
+            f"(1-based): {[i + 1 for i in reclassified_as_answer_pages]}"
+        )
 
     log(
         f"Final result: {len(qp_page_indices_0based)} question paper "
@@ -2594,8 +2652,14 @@ def process_pdf(file_input, status_callback=None):
 
     if not official_questions:
         raise Exception(
-            "Question paper pages were identified, but no questions were extracted.\n"
-            f"Detected pages: {[p+1 for p in qp_page_indices]}"
+            "Question paper pages were identified, but no questions were extracted from any "
+            "of them.\n"
+            f"Detected pages: {[p+1 for p in qp_page_indices]}\n\n"
+            "This means EVERY question-paper cluster individually failed extraction (see the "
+            "'WARNING: cluster (pages ...) produced ZERO questions' log lines above for which "
+            "specific pages and why). If the detected pages look scattered/non-contiguous, the "
+            "page classification itself is likely unreliable for this document -- check the "
+            "OCR text of those specific pages directly."
         )
 
     # FIX: admin/cover pages (roll number, letterhead, etc.) are now
