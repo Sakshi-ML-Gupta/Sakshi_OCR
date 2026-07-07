@@ -918,6 +918,42 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     log(f"Admin/cover pages identified: {len(admin_page_indices_0based)} page(s) "
         f"(these will be excluded from BOTH question and answer text)")
 
+    # =====================================================================
+    # SAFETY NET: a page classified as "admin" that comes AFTER the last
+    # question-paper page AND still has substantial text content is very
+    # unlikely to genuinely be a blank cover sheet -- genuine admin pages
+    # (roll number, letterhead) almost always sit at the START of a
+    # booklet, before the question paper. A page near the END of the
+    # document with real text is far more likely to be the tail end of
+    # the student's LAST answer, which a chunk-boundary classification
+    # call can mistake for "blank/admin" if that page happens to be short
+    # (e.g. just a concluding paragraph). This was a confirmed cause of
+    # "the last answer's final page silently disappeared" -- since an
+    # admin page is excluded from BOTH question and answer text, its
+    # content is gone entirely rather than merely misattributed.
+    # =====================================================================
+    TRAILING_ADMIN_MIN_CHARS = 150
+    if admin_page_indices_0based and qp_page_indices_0based:
+        last_qp_page = max(qp_page_indices_0based)
+        reclassified = []
+        for idx in list(admin_page_indices_0based):
+            if idx > last_qp_page and len(pages[idx]["raw_text"].strip()) >= TRAILING_ADMIN_MIN_CHARS:
+                reclassified.append(idx)
+
+        if reclassified:
+            for idx in reclassified:
+                char_count = len(pages[idx]["raw_text"].strip())
+                log(
+                    f"RECLASSIFYING page {idx + 1}: was detected as an admin/cover page, but it "
+                    f"comes AFTER the last question-paper page and contains {char_count} characters "
+                    f"of real text -- almost certainly the tail end of the student's last answer, "
+                    f"not a blank sheet. Moving it back to answer pages so its content isn't lost."
+                )
+            admin_page_indices_0based = [
+                i for i in admin_page_indices_0based if i not in reclassified
+            ]
+            log(f"Admin/cover pages after trailing-page safety check: {len(admin_page_indices_0based)} page(s)")
+
     if len(qp_page_indices_0based) >= 2:
         qp_page_lengths = [
             (i, len(pages[i]["raw_text"])) for i in qp_page_indices_0based
@@ -1104,15 +1140,17 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
     return None
 
 
-BACKWARD_REFINE_SYSTEM_PROMPT = """You previously identified that a student's answer to a specific question begins at a certain line. Now double-check: does the answer ACTUALLY begin a bit EARLIER than that, within the short window of text shown here (which ends right at the previously-identified line)?
+BACKWARD_REFINE_SYSTEM_PROMPT = """You previously identified that a student's answer to a specific question begins at a certain line. Now double-check: does the answer ACTUALLY begin EARLIER than that, somewhere within the window of text shown here (which ends right at the previously-identified line)?
 
-This matters because answers sometimes have a short introductory sentence or two (e.g. restating part of the question, or a brief lead-in) that a first pass can miss and instead pick up the answer a paragraph or two in -- which would incorrectly cut off the answer's true opening.
+This matters a lot: the previous identification can sometimes be off by a WHOLE PAGE or more, not just a line or two -- e.g. it can accidentally latch onto a later paragraph that happens to restate the question's core definition more explicitly, while the answer's TRUE opening (an earlier, less obviously-labeled paragraph, possibly with no "Ans"/"उत्तर" label at all) sits further back and gets wrongly left attached to a DIFFERENT, earlier question's answer instead. Do not assume the previous identification is "probably close enough" -- actively scan the ENTIRE window shown, from its very first line, for the true earliest point where this specific question's subject matter is being addressed.
 
 You are given:
 1. The exact text of the target question.
-2. A short window of text ending exactly at the previously-identified start line (inclusive).
+2. A window of text ending exactly at the previously-identified start line (inclusive). This window may span more than one page's worth of the student's writing.
 
-Decide: within THIS window, is there an EARLIER line where the answer to this exact question actually begins (e.g. a restatement, an "Ans"/"उत्तर" label, or the first line clearly on-topic for this question)?
+Decide: within THIS window, is there an EARLIER line where the answer to this exact question actually begins? Look for:
+- An explicit restart label (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a matching question number), OR
+- A clear but UNLABELED shift in subject matter to this question's specific topic -- the student may simply start writing about it without any label at all, especially for sub-parts of a multi-part question.
 
 Return ONLY valid JSON (no markdown fences, no commentary) in exactly one of these two shapes:
 
@@ -1122,7 +1160,7 @@ or
 
 {"earlier_start_found": false}
 
-If earlier_start_found is true, start_line MUST be one of the exact line numbers shown in [brackets], and MUST be earlier than or equal to the last line shown. Only report an earlier line if you are confident the answer genuinely starts there -- if the previously-identified line already looks correct, return false."""
+If earlier_start_found is true, start_line MUST be one of the exact line numbers shown in [brackets], and MUST be earlier than or equal to the last line shown. Report false only if you are genuinely confident this ENTIRE window is still part of an earlier, different topic and none of it belongs to the target question."""
 
 
 def _build_backward_refine_prompt(window_lines: list, question_text: str, ref_label: str) -> str:
@@ -1162,12 +1200,19 @@ def _parse_backward_refine_response(content: str) -> tuple:
     return True, start_line
 
 
-BACKWARD_REFINE_MAX_ITERATIONS = 15  # generous cap on how many backward windows we'll walk through
+BACKWARD_REFINE_WINDOW_CHARS = 3500  # deliberately smaller than the forward search's window --
+                                       # roughly one page's worth of text per check, not two. A large
+                                       # window gives the model too much to hold at once, making it
+                                       # easy to miss a SUBTLE, unlabeled topic-shift buried partway
+                                       # through -- exactly what caused a whole page to stay wrongly
+                                       # attached to the wrong answer even with backward-refine active.
+BACKWARD_REFINE_MAX_ITERATIONS = 30  # raised to compensate for the smaller window -- still cheap,
+                                       # since most documents only need 1-2 iterations in practice
 
 
 def _refine_start_backward(client, numbered_lines: list, question_text: str, ref_label: str,
                              candidate_start: int, floor_idx: int, budget: "_TokenBudgetTracker",
-                             log, window_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS,
+                             log, window_chars: int = BACKWARD_REFINE_WINDOW_CHARS,
                              max_iterations: int = BACKWARD_REFINE_MAX_ITERATIONS):
     """
     After the forward search finds a candidate start_line, double-check
