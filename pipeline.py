@@ -282,7 +282,19 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         )
 
     return pages
+import hashlib
 
+def run_ocr_cached(file_bytes, file_name, status_callback=None, cache_dir="./.ocr_cache"):
+    os.makedirs(cache_dir, exist_ok=True)
+    key = hashlib.sha256(file_bytes).hexdigest()
+    cache_path = os.path.join(cache_dir, f"{key}.json")
+    if os.path.exists(cache_path):
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    pages = run_ocr(file_bytes, file_name, status_callback)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(pages, f, ensure_ascii=False)
+    return pages
 
 # =========================================================
 # BUILD OCR JSON
@@ -322,7 +334,7 @@ def process_reference(file_input, status_callback=None):
 
 GROQ_MODEL = "openai/gpt-oss-120b"
 
-TPM_LIMIT = 8000
+TPM_LIMIT = 30000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 
