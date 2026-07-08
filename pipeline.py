@@ -1332,23 +1332,10 @@ def _build_sub_part_hint(questions: list, i: int) -> str:
 def _verify_earliest_start(client, numbered_lines: list, question_text: str, ref_label: str,
                              search_from_idx: int, found_start: int, budget: "_TokenBudgetTracker",
                              log) -> int:
-    """
-    Re-scans the ENTIRE gap between search_from_idx and found_start (not just
-    a fixed 20-line tail) for an earlier genuine start of this answer, using
-    the same reliable forward-windowed search used by the main search.
-
-    This fixes the "a whole page got swallowed into the previous answer"
-    bug: previously this check only looked at the last 20 lines, so if the
-    true start was further back (e.g. an entire page earlier), it was never
-    found and that content silently stayed attributed to the PREVIOUS
-    question instead.
-    """
     gap = found_start - search_from_idx
     if gap <= 0:
         return found_start
 
-    # bound the re-scan to strictly before the already-found line, so it
-    # can only move the start EARLIER, never later
     earlier = _find_answer_start_sequential(
         client, numbered_lines, question_text, ref_label,
         search_from_idx, budget, log,
@@ -1360,33 +1347,6 @@ def _verify_earliest_start(client, numbered_lines: list, question_text: str, ref
         return earlier
 
     return found_start
-                                 
-    def _parse_verify(content: str) -> int:
-        content = content.strip()
-        if content.startswith("```"):
-            content = re.sub(r'^```(?:json)?\s*\n?', '', content)
-            content = re.sub(r'\n?```\s*$', '', content)
-            content = content.strip()
-        data = json.loads(content)
-        return int(data["start_line"])
-
-    try:
-        corrected = _call_groq_with_retries(
-            client,
-            "You are double-checking the exact starting line of a student's answer within a "
-            "short, already-narrowed range of text. Respond with ONLY valid JSON.",
-            verify_prompt, _parse_verify, budget, log, max_retries=1
-        )
-        valid_ids = {idx for idx, _ in window}
-        if corrected in valid_ids and corrected <= found_start:
-            if corrected != found_start:
-                log(f"  backward-check moved {ref_label}'s start earlier: {found_start} -> {corrected}")
-            return corrected
-    except Exception as e:
-        log(f"  backward-check failed for {ref_label} (keeping original start {found_start}): {e}")
-
-    return found_start
-
 
 # =========================================================
 # WINDOWED MULTI-TARGET SCAN
