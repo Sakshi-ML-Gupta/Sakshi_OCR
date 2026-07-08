@@ -1135,6 +1135,7 @@ Decide: does the student's response to THIS EXACT question begin somewhere in th
 Guidance:
 - A response typically begins where the student restates or references the question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a matching question number) OR, if there's no such label, where the content clearly starts addressing this specific question's topic (matching its distinctive subject matter).
 - Do not confuse this with a DIFFERENT question's answer, even if it appears earlier in the window -- you are looking for this one specific question only.
+- Labels can be VERY SHORT and bare -- e.g. just "Q1", "Q.1", "Q(i)", "Q.i", "1)", "(i)" -- immediately followed by the answer content with NO restated question text at all. Such a bare label matching this question's own number/sub-part label is a STRONG, sufficient signal of the genuine start on its own -- do not require restated question text or topical wording overlap to accept a match in these cases.
 - CRITICAL -- do not skip the true beginning of the answer: if the answer opens with a short introductory or transitional sentence before it clearly states the topic (e.g. a lead-in sentence, a brief restatement, a general opening remark), that introductory line IS part of this answer and must be reported as start_line -- NOT a later, more obviously on-topic line. Always report the EARLIEST line at which this answer begins, never a later line just because it states the topic more explicitly. Skipping a genuine opening line/paragraph is a serious error.
 - CRITICAL -- content, definitions, or explanations CAN legitimately be repeated more than once across the document: the SAME fact or definition may correctly appear in more than one answer (e.g. two different questions both require explaining the same underlying concept), or a student may restate a definition again later as a recap within a long answer. Seeing similar wording earlier in the document does NOT disqualify a later occurrence from being a genuine, separate answer start for the target question -- judge each occurrence on whether IT is addressing the target question at that point in the document, not on whether the wording is "new."
 - If the target question's answer does not begin anywhere in this window, say so plainly. It is very common and expected for a window to not contain it -- do not force a match.
@@ -1152,13 +1153,24 @@ If found, start_line MUST be one of the exact line numbers shown in [brackets] i
 
 
 def _build_sequential_search_prompt(window_lines: list, question_text: str, ref_label: str,
-                                      extra_reminder: str = None) -> str:
+                                      extra_reminder: str = None, context_before: list = None) -> str:
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
     reminder_block = f"{extra_reminder}\n\n" if extra_reminder else ""
+    context_block = ""
+    if context_before:
+        context_lines_block = "\n".join(f"[{idx}] {text}" for idx, text in context_before)
+        context_block = (
+            f"CONTEXT -- the lines immediately BEFORE this window (for reference only, "
+            f"so you can tell whether the window's opening lines are a genuine NEW start "
+            f"or a continuation of what came before -- these lines are NOT part of the "
+            f"searchable window and must NEVER be reported as start_line):\n"
+            f"{context_lines_block}\n\n"
+        )
     return (
         f"{reminder_block}"
+        f"{context_block}"
         f"TARGET QUESTION ({ref_label}): {question_text}\n\n"
-        f"TEXT WINDOW (line-numbered):\n{lines_block}"
+        f"TEXT WINDOW (line-numbered) -- ONLY lines in THIS section may be reported as start_line:\n{lines_block}"
     )
 
 
@@ -1205,24 +1217,52 @@ SEQUENTIAL_SEARCH_MAX_WINDOWS = 200  # generous safety cap; a real document will
 # context in at least one window to be recognized.
 SEQUENTIAL_SEARCH_OVERLAP_LINES = 5
 
+_BARE_LABEL_RE = re.compile(
+    r'^\s*(?:Q\.?\s*|प्र\.?\s*|प्रश्न\.?\s*)?'
+    r'\(?([ivxlcdm]+|\d+)\)?\s*[.:\-)]?\s*$',
+    re.IGNORECASE
+)
+
+
+def _find_bare_label_candidates(window_lines: list, question_text: str) -> list:
+    """
+    Deterministic (non-LLM) scan for BARE numeric/roman labels (e.g. "Q1",
+    "Q.i", "(ii)", "1)") that match the target question's own number or
+    sub-part label, on lines with little/no other text. Used only to
+    generate a HINT for the LLM search -- never to decide the boundary
+    itself -- since bare-label documents (no restated question, direct
+    answer follows) are otherwise very hard for the model to anchor on.
+    """
+    q_num = _extract_leading_number(question_text)
+    q_label = _extract_sub_part_label(question_text)
+    if not q_num and not q_label:
+        return []
+
+    candidates = []
+    for idx, text in window_lines:
+        stripped = text.strip()
+        if len(stripped) > 15:
+            continue  # bare labels are short; skip lines with real content
+        m = _BARE_LABEL_RE.match(stripped)
+        if not m:
+            continue
+        token = m.group(1).lower()
+        if q_num and token == str(q_num):
+            candidates.append(idx)
+        elif q_label:
+            inner = q_label.strip("()").lower()
+            if token == inner:
+                candidates.append(idx)
+
+    return candidates
 
 def _find_answer_start_sequential(client, numbered_lines: list, question_text: str, ref_label: str,
                                     search_from_idx: int, budget: "_TokenBudgetTracker", log,
                                     window_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS,
                                     max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS,
                                     extra_reminder: str = None,
-                                    end_idx: int = None):
-    """
-    Slides forward through numbered_lines in overlapping windows,
-    starting at search_from_idx, asking a single yes/no+line-number
-    question per window, until the target's start is found or the
-    search region is exhausted. Returns the found start_line, or None.
-
-    end_idx (exclusive) optionally bounds how far forward the search is
-    allowed to go -- used by the fallback pass in map_answers_sequential
-    to scope a leftover question's search to the specific gap between its
-    already-found neighbors, instead of scanning the whole document.
-    """
+                                    end_idx: int = None,
+                                    context_lookback: int = 6):
     total_lines = len(numbered_lines) if end_idx is None else min(len(numbered_lines), end_idx)
     pointer = search_from_idx
     windows_tried = 0
@@ -1239,7 +1279,23 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
         if not window:
             break
 
-        user_prompt = _build_sequential_search_prompt(window, question_text, ref_label, extra_reminder)
+        context_before = numbered_lines[max(0, pointer - context_lookback):pointer] if pointer > 0 else None
+
+        # Patch 4 hint hook -- bare-label candidates (see Patch 4 below)
+        label_hint = None
+        candidates = _find_bare_label_candidates(window, question_text)
+        if candidates:
+            label_hint = (
+                f"HINT: a bare numeric/roman label matching this question's own number "
+                f"was detected (by simple pattern-matching, not verified) at line(s) "
+                f"{candidates} in this window. A bare label like this (e.g. 'Q1', 'Q.i') "
+                f"is a strong, valid start signal even with NO restated question text -- "
+                f"check these lines carefully and accept one if the content that follows "
+                f"genuinely addresses this question."
+            )
+        combined_reminder = "\n\n".join(filter(None, [extra_reminder, label_hint])) or None
+
+        user_prompt = _build_sequential_search_prompt(window, question_text, ref_label, combined_reminder, context_before)
         try:
             found, start_line = _call_groq_with_retries(
                 client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
@@ -1260,12 +1316,8 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
             )
 
         if idx >= total_lines:
-            break  # reached the end of the search region -- nothing left to overlap into
+            break
 
-        # Advance with a small overlap instead of jumping straight past
-        # this window's last few lines -- guarantees forward progress
-        # (idx always > pointer) while still catching boundary-straddling
-        # starts on the next call.
         pointer = max(pointer + 1, idx - SEQUENTIAL_SEARCH_OVERLAP_LINES)
         windows_tried += 1
 
@@ -1332,6 +1384,13 @@ def _build_sub_part_hint(questions: list, i: int) -> str:
 def _verify_earliest_start(client, numbered_lines: list, question_text: str, ref_label: str,
                              search_from_idx: int, found_start: int, budget: "_TokenBudgetTracker",
                              log) -> int:
+    """
+    Re-scans the ENTIRE gap between search_from_idx and found_start for an
+    earlier genuine start of this answer, using the same forward-windowed
+    search (now with lookback context -- see Patch 2). Only ever moves the
+    start EARLIER, never later -- the mirror-image "too early" case is
+    handled separately by _confirm_boundary (Patch 3).
+    """
     gap = found_start - search_from_idx
     if gap <= 0:
         return found_start
@@ -1347,7 +1406,6 @@ def _verify_earliest_start(client, numbered_lines: list, question_text: str, ref
         return earlier
 
     return found_start
-
 # =========================================================
 # WINDOWED MULTI-TARGET SCAN
 #
@@ -1376,26 +1434,79 @@ def _verify_earliest_start(client, numbered_lines: list, question_text: str, ref
 # this scan (and the sequential fallback below) have run.
 # =========================================================
 
-WINDOWED_MULTI_TARGET_SYSTEM_PROMPT = """You are resolving the internal boundaries WITHIN a small, already-confirmed block of text that belongs to a multi-part question's sibling sub-parts.
+BOUNDARY_CONFIRM_SYSTEM_PROMPT = """You are double-checking a proposed boundary line between two consecutive answers in a student's exam booklet.
 
 You are given:
-1. A short list of candidate sub-parts (2-5 typically), each tagged with a REF label (REF-B, REF-C, ...). These are CONFIRMED to be sibling sub-parts of the SAME parent question -- the text window shown definitely contains some or all of their answers, back to back, in order.
-2. The exact text window (line-numbered) that this whole group's answers fall within.
+1. The text of the PREVIOUS question (whose answer should end right before the proposed boundary).
+2. The text of the CURRENT/target question (whose answer should begin at the proposed boundary).
+3. A short window of text (line-numbered) centered on the proposed boundary line.
 
-Your task: for each sibling sub-part, find the line where ITS OWN portion begins (i.e. where the student moves on from the previous sibling's content to start addressing this one specifically).
+Decide: does the proposed boundary line genuinely mark the FIRST line of the CURRENT question's answer -- i.e., is everything from the boundary line onward truly about the CURRENT question, and everything before it truly still about the PREVIOUS question (or noise/labels)?
 
-Guidance:
-- The siblings appear in order in this window. Look for the transition points: a new label (e.g. (ii), (iii)), a sub-part identifier, or a clear shift in exactly what specific aspect is now being addressed -- even though all siblings share the same overall topic (they're part of one parent question).
-- The FIRST sibling in the list normally starts at or very near the beginning of this window (it may already be confirmed separately -- focus your effort on finding where the LATER siblings begin).
-- PRECISION MATTERS MOST: only report a sibling's start_line if you can identify a genuine, specific transition point for it. If you cannot clearly tell where one sibling's content ends and the next begins, it is much better to leave that boundary unreported than to guess -- an incorrect split would mix one sibling's answer into another's. A sibling with no reported start will simply be treated as folded into the content of whichever sibling came before it, which is a safer default than a wrong guess.
-- Content, definitions, or explanations CAN legitimately repeat across siblings -- do not reject a genuine transition just because similar wording appeared for an earlier sibling.
-- Always report the EARLIEST line at which each identified sibling's own content begins.
+Two kinds of mistakes are possible, and both are equally serious:
+- TOO EARLY: the proposed line is still part of the PREVIOUS answer's content (e.g. a coincidental keyword overlap, a sub-point within the previous explanation) -- the CURRENT answer actually starts LATER. This mistake silently truncates the PREVIOUS answer and steals its final content into the CURRENT one.
+- TOO LATE: the CURRENT answer actually starts EARLIER than proposed (e.g. an introductory line, or an entire page, was missed).
+
+If the proposed line is correct, confirm it. If not, report the corrected line number (which MUST be one of the line numbers shown in the window). If you cannot confidently identify a better line within this window, keep the original proposed line -- do not guess.
 
 Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
 
-{"starts": [{"ref": "REF-B", "start_line": 42}, {"ref": "REF-C", "start_line": 58}]}
+{"corrected_start_line": 42}"""
 
-Only include sibling(s) whose start you can confidently identify -- omitting an uncertain one is expected and safe. Every start_line MUST be an exact line number shown in [brackets] in this window."""
+
+def _build_boundary_confirm_prompt(window_lines: list, prev_question: str, curr_question: str, proposed_line: int) -> str:
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
+    return (
+        f"PREVIOUS QUESTION: {prev_question}\n\n"
+        f"CURRENT QUESTION (target): {curr_question}\n\n"
+        f"PROPOSED BOUNDARY LINE: {proposed_line}\n\n"
+        f"TEXT WINDOW (line-numbered):\n{lines_block}"
+    )
+
+
+def _parse_boundary_confirm_response(content: str) -> int:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+    data = json.loads(content)
+    return int(data["corrected_start_line"])
+
+
+def _confirm_boundary(client, numbered_lines: list, prev_question: str, curr_question: str,
+                        proposed_line: int, budget: "_TokenBudgetTracker", log,
+                        radius: int = 15) -> int:
+    """
+    Tight, LOCAL, bidirectional re-check around a proposed boundary line --
+    unlike _verify_earliest_start (which only ever moves a start earlier),
+    this catches the mirror-image bug: a boundary set TOO EARLY, which
+    silently truncates the end of the PREVIOUS answer (the "last page
+    skipped" symptom) while stealing that content into the following
+    answer (the "page swallowed" symptom).
+    """
+    lo = max(0, proposed_line - radius)
+    hi = min(len(numbered_lines) - 1, proposed_line + radius)
+    window = [nl for nl in numbered_lines if lo <= nl[0] <= hi]
+    if not window:
+        return proposed_line
+
+    user_prompt = _build_boundary_confirm_prompt(window, prev_question, curr_question, proposed_line)
+    try:
+        corrected = _call_groq_with_retries(
+            client, BOUNDARY_CONFIRM_SYSTEM_PROMPT, user_prompt,
+            _parse_boundary_confirm_response, budget, log, max_retries=1
+        )
+    except Exception as e:
+        log(f"  boundary confirm failed for line {proposed_line} (keeping original): {e}")
+        return proposed_line
+
+    valid_ids = {idx for idx, _ in window}
+    if corrected in valid_ids and corrected != proposed_line:
+        log(f"  boundary confirm adjusted start: {proposed_line} -> {corrected}")
+        return corrected
+
+    return proposed_line
 
 
 def _build_windowed_multi_target_prompt(window_lines: list, open_questions: list,
@@ -1687,9 +1798,14 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 i = group_indices[-1] + 1
                 continue
 
-            group_start = _verify_earliest_start(client, numbered_lines, first_q, first_ref, pointer, group_start, budget, log)
-            found_starts[first_ref] = group_start
-            log(f"  found {first_ref} (group start) at line {group_start}")
+            if start_line is not None:
+                start_line = _verify_earliest_start(
+                     client, numbered_lines, q, ref, search_from_idx, start_line, budget, log
+                )
+                if i > 0:
+                    start_line = _confirm_boundary(
+                        client, numbered_lines, questions[i - 1], q, start_line, budget, log
+                    )
 
             # Find where the group as a WHOLE ends: the next, non-sibling
             # question's start (single-target search, same precision as
