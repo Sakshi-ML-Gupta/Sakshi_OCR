@@ -323,7 +323,7 @@ def process_reference(file_input, status_callback=None):
 
     file_bytes, file_name = _normalize_file_input(file_input, default_name="reference.pdf")
 
-    pages = run_ocr(file_bytes, file_name, status_callback)
+    pages = run_ocr_cached(file_bytes, file_name, status_callback)
     log(f"Reference OCR complete -- {len(pages)} page(s)")
     return build_ocr_json(pages)
 
