@@ -826,6 +826,49 @@ def _build_canonical_questions_prompt(qp_pages: list) -> str:
     )
 
 
+def _strip_repeating_boilerplate(pages: list, log=print, min_chars: int = 80) -> list:
+    """
+    Detects text blocks (paragraphs) that appear verbatim on 2 or more
+    different pages -- e.g. a student ID card, letterhead, or
+    registration-details block that got scanned/OCR'd repeatedly across
+    the booklet. Such content is never part of any single answer;
+    leaving it in confuses answer-boundary search (identical blocks
+    reappearing make it much harder for the search to tell where a
+    real, unique boundary is). Removes every occurrence of any
+    repeating block from every page's raw_text.
+    """
+    from collections import defaultdict
+
+    block_pages = defaultdict(set)
+    page_blocks = []
+
+    for page in pages:
+        blocks = [b.strip() for b in re.split(r'\n\s*\n', page["raw_text"]) if len(b.strip()) >= min_chars]
+        page_blocks.append(blocks)
+        for b in blocks:
+            block_pages[b].add(page["page_number"])
+
+    repeating = {b for b, pgs in block_pages.items() if len(pgs) >= 2}
+
+    if not repeating:
+        return pages
+
+    log(
+        f"Detected {len(repeating)} repeating boilerplate block(s) across multiple "
+        f"pages (e.g. letterhead, ID card, registration details) -- removing them "
+        f"so they don't interfere with answer boundary detection."
+    )
+
+    new_pages = []
+    for page, blocks in zip(pages, page_blocks):
+        text = page["raw_text"]
+        for b in repeating:
+            text = text.replace(b, "")
+        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text).strip()
+        new_pages.append({"page_number": page["page_number"], "raw_text": text})
+
+    return new_pages
+
 def _parse_canonical_questions_response(content: str) -> list:
     content = content.strip()
     if content.startswith("```"):
@@ -1994,10 +2037,13 @@ def process_pdf(file_input, status_callback=None):
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
 
     pages = run_ocr_cached(file_bytes, file_name, status_callback)
+    pages = _strip_repeating_boilerplate(pages, log)   # <-- NEW
 
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
+
+  
 
     qp_page_indices, official_questions, admin_page_indices = identify_questions_with_llm(pages, status_callback)
 
