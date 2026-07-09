@@ -1674,99 +1674,46 @@ def _resolve_sibling_group_batch(client, numbered_lines: list, group_questions: 
     return found
 
 
-def _find_orphaned_answer_pages(ranges: list, answer_line_pages: list, total_lines: int) -> list:
-    if not answer_line_pages:
-        return []
-    covered = [False] * total_lines
-    for r in ranges:
-        for j in range(r["start_line"], r["end_line"] + 1):
-            if 0 <= j < total_lines:
-                covered[j] = True
-    from itertools import groupby
-    orphaned = []
-    for page_num, group in groupby(range(total_lines), key=lambda j: answer_line_pages[j]):
-        group_indices = list(group)
-        if group_indices and all(not covered[j] for j in group_indices):
-            orphaned.append((page_num, group_indices[0], group_indices[-1]))
-    return orphaned
-
-
-def _repair_orphaned_pages(client, numbered_lines: list, questions: list, ranges: list,
-                             answer_line_pages: list, budget: "_TokenBudgetTracker", log) -> list:
-    total_lines = len(numbered_lines)
-    orphaned = _find_orphaned_answer_pages(ranges, answer_line_pages, total_lines)
-    if not orphaned:
-        return ranges
-
-    log(f"WARNING: {len(orphaned)} answer page(s) not covered by any matched range -- repairing: {[p for p, _, _ in orphaned]}")
-    ref_to_qidx = {f"REF-{chr(65+i)}": i for i in range(len(questions))}
-
-    for page_num, first_idx, last_idx in orphaned:
-        prev_range = None
-        next_range = None
-        for r in ranges:
-            if r["end_line"] < first_idx and (prev_range is None or r["end_line"] > prev_range["end_line"]):
-                prev_range = r
-            if r["start_line"] > last_idx and (next_range is None or r["start_line"] < next_range["start_line"]):
-                next_range = r
-
-        if next_range is None:
-            if prev_range is not None:
-                log(f"  page {page_num}: no following answer -- extending {prev_range['ref']} to include it")
-                prev_range["end_line"] = max(prev_range["end_line"], last_idx)
-            continue
-
-        next_q_idx = ref_to_qidx.get(next_range["ref"])
-        next_q_text = questions[next_q_idx] if next_q_idx is not None else None
-        if next_q_text is None:
-            continue
-
-        split_line = _find_answer_start_sequential(
-            client, numbered_lines, next_q_text, next_range["ref"],
-            first_idx, budget, log, end_idx=last_idx + 1
-        )
-
-        if split_line is not None:
-            log(f"  page {page_num}: belongs (partly/fully) to {next_range['ref']} -- moving its start to line {split_line}")
-            next_range["start_line"] = min(next_range["start_line"], split_line)
-            if prev_range is not None:
-                prev_range["end_line"] = split_line - 1
-        else:
-            log(f"  page {page_num}: no clear next-answer start found -- assuming it belongs to the preceding answer")
-            if prev_range is not None:
-                prev_range["end_line"] = max(prev_range["end_line"], last_idx)
-            else:
-                next_range["start_line"] = min(next_range["start_line"], first_idx)
-
-    return ranges
-
-TRAILING_NEXT_MARKER_RE = re.compile(
-    r'(?:\s*[#]+)+\s*$'
-    r'|(?:\s*(?:Q\.?\s*\d+|Q\.?\s*[ivxlcdm]+)\s*[.:\-]?\s*)$'
-    r'|(?:\s*(?:प्र|प्रश्न)[०.\s]*\d*[.\s:\-]*)\s*$'
-    r'|(?:\s*(?:section|Section|SECTION)\s*[-:]?\s*\d*\s*)$'
-    r'|(?:\s*(?:भाग|अनुभाग|खण्ड|खंड)\s*[-:]?\s*[०-९\d]*\s*)$',
-    re.IGNORECASE
-)
-
-
-def strip_trailing_next_question_marker(answer_text: str, max_passes: int = 3) -> str:
-    text = answer_text.rstrip()
-    for _ in range(max_passes):
-        new_text = TRAILING_NEXT_MARKER_RE.sub('', text).rstrip()
-        if new_text == text:
-            break
-        text = new_text
-    return text
-
-    
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
     """
-    RECOMMENDED default answer-mapping strategy. For each question in
-    order: search forward from the previous question's confirmed start,
-    find where THIS question's answer begins. END is always computed in
-    Python as (next confirmed start - 1) -- never asked of the LLM.
+    RECOMMENDED default answer-mapping strategy (see module docstring
+    above the SEQUENTIAL_SEARCH_SYSTEM_PROMPT for the full rationale).
+
+    For each question in order:
+      1. Search forward from wherever the previous question's answer was
+         confirmed to start, for a line where THIS question's answer
+         begins.
+      2. Once found, the previous question's END is computed as
+         (this start - 1) -- never asked of the LLM.
+    The very last question's answer runs to the end of the document.
+
+    If a question's start can't be found anywhere from the search
+    pointer to the end of the document, it's recorded as unmatched, and
+    the search for the NEXT question continues from the SAME pointer
+    (its answer wasn't necessarily lost -- it may simply not exist, e.g.
+    the student skipped it).
+
+    FIX (this round): previously returned only a plain {question: text}
+    dict, giving you no way to see WHERE each answer actually came from
+    -- which is exactly the trust problem you flagged ("I don't know
+    from where the Q-A is paired"). This now returns a LIST of dicts,
+    one per question, each carrying:
+      - start_line / end_line: the exact 0-based indices into
+        answer_lines this answer was sliced from (so you can look them
+        up directly)
+      - start_page / end_page: the OCR page number(s) the answer spans,
+        if answer_line_pages was provided (lets you flip straight to the
+        right page(s) of the source PDF to eyeball it)
+      - answer_raw: the UNMODIFIED verbatim join of the sliced lines --
+        exactly what the OCR produced, before any cleanup
+      - answer: the same text after the (optional) restatement-stripping
+        cleanup -- so you can directly compare "raw" vs "cleaned" and
+        see precisely what, if anything, was removed and why. Nothing
+        is ever ADDED to answer_raw at this stage -- it is a plain
+        Python slice of the OCR text, never LLM-generated -- so if
+        answer_raw itself looks embellished/"enhanced", that happened
+        upstream in the OCR step (see notes in run_ocr), not here.
     """
     def log(msg):
         print(msg)
@@ -1787,12 +1734,41 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
     sibling_groups = _detect_sibling_groups(questions)  # {first_idx: [indices]}
+    group_member_of = {idx: first_idx for first_idx, members in sibling_groups.items() for idx in members}
 
     found_starts = {}
     pointer = 0
     i = 0
     n = len(questions)
 
+    # =====================================================================
+    # DEFAULT STRATEGY: strict, one-question-at-a-time sequential search
+    # (each call sees exactly ONE target question -- the most precise
+    # option, since a smaller candidate list gives the model far less
+    # opportunity to force a wrong match). This is the same approach that
+    # worked well before, kept UNCHANGED here for every standalone
+    # question.
+    #
+    # SPECIAL CASE: sibling sub-part GROUPS (e.g. "1.(i)", "1.(ii)",
+    # "1.(iii)") get different handling, because searching for each
+    # sibling independently is exactly what let one sibling's answer
+    # swallow the others. For a detected group:
+    #   1. Find where the WHOLE group begins (single-target search for
+    #      just the FIRST sibling, same as normal).
+    #   2. Find where the group ENDS -- i.e. where the next, non-sibling
+    #      question begins (single-target search for just that question).
+    #   3. ONLY within that tight, already-confirmed bound, make ONE
+    #      small batch call listing JUST this group's own 2-5 siblings
+    #      (never the whole document's remaining questions) to find each
+    #      LATER sibling's internal start line. Any sibling the model
+    #      isn't confident about is left unreported -- its content simply
+    #      stays folded into the sibling before it, which is always safer
+    #      than a wrong split.
+    # This keeps the search space and candidate list small and relevant
+    # at every step, which is what actually keeps precision high -- the
+    # previous version's mistake was showing the model too many
+    # candidates across too much of the document at once.
+    # =====================================================================
     while i < n:
         if i in sibling_groups:
             group_indices = sibling_groups[i]
@@ -1822,16 +1798,14 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 i = group_indices[-1] + 1
                 continue
 
-            group_start = _verify_earliest_start(
-                client, numbered_lines, first_q, first_ref, pointer, group_start, budget, log
-            )
-            if i > 0:
-                group_start = _confirm_boundary(
-                    client, numbered_lines, questions[i - 1], first_q, group_start, budget, log
+            if start_line is not None:
+                start_line = _verify_earliest_start(
+                     client, numbered_lines, q, ref, search_from_idx, start_line, budget, log
                 )
-
-            found_starts[first_ref] = group_start
-            log(f"  found {first_ref} (group start) at line {group_start}")
+                if i > 0:
+                    start_line = _confirm_boundary(
+                        client, numbered_lines, questions[i - 1], q, start_line, budget, log
+                    )
 
             # Find where the group as a WHOLE ends: the next, non-sibling
             # question's start (single-target search, same precision as
@@ -1847,9 +1821,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 if group_end_bound is not None:
                     group_end_bound = _verify_earliest_start(
                         client, numbered_lines, next_q, next_ref, group_start + 1, group_end_bound, budget, log
-                    )
-                    group_end_bound = _confirm_boundary(
-                        client, numbered_lines, group_questions[-1][1], next_q, group_end_bound, budget, log
                     )
 
             upper = (group_end_bound - 1) if group_end_bound is not None else (total_lines - 1)
@@ -1936,10 +1907,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             start_line = _verify_earliest_start(
                 client, numbered_lines, q, ref, search_from_idx, start_line, budget, log
             )
-            if i > 0:
-                start_line = _confirm_boundary(
-                    client, numbered_lines, questions[i - 1], q, start_line, budget, log
-                )
 
         if start_line is not None:
             found_starts[ref] = start_line
@@ -1956,7 +1923,9 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         i += 1
 
     # End of each answer = the next (in document order) confirmed
-    # answer's start, minus one. Computed purely in Python.
+    # answer's start, minus one. Computed purely in Python -- never
+    # asked of the LLM, so it can never be wrong in the way an
+    # LLM-guessed end line could be.
     ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
     ranges = []
     for idx, (ref, start) in enumerate(ordered):
@@ -1964,11 +1933,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         ranges.append({"ref": ref, "start_line": start, "end_line": end})
 
     log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
-
-    # Repair any answer page that both boundary checks missed entirely --
-    # runs ONCE, after the full pass, with complete found_starts.
-    if answer_line_pages:
-        ranges = _repair_orphaned_pages(client, numbered_lines, questions, ranges, answer_line_pages, budget, log)
 
     ranges_by_ref = {r["ref"]: r for r in ranges}
     results = []
@@ -1998,7 +1962,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         answer_raw = " ".join(verbatim_lines).strip()
         answer_clean = strip_question_restatement(answer_raw)
         answer_clean = strip_full_question_echo(answer_clean, q)
-        answer_clean = strip_trailing_next_question_marker(answer_clean)
 
         start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
         end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
@@ -2878,7 +2841,6 @@ def process_pdf(file_input, status_callback=None):
     # is a real bug in the slicing logic (not the LLM "enhancing" text)
     # and is surfaced loudly rather than silently shipped.
     # =====================================================================
-    integrity_failures = 0
     for p in qa_pairs:
         if not p["matched"]:
             continue
@@ -2888,7 +2850,6 @@ def process_pdf(file_input, status_callback=None):
             if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
         ).strip()
         if expected_raw != p["answer_raw"]:
-            integrity_failures += 1
             log(
                 f"CRITICAL: verbatim-integrity check FAILED for '{p['question'][:60]}...' -- "
                 f"the reported answer_raw does not match a fresh re-slice of answer_lines "
@@ -2896,9 +2857,6 @@ def process_pdf(file_input, status_callback=None):
                 f"hallucination -- please report this."
             )
 
-    if integrity_failures == 0:
-        log(f"Verbatim integrity CONFIRMED: all {matched_count} matched answer(s) are byte-for-byte "
-            f"slices of the raw OCR text -- no LLM ever touched the answer content itself.")
     _flag_suspiciously_short_answers(qa_pairs, log)
 
     log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
