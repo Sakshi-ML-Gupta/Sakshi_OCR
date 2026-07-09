@@ -123,7 +123,8 @@ if (
         st.session_state.result = (ocr_json, qa_pairs)
 
     except Exception as e:
-        st.session_state.error = str(e)
+        import traceback
+        st.session_state.error = f"{e}\n\n```\n{traceback.format_exc()}\n```"
 
     finally:
         st.session_state.is_processing = False
