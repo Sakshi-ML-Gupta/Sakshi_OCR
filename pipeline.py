@@ -1673,23 +1673,15 @@ def _resolve_sibling_group_batch(client, numbered_lines: list, group_questions: 
 
     return found
 
+
 def _find_orphaned_answer_pages(ranges: list, answer_line_pages: list, total_lines: int) -> list:
-    """
-    Detects OCR pages that are covered by NO matched answer range at all --
-    i.e. both the preceding AND following boundary search missed it. This
-    is the case that survives _confirm_boundary (which only checks a small
-    radius around an ALREADY-proposed boundary and won't fire if both
-    neighboring answers agree on excluding a whole page in between).
-    """
     if not answer_line_pages:
         return []
-
     covered = [False] * total_lines
     for r in ranges:
         for j in range(r["start_line"], r["end_line"] + 1):
             if 0 <= j < total_lines:
                 covered[j] = True
-
     from itertools import groupby
     orphaned = []
     for page_num, group in groupby(range(total_lines), key=lambda j: answer_line_pages[j]):
@@ -1701,21 +1693,12 @@ def _find_orphaned_answer_pages(ranges: list, answer_line_pages: list, total_lin
 
 def _repair_orphaned_pages(client, numbered_lines: list, questions: list, ranges: list,
                              answer_line_pages: list, budget: "_TokenBudgetTracker", log) -> list:
-    """
-    Finds pages covered by NO answer range and repairs them by running a
-    scoped search (bounded exactly to that page) for the NEXT question's
-    genuine start within it. If found, splits the page between the two
-    neighboring answers at that point. If not found, the page is assumed
-    to belong entirely to the PRECEDING answer (safer default than
-    guessing a wrong split).
-    """
     total_lines = len(numbered_lines)
     orphaned = _find_orphaned_answer_pages(ranges, answer_line_pages, total_lines)
     if not orphaned:
         return ranges
 
     log(f"WARNING: {len(orphaned)} answer page(s) not covered by any matched range -- repairing: {[p for p, _, _ in orphaned]}")
-
     ref_to_qidx = {f"REF-{chr(65+i)}": i for i in range(len(questions))}
 
     for page_num, first_idx, last_idx in orphaned:
@@ -1768,16 +1751,6 @@ TRAILING_NEXT_MARKER_RE = re.compile(
 
 
 def strip_trailing_next_question_marker(answer_text: str, max_passes: int = 3) -> str:
-    """
-    Even when start/end LINE boundaries are correct, the OCR'd text on the
-    boundary line itself sometimes has the NEXT question's label leaked
-    onto the same line/paragraph as the previous answer's last sentence
-    (e.g. "...निबंध पूर्ण होता है। प्र.6"). Since boundaries work at line
-    granularity, this trailing fragment survives inside the assembled
-    answer. This strips it ONLY from the END -- never touches the middle
-    of genuine answer content -- run repeatedly since more than one stray
-    marker can be stacked (e.g. "...उत्तर पूर्ण। # Q.7").
-    """
     text = answer_text.rstrip()
     for _ in range(max_passes):
         new_text = TRAILING_NEXT_MARKER_RE.sub('', text).rstrip()
@@ -1785,47 +1758,15 @@ def strip_trailing_next_question_marker(answer_text: str, max_passes: int = 3) -
             break
         text = new_text
     return text
+
     
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
     """
-    RECOMMENDED default answer-mapping strategy (see module docstring
-    above the SEQUENTIAL_SEARCH_SYSTEM_PROMPT for the full rationale).
-
-    For each question in order:
-      1. Search forward from wherever the previous question's answer was
-         confirmed to start, for a line where THIS question's answer
-         begins.
-      2. Once found, the previous question's END is computed as
-         (this start - 1) -- never asked of the LLM.
-    The very last question's answer runs to the end of the document.
-
-    If a question's start can't be found anywhere from the search
-    pointer to the end of the document, it's recorded as unmatched, and
-    the search for the NEXT question continues from the SAME pointer
-    (its answer wasn't necessarily lost -- it may simply not exist, e.g.
-    the student skipped it).
-
-    FIX (this round): previously returned only a plain {question: text}
-    dict, giving you no way to see WHERE each answer actually came from
-    -- which is exactly the trust problem you flagged ("I don't know
-    from where the Q-A is paired"). This now returns a LIST of dicts,
-    one per question, each carrying:
-      - start_line / end_line: the exact 0-based indices into
-        answer_lines this answer was sliced from (so you can look them
-        up directly)
-      - start_page / end_page: the OCR page number(s) the answer spans,
-        if answer_line_pages was provided (lets you flip straight to the
-        right page(s) of the source PDF to eyeball it)
-      - answer_raw: the UNMODIFIED verbatim join of the sliced lines --
-        exactly what the OCR produced, before any cleanup
-      - answer: the same text after the (optional) restatement-stripping
-        cleanup -- so you can directly compare "raw" vs "cleaned" and
-        see precisely what, if anything, was removed and why. Nothing
-        is ever ADDED to answer_raw at this stage -- it is a plain
-        Python slice of the OCR text, never LLM-generated -- so if
-        answer_raw itself looks embellished/"enhanced", that happened
-        upstream in the OCR step (see notes in run_ocr), not here.
+    RECOMMENDED default answer-mapping strategy. For each question in
+    order: search forward from the previous question's confirmed start,
+    find where THIS question's answer begins. END is always computed in
+    Python as (next confirmed start - 1) -- never asked of the LLM.
     """
     def log(msg):
         print(msg)
@@ -1846,41 +1787,12 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
     sibling_groups = _detect_sibling_groups(questions)  # {first_idx: [indices]}
-    group_member_of = {idx: first_idx for first_idx, members in sibling_groups.items() for idx in members}
 
     found_starts = {}
     pointer = 0
     i = 0
     n = len(questions)
 
-    # =====================================================================
-    # DEFAULT STRATEGY: strict, one-question-at-a-time sequential search
-    # (each call sees exactly ONE target question -- the most precise
-    # option, since a smaller candidate list gives the model far less
-    # opportunity to force a wrong match). This is the same approach that
-    # worked well before, kept UNCHANGED here for every standalone
-    # question.
-    #
-    # SPECIAL CASE: sibling sub-part GROUPS (e.g. "1.(i)", "1.(ii)",
-    # "1.(iii)") get different handling, because searching for each
-    # sibling independently is exactly what let one sibling's answer
-    # swallow the others. For a detected group:
-    #   1. Find where the WHOLE group begins (single-target search for
-    #      just the FIRST sibling, same as normal).
-    #   2. Find where the group ENDS -- i.e. where the next, non-sibling
-    #      question begins (single-target search for just that question).
-    #   3. ONLY within that tight, already-confirmed bound, make ONE
-    #      small batch call listing JUST this group's own 2-5 siblings
-    #      (never the whole document's remaining questions) to find each
-    #      LATER sibling's internal start line. Any sibling the model
-    #      isn't confident about is left unreported -- its content simply
-    #      stays folded into the sibling before it, which is always safer
-    #      than a wrong split.
-    # This keeps the search space and candidate list small and relevant
-    # at every step, which is what actually keeps precision high -- the
-    # previous version's mistake was showing the model too many
-    # candidates across too much of the document at once.
-    # =====================================================================
     while i < n:
         if i in sibling_groups:
             group_indices = sibling_groups[i]
@@ -1910,14 +1822,16 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 i = group_indices[-1] + 1
                 continue
 
-            if start_line is not None:
-                start_line = _verify_earliest_start(
-                     client, numbered_lines, q, ref, search_from_idx, start_line, budget, log
+            group_start = _verify_earliest_start(
+                client, numbered_lines, first_q, first_ref, pointer, group_start, budget, log
+            )
+            if i > 0:
+                group_start = _confirm_boundary(
+                    client, numbered_lines, questions[i - 1], first_q, group_start, budget, log
                 )
-                if i > 0:
-                    start_line = _confirm_boundary(
-                        client, numbered_lines, questions[i - 1], q, start_line, budget, log
-                    )
+
+            found_starts[first_ref] = group_start
+            log(f"  found {first_ref} (group start) at line {group_start}")
 
             # Find where the group as a WHOLE ends: the next, non-sibling
             # question's start (single-target search, same precision as
@@ -1934,20 +1848,12 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                     group_end_bound = _verify_earliest_start(
                         client, numbered_lines, next_q, next_ref, group_start + 1, group_end_bound, budget, log
                     )
+                    group_end_bound = _confirm_boundary(
+                        client, numbered_lines, group_questions[-1][1], next_q, group_end_bound, budget, log
+                    )
 
             upper = (group_end_bound - 1) if group_end_bound is not None else (total_lines - 1)
 
-            ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
-            ranges = []
-            for idx, (ref, start) in enumerate(ordered):
-                end = ordered[idx + 1][1] - 1 if idx + 1 < len(ordered) else total_lines - 1
-                ranges.append({"ref": ref, "start_line": start, "end_line": end})
-
-            log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
-
-    # NEW: repair any answer page that both boundary checks missed entirely
-            if answer_line_pages:
-                 ranges = _repair_orphaned_pages(client, numbered_lines, questions, ranges, answer_line_pages, budget, log)
             # Narrow, bounded batch call -- ONLY this group's own siblings,
             # ONLY within [group_start, upper].
             if len(group_questions) > 1:
@@ -2030,6 +1936,10 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             start_line = _verify_earliest_start(
                 client, numbered_lines, q, ref, search_from_idx, start_line, budget, log
             )
+            if i > 0:
+                start_line = _confirm_boundary(
+                    client, numbered_lines, questions[i - 1], q, start_line, budget, log
+                )
 
         if start_line is not None:
             found_starts[ref] = start_line
@@ -2046,9 +1956,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         i += 1
 
     # End of each answer = the next (in document order) confirmed
-    # answer's start, minus one. Computed purely in Python -- never
-    # asked of the LLM, so it can never be wrong in the way an
-    # LLM-guessed end line could be.
+    # answer's start, minus one. Computed purely in Python.
     ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
     ranges = []
     for idx, (ref, start) in enumerate(ordered):
@@ -2056,6 +1964,11 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         ranges.append({"ref": ref, "start_line": start, "end_line": end})
 
     log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
+
+    # Repair any answer page that both boundary checks missed entirely --
+    # runs ONCE, after the full pass, with complete found_starts.
+    if answer_line_pages:
+        ranges = _repair_orphaned_pages(client, numbered_lines, questions, ranges, answer_line_pages, budget, log)
 
     ranges_by_ref = {r["ref"]: r for r in ranges}
     results = []
@@ -2085,7 +1998,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         answer_raw = " ".join(verbatim_lines).strip()
         answer_clean = strip_question_restatement(answer_raw)
         answer_clean = strip_full_question_echo(answer_clean, q)
-        answer_clean = strip_trailing_next_question_marker(answer_clean)   # <-- NEW
+        answer_clean = strip_trailing_next_question_marker(answer_clean)
 
         start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
         end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
