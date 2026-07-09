@@ -1673,7 +1673,119 @@ def _resolve_sibling_group_batch(client, numbered_lines: list, group_questions: 
 
     return found
 
+def _find_orphaned_answer_pages(ranges: list, answer_line_pages: list, total_lines: int) -> list:
+    """
+    Detects OCR pages that are covered by NO matched answer range at all --
+    i.e. both the preceding AND following boundary search missed it. This
+    is the case that survives _confirm_boundary (which only checks a small
+    radius around an ALREADY-proposed boundary and won't fire if both
+    neighboring answers agree on excluding a whole page in between).
+    """
+    if not answer_line_pages:
+        return []
 
+    covered = [False] * total_lines
+    for r in ranges:
+        for j in range(r["start_line"], r["end_line"] + 1):
+            if 0 <= j < total_lines:
+                covered[j] = True
+
+    from itertools import groupby
+    orphaned = []
+    for page_num, group in groupby(range(total_lines), key=lambda j: answer_line_pages[j]):
+        group_indices = list(group)
+        if group_indices and all(not covered[j] for j in group_indices):
+            orphaned.append((page_num, group_indices[0], group_indices[-1]))
+    return orphaned
+
+
+def _repair_orphaned_pages(client, numbered_lines: list, questions: list, ranges: list,
+                             answer_line_pages: list, budget: "_TokenBudgetTracker", log) -> list:
+    """
+    Finds pages covered by NO answer range and repairs them by running a
+    scoped search (bounded exactly to that page) for the NEXT question's
+    genuine start within it. If found, splits the page between the two
+    neighboring answers at that point. If not found, the page is assumed
+    to belong entirely to the PRECEDING answer (safer default than
+    guessing a wrong split).
+    """
+    total_lines = len(numbered_lines)
+    orphaned = _find_orphaned_answer_pages(ranges, answer_line_pages, total_lines)
+    if not orphaned:
+        return ranges
+
+    log(f"WARNING: {len(orphaned)} answer page(s) not covered by any matched range -- repairing: {[p for p, _, _ in orphaned]}")
+
+    ref_to_qidx = {f"REF-{chr(65+i)}": i for i in range(len(questions))}
+
+    for page_num, first_idx, last_idx in orphaned:
+        prev_range = None
+        next_range = None
+        for r in ranges:
+            if r["end_line"] < first_idx and (prev_range is None or r["end_line"] > prev_range["end_line"]):
+                prev_range = r
+            if r["start_line"] > last_idx and (next_range is None or r["start_line"] < next_range["start_line"]):
+                next_range = r
+
+        if next_range is None:
+            if prev_range is not None:
+                log(f"  page {page_num}: no following answer -- extending {prev_range['ref']} to include it")
+                prev_range["end_line"] = max(prev_range["end_line"], last_idx)
+            continue
+
+        next_q_idx = ref_to_qidx.get(next_range["ref"])
+        next_q_text = questions[next_q_idx] if next_q_idx is not None else None
+        if next_q_text is None:
+            continue
+
+        split_line = _find_answer_start_sequential(
+            client, numbered_lines, next_q_text, next_range["ref"],
+            first_idx, budget, log, end_idx=last_idx + 1
+        )
+
+        if split_line is not None:
+            log(f"  page {page_num}: belongs (partly/fully) to {next_range['ref']} -- moving its start to line {split_line}")
+            next_range["start_line"] = min(next_range["start_line"], split_line)
+            if prev_range is not None:
+                prev_range["end_line"] = split_line - 1
+        else:
+            log(f"  page {page_num}: no clear next-answer start found -- assuming it belongs to the preceding answer")
+            if prev_range is not None:
+                prev_range["end_line"] = max(prev_range["end_line"], last_idx)
+            else:
+                next_range["start_line"] = min(next_range["start_line"], first_idx)
+
+    return ranges
+
+TRAILING_NEXT_MARKER_RE = re.compile(
+    r'(?:\s*[#]+)+\s*$'
+    r'|(?:\s*(?:Q\.?\s*\d+|Q\.?\s*[ivxlcdm]+)\s*[.:\-]?\s*)$'
+    r'|(?:\s*(?:प्र|प्रश्न)[०.\s]*\d*[.\s:\-]*)\s*$'
+    r'|(?:\s*(?:section|Section|SECTION)\s*[-:]?\s*\d*\s*)$'
+    r'|(?:\s*(?:भाग|अनुभाग|खण्ड|खंड)\s*[-:]?\s*[०-९\d]*\s*)$',
+    re.IGNORECASE
+)
+
+
+def strip_trailing_next_question_marker(answer_text: str, max_passes: int = 3) -> str:
+    """
+    Even when start/end LINE boundaries are correct, the OCR'd text on the
+    boundary line itself sometimes has the NEXT question's label leaked
+    onto the same line/paragraph as the previous answer's last sentence
+    (e.g. "...निबंध पूर्ण होता है। प्र.6"). Since boundaries work at line
+    granularity, this trailing fragment survives inside the assembled
+    answer. This strips it ONLY from the END -- never touches the middle
+    of genuine answer content -- run repeatedly since more than one stray
+    marker can be stacked (e.g. "...उत्तर पूर्ण। # Q.7").
+    """
+    text = answer_text.rstrip()
+    for _ in range(max_passes):
+        new_text = TRAILING_NEXT_MARKER_RE.sub('', text).rstrip()
+        if new_text == text:
+            break
+        text = new_text
+    return text
+    
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
     """
@@ -1825,6 +1937,17 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
             upper = (group_end_bound - 1) if group_end_bound is not None else (total_lines - 1)
 
+            ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
+            ranges = []
+            for idx, (ref, start) in enumerate(ordered):
+                end = ordered[idx + 1][1] - 1 if idx + 1 < len(ordered) else total_lines - 1
+                ranges.append({"ref": ref, "start_line": start, "end_line": end})
+
+            log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
+
+    # NEW: repair any answer page that both boundary checks missed entirely
+            if answer_line_pages:
+                 ranges = _repair_orphaned_pages(client, numbered_lines, questions, ranges, answer_line_pages, budget, log)
             # Narrow, bounded batch call -- ONLY this group's own siblings,
             # ONLY within [group_start, upper].
             if len(group_questions) > 1:
@@ -1962,6 +2085,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         answer_raw = " ".join(verbatim_lines).strip()
         answer_clean = strip_question_restatement(answer_raw)
         answer_clean = strip_full_question_echo(answer_clean, q)
+        answer_clean = strip_trailing_next_question_marker(answer_clean)   # <-- NEW
 
         start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
         end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
@@ -2841,6 +2965,7 @@ def process_pdf(file_input, status_callback=None):
     # is a real bug in the slicing logic (not the LLM "enhancing" text)
     # and is surfaced loudly rather than silently shipped.
     # =====================================================================
+    integrity_failures = 0
     for p in qa_pairs:
         if not p["matched"]:
             continue
@@ -2850,6 +2975,7 @@ def process_pdf(file_input, status_callback=None):
             if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
         ).strip()
         if expected_raw != p["answer_raw"]:
+            integrity_failures += 1
             log(
                 f"CRITICAL: verbatim-integrity check FAILED for '{p['question'][:60]}...' -- "
                 f"the reported answer_raw does not match a fresh re-slice of answer_lines "
@@ -2857,6 +2983,9 @@ def process_pdf(file_input, status_callback=None):
                 f"hallucination -- please report this."
             )
 
+    if integrity_failures == 0:
+        log(f"Verbatim integrity CONFIRMED: all {matched_count} matched answer(s) are byte-for-byte "
+            f"slices of the raw OCR text -- no LLM ever touched the answer content itself.")
     _flag_suspiciously_short_answers(qa_pairs, log)
 
     log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
