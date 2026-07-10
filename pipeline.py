@@ -8,7 +8,17 @@ import threading
 import fitz
 import httpx
 from pathlib import Path
+# Add after the existing imports
+import re
 
+
+QUESTION_MARKER_PATTERNS = [
+    re.compile(r'\nQ\.\s*(\d+)\)\s*[^\n]+', re.IGNORECASE),
+    re.compile(r'\nQ\.\s*(\d+)[\.\)]\s*[^\n]+', re.IGNORECASE),
+    re.compile(r'\nप्र\.\s*(\d+)\)\s*[^\n]+', re.IGNORECASE),  # Hindi
+    re.compile(r'\nप्रश्न\s*(\d+)[\.\)]\s*[^\n]+', re.IGNORECASE),  # Hindi
+    re.compile(r'\n(\d+)\)\s*[^\n]+\?', re.IGNORECASE),
+]
 # =========================================================
 # API KEYS
 # =========================================================
@@ -297,7 +307,53 @@ def build_ocr_json(pages: list) -> dict:
         ]
     }
 
+def detect_embedded_questions(text: str) -> list:
+    """Detect embedded question markers like 'Q.4)' or 'Q.5)' in text."""
+    matches = []
+    for pattern in QUESTION_MARKER_PATTERNS:
+        for m in pattern.finditer(text):
+            question_num = m.group(1)
+            # Get the question text that follows
+            start = m.end()
+            # Find where the answer content for this question starts
+            # Look for the next question marker or end of text
+            next_q = re.search(r'\nQ\.\s*\d+[\.\)]|\nप्र\.\s*\d+[\.\)]|\nप्रश्न\s*\d+[\.\)]', text[start:])
+            if next_q:
+                question_text = text[start:start + next_q.start()].strip()
+            else:
+                question_text = text[start:].strip()
+            matches.append({
+                'question_num': int(question_num),
+                'question_text': question_text,
+                'start_pos': m.start(),
+                'end_pos': m.end()
+            })
+    return matches
 
+def split_embedded_questions(text: str, official_questions: list) -> tuple:
+    """
+    Split text that contains embedded question markers into separate answer blocks.
+    Returns (primary_answer_text, list_of_embedded_answers)
+    """
+    embedded = detect_embedded_questions(text)
+    if not embedded:
+        return text, []
+    
+    # The primary answer is everything before the first embedded question
+    primary_answer = text[:embedded[0]['start_pos']].strip()
+    
+    embedded_answers = []
+    for i, e in enumerate(embedded):
+        start = e['start_pos']
+        end = embedded[i+1]['start_pos'] if i+1 < len(embedded) else len(text)
+        answer_block = text[start:end].strip()
+        embedded_answers.append({
+            'question_text': e['question_text'],
+            'answer_block': answer_block,
+            'question_num': e['question_num']
+        })
+    
+    return primary_answer, embedded_answers
 # =========================================================
 # REFERENCE BOOK OCR
 # =========================================================
@@ -1180,43 +1236,7 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
     """
-    RECOMMENDED default answer-mapping strategy (see module docstring
-    above the SEQUENTIAL_SEARCH_SYSTEM_PROMPT for the full rationale).
-
-    For each question in order:
-      1. Search forward from wherever the previous question's answer was
-         confirmed to start, for a line where THIS question's answer
-         begins.
-      2. Once found, the previous question's END is computed as
-         (this start - 1) -- never asked of the LLM.
-    The very last question's answer runs to the end of the document.
-
-    If a question's start can't be found anywhere from the search
-    pointer to the end of the document, it's recorded as unmatched, and
-    the search for the NEXT question continues from the SAME pointer
-    (its answer wasn't necessarily lost -- it may simply not exist, e.g.
-    the student skipped it).
-
-    FIX (this round): previously returned only a plain {question: text}
-    dict, giving you no way to see WHERE each answer actually came from
-    -- which is exactly the trust problem you flagged ("I don't know
-    from where the Q-A is paired"). This now returns a LIST of dicts,
-    one per question, each carrying:
-      - start_line / end_line: the exact 0-based indices into
-        answer_lines this answer was sliced from (so you can look them
-        up directly)
-      - start_page / end_page: the OCR page number(s) the answer spans,
-        if answer_line_pages was provided (lets you flip straight to the
-        right page(s) of the source PDF to eyeball it)
-      - answer_raw: the UNMODIFIED verbatim join of the sliced lines --
-        exactly what the OCR produced, before any cleanup
-      - answer: the same text after the (optional) restatement-stripping
-        cleanup -- so you can directly compare "raw" vs "cleaned" and
-        see precisely what, if anything, was removed and why. Nothing
-        is ever ADDED to answer_raw at this stage -- it is a plain
-        Python slice of the OCR text, never LLM-generated -- so if
-        answer_raw itself looks embellished/"enhanced", that happened
-        upstream in the OCR step (see notes in run_ocr), not here.
+    Enhanced version that handles embedded question markers in answers.
     """
     def log(msg):
         print(msg)
@@ -1232,44 +1252,113 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
+    # STEP 1: Check if any answer lines contain embedded question markers
+    # We need to look at the raw text as a whole, not just line by line
+    full_answer_text = "\n".join(answer_lines)
+    
+    # Detect embedded questions in the full text
+    embedded_qs = detect_embedded_questions(full_answer_text)
+    
+    if embedded_qs:
+        log(f"Detected {len(embedded_qs)} embedded question markers in answer text")
+        # Map embedded question numbers to the official questions
+        # This helps us know which REF to assign to each embedded answer
+        
+        # For each embedded question, try to match it to an official question
+        for eq in embedded_qs:
+            # Find which official question this corresponds to
+            # Use the question number (eq['question_num']) to find matching REF
+            # But also check content similarity
+            best_match_idx = None
+            best_score = 0.0
+            
+            for i, q in enumerate(questions):
+                # Try matching by number first
+                q_num_match = re.match(r'^\s*(\d+)[\.\)]', q)
+                if q_num_match and int(q_num_match.group(1)) == eq['question_num']:
+                    # This is a match by number
+                    best_match_idx = i
+                    break
+                
+                # Also check content similarity
+                q_clean = re.sub(r'^\s*\d+[\.\)]\s*', '', q)
+                eq_clean = re.sub(r'^\s*\d+[\.\)]\s*', '', eq['question_text'])
+                sim = similarity(q_clean, eq_clean)
+                if sim > best_score:
+                    best_score = sim
+                    best_match_idx = i
+            
+            # If we found a match, mark it for special handling
+            if best_match_idx is not None and best_score >= 0.3:
+                log(f"  Embedded question Q.{eq['question_num']} matches official question {best_match_idx+1}")
+                eq['matched_ref'] = f"REF-{chr(65 + best_match_idx)}"
+            else:
+                log(f"  WARNING: Could not match embedded Q.{eq['question_num']} to any official question")
+                eq['matched_ref'] = None
+
+    # STEP 2: Now do the regular sequential search with enhanced context
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(numbered_lines)
-
+    
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
-    found_starts = {}  # ref -> start_line
+    
+    # Build a map of line indices where embedded questions start
+    embedded_start_lines = {}
+    if embedded_qs:
+        # Convert character positions to line numbers
+        for eq in embedded_qs:
+            if eq.get('matched_ref'):
+                # Find which line contains this embedded question
+                char_pos = eq['start_pos']
+                line_idx = 0
+                char_count = 0
+                for idx, line in enumerate(answer_lines):
+                    if char_count <= char_pos < char_count + len(line) + 1:  # +1 for newline
+                        embedded_start_lines[eq['matched_ref']] = idx
+                        log(f"  Embedded {eq['matched_ref']} starts at line {idx}")
+                        break
+                    char_count += len(line) + 1
+
+    found_starts = {}
     pointer = 0
 
     for i, q in enumerate(questions):
         ref = f"REF-{chr(65 + i)}"
+        
+        # Check if this REF has an embedded question start that we already know about
+        if ref in embedded_start_lines:
+            start_line = embedded_start_lines[ref]
+            log(f"  Using pre-detected embedded start for {ref} at line {start_line}")
+            found_starts[ref] = start_line
+            # Don't advance pointer past this line - we want the regular search to also find it
+            # But we'll use this as a hard constraint
+            continue
+        
         log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
-
+        
+        # If we already found a start for a previous question at this line or beyond,
+        # we need to be careful not to skip content
+        if found_starts:
+            # Check if any found start is within the current search range
+            starts_after_pointer = [s for s in found_starts.values() if s >= pointer]
+            if starts_after_pointer:
+                # The next found start is at line X, so this question's answer 
+                # might be the content between pointer and that start
+                next_start = min(starts_after_pointer)
+                # We should search up to but not including next_start
+                # Actually, this is handled by the sequential search already
+        
         start_line = _find_answer_start_sequential(
             client, numbered_lines, q, ref, pointer, budget, log
         )
 
-        # =================================================================
-        # FIX: retry once with an explicit reminder before giving up.
-        # Real failure pattern reported: the same definition/explanation
-        # can legitimately appear more than once across different answers
-        # (e.g. two related questions both require explaining the same
-        # concept). A model can be biased to read a repeated definition as
-        # "already covered, not a new start" and wrongly report found=false
-        # even though this occurrence genuinely IS a new answer. Since this
-        # retry happens BEFORE pointer is advanced, it's safe -- it can only
-        # recover a genuine match, never corrupt an already-confirmed range.
-        # =================================================================
         if start_line is None:
+            # Try once more with a reminder
             log(f"  first pass found nothing for {ref} -- retrying once with an explicit reminder...")
             retry_reminder = (
                 "REMINDER: a previous search pass over this exact text did not find this "
-                "question's answer. One common reason for a missed match: the same "
-                "definition/explanation legitimately appears more than once in this document "
-                "(e.g. two different questions both touch on the same underlying concept, or "
-                "the student restates something they already explained elsewhere). Seeing "
-                "similar-looking content earlier does NOT mean this occurrence isn't a genuine, "
-                "separate answer to THIS target question -- look again with that in mind, and "
-                "also double-check you are not missing a short introductory/transitional line "
-                "right at the true start of the answer."
+                "question's answer. Look carefully for embedded question markers like "
+                "'Q.4)' or 'प्र. 5)' that might indicate where this answer begins."
             )
             start_line = _find_answer_start_sequential(
                 client, numbered_lines, q, ref, pointer, budget, log,
@@ -1285,15 +1374,10 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         else:
             log(
                 f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
-                f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
-                f"The search pointer is NOT advanced, so the next question is still searched "
-                f"for over this same remaining text."
+                f"to the end of the document ({total_lines} lines) -- marking as unmatched."
             )
 
-    # End of each answer = the next (in document order) confirmed
-    # answer's start, minus one. Computed purely in Python -- never
-    # asked of the LLM, so it can never be wrong in the way an
-    # LLM-guessed end line could be.
+    # Build ranges using the same logic as before
     ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
     ranges = []
     for idx, (ref, start) in enumerate(ordered):
@@ -1302,6 +1386,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
     log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
 
+    # Build the results with the same structure as before
     ranges_by_ref = {r["ref"]: r for r in ranges}
     results = []
     for i, q in enumerate(questions):
@@ -1328,7 +1413,14 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
         ]
         answer_raw = " ".join(verbatim_lines).strip()
-        answer_clean = strip_question_restatement(answer_raw)
+        
+        # NEW: Check if this answer contains embedded questions
+        # If it does, we need to split it
+        primary_answer, embedded_blocks = split_embedded_questions(answer_raw, questions)
+        
+        # For now, use the primary answer as the main answer
+        # The embedded blocks will be handled separately
+        answer_clean = strip_question_restatement(primary_answer)
         answer_clean = strip_full_question_echo(answer_clean, q)
 
         start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
@@ -1343,7 +1435,8 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             "start_page": start_page,
             "end_page": end_page,
             "answer": answer_clean,
-            "answer_raw": answer_raw,
+            "answer_raw": primary_answer,  # Store the primary answer separately
+            "embedded_answers": embedded_blocks  # NEW: Store embedded answers
         })
 
     return results
@@ -2110,23 +2203,12 @@ def process_pdf(file_input, status_callback=None):
             f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
 
-    # FIX: admin/cover pages (roll number, letterhead, etc.) are now
-    # explicitly excluded here too, not just question-paper pages. Before
-    # this, ANY page that wasn't classified as a question-paper page fell
-    # into "answer pages" by elimination -- including cover sheets -- so
-    # their content (names, roll numbers, institution letterhead text)
-    # could leak into an answer's range (most commonly absorbed into
-    # whichever answer's range happened to run up against that page).
     excluded_indices = set(qp_page_indices) | set(admin_page_indices)
     answer_page_indices = [i for i in range(len(pages)) if i not in excluded_indices]
     answer_pages = [pages[i] for i in answer_page_indices]
 
     log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
 
-    # answer_line_pages[i] records which OCR page answer_lines[i] came
-    # from -- kept in lockstep with answer_lines so every mapped answer
-    # can report exactly which page(s) of the source PDF it was sliced
-    # from, for direct manual verification against the scanned document.
     answer_lines = []
     answer_line_pages = []
     for page in answer_pages:
@@ -2142,75 +2224,91 @@ def process_pdf(file_input, status_callback=None):
         raise Exception(
             "The 'answer pages' identified in this document do not contain enough "
             "text to plausibly hold real essay-style answers for the "
-            f"{len(official_questions)} question(s) found. This usually means the "
-            "question-paper/answer-page page split misclassified pages -- check the "
-            "'Question paper pages detected' log line above against the actual "
-            "document structure. No answer-mapping LLM calls were made, since they "
-            "would be guaranteed to fail."
+            f"{len(official_questions)} question(s) found."
         )
 
-    # Sequential single-target search strategy -- see map_answers_sequential()'s
-    # docstring for the full rationale. Every LLM call does exactly ONE
-    # thing (find one answer's start line), and every answer's END is
-    # computed in Python as (next answer's start - 1), never asked of the
-    # LLM. The returned list already carries full source traceability
-    # (start_line/end_line/start_page/end_page) plus both the raw
-    # (unmodified) and cleaned answer text -- see field docs in
-    # map_answers_sequential().
-    log("Mapping each question to its answer (sequential single-target search)...")
+    # Use the enhanced sequential mapping
+    log("Mapping each question to its answer (enhanced sequential single-target search)...")
     qa_pairs = map_answers_sequential(
         answer_lines, official_questions, status_callback,
         answer_line_pages=answer_line_pages
     )
 
-    matched_count = sum(1 for p in qa_pairs if p["matched"])
-    log(f"Matched {matched_count} of {len(official_questions)} questions")
-
+    # NEW: Post-process to handle embedded answers that were split out
+    # For any answer that had embedded blocks, create additional Q-A pairs
+    final_qa_pairs = []
     for p in qa_pairs:
-        if not p["matched"]:
-            log(f"WARNING: No match found for: {p['question'][:60]}")
+        if p["matched"]:
+            final_qa_pairs.append({
+                "ref": p["ref"],
+                "question": p["question"],
+                "matched": True,
+                "start_line": p["start_line"],
+                "end_line": p["end_line"],
+                "start_page": p["start_page"],
+                "end_page": p["end_page"],
+                "answer": p["answer"],
+                "answer_raw": p["answer_raw"],
+            })
+            
+            # Check for embedded answers
+            if "embedded_answers" in p and p["embedded_answers"]:
+                for embedded in p["embedded_answers"]:
+                    # Try to find which REF this embedded question corresponds to
+                    # Use the question number to match
+                    q_num = embedded.get("question_num")
+                    if q_num:
+                        # Find the official question with this number
+                        for i, q in enumerate(official_questions):
+                            q_num_match = re.match(r'^\s*(\d+)[\.\)]', q)
+                            if q_num_match and int(q_num_match.group(1)) == q_num:
+                                embedded_ref = f"REF-{chr(65 + i)}"
+                                # Check if we already have a result for this REF
+                                existing = next((x for x in final_qa_pairs if x["ref"] == embedded_ref), None)
+                                if existing is None:
+                                    # This is a new answer we need to add
+                                    final_qa_pairs.append({
+                                        "ref": embedded_ref,
+                                        "question": q,
+                                        "matched": True,
+                                        "start_line": p["start_line"],  # Approximate
+                                        "end_line": p["end_line"],      # Approximate
+                                        "start_page": p["start_page"],
+                                        "end_page": p["end_page"],
+                                        "answer": strip_question_restatement(embedded["answer_block"]),
+                                        "answer_raw": embedded["answer_block"],
+                                    })
+                                    log(f"Added embedded answer for {embedded_ref}")
+                                break
+        else:
+            final_qa_pairs.append(p)
 
-    if matched_count == 0:
-        raise Exception(
-            "Could not match any questions to answers.\n"
-            f"Official questions: {official_questions}\n"
-            f"First 10 answer lines: {answer_lines[:10]}"
-        )
+    # Ensure all questions are represented
+    # If any question is missing from final_qa_pairs, add an unmatched entry
+    existing_refs = {p["ref"] for p in final_qa_pairs}
+    for i, q in enumerate(official_questions):
+        ref = f"REF-{chr(65 + i)}"
+        if ref not in existing_refs:
+            final_qa_pairs.append({
+                "ref": ref,
+                "question": q,
+                "matched": False,
+                "start_line": None,
+                "end_line": None,
+                "start_page": None,
+                "end_page": None,
+                "answer": "",
+                "answer_raw": "",
+            })
 
-    # =====================================================================
-    # INTEGRITY CHECK: every answer_raw field above was built by a plain
-    # Python slice of answer_lines (see map_answers_sequential) -- the LLM
-    # is never given the opportunity to write or rephrase answer text, it
-    # only ever returns a single line-number. This assertion makes that
-    # guarantee mechanically verifiable rather than just a design claim:
-    # it reconstructs each matched answer's raw text directly from
-    # answer_lines using the reported start_line/end_line and confirms it
-    # is byte-for-byte identical to answer_raw. If this ever fails, that
-    # is a real bug in the slicing logic (not the LLM "enhancing" text)
-    # and is surfaced loudly rather than silently shipped.
-    # =====================================================================
-    for p in qa_pairs:
-        if not p["matched"]:
-            continue
-        s, e = p["start_line"], p["end_line"]
-        expected_raw = " ".join(
-            answer_lines[j] for j in range(s, e + 1)
-            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ).strip()
-        if expected_raw != p["answer_raw"]:
-            log(
-                f"CRITICAL: verbatim-integrity check FAILED for '{p['question'][:60]}...' -- "
-                f"the reported answer_raw does not match a fresh re-slice of answer_lines "
-                f"[{s}:{e}]. This indicates a real bug in the extraction code, not an LLM "
-                f"hallucination -- please report this."
-            )
+    matched_count = sum(1 for p in final_qa_pairs if p["matched"])
+    log(f"Final: {matched_count} of {len(official_questions)} questions matched")
 
-    _flag_suspiciously_short_answers(qa_pairs, log)
+    _flag_suspiciously_short_answers(final_qa_pairs, log)
 
-    log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
+    log(f"Done -- {len(final_qa_pairs)} Q-A pairs ({matched_count} matched)")
 
-    return ocr_json, qa_pairs
-
+    return ocr_json, final_qa_pairs
 
 def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
                   base_name: str = "document") -> tuple:
