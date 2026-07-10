@@ -919,25 +919,27 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         f"(these will be excluded from BOTH question and answer text)")
 
     # =====================================================================
-    # FIX (this round): the previous version reclassified any "outlier
-    # length" question-paper page straight into the answer pool, based on
-    # LENGTH ALONE. This is unsafe: some genuine question papers legitimately
-    # have a long closing section (general instructions, marking-scheme
-    # notes, "all the best"/footer remarks, etc.) that is long but is still
-    # 100% question-paper content, NOT a student's answer opening. Moving
-    # such a page into answer_lines silently injects exam-paper text into
-    # whatever answer happens to sit at that position (most commonly the
-    # LAST answer, since sequential mapping's final range runs to
-    # end-of-document) -- this is the confirmed cause of "exam paper's
-    # conclusion showing up inside an answer" bug.
+    # FIX (reverted to a SAFE, NARROW version): an earlier attempt here
+    # reclassified any "outlier length" question-paper page into the answer
+    # pool, and a later attempt added an average-line-length ("looks like
+    # flowing prose") heuristic on top. BOTH were too aggressive in
+    # practice and caused regressions in either direction:
+    #   - length-only reclassification could move a genuinely long but
+    #     100% legitimate question-paper page (e.g. a long closing
+    #     instructions/marking-scheme section) into the answer pool,
+    #     leaking exam-paper text into whatever answer sits at that
+    #     position (usually the last one, since sequential mapping's final
+    #     range runs to end-of-document).
+    #   - the added "flowing prose" (avg line length) signal was too broad
+    #     and reclassified genuine long question-paper pages (paragraph-
+    #     style questions, lengthy instructions) as if they were student
+    #     answers, corrupting the question/answer split further.
     #
-    # Fix: length outlier is now only a CANDIDATE signal. A page is only
-    # actually reclassified if it ALSO shows content-level evidence of
-    # being a student answer (an "Ans"/"उत्तर"/similar answer-marker, or a
-    # first-person/explanatory answer-style opening) -- not just because
-    # it's long. If the outlier doesn't show that evidence, we leave it as
-    # a question-paper page and only log a warning, exactly as before this
-    # feature was added.
+    # This version keeps ONLY the narrowest, safest signal: an outlier-
+    # length question-paper page is reclassified ONLY if it also contains
+    # an EXPLICIT answer-style marker (e.g. "Ans", "उत्तर") near its start.
+    # Anything else is left as a question-paper page, with just a logged
+    # warning -- never silently moved.
     # =====================================================================
     if len(qp_page_indices_0based) >= 2:
         qp_page_lengths = [
@@ -952,26 +954,10 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         ]
 
         def _looks_like_student_answer(page_idx: int) -> bool:
-            text = pages[page_idx]["raw_text"]
-            # Check first ~400 chars for an explicit answer-style marker
-            # (reuses the same marker pattern used elsewhere for answer
-            # boundary detection, so this stays consistent with the rest
-            # of the pipeline and works across languages/scripts).
-            head = text[:400]
-            if _ANSWER_START_RE.search(head):
-                return True
-            # Secondary signal: a long block of flowing prose with very
-            # few short numbered "prompt" lines (i.e. reads like an
-            # explanation being written, not a terse list of instructions)
-            # -- approximate via average line length, which is reliably
-            # much higher in flowing answer prose than in a printed
-            # question list.
-            lines = [l for l in text.split("\n") if l.strip()]
-            if len(lines) >= 3:
-                avg_line_len = sum(len(l) for l in lines) / len(lines)
-                if avg_line_len > 120:
-                    return True
-            return False
+            # Only an explicit answer-style marker near the start of the
+            # page counts as evidence. This is deliberately narrow.
+            head = pages[page_idx]["raw_text"][:400]
+            return bool(_ANSWER_START_RE.search(head))
 
         confirmed_outliers = [
             page_idx for page_idx in length_outliers if _looks_like_student_answer(page_idx)
@@ -985,10 +971,10 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
                 length = dict(qp_page_lengths)[page_idx]
                 log(
                     f"NOT reclassifying page {page_idx + 1}: length is an outlier "
-                    f"({length} chars vs median {median_length}), but no answer-style "
-                    f"content markers were found -- treating this as genuine (if unusually "
-                    f"long) question-paper content, e.g. closing instructions or a marking "
-                    f"scheme note, to avoid leaking exam-paper text into a student's answer."
+                    f"({length} chars vs median {median_length}), but no explicit "
+                    f"answer-marker was found -- treating this as genuine (if unusually "
+                    f"long) question-paper content, to avoid leaking exam-paper text "
+                    f"into a student's answer."
                 )
 
         if confirmed_outliers and len(confirmed_outliers) <= len(qp_page_indices_0based) // 2:
@@ -997,10 +983,9 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
                 log(
                     f"RECLASSIFYING page {page_idx + 1}: was detected as a question "
                     f"paper page, is {length} chars long (median for this document's "
-                    f"other question paper pages is {median_length}), AND shows "
-                    f"content-level evidence of being a student's answer opening "
-                    f"(answer-marker text and/or long flowing prose). Moving it to "
-                    f"the answer pages so its content is not lost."
+                    f"other question paper pages is {median_length}), AND contains an "
+                    f"explicit answer-style marker (e.g. 'Ans'/'उत्तर') near its start. "
+                    f"Moving it to the answer pages so its content is not lost."
                 )
             qp_page_indices_0based = [
                 i for i in qp_page_indices_0based if i not in confirmed_outliers
@@ -1008,12 +993,11 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         elif confirmed_outliers:
             log(
                 f"WARNING: {len(confirmed_outliers)} of {len(qp_page_indices_0based)} "
-                f"detected question-paper pages look like student-answer openings "
-                f"(outlier length + answer-style content). That's too large a "
-                f"fraction to auto-reclassify safely -- leaving them as "
-                f"question-paper pages, but this may mean the question/answer page "
-                f"split for this document is unreliable. Pages flagged: "
-                f"{[p+1 for p in confirmed_outliers]}"
+                f"detected question-paper pages are unusually long AND contain an "
+                f"explicit answer-style marker. That's too large a fraction to "
+                f"auto-reclassify safely -- leaving them as question-paper pages, but "
+                f"this may mean the question/answer page split for this document is "
+                f"unreliable. Pages flagged: {[p+1 for p in confirmed_outliers]}"
             )
 
     # Stage 2: single consistent pass over the CONFIRMED question-paper
@@ -1165,45 +1149,30 @@ def _parse_sequential_search_response(content: str) -> tuple:
 SEQUENTIAL_SEARCH_WINDOW_CHARS = 11000  # same safe-per-call char budget used elsewhere in this module
 SEQUENTIAL_SEARCH_MAX_WINDOWS = 200  # generous safety cap; a real document will exhaust far sooner
 
-# FIX: windows were previously advanced with ZERO overlap (pointer = idx).
-# This caused a confirmed bug: if an answer's opening/intro line landed
-# right at the END of a window, the LLM often couldn't confidently confirm
-# it as a genuine answer-start without the following context lines (which
-# were in the NEXT window) -- so it reported found=false for that window.
-# The pointer then jumped past that intro line entirely, and the NEXT
-# window only showed the answer's body (post-intro), which the LLM matched
-# as the start instead -- silently skipping the real opening paragraph.
-#
-# Adding a small trailing-line overlap means boundary lines get re-shown
-# with fresh follow-up context in the next window too, so an intro line
-# sitting right on a window edge gets a second chance to be recognized in
-# context instead of being permanently skipped.
-SEQUENTIAL_SEARCH_OVERLAP_LINES = 6
-
 
 def _find_answer_start_sequential(client, numbered_lines: list, question_text: str, ref_label: str,
                                     search_from_idx: int, budget: "_TokenBudgetTracker", log,
                                     window_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS,
                                     max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS,
-                                    overlap_lines: int = SEQUENTIAL_SEARCH_OVERLAP_LINES,
                                     extra_reminder: str = None):
     """
-    Slides forward through numbered_lines in windows, starting at
-    search_from_idx, asking a single yes/no+line-number question per
-    window, until the target's start is found or the document is
-    exhausted. Returns the found start_line, or None.
+    Slides forward through numbered_lines in NON-OVERLAPPING windows,
+    starting at search_from_idx, asking a single yes/no+line-number
+    question per window, until the target's start is found or the
+    document is exhausted. Returns the found start_line, or None.
 
-    Windows advance with a small trailing overlap (overlap_lines) rather
-    than a hard cut, so a genuine answer-opening line that happens to sit
-    right at a window boundary gets shown again -- this time with more
-    following context -- instead of being permanently skipped. See the
-    module-level comment on SEQUENTIAL_SEARCH_OVERLAP_LINES for the full
-    rationale / confirmed failure mode this fixes.
+    NOTE: a trailing-line overlap between windows was tried here to fix a
+    reported "intro paragraph gets skipped" issue, but it was REVERTED --
+    combined with the "repeated content is OK" guidance in the system
+    prompt above, overlap increased false-positive early matches (a line
+    still belonging to the CURRENT open answer would get matched as the
+    NEXT answer's start), which caused a worse regression (mixed/missing
+    answers across most questions, not just an edge case). Back to the
+    original, more conservative zero-overlap behavior.
     """
     total_lines = len(numbered_lines)
     pointer = search_from_idx
     windows_tried = 0
-    last_window_end_idx = None  # tracks idx (exclusive) of previous window, to guarantee forward progress
 
     while pointer < total_lines and windows_tried < max_windows:
         window = []
@@ -1237,18 +1206,11 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                 f"treating this window as a non-match"
             )
 
-        # Advance with overlap: re-show the last `overlap_lines` lines of
-        # this window in the NEXT window too, so a boundary-straddling
-        # intro/opening line gets re-evaluated with more forward context
-        # instead of being skipped forever. Guarantee forward progress
-        # (next_pointer must always be > current pointer) so this can
-        # never loop in place.
-        next_pointer = idx - overlap_lines
-        next_pointer = max(next_pointer, pointer + 1)
-        pointer = next_pointer
+        pointer = idx  # move forward to the next window, no overlap
         windows_tried += 1
 
     return None
+
 
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
@@ -1270,11 +1232,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     (its answer wasn't necessarily lost -- it may simply not exist, e.g.
     the student skipped it).
 
-    FIX (this round): previously returned only a plain {question: text}
-    dict, giving you no way to see WHERE each answer actually came from
-    -- which is exactly the trust problem you flagged ("I don't know
-    from where the Q-A is paired"). This now returns a LIST of dicts,
-    one per question, each carrying:
+    Returns a LIST of dicts, one per question, each carrying:
       - start_line / end_line: the exact 0-based indices into
         answer_lines this answer was sliced from (so you can look them
         up directly)
@@ -1430,16 +1388,16 @@ def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
 
     # =====================================================================
-    # FIX: this is the key piece of context that was completely missing
-    # before. When a single answer is so long it has to be split across two
-    # LLM calls (chunks), the SECOND chunk previously had zero information
-    # telling it "you are looking at the tail end of an answer that already
-    # started". Without that, the model has no basis to assign the opening
-    # lines of this chunk to any REF (they usually don't restate the
-    # question -- that only happens once, at the true start of the answer),
-    # so those lines were silently dropped from every range -- exactly the
-    # "answer missing its ending" bug. This note gives the model the
-    # missing context explicitly.
+    # This is the key piece of context: when a single answer is so long it
+    # has to be split across two LLM calls (chunks), the SECOND chunk
+    # previously had zero information telling it "you are looking at the
+    # tail end of an answer that already started". Without that, the
+    # model has no basis to assign the opening lines of this chunk to any
+    # REF (they usually don't restate the question -- that only happens
+    # once, at the true start of the answer), so those lines were
+    # silently dropped from every range -- exactly the "answer missing
+    # its ending" bug. This note gives the model the missing context
+    # explicitly.
     # =====================================================================
     carry_over_note = ""
     if carry_over_ref:
@@ -1767,22 +1725,21 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     Maps each official question to its verbatim answer text, extracted
     INDEPENDENTLY per question via LLM-identified line boundaries.
 
-    FIX (this round): two changes vs. the previous version, both aimed
-    directly at "answers missing their ending paragraph/lines":
+    Two properties, both aimed directly at "answers missing their ending
+    paragraph/lines":
 
-    1. Chunks that are force-split mid-answer now carry an explicit
+    1. Chunks that are force-split mid-answer carry an explicit
        carry_over_ref forward into the NEXT chunk's prompt (see
        _build_answer_map_user_prompt), so the model knows the opening
        lines of that chunk likely continue an already-open answer
        instead of having no basis to assign them to any REF at all.
 
     2. When the SAME ref genuinely appears in two adjacent chunks due to
-       a carry-over split, the two partial ranges are now MERGED into
-       one continuous range (extending end_line) instead of the old
-       behavior of picking whichever single range was "longer" and
-       silently discarding the other -- which is precisely how a valid
-       second half of an answer could vanish even after being correctly
-       identified by the LLM.
+       a carry-over split, the two partial ranges are MERGED into one
+       continuous range (extending end_line) instead of picking
+       whichever single range was "longer" and silently discarding the
+       other -- which is precisely how a valid second half of an answer
+       could vanish even after being correctly identified by the LLM.
     """
     def log(msg):
         print(msg)
@@ -1831,16 +1788,16 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             continue
 
         # =================================================================
-        # FIX (this round): completeness check + targeted retry, aimed
-        # directly at "the LLM does the first 2-3 answers correctly then
-        # just stops". expected_new_indices is OUR OWN independent
-        # estimate (from the regex/word-overlap detector, not the LLM) of
-        # which questions genuinely start an answer inside this chunk.
-        # If the model returned fewer distinct refs than we expected, it
-        # very likely quit early -- so we ask it again, ONE more time,
-        # explicitly naming exactly which REF(s) it missed and confirming
-        # they ARE present in this exact text. This is cheap (only fires
-        # when something looks wrong) and far more reliable than hoping a
+        # FIX: completeness check + targeted retry, aimed directly at "the
+        # LLM does the first 2-3 answers correctly then just stops".
+        # expected_new_indices is OUR OWN independent estimate (from the
+        # regex/word-overlap detector, not the LLM) of which questions
+        # genuinely start an answer inside this chunk. If the model
+        # returned fewer distinct refs than we expected, it very likely
+        # quit early -- so we ask it again, ONE more time, explicitly
+        # naming exactly which REF(s) it missed and confirming they ARE
+        # present in this exact text. This is cheap (only fires when
+        # something looks wrong) and far more reliable than hoping a
         # generic retry produces a different, complete answer.
         # =================================================================
         expected_refs = {f"REF-{chr(65 + qi)}" for qi in expected_new_indices}
@@ -2120,12 +2077,10 @@ def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print
 
 def _flag_suspiciously_short_answers(qa_pairs: list, log=print) -> None:
     """
-    NEW: lightweight, always-on diagnostic (not a hard failure) that flags
+    Lightweight, always-on diagnostic (not a hard failure) that flags
     matched answers which are suspiciously short compared to the rest of
     the document's answers -- a strong signal of truncation (start or end
-    clipped) even when a range WAS found. This surfaces exactly the class
-    of bug you reported ("skips starting/ending paragraphs") in the logs
-    immediately, per-document, without needing a separate benchmark run.
+    clipped) even when a range WAS found.
     """
     matched_lengths = [len(p["answer"]) for p in qa_pairs if p.get("matched") and p["answer"].strip()]
     if len(matched_lengths) < 2:
@@ -2183,13 +2138,12 @@ def process_pdf(file_input, status_callback=None):
             f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
 
-    # FIX: admin/cover pages (roll number, letterhead, etc.) are now
-    # explicitly excluded here too, not just question-paper pages. Before
-    # this, ANY page that wasn't classified as a question-paper page fell
+    # Admin/cover pages (roll number, letterhead, etc.) are explicitly
+    # excluded here too, not just question-paper pages. Otherwise ANY
+    # page that wasn't classified as a question-paper page would fall
     # into "answer pages" by elimination -- including cover sheets -- so
     # their content (names, roll numbers, institution letterhead text)
-    # could leak into an answer's range (most commonly absorbed into
-    # whichever answer's range happened to run up against that page).
+    # could leak into an answer's range.
     excluded_indices = set(qp_page_indices) | set(admin_page_indices)
     answer_page_indices = [i for i in range(len(pages)) if i not in excluded_indices]
     answer_pages = [pages[i] for i in answer_page_indices]
