@@ -1232,167 +1232,191 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
 
     return None
 
-
-def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
-                             answer_line_pages: list = None) -> list:
+def find_answer_boundaries(lines: list, questions: list) -> dict:
     """
-    Enhanced version that handles embedded question markers in answers.
+    Find where each answer starts and ends using pattern matching.
+    This is FAR more reliable than asking Groq to guess boundaries.
+    """
+    boundaries = {}
+    current_question_idx = None
+    current_start = None
+    
+    for line_idx, line in enumerate(lines):
+        # Check if this line starts a new answer
+        is_new_answer = False
+        matched_q_idx = None
+        
+        # Check each pattern
+        for pattern in ANSWER_START_PATTERNS:
+            if pattern.search(line):
+                is_new_answer = True
+                # Try to match this to a question
+                for i, q in enumerate(questions):
+                    # Extract question number from the pattern
+                    num_match = re.search(r'\d+', line)
+                    if num_match:
+                        q_num = int(num_match.group())
+                        # Check if the question starts with this number
+                        q_num_match = re.match(r'^\s*(\d+)[\.\)]', q)
+                        if q_num_match and int(q_num_match.group(1)) == q_num:
+                            matched_q_idx = i
+                            break
+                break
+        
+        if is_new_answer:
+            # If we were tracking a previous answer, save it
+            if current_question_idx is not None and current_start is not None:
+                boundaries[current_question_idx] = {
+                    'start': current_start,
+                    'end': line_idx - 1
+                }
+            # Start tracking the new answer
+            current_question_idx = matched_q_idx if matched_q_idx is not None else current_question_idx
+            current_start = line_idx
+    
+    # Save the last answer
+    if current_question_idx is not None and current_start is not None:
+        boundaries[current_question_idx] = {
+            'start': current_start,
+            'end': len(lines) - 1
+        }
+    
+    return boundaries
+
+def refine_boundaries_with_context(lines: list, boundaries: dict, questions: list) -> dict:
+    """
+    Refine boundaries by looking at the actual content.
+    If an answer starts with a restatement of the question, skip it.
+    """
+    refined = {}
+    
+    for q_idx, bounds in boundaries.items():
+        start = bounds['start']
+        end = bounds['end']
+        
+        # Get the actual answer text
+        answer_lines = lines[start:end+1]
+        answer_text = " ".join(answer_lines)
+        
+        # Check if the answer starts with a restatement of the question
+        question_text = questions[q_idx] if q_idx < len(questions) else ""
+        
+        # Find the actual start of the answer (skip restatement)
+        actual_start = start
+        for i, line in enumerate(answer_lines):
+            # Check if this line contains the actual answer content
+            # (not just a restatement of the question)
+            if not is_question_restatement(line, question_text):
+                actual_start = start + i
+                break
+        
+        refined[q_idx] = {
+            'start': actual_start,
+            'end': end,
+            'original_start': start
+        }
+    
+    return refined
+
+def is_question_restatement(line: str, question_text: str) -> bool:
+    """Check if a line is just restating the question."""
+    # Remove common prefixes
+    cleaned_line = re.sub(r'^(?:Ans(?:wer)?|उत्तर|प्रश्न|प्र)[\s\.:-]*\d*[\s\.:-]*', '', line, flags=re.IGNORECASE)
+    cleaned_line = cleaned_line.strip()
+    
+    # If the line is short, it's probably not a restatement
+    if len(cleaned_line) < 20:
+        return False
+    
+    # Extract key words from the question
+    q_words = set(re.findall(r'[a-zA-Z\u0900-\u097F]{3,}', question_text.lower()))
+    line_words = set(re.findall(r'[a-zA-Z\u0900-\u097F]{3,}', cleaned_line.lower()))
+    
+    # If most of the question's key words appear in the line, it's a restatement
+    if q_words and line_words:
+        overlap = len(q_words & line_words) / len(q_words)
+        return overlap > 0.4
+    
+    return False
+    
+def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
+                                 answer_line_pages: list = None) -> list:
+    """
+    The old method with fixes for the specific issues:
+    1. Don't skip opening paragraphs - search from the beginning of the document
+    2. Don't include the next question's heading - truncate at question markers
     """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
-
+    
     from groq import Groq
-
+    
     api_key = get_api_key("GROQ_API_KEY")
     if not api_key:
         raise Exception("GROQ_API_KEY not found in secrets or environment")
-
+    
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
-
-    # STEP 1: Check if any answer lines contain embedded question markers
-    # We need to look at the raw text as a whole, not just line by line
-    full_answer_text = "\n".join(answer_lines)
     
-    # Detect embedded questions in the full text
-    embedded_qs = detect_embedded_questions(full_answer_text)
-    
-    if embedded_qs:
-        log(f"Detected {len(embedded_qs)} embedded question markers in answer text")
-        # Map embedded question numbers to the official questions
-        # This helps us know which REF to assign to each embedded answer
-        
-        # For each embedded question, try to match it to an official question
-        for eq in embedded_qs:
-            # Find which official question this corresponds to
-            # Use the question number (eq['question_num']) to find matching REF
-            # But also check content similarity
-            best_match_idx = None
-            best_score = 0.0
-            
-            for i, q in enumerate(questions):
-                # Try matching by number first
-                q_num_match = re.match(r'^\s*(\d+)[\.\)]', q)
-                if q_num_match and int(q_num_match.group(1)) == eq['question_num']:
-                    # This is a match by number
-                    best_match_idx = i
-                    break
-                
-                # Also check content similarity
-                q_clean = re.sub(r'^\s*\d+[\.\)]\s*', '', q)
-                eq_clean = re.sub(r'^\s*\d+[\.\)]\s*', '', eq['question_text'])
-                sim = similarity(q_clean, eq_clean)
-                if sim > best_score:
-                    best_score = sim
-                    best_match_idx = i
-            
-            # If we found a match, mark it for special handling
-            if best_match_idx is not None and best_score >= 0.3:
-                log(f"  Embedded question Q.{eq['question_num']} matches official question {best_match_idx+1}")
-                eq['matched_ref'] = f"REF-{chr(65 + best_match_idx)}"
-            else:
-                log(f"  WARNING: Could not match embedded Q.{eq['question_num']} to any official question")
-                eq['matched_ref'] = None
-
-    # STEP 2: Now do the regular sequential search with enhanced context
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(numbered_lines)
     
-    ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
-    
-    # Build a map of line indices where embedded questions start
-    embedded_start_lines = {}
-    if embedded_qs:
-        # Convert character positions to line numbers
-        for eq in embedded_qs:
-            if eq.get('matched_ref'):
-                # Find which line contains this embedded question
-                char_pos = eq['start_pos']
-                line_idx = 0
-                char_count = 0
-                for idx, line in enumerate(answer_lines):
-                    if char_count <= char_pos < char_count + len(line) + 1:  # +1 for newline
-                        embedded_start_lines[eq['matched_ref']] = idx
-                        log(f"  Embedded {eq['matched_ref']} starts at line {idx}")
-                        break
-                    char_count += len(line) + 1
-
-    found_starts = {}
+    # FIX 1: Start searching from the FIRST line, not from pointer
+    # This ensures we don't skip the opening paragraph
     pointer = 0
-
+    found_starts = {}
+    
     for i, q in enumerate(questions):
         ref = f"REF-{chr(65 + i)}"
+        log(f"Searching for the start of {ref} ({q[:60]}...)")
         
-        # Check if this REF has an embedded question start that we already know about
-        if ref in embedded_start_lines:
-            start_line = embedded_start_lines[ref]
-            log(f"  Using pre-detected embedded start for {ref} at line {start_line}")
-            found_starts[ref] = start_line
-            # Don't advance pointer past this line - we want the regular search to also find it
-            # But we'll use this as a hard constraint
-            continue
-        
-        log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
-        
-        # If we already found a start for a previous question at this line or beyond,
-        # we need to be careful not to skip content
-        if found_starts:
-            # Check if any found start is within the current search range
-            starts_after_pointer = [s for s in found_starts.values() if s >= pointer]
-            if starts_after_pointer:
-                # The next found start is at line X, so this question's answer 
-                # might be the content between pointer and that start
-                next_start = min(starts_after_pointer)
-                # We should search up to but not including next_start
-                # Actually, this is handled by the sequential search already
-        
-        start_line = _find_answer_start_sequential(
-            client, numbered_lines, q, ref, pointer, budget, log
+        # FIX 2: Search from the beginning, with a wider window
+        start_line = _find_answer_start_sequential_improved(
+            client, numbered_lines, q, ref, pointer, budget, log,
+            window_chars=15000  # Larger window to capture full answers
         )
-
-        if start_line is None:
-            # Try once more with a reminder
-            log(f"  first pass found nothing for {ref} -- retrying once with an explicit reminder...")
-            retry_reminder = (
-                "REMINDER: a previous search pass over this exact text did not find this "
-                "question's answer. Look carefully for embedded question markers like "
-                "'Q.4)' or 'प्र. 5)' that might indicate where this answer begins."
-            )
-            start_line = _find_answer_start_sequential(
-                client, numbered_lines, q, ref, pointer, budget, log,
-                extra_reminder=retry_reminder
-            )
-            if start_line is not None:
-                log(f"  retry recovered {ref} starting at line {start_line}")
-
+        
         if start_line is not None:
             found_starts[ref] = start_line
             log(f"  found {ref} starting at line {start_line}")
             pointer = start_line + 1
         else:
-            log(
-                f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
-                f"to the end of the document ({total_lines} lines) -- marking as unmatched."
-            )
-
-    # Build ranges using the same logic as before
+            log(f"WARNING: could not find the start of {ref}")
+    
+    # Build ranges
     ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
     ranges = []
     for idx, (ref, start) in enumerate(ordered):
-        end = ordered[idx + 1][1] - 1 if idx + 1 < len(ordered) else total_lines - 1
+        if idx + 1 < len(ordered):
+            # FIX 3: End the answer BEFORE the next question starts
+            next_start = ordered[idx + 1][1]
+            # Check if the next_start line actually starts a new question
+            # If not, we might have a false positive
+            next_line = answer_lines[next_start] if next_start < len(answer_lines) else ""
+            if is_question_start(next_line):
+                end = next_start - 1
+            else:
+                # The next "start" might not be a real question start
+                # Look for the next real question start
+                end = find_next_real_question_start(answer_lines, next_start, questions) - 1
+        else:
+            end = total_lines - 1
+        
+        # Ensure end >= start
+        if end < start:
+            end = start
+        
         ranges.append({"ref": ref, "start_line": start, "end_line": end})
-
-    log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
-
-    # Build the results with the same structure as before
+    
+    # Build results
     ranges_by_ref = {r["ref"]: r for r in ranges}
     results = []
     for i, q in enumerate(questions):
         ref = f"REF-{chr(65 + i)}"
         r = ranges_by_ref.get(ref)
-
+        
         if r is None:
             results.append({
                 "ref": ref,
@@ -1406,26 +1430,31 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 "answer_raw": "",
             })
             continue
-
+        
         s, e = r["start_line"], r["end_line"]
-        verbatim_lines = [
-            answer_lines[j] for j in range(s, e + 1)
-            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ]
+        
+        # FIX 4: Don't include lines that are question markers
+        verbatim_lines = []
+        for j in range(s, e + 1):
+            if 0 <= j < len(answer_lines):
+                line = answer_lines[j]
+                # Skip if this line is a question marker
+                if is_question_marker(line):
+                    continue
+                if line.strip() and not is_noise(line):
+                    verbatim_lines.append(line)
+        
         answer_raw = " ".join(verbatim_lines).strip()
         
-        # NEW: Check if this answer contains embedded questions
-        # If it does, we need to split it
-        primary_answer, embedded_blocks = split_embedded_questions(answer_raw, questions)
+        # FIX 5: Remove any trailing question marker
+        answer_raw = remove_trailing_question_marker(answer_raw)
         
-        # For now, use the primary answer as the main answer
-        # The embedded blocks will be handled separately
-        answer_clean = strip_question_restatement(primary_answer)
+        answer_clean = strip_question_restatement(answer_raw)
         answer_clean = strip_full_question_echo(answer_clean, q)
-
+        
         start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
         end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
-
+        
         results.append({
             "ref": ref,
             "question": q,
@@ -1435,12 +1464,86 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             "start_page": start_page,
             "end_page": end_page,
             "answer": answer_clean,
-            "answer_raw": primary_answer,  # Store the primary answer separately
-            "embedded_answers": embedded_blocks  # NEW: Store embedded answers
+            "answer_raw": answer_raw,
         })
-
+    
     return results
 
+def clean_answer_text(text: str) -> str:
+    """
+    Clean up answer text:
+    1. Remove leading "Ans" or "उत्तर" labels
+    2. Remove trailing question markers (like "Q.7)")
+    3. Remove any "निष्कर्ष" that belongs to the next question
+    """
+    # Remove leading labels
+    text = re.sub(r'^(?:Ans(?:wer)?|उत्तर|प्रश्न|प्र)[\s\.:-]*\d*[\s\.:-]*', '', text, flags=re.IGNORECASE)
+    
+    # Remove trailing question markers
+    # If the text ends with something like "Q.7) कविता के अनुवाद...", remove it
+    match = re.search(r'(Q\.?\s*\d+[\s\.:-]+[^\n]+)$', text, re.IGNORECASE)
+    if match:
+        text = text[:match.start()].strip()
+    
+    # Also remove Hindi question markers
+    match = re.search(r'(प्र\.\s*\d+[\s\.:-]+[^\n]+)$', text, re.IGNORECASE)
+    if match:
+        text = text[:match.start()].strip()
+    
+    return text.strip()
+
+def is_question_start(line: str) -> bool:
+    """Check if a line starts a new question."""
+    for pattern in ANSWER_START_PATTERNS:
+        if pattern.search(line):
+            return True
+    return False
+
+def is_question_marker(line: str) -> bool:
+    """Check if a line is just a question marker (like 'Q.7)') and nothing else."""
+    # If the line starts with a question marker and is short, it's probably just a marker
+    for pattern in ANSWER_START_PATTERNS:
+        if pattern.search(line):
+            # Check if there's actual content after the marker
+            cleaned = re.sub(r'^\s*(?:Ans(?:wer)?|उत्तर|प्रश्न|प्र)[\s\.:-]*\d*[\s\.:-]*', '', line, flags=re.IGNORECASE)
+            if len(cleaned.strip()) < 10:
+                return True
+    return False
+
+def remove_trailing_question_marker(text: str) -> str:
+    """Remove any trailing question marker from the text."""
+    # Look for a pattern like "Q.7) कविता के अनुवाद..." at the end
+    patterns = [
+        r'Q\.?\s*\d+[\s\.:-]+[^\n]+\s*$',
+        r'प्र\.\s*\d+[\s\.:-]+[^\n]+\s*$',
+        r'प्रश्न\s*\d+[\s\.:-]+[^\n]+\s*$',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            # Check if this is actually the start of a new question
+            # If the matched text starts with "Q." or "प्र.", it's a new question
+            matched_text = match.group(0)
+            if re.match(r'^\s*Q\.?\s*\d+', matched_text, re.IGNORECASE) or \
+               re.match(r'^\s*प्र\.?\s*\d+', matched_text, re.IGNORECASE):
+                text = text[:match.start()].strip()
+                break
+    return text
+
+def find_next_real_question_start(lines: list, start_idx: int, questions: list) -> int:
+    """Find the next line that starts a new question."""
+    for i in range(start_idx, len(lines)):
+        line = lines[i]
+        for pattern in ANSWER_START_PATTERNS:
+            if pattern.search(line):
+                # Verify this actually matches a question
+                for q in questions:
+                    q_num_match = re.match(r'^\s*(\d+)[\.\)]', q)
+                    if q_num_match:
+                        num = int(q_num_match.group(1))
+                        if re.search(rf'\b{num}\b', line):
+                            return i
+    return len(lines)
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
                                     carry_over_ref: str = None) -> str:
@@ -1531,7 +1634,24 @@ _ANSWER_START_RE = re.compile(
     r'^\s*(?:Ans(?:wer)?[.\s:-]+\d*|उत्तर\s*\d*\s*[\-\:]?|प्र[०.\s]*\d*|Q\.?\s*\d+[.\s:-])',
     re.IGNORECASE
 )
+ANSWER_START_PATTERNS = [
+    # English patterns
+    re.compile(r'^\s*(?:Ans(?:wer)?|Solution)[\s\.:-]*\d*', re.IGNORECASE),
+    re.compile(r'^\s*Q\.?\s*\d+[\s\.:-]+', re.IGNORECASE),
+    re.compile(r'^\s*Question\s*\d+[\s\.:-]+', re.IGNORECASE),
+    # Hindi patterns
+    re.compile(r'^\s*(?:उत्तर|प्रश्न|प्र)[\s\.:-]*\d*', re.IGNORECASE),
+    re.compile(r'^\s*प्र\.\s*\d+[\s\.:-]+', re.IGNORECASE),
+    # Just a number followed by a dot or bracket
+    re.compile(r'^\s*\d+[\.\)]\s+[A-Za-z\u0900-\u097F]', re.IGNORECASE),
+]
 
+# Patterns that indicate the END of an answer
+ANSWER_END_PATTERNS = [
+    re.compile(r'^\s*Q\.?\s*\d+[\s\.:-]+', re.IGNORECASE),
+    re.compile(r'^\s*प्र\.\s*\d+[\s\.:-]+', re.IGNORECASE),
+    re.compile(r'^\s*\d+[\.\)]\s+[A-Za-z\u0900-\u097F]', re.IGNORECASE),
+]
 
 def _normalize_for_overlap_match(text: str) -> str:
     text = text.lower().strip()
