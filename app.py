@@ -4,58 +4,41 @@ import json
 import re
 import subprocess
 import shutil
+import logging
 from pypdf import PdfReader
 from groq import Groq
 
-# ----------------------------------------------------------------------
-# Page Configurations & Setup
-# ----------------------------------------------------------------------
-st.set_page_config(page_title="Resilient Assignment Parser", page_icon="📝", layout="wide")
+# Suppress noisy standard library PDF warnings in terminal
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
-st.title("Resilient University Assignment Q&A Pipeline")
+# ----------------------------------------------------------------------
+# Page Setup
+# ----------------------------------------------------------------------
+st.set_page_config(page_title="Automated Assignment Parser", page_icon="📝", layout="wide")
+
+st.title("Automated University Assignment Q&A Pipeline")
 st.write(
-    "Process scanned booklets with Datalab Chandra OCR & Groq. "
-    "Includes **Manual Overrides** to correct LLM mistakes before mapping."
+    "Upload a scanned student assignment booklet to run the entire OCR, "
+    "classification, extraction, and answer-mapping process automatically."
 )
 
-# Initialize Session State to track pipeline steps
-if "raw_pages" not in st.session_state:
-    st.session_state.raw_pages = None
-if "classified_pages" not in st.session_state:
-    st.session_state.classified_pages = None
-if "extracted_questions" not in st.session_state:
-    st.session_state.extracted_questions = None
-if "mapped_results" not in st.session_state:
-    st.session_state.mapped_results = None
-
 # ----------------------------------------------------------------------
-# Sidebar Settings
+# Sidebar Controls
 # ----------------------------------------------------------------------
-st.sidebar.header("Configuration Settings")
+st.sidebar.header("Pipeline Settings")
 groq_api_key = st.sidebar.text_input("Groq API Key", type="password", value=os.getenv("GROQ_API_KEY", ""))
 groq_model = st.sidebar.selectbox(
-    "Groq Model Selection",
+    "Groq Model",
     ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
-    index=0
+    index=0,
+    help="Llama 3.3 70B is highly recommended for structured boundary mapping reasoning."
 )
 
 ocr_mode = st.sidebar.radio(
-    "OCR Model Mode",
-    ["Datalab Chandra (Local CLI)", "PyPDF Fallback (For CPU/Local Testing)"],
-    index=1
-)
-
-# Reset pipeline if a new file is uploaded
-def reset_pipeline():
-    st.session_state.raw_pages = None
-    st.session_state.classified_pages = None
-    st.session_state.extracted_questions = None
-    st.session_state.mapped_results = None
-
-uploaded_file = st.file_uploader(
-    "Upload Scanned PDF Student Answer Booklet", 
-    type=["pdf"], 
-    on_change=reset_pipeline
+    "OCR System Mode",
+    ["Datalab Chandra (Local CLI)", "PyPDF Reader Fallback"],
+    index=1,
+    help="Datalab Chandra will run if installed. Choose Fallback for standard PDF text reading."
 )
 
 # ----------------------------------------------------------------------
@@ -71,14 +54,16 @@ def run_fallback_ocr(pdf_path):
     return pages
 
 
-def run_chandra_ocr(pdf_bytes, filename):
+def run_chandra_ocr(pdf_bytes, filename, status):
     temp_pdf_path = f"temp_{filename}"
     with open(temp_pdf_path, "wb") as f:
         f.write(pdf_bytes)
         
     if "Fallback" in ocr_mode:
+        status.write("🔄 OCR: Running PyPDF extraction fallback...")
         return run_fallback_ocr(temp_pdf_path)
         
+    status.write("🔄 OCR: Launching local Datalab Chandra OCR model...")
     output_dir = "chandra_temp_output"
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
@@ -106,9 +91,9 @@ def run_chandra_ocr(pdf_bytes, filename):
                 processed_pages.append({"page_num": i + 1, "text": page_text.strip()})
             return processed_pages
         else:
-            raise FileNotFoundError("Chandra completed successfully but no output .md was found.")
+            raise FileNotFoundError("Chandra execution finished but output file was missing.")
     except Exception as e:
-        st.warning(f"Chandra OCR local runtime error: {str(e)}. Defaulting to standard text reader.")
+        status.write(f"⚠️ Chandra execution failed: {str(e)}. Defaulting to standard reader.")
         return run_fallback_ocr(temp_pdf_path)
     finally:
         if os.path.exists(temp_pdf_path):
@@ -117,29 +102,32 @@ def run_chandra_ocr(pdf_bytes, filename):
             shutil.rmtree(output_dir)
 
 
-def classify_pages(pages, client, model):
+def classify_pages(pages, client, model, status):
+    status.write("🔄 Classification: Categorizing booklet pages...")
     classified_pages = []
+    
     for page in pages:
         page_num = page['page_num']
         text_content = page['text']
+        # Optimization: Limit context tokens to speed up classification
         truncated_text = text_content[:1200]
         
         prompt = f"""
-You are an expert document classifier. Your job is to classify this page of a university student assignment/exam booklet.
-Classifications:
-1. "Question Paper" - Contains printed questions, marks, or instructions.
-2. "Admin/Cover" - Cover sheets, grade card, registration forms.
-3. "Answer Page" - Written answers.
+You are an expert document classifier. Your job is to classify this single page from a university student assignment/exam booklet.
+Classes:
+1. "Question Paper" - Contains printed list of official questions, marks, and instructions.
+2. "Admin/Cover" - Student info, registration forms, evaluator marking sheets, feed back pages.
+3. "Answer Page" - Contains student's handwritten answers.
 
 Page Content:
 ---
 {truncated_text}
 ---
 
-Respond ONLY with a JSON object:
+Respond ONLY with a JSON object in this format:
 {{
   "classification": "Question Paper" | "Admin/Cover" | "Answer Page",
-  "reason": "Brief explanation"
+  "reason": "Brief reason"
 }}
 """
         try:
@@ -161,25 +149,38 @@ Respond ONLY with a JSON object:
                 "page_num": page_num,
                 "text": text_content,
                 "classification": "Answer Page",
-                "reason": "Fallback due to LLM error"
+                "reason": "Error fallback"
             })
     return classified_pages
 
 
-def extract_questions_from_text(qp_text, client, model):
+def extract_questions(classified_pages, client, model, status):
+    status.write("🔄 Extraction: Identifying canonical question list...")
+    
+    # Identify pages classified as Question Paper
+    qp_pages = [p for p in classified_pages if p['classification'] == "Question Paper"]
+    
+    # AUTOMATED FALLBACK: If LLM missed Question Paper page labels, assume Pages 1 and 2 are the target source
+    if not qp_pages:
+        status.write("⚠️ Heuristic Fallback: No 'Question Paper' pages classified. Analyzing pages 1-2 as fallback...")
+        qp_pages = [p for p in classified_pages if p['page_num'] in [1, 2]]
+        
+    qp_text = "\n\n".join([f"--- Page {p['page_num']} ---\n{p['text']}" for p in qp_pages])
+    
     prompt = f"""
-Analyze the following Question Paper text and extract all questions.
+Identify and list all distinct questions and sub-questions from the text.
 Rules:
-1. Sub-questions must be individual list entries (e.g. split Q1 into Q1.(a), Q1.(b)). Do not merge them.
-2. Respond ONLY with a JSON object.
+1. Sub-questions must be extracted as separate list items (e.g. split Q1 into Q1.(a), Q1.(b)). Do not group them.
+2. Maintain the original question text.
+3. Respond ONLY with a JSON object containing a "questions" array.
 
-Question Paper Text:
+Document Text:
 {qp_text}
 
 JSON Output Format:
 {{
   "questions": [
-    {{ "id": "1.(a)", "text": "Question details here..." }}
+    {{ "id": "1.(a)", "text": "Question detail text..." }}
   ]
 }}
 """
@@ -191,9 +192,11 @@ JSON Output Format:
             temperature=0.0
         )
         res_json = json.loads(response.choices[0].message.content)
-        return res_json.get("questions", [])
+        questions = res_json.get("questions", [])
+        status.write(f"✅ Extracted {len(questions)} individual questions/sub-questions.")
+        return questions
     except Exception as e:
-        st.error(f"Failed to parse questions: {str(e)}")
+        status.write(f"⚠️ Extraction failed: {str(e)}")
         return []
 
 
@@ -207,11 +210,16 @@ def verify_integrity(sliced_lines, start_idx, end_idx, all_lines):
     return True
 
 
-def map_answers(classified_pages, questions, client, model, status_placeholder):
+def map_answers(classified_pages, questions, client, model, status):
+    status.write("🔄 Mapping: Aligning answers to extracted questions...")
+    
+    # Isolate actual answer pages
     answer_pages = [p for p in classified_pages if p['classification'] == "Answer Page"]
     if not answer_pages:
+        status.write("⚠️ No 'Answer Page' directories available to map.")
         return []
         
+    # Build continuous line coordinate canvas
     all_lines = []
     global_idx = 0
     for page in answer_pages:
@@ -221,6 +229,7 @@ def map_answers(classified_pages, questions, client, model, status_placeholder):
             all_lines.append({"idx": global_idx, "text": line, "page_num": page_num})
             global_idx += 1
             
+    # Remove blank lines to compress context token size
     llm_lines_repr = []
     for line_obj in all_lines:
         cleaned_text = line_obj['text'].strip()
@@ -236,20 +245,21 @@ def map_answers(classified_pages, questions, client, model, status_placeholder):
         q_id = q.get("id", f"Q{i+1}")
         q_text = q.get("text", "")
         
-        status_placeholder.write(f"🔄 Mapping Answer for Question **{q_id}**...")
+        status.write(f"➡️ Locating boundaries for Question {q_id}...")
         
         prompt = f"""
-Identify the start and end line index for the target question.
-Because booklets are sequential, the answer most likely starts at/after index {last_end_index}. 
-Only return the raw line indices in JSON.
+Find the exact start and end line indices corresponding to the student's handwritten answer.
+- Rely on line numbers ('L<number>').
+- The student likely answered this near or after index {last_end_index} (sequential mapping).
+- Respond ONLY with JSON coordinates. Do not summarize or paraphrase the answer text.
 
 Target Question:
 "{q_text}"
 
-OCR Transcript lines:
+Student OCR Transcript lines:
 {llm_document_context}
 
-Respond ONLY with a JSON object:
+JSON Output Format:
 {{
   "start_index": <integer_index>,
   "end_index": <integer_index>,
@@ -273,19 +283,21 @@ Respond ONLY with a JSON object:
                 qa_results.append({
                     "question_id": q_id,
                     "question": q_text,
-                    "answer": "[Mapping boundaries out of range]",
+                    "answer": "[No valid student answer bounds identified]",
                     "pages": [],
-                    "confidence": "failed"
+                    "confidence": "out_of_bounds"
                 })
                 continue
                 
+            # Perform Python Slicing on the target raw data
             sliced_lines = all_lines[start_idx : end_idx + 1]
             
+            # Non-negotiable Integrity Check Verification
             if not verify_integrity(sliced_lines, start_idx, end_idx, all_lines):
                 qa_results.append({
                     "question_id": q_id,
                     "question": q_text,
-                    "answer": "[Error: Integrity verification failed]",
+                    "answer": "[Error: Slicing integrity validation failed]",
                     "pages": [],
                     "confidence": "integrity_failed"
                 })
@@ -304,13 +316,15 @@ Respond ONLY with a JSON object:
                 "confidence": "high",
                 "explanation": res_json.get("explanation", "")
             })
+            
+            # Step the index tracker sequentially
             last_end_index = end_idx
             
         except Exception as e:
             qa_results.append({
                 "question_id": q_id,
                 "question": q_text,
-                "answer": f"[Error mapping answer: {str(e)}]",
+                "answer": f"[Mapping error occurred: {str(e)}]",
                 "pages": [],
                 "confidence": "failed"
             })
@@ -318,122 +332,70 @@ Respond ONLY with a JSON object:
     return qa_results
 
 # ----------------------------------------------------------------------
-# Interactive Execution Flow
+# Pipeline Execution Flow
 # ----------------------------------------------------------------------
 if uploaded_file:
     if not groq_api_key:
-        st.warning("Please enter your Groq API Key in the sidebar to proceed.")
+        st.warning("⚠️ Please provide a Groq API Key in the sidebar settings to begin.")
     else:
         client = Groq(api_key=groq_api_key)
-
-        # STEP 1: OCR (Run automatically on upload if not done yet)
-        if st.session_state.raw_pages is None:
-            with st.spinner("Stage 1: Running OCR on the PDF document..."):
-                st.session_state.raw_pages = run_chandra_ocr(uploaded_file.getvalue(), uploaded_file.name)
-            st.success("Stage 1: OCR Processing completed!")
-
-        # STEP 2: Classification (Run automatically after OCR)
-        if st.session_state.classified_pages is None:
-            with st.spinner("Stage 2: Running Page Classification..."):
-                st.session_state.classified_pages = classify_pages(st.session_state.raw_pages, client, groq_model)
-            st.success("Stage 2: Initial classification completed!")
-
-        # --- MANUAL OVERRIDE INTERFACE ---
-        st.header("Step-by-Step Document Adjustment Panel")
-        st.write("Review and adjust the page types to ensure the pipeline proceeds without failure.")
-
-        # Let user override classifications in real-time
-        with st.expander("📝 View & Adjust Page Classifications"):
-            cols = st.columns(4)
-            for i, page in enumerate(st.session_state.classified_pages):
-                col_idx = i % 4
-                with cols[col_idx]:
-                    st.write(f"**Page {page['page_num']}**")
-                    new_val = st.selectbox(
-                        f"Type for P.{page['page_num']}",
-                        ["Question Paper", "Admin/Cover", "Answer Page"],
-                        index=["Question Paper", "Admin/Cover", "Answer Page"].index(page['classification']),
-                        key=f"class_{page['page_num']}"
-                    )
-                    # Update configuration in session state
-                    st.session_state.classified_pages[i]['classification'] = new_val
-
-        # STEP 3: Question Extraction Trigger
-        if st.button("Extract Questions From Classified Pages"):
-            qp_pages = [p for p in st.session_state.classified_pages if p['classification'] == "Question Paper"]
-            if qp_pages:
-                qp_text = "\n\n".join([f"--- QP Page {p['page_num']} ---\n{p['text']}" for p in qp_pages])
-                with st.spinner("Analyzing Question Paper pages..."):
-                    st.session_state.extracted_questions = extract_questions_from_text(qp_text, client, groq_model)
+        
+        # Use a single automated status widget to process end-to-end with no intermediate button clicks
+        with st.status("Processing Pipeline (Running Automatically)...", expanded=True) as status:
+            
+            # Stage 1: OCR
+            raw_pages = run_chandra_ocr(uploaded_file.getvalue(), uploaded_file.name, status)
+            
+            # Stage 2: Page Classification
+            classified_pages = classify_pages(raw_pages, client, groq_model, status)
+            
+            # Stage 2b: Question Extraction (with auto-fallback logic inside)
+            extracted_questions = extract_questions(classified_pages, client, groq_model, status)
+            
+            # Stage 3: Sequential Mapping
+            if extracted_questions:
+                mapped_results = map_answers(classified_pages, extracted_questions, client, groq_model, status)
             else:
-                st.session_state.extracted_questions = []
+                mapped_results = []
+                status.write("❌ Pipeline finished early: No questions were extracted to match.")
+                
+            status.update(label="Pipeline Processing Complete!", state="complete", expanded=False)
 
-        # --- QUESTION OVERRIDE / MANUAL FALLBACK WRITER ---
-        if st.session_state.extracted_questions is not None:
-            st.subheader("Extracted Questions List")
+        # Display output panels once the pipeline concludes
+        if mapped_results:
+            st.success("Automated Processing Completed Successfully!")
             
-            if len(st.session_state.extracted_questions) == 0:
-                st.warning("⚠️ No questions found. You can manually enter or edit questions below.")
-            
-            # Interactive JSON editor or text-based question input
-            q_list_raw = json.dumps(st.session_state.extracted_questions, indent=2)
-            edited_q_json = st.text_area(
-                "Manually Edit/Add Questions (JSON format):", 
-                value=q_list_raw, 
-                height=250,
-                help="You can manually specify questions here if the LLM missed them or if the PDF did not contain the question paper."
-            )
-            try:
-                st.session_state.extracted_questions = json.loads(edited_q_json)
-            except Exception as e:
-                st.error("Invalid JSON syntax in manual editor. Please fix the formatting.")
-
-            # STEP 4: Execution of Sequential Mapping
-            if st.button("Run Sequential Answer Mapping", type="primary"):
-                if not st.session_state.extracted_questions:
-                    st.error("Cannot run mapping without a valid list of questions.")
-                else:
-                    status_placeholder = st.empty()
-                    with st.spinner("Mapping questions to exact raw handwritten answer text..."):
-                        st.session_state.mapped_results = map_answers(
-                            st.session_state.classified_pages,
-                            st.session_state.extracted_questions,
-                            client,
-                            groq_model,
-                            status_placeholder
-                        )
-                    status_placeholder.empty()
-                    st.success("Mapping Completed successfully!")
-
-        # --- SHOW RESULTS ---
-        if st.session_state.mapped_results:
-            st.header("Pipeline Output Results")
-            tab1, tab2 = st.tabs(["Mapped Q&A pairs", "Metadata & Debug Export"])
+            tab1, tab2, tab3 = st.tabs(["Mapped Q&A Results", "Classification Diagnostics", "Raw OCR Data"])
             
             with tab1:
-                for item in st.session_state.mapped_results:
-                    with st.expander(f"Question {item['question_id']} (Pages: {item['pages']})"):
+                st.subheader("Extracted Q&A Pairs")
+                for item in mapped_results:
+                    with st.expander(f"Question {item['question_id']} (Pages Spanned: {item['pages']})"):
                         st.markdown(f"**Question:**\n`{item['question']}`")
                         st.markdown("**Mapped Raw Answer Text:**")
                         st.code(item['answer'], language="text")
                         
             with tab2:
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.download_button(
-                        label="Download Final Q&A JSON",
-                        data=json.dumps(st.session_state.mapped_results, indent=2),
-                        file_name="final_qa_mapping.json",
-                        mime="application/json"
-                    )
-                with col2:
-                    st.download_button(
-                        label="Download Full Document States",
-                        data=json.dumps({
-                            "pages": st.session_state.raw_pages,
-                            "classification": st.session_state.classified_pages,
-                            "questions": st.session_state.extracted_questions
-                        }, indent=2),
-                        file_name="pipeline_debug_export.json",
-                        mime="application/json"
-                    )
+                st.subheader("Page Classifications")
+                st.json(classified_pages)
+                
+            with tab3:
+                st.subheader("Raw Page Transcripts")
+                st.json(raw_pages)
+                
+            # Download actions
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    label="Download Q&A Pairs (JSON)",
+                    data=json.dumps(mapped_results, indent=2),
+                    file_name="extracted_qa_pairs.json",
+                    mime="application/json"
+                )
+            with col2:
+                st.download_button(
+                    label="Download OCR Text (JSON)",
+                    data=json.dumps(raw_pages, indent=2),
+                    file_name="ocr_raw_pages.json",
+                    mime="application/json"
+                )
