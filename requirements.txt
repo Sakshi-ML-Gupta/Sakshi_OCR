@@ -2,4 +2,4 @@ streamlit
 pymupdf
 python-dotenv
 groq
-
+pypdf
