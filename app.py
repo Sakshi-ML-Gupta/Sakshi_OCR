@@ -23,7 +23,7 @@ Required environment variables / st.secrets entries:
 import tuple_error_diagnostic  # noqa: F401  (imported for its side effect)
 
 import streamlit as st
-#from pipeline import process_pdf
+from pipeline import process_pdf
 
 
 st.set_page_config(page_title="Assignment OCR + Q&A Extractor", layout="wide")
