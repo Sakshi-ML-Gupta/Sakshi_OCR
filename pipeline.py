@@ -1672,22 +1672,473 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
         end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
 
+    return results
+
+
+# =========================================================
+# BOUNDARY-FIRST + HOLISTIC ALIGNMENT ANSWER MAPPING
+# (recommended, default -- replaces the sequential single-target
+# approach above, which is kept in the file but no longer called)
+#
+# WHY THE SEQUENTIAL APPROACH ABOVE WAS REPLACED:
+# It asked the LLM N separate, blind questions per document ("does
+# REF-X's answer start somewhere in this small window?"), one target at
+# a time, with each search's starting point depending on the PREVIOUS
+# question's result. This has two structural problems, independent of
+# any prompt wording:
+#   1. Errors cascade: if question 3's start is found even slightly
+#      wrong, question 4's search begins from that wrong point, and
+#      every question after it inherits the error -- this is the
+#      confirmed cause of "answers mixed together" and "questions
+#      repeating" reports.
+#   2. The LLM never sees the overall structure of the document -- it
+#      is only ever shown a small, isolated slice and asked to make an
+#      artificial single yes/no judgment about ONE external target it
+#      cannot cross-reference against anything else. This wastes the
+#      LLM's actual strength, which is holistic pattern recognition
+#      across a full set of information.
+#
+# NEW DESIGN -- two clean, independent stages:
+#   STAGE 1 (boundary detection): scan the document in windows and, in
+#   ONE call per window, ask a much more natural question -- "where does
+#   EVERY new/distinct answer begin in this window?" -- with no
+#   dependency on any specific target question. This is pure content
+#   segmentation, a task LLMs are naturally good at, and errors in one
+#   window do NOT propagate to any other window (no shared search
+#   pointer).
+#   STAGE 2 (holistic alignment): once all candidate boundaries are
+#   collected (just their line numbers + a short excerpt each -- a small
+#   amount of data), show the LLM the COMPLETE list of official
+#   questions AND the COMPLETE list of candidate boundaries TOGETHER, in
+#   ONE call, and ask it to align them. Because this call sees
+#   everything at once, the LLM can use full-document context and
+#   ordering to resolve ambiguity correctly -- something it structurally
+#   could not do when only shown one tiny slice at a time.
+#
+# This also fixes the "assignment conclusion swallowed into last answer"
+# issue: the last matched answer's end is verified (via
+# _find_last_answer_true_end) instead of being blindly assumed to run to
+# the end of the document.
+# =========================================================
+
+BOUNDARY_DETECTION_SYSTEM_PROMPT = """You are scanning a window of line-numbered OCR text from a student's exam answer booklet. Multiple separate answers to different exam questions appear back-to-back in this document, usually (but not always) in the same order as the question paper.
+
+Your task: identify every point in this window where a NEW, DISTINCT answer begins -- i.e. every genuine boundary where the content shifts to answering a different question than whatever came before it.
+
+===========================================================
+RULE 1 -- REPORT THE EARLIEST LINE OF EACH ANSWER, NOT THE CLEAREST
+===========================================================
+An answer's true start is often NOT the sentence that most obviously states its topic. Before that, there is very often a short label ("Ans 5-", "उत्तर 6", "Q.5", "5)"), a one-line restatement of the question, or a brief introductory/transitional sentence. If any such line exists immediately before the "obviously on-topic" content, report THAT earlier line as start_line, not the later one. When in doubt between two candidate lines for the same answer, always choose the earlier one.
+
+===========================================================
+RULE 2 -- ONLY REPORT GENUINE BOUNDARIES, NOT SUB-POINTS
+===========================================================
+A single long answer commonly contains its own internal numbered or bulleted sub-points as part of ONE continuous explanation (e.g. a student listing several causes/features/steps while answering ONE question). These are NOT separate boundaries -- do not report them. Only report a boundary when the content genuinely shifts to a DIFFERENT question's answer (a real topic change), not merely because a new number or bullet appears.
+
+===========================================================
+RULE 3 -- IGNORE OCR ARTIFACT/ANNOTATION DESCRIPTIONS
+===========================================================
+Some lines are the OCR engine's own description of a visual element on the page (e.g. "[Logo]", "There is a red pen mark here", "Scribbled line", "Stamp", "Signature", doodles, underlines) rather than actual student writing. These are never boundaries and must be ignored -- if genuine answer content begins on the line right after such a description, use that real content line as the start_line, not the artifact-description line.
+
+===========================================================
+OUTPUT
+===========================================================
+For each genuine boundary found, report:
+- start_line: the earliest line number of that new answer (per Rule 1)
+- hint: a short verbatim excerpt (roughly 10-20 words) of the opening content, to help identify which official question this answer responds to later
+
+If this window contains NO new answer starts at all (e.g. it is entirely the continuation of an answer that began earlier), return an empty list -- this is normal and expected, especially for windows in the middle of a long answer.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{"boundaries": [{"start_line": 12, "hint": "Ans 5- Discuss the causes of the French Revolution"}, {"start_line": 45, "hint": "The main function of the kidney is to"}]}
+
+If none found: {"boundaries": []}"""
+
+
+def _parse_boundary_detection_response(content: str) -> list:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    data = json.loads(content)
+    if not isinstance(data, dict) or "boundaries" not in data:
+        raise ValueError(f"Response missing 'boundaries' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    boundaries = data["boundaries"]
+    if not isinstance(boundaries, list):
+        raise ValueError(f"'boundaries' must be a list, got: {type(boundaries).__name__}")
+
+    result = []
+    for b in boundaries:
+        if not isinstance(b, dict) or "start_line" not in b:
+            continue
+        try:
+            start_line = int(b["start_line"])
+        except (ValueError, TypeError):
+            continue
+        hint = str(b.get("hint", "")).strip()
+        result.append({"start_line": start_line, "hint": hint})
+    return result
+
+
+BOUNDARY_DETECTION_WINDOW_CHARS = 9000
+BOUNDARY_DETECTION_OVERLAP_LINES = 8
+
+
+def _chunk_lines_with_overlap(numbered_lines: list, window_chars: int, overlap_lines: int) -> list:
+    """
+    Simple char-budget windowing WITH a small trailing overlap between
+    consecutive windows. Safe here (unlike the old per-question sequential
+    search) because this is used only for boundary DETECTION -- there is
+    no specific target being searched for, so a boundary appearing twice
+    across two overlapping windows is just de-duplicated afterward, never
+    mis-assigned to the wrong question.
+    """
+    chunks = []
+    total = len(numbered_lines)
+    pointer = 0
+    while pointer < total:
+        window = []
+        chars = 0
+        idx = pointer
+        while idx < total and (not window or chars + len(numbered_lines[idx][1]) <= window_chars):
+            window.append(numbered_lines[idx])
+            chars += len(numbered_lines[idx][1])
+            idx += 1
+        if not window:
+            break
+        chunks.append(window)
+        if idx >= total:
+            break
+        pointer = max(idx - overlap_lines, pointer + 1)
+    return chunks
+
+
+def _detect_all_boundaries(client, answer_lines: list, budget: "_TokenBudgetTracker", log) -> list:
+    numbered_lines = list(enumerate(answer_lines))
+    chunks = _chunk_lines_with_overlap(numbered_lines, BOUNDARY_DETECTION_WINDOW_CHARS, BOUNDARY_DETECTION_OVERLAP_LINES)
+    log(f"Scanning {len(chunks)} window(s) for answer boundaries...")
+
+    raw_boundaries = []
+    for i, window in enumerate(chunks):
+        lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window)
+        user_prompt = f"TEXT WINDOW (line-numbered):\n{lines_block}"
+        try:
+            found = _call_groq_with_retries(
+                client, BOUNDARY_DETECTION_SYSTEM_PROMPT, user_prompt,
+                _parse_boundary_detection_response, budget, log
+            )
+        except Exception as e:
+            log(f"WARNING: boundary detection failed for window {i+1}/{len(chunks)}: {e}")
+            continue
+
+        valid_ids = {idx for idx, _ in window}
+        for b in found:
+            if b["start_line"] in valid_ids:
+                raw_boundaries.append(b)
+            else:
+                log(f"WARNING: discarding boundary at out-of-range line {b['start_line']} (window {i+1})")
+
+    raw_boundaries.sort(key=lambda b: b["start_line"])
+    boundaries = []
+    for b in raw_boundaries:
+        if boundaries and b["start_line"] - boundaries[-1]["start_line"] <= 2:
+            continue  # near-duplicate from overlapping windows -- keep the earlier one already kept
+        boundaries.append(b)
+
+    log(f"Detected {len(boundaries)} candidate answer boundary(ies) across the document")
+    return boundaries
+
+
+ALIGNMENT_SYSTEM_PROMPT = """You are matching a list of OFFICIAL exam questions to a list of CANDIDATE answer boundaries detected earlier in a student's answer booklet. Both lists are conceptually in DOCUMENT ORDER: questions are numbered in the order the question paper asks them, and boundaries are numbered in the order they appear in the student's answers (increasing line number).
+
+Your task: for each official question (by its REF label), decide WHICH boundary (by its index) is the true start of that question's answer -- if any.
+
+Guidance:
+- A student very commonly answers questions in the same order as the question paper, but may skip questions or answer out of order. Some detected boundaries may also be spurious (not a real answer start) -- you do not need to use every boundary.
+- Use each boundary's hint (a short excerpt of its opening content) to judge which boundary's topic matches which question's topic.
+- Each boundary may be assigned to AT MOST ONE question. Each question may be assigned AT MOST ONE boundary.
+- If a question's answer does not appear to be present among the boundaries at all, omit that REF from your output entirely -- do not force a match.
+- DOCUMENT ORDER is a strong signal: if question 3 matches boundary index 5, question 4's answer (if present at all) will almost always be at a boundary index greater than 5, never less. Use this to resolve ambiguity between similar-looking candidates.
+
+You will be given:
+1. The official questions, each tagged [REF-X].
+2. The candidate boundaries, each tagged [BOUNDARY-N] with its line number and a short hint of its opening content.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{"matches": [{"ref": "REF-A", "boundary_index": 2}, {"ref": "REF-B", "boundary_index": 5}]}"""
+
+
+def _build_alignment_prompt(questions: list, boundaries: list) -> str:
+    q_block = "\n".join(f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions))
+    b_block = "\n".join(
+        f"[BOUNDARY-{i}] (line {b['start_line']}) {b['hint']}" for i, b in enumerate(boundaries)
+    )
+    return (
+        f"OFFICIAL QUESTIONS (in question-paper order):\n{q_block}\n\n"
+        f"CANDIDATE BOUNDARIES (in document order):\n{b_block}"
+    )
+
+
+def _parse_alignment_response(content: str) -> list:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    data = json.loads(content)
+    if not isinstance(data, dict) or "matches" not in data:
+        raise ValueError(f"Response missing 'matches' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    matches = data["matches"]
+    if not isinstance(matches, list):
+        raise ValueError(f"'matches' must be a list, got: {type(matches).__name__}")
+
+    result = []
+    for m in matches:
+        if not isinstance(m, dict) or "ref" not in m or "boundary_index" not in m:
+            continue
+        try:
+            result.append({
+                "ref": str(m["ref"]).strip().upper(),
+                "boundary_index": int(m["boundary_index"]),
+            })
+        except (ValueError, TypeError):
+            continue
+    return result
+
+
+LAST_ANSWER_END_SYSTEM_PROMPT = """You are looking at the FINAL portion of a student's exam answer booklet (OCR'd, line-numbered), starting from where their LAST answer begins. This tail section may contain:
+1. The remainder of the student's genuine answer content (their own reasoning/explanation for the target question) -- this is the ONLY thing that should be included.
+2. AFTER the student's real answer content ends, there may be trailing material that is NOT part of the answer itself: e.g. an overall assignment/exam-level closing remark, a general concluding statement about the whole assignment/course (not specific to this one question), an institutional footer, "thank you" notes, blank/signature lines, or similar wrap-up text.
+
+Your task: find the LAST line number that is still genuinely part of the student's answer to the target question -- i.e. the line right before any such trailing, non-answer-specific material begins (if any exists). If the entire text shown is genuine answer content with no trailing wrap-up material, the last line of the text IS the answer's end.
+
+Guidance:
+- Only exclude trailing content if it is clearly NOT part of answering this specific question -- e.g. it talks about the assignment/paper/course as a whole rather than continuing this answer's explanation, or it's a generic sign-off/closing statement.
+- Do NOT exclude a line just because it sounds like a summary or concluding sentence OF THIS ANSWER ITSELF (a student's own concluding sentence for their own answer is normal and should be INCLUDED, not excluded).
+- If you are not confident there is any trailing non-answer material, default to including everything (report the last line of the text shown).
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{"end_line": 87}
+
+end_line MUST be one of the exact line numbers shown in [brackets] in the text below."""
+
+
+def _parse_last_answer_end_response(content: str) -> int:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+    data = json.loads(content)
+    if not isinstance(data, dict) or "end_line" not in data:
+        raise ValueError(f"Response missing 'end_line' key: {data!r}")
+    return int(data["end_line"])
+
+
+def _find_last_answer_true_end(client, numbered_lines: list, question_text: str, ref_label: str,
+                                 start_line: int, budget: "_TokenBudgetTracker", log,
+                                 max_chars: int = BOUNDARY_DETECTION_WINDOW_CHARS) -> int:
+    total_lines = len(numbered_lines)
+    tail = []
+    chars = 0
+    idx = start_line
+    while idx < total_lines and (not tail or chars + len(numbered_lines[idx][1]) <= max_chars):
+        tail.append(numbered_lines[idx])
+        chars += len(numbered_lines[idx][1])
+        idx += 1
+
+    if not tail:
+        return total_lines - 1
+
+    default_end = tail[-1][0]  # safe fallback: include everything, as before this fix
+
+    lines_block = "\n".join(f"[{i}] {t}" for i, t in tail)
+    user_prompt = f"TARGET QUESTION ({ref_label}): {question_text}\n\nTEXT (line-numbered, this is the tail of the document):\n{lines_block}"
+
+    try:
+        end_line = _call_groq_with_retries(
+            client, LAST_ANSWER_END_SYSTEM_PROMPT, user_prompt,
+            _parse_last_answer_end_response, budget, log, max_retries=2
+        )
+    except Exception as e:
+        log(f"WARNING: could not verify true end of last answer ({ref_label}), keeping full tail: {e}")
+        return default_end
+
+    valid_ids = {i for i, _ in tail}
+    if end_line not in valid_ids:
+        log(f"WARNING: last-answer end_line {end_line} out of range, keeping full tail as fallback")
+        return default_end
+
+    if end_line < default_end:
+        log(
+            f"Trimmed last answer ({ref_label}): content after line {end_line} was identified "
+            f"as trailing non-answer material (e.g. an overall assignment conclusion) and excluded."
+        )
+
+    return end_line
+
+
+def map_answers_by_boundary_detection(answer_lines: list, questions: list, status_callback=None,
+                                        answer_line_pages: list = None) -> list:
+    """
+    RECOMMENDED default answer-mapping strategy. See the module comment
+    above BOUNDARY_DETECTION_SYSTEM_PROMPT for the full rationale.
+
+    Stage 1: detect ALL answer-start boundaries in the document, content-
+    first, with no dependency on any specific target question (so a
+    detection error in one window can't cascade into every question after
+    it, unlike the old sequential single-target search).
+
+    Stage 2: show the LLM the complete list of official questions AND the
+    complete list of detected boundaries TOGETHER, in one holistic call,
+    and let it align them using full-document context and ordering.
+
+    The last matched answer's end is verified against trailing
+    non-answer content (e.g. an overall assignment conclusion) instead of
+    being assumed to run to the end of the document.
+
+    Returns a list of dicts, one per question, in the same shape as
+    map_answers_sequential() (ref/question/matched/start_line/end_line/
+    start_page/end_page/answer/answer_raw).
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
+        raise Exception("GROQ_API_KEY not found in secrets or environment")
+
+    client = Groq(api_key=api_key)
+    budget = _TokenBudgetTracker()
+
+    numbered_lines = list(enumerate(answer_lines))
+    ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
+
+    def _empty_result(reason: str):
+        log(f"WARNING: {reason} -- returning all questions as unmatched")
+        return [
+            {"ref": f"REF-{chr(65+i)}", "question": q, "matched": False,
+             "start_line": None, "end_line": None, "start_page": None, "end_page": None,
+             "answer": "", "answer_raw": ""}
+            for i, q in enumerate(questions)
+        ]
+
+    # Stage 1
+    boundaries = _detect_all_boundaries(client, answer_lines, budget, log)
+    if not boundaries:
+        return _empty_result("no answer boundaries were detected anywhere in the document")
+
+    # Stage 2
+    alignment_prompt = _build_alignment_prompt(questions, boundaries)
+    try:
+        matches = _call_groq_with_retries(
+            client, ALIGNMENT_SYSTEM_PROMPT, alignment_prompt,
+            _parse_alignment_response, budget, log
+        )
+    except Exception as e:
+        log(f"WARNING: question-to-boundary alignment failed: {e}")
+        matches = []
+
+    matches_by_ref = {m["ref"]: m["boundary_index"] for m in matches if "ref" in m}
+
+    # Validate + enforce monotonic document order: process questions in
+    # their own order and require each accepted match's boundary_index to
+    # be >= the previous accepted match's boundary_index. This preserves
+    # the "answers appear in roughly question-paper order" guarantee
+    # without ever letting one bad match silently corrupt the rest --
+    # a rejected match here just leaves that one question unmatched,
+    # it doesn't shift or break any other question's mapping.
+    used_boundary_indices = set()
+    ordered_valid_matches = []
+    last_boundary_idx = -1
+
+    for i, q in enumerate(questions):
+        ref = f"REF-{chr(65+i)}"
+        if ref not in matches_by_ref:
+            continue
+        b_idx = matches_by_ref[ref]
+        if not (0 <= b_idx < len(boundaries)):
+            log(f"WARNING: alignment gave out-of-range boundary_index {b_idx} for {ref}, ignoring")
+            continue
+        if b_idx in used_boundary_indices:
+            log(f"WARNING: alignment assigned boundary {b_idx} to more than one question, ignoring the later duplicate ({ref})")
+            continue
+        if b_idx < last_boundary_idx:
+            log(
+                f"WARNING: alignment gave {ref} boundary_index {b_idx}, which is out of "
+                f"document order (before the previous match at {last_boundary_idx}) -- ignoring"
+            )
+            continue
+        used_boundary_indices.add(b_idx)
+        last_boundary_idx = b_idx
+        ordered_valid_matches.append((ref, b_idx))
+
+    log(f"Alignment matched {len(ordered_valid_matches)} of {len(questions)} question(s) to boundaries")
+
+    # Build final ranges: end = next matched boundary's start - 1; the
+    # last matched question's end is verified rather than assumed.
+    ranges_by_ref = {}
+    for idx, (ref, b_idx) in enumerate(ordered_valid_matches):
+        start = boundaries[b_idx]["start_line"]
+        if idx + 1 < len(ordered_valid_matches):
+            next_start = boundaries[ordered_valid_matches[idx + 1][1]]["start_line"]
+            end = next_start - 1
+        else:
+            end = _find_last_answer_true_end(
+                client, numbered_lines, ref_to_question[ref], ref, start, budget, log
+            )
+        ranges_by_ref[ref] = {"start_line": start, "end_line": end}
+
+    results = []
+    for i, q in enumerate(questions):
+        ref = f"REF-{chr(65+i)}"
+        r = ranges_by_ref.get(ref)
+
+        if r is None:
+            results.append({
+                "ref": ref, "question": q, "matched": False,
+                "start_line": None, "end_line": None,
+                "start_page": None, "end_page": None,
+                "answer": "", "answer_raw": "",
+            })
+            continue
+
+        s, e = r["start_line"], r["end_line"]
+        verbatim_lines = [
+            answer_lines[j] for j in range(s, e + 1)
+            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
+        ]
+        answer_raw = " ".join(verbatim_lines).strip()
+        answer_clean = strip_question_restatement(answer_raw)
+        answer_clean = strip_full_question_echo(answer_clean, q)
+
+        start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
+        end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
+
         results.append({
-            "ref": ref,
-            "question": q,
-            "matched": True,
-            "start_line": s,
-            "end_line": e,
-            "start_page": start_page,
-            "end_page": end_page,
-            "answer": answer_clean,
-            "answer_raw": answer_raw,
+            "ref": ref, "question": q, "matched": True,
+            "start_line": s, "end_line": e,
+            "start_page": start_page, "end_page": end_page,
+            "answer": answer_clean, "answer_raw": answer_raw,
         })
 
     return results
 
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
+
                                     carry_over_ref: str = None) -> str:
     questions_block = "\n".join(
         f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
@@ -2532,16 +2983,15 @@ def process_pdf(file_input, status_callback=None):
             "would be guaranteed to fail."
         )
 
-    # Sequential single-target search strategy -- see map_answers_sequential()'s
-    # docstring for the full rationale. Every LLM call does exactly ONE
-    # thing (find one answer's start line), and every answer's END is
-    # computed in Python as (next answer's start - 1), never asked of the
-    # LLM. The returned list already carries full source traceability
-    # (start_line/end_line/start_page/end_page) plus both the raw
-    # (unmodified) and cleaned answer text -- see field docs in
-    # map_answers_sequential().
-    log("Mapping each question to its answer (sequential single-target search)...")
-    qa_pairs = map_answers_sequential(
+    # Boundary-first + holistic alignment strategy -- see
+    # map_answers_by_boundary_detection()'s docstring for the full
+    # rationale. Stage 1 detects all answer boundaries content-first (no
+    # per-question dependency, so no error cascade). Stage 2 aligns the
+    # complete question list against the complete boundary list in one
+    # holistic call, letting the LLM use full-document context instead of
+    # blind, isolated per-window guessing.
+    log("Mapping each question to its answer (boundary detection + holistic alignment)...")
+    qa_pairs = map_answers_by_boundary_detection(
         answer_lines, official_questions, status_callback,
         answer_line_pages=answer_line_pages
     )
