@@ -1694,19 +1694,38 @@ _OCR_ARTIFACT_DESCRIPTION_RE = re.compile(
 )
 
 
+_ANNOTATION_MARK_WORDS = re.compile(
+    r'\b(?:circl(?:e|ing|ed)|arrow|underlin\w*|scribbl\w*|doodle\w*|'
+    r'tick\s*mark|cross\s*mark|strike[\s-]?through)\b', re.IGNORECASE
+)
+_ANNOTATION_COLOR_WORDS = re.compile(r'\bred\s*(?:pen|ink|colou?r)?\b', re.IGNORECASE)
+_ANNOTATION_ACTION_WORDS = re.compile(
+    r'\b(?:originates?\s+from|points?\s+(?:diagonally|towards?|downwards?|upwards?|'
+    r'to\s+the\s+(?:left|right))|containing\s+the\s+number|blank\s+space\s+of\s+the\s+page|'
+    r'corner\s+of\s+the\s+page|across\s+the\s+page|drawn\s+(?:in|on)|marked?\s+(?:in|with))\b',
+    re.IGNORECASE
+)
+
 def _is_ocr_artifact_description(line: str) -> bool:
-    """
-    Detects lines where the OCR engine described a VISUAL artifact on the
-    page (a logo, stamp, red-pen scribble/underline, stray mark, doodle,
-    etc.) in prose, instead of transcribing actual student writing. These
-    are OCR commentary about the page, never student answer content, and
-    must be excluded both from extracted answer text AND from candidate
-    answer-start/transition lines.
-    """
     stripped = line.strip()
     if not stripped:
         return False
-    return bool(_OCR_ARTIFACT_DESCRIPTION_RE.match(stripped))
+    if _OCR_ARTIFACT_DESCRIPTION_RE.match(stripped):
+        return True
+    # Broader signature: OCR sometimes narrates an examiner's red-pen
+    # annotation (circle around a question number, arrow, tick, etc.) as
+    # a full descriptive sentence instead of transcribing real writing.
+    # These don't start with "there is", so the anchored regex above
+    # misses them. Require at least 2 of 3 signal categories together
+    # (mark-type + color/ink + description-action wording) so genuine
+    # academic content that happens to mention "arrow" or "circle" once
+    # isn't falsely flagged.
+    has_mark = bool(_ANNOTATION_MARK_WORDS.search(stripped))
+    has_color = bool(_ANNOTATION_COLOR_WORDS.search(stripped))
+    has_action = bool(_ANNOTATION_ACTION_WORDS.search(stripped))
+    if (has_mark + has_color + has_action) >= 2 and len(stripped) <= 300:
+        return True
+    return False
 
 
 def is_noise(line: str) -> bool:
@@ -1943,10 +1962,21 @@ def process_pdf(file_input, status_callback=None):
     answer_lines = []
     answer_line_pages = []
     for page in answer_pages:
+        page_kept_any = False
         for line in page["raw_text"].split("\n"):
             if not is_noise(line):
                 answer_lines.append(line)
                 answer_line_pages.append(page["page_number"])
+                page_kept_any = True
+        if not page_kept_any and page["raw_text"].strip():
+            log(
+                f"WARNING: page {page['page_number']} produced ZERO usable answer "
+                f"lines after filtering, despite having {len(page['raw_text'])} chars "
+                f"of raw OCR text. This usually means Chandra mis-transcribed the "
+                f"WHOLE page as an annotation description (red-pen marks etc.) instead "
+                f"of the actual handwriting -- real content may be LOST here, not just "
+                f"filtered. Manually check page {page['page_number']} in the source PDF."
+            )
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
