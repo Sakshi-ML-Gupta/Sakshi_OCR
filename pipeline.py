@@ -359,6 +359,27 @@ Critical rules for telling question-paper pages apart from answer pages that hap
 - Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate.
 - Output ONLY the JSON object described above. No prose before or after it. No markdown code fences."""
 
+def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker",
+                          log, max_retries: int = 4) -> tuple:
+    user_prompt = _build_qp_user_prompt(pages_chunk)
+
+    # DEBUG: log which pages went into this chunk and a short preview,
+    # so a zero-QP-page result can be traced back to what the model
+    # actually saw.
+    page_nums = [p["page_number"] for p in pages_chunk]
+    log(f"  [debug] chunk pages {page_nums} -- previews:")
+    for p in pages_chunk:
+        preview = p["raw_text"][:150].replace("\n", " ")
+        log(f"  [debug]   page {p['page_number']}: {preview!r}")
+
+    def _debug_parser(content):
+        log(f"  [debug] raw LLM response for chunk pages {page_nums}: {content[:800]!r}")
+        return _parse_qp_llm_response(content)
+
+    return _call_groq_with_retries(
+        client, QP_SYSTEM_PROMPT, user_prompt, _debug_parser,
+        budget, log, max_retries
+    )
 
 def _chunk_pages_by_char_budget(pages: list, max_chars: int = MAX_CHARS_PER_CHUNK,
                                   overlap_pages: int = CHUNK_OVERLAP_PAGES) -> list:
