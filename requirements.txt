@@ -1,5 +1,4 @@
-streamlit
-pymupdf
-python-dotenv
-groq
-pypdf
+streamlit>=1.38
+requests>=2.32
+groq>=0.11
+python-dotenv>=1.0
