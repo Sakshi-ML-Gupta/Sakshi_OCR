@@ -1155,24 +1155,10 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                                     window_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS,
                                     max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS,
                                     extra_reminder: str = None):
-    """
-    Slides forward through numbered_lines in NON-OVERLAPPING windows,
-    starting at search_from_idx, asking a single yes/no+line-number
-    question per window, until the target's start is found or the
-    document is exhausted. Returns the found start_line, or None.
-
-    NOTE: a trailing-line overlap between windows was tried here to fix a
-    reported "intro paragraph gets skipped" issue, but it was REVERTED --
-    combined with the "repeated content is OK" guidance in the system
-    prompt above, overlap increased false-positive early matches (a line
-    still belonging to the CURRENT open answer would get matched as the
-    NEXT answer's start), which caused a worse regression (mixed/missing
-    answers across most questions, not just an edge case). Back to the
-    original, more conservative zero-overlap behavior.
-    """
     total_lines = len(numbered_lines)
     pointer = search_from_idx
     windows_tried = 0
+    prev_window_tail = []  # last few (idx, text) lines from the PREVIOUS window, re-shown for context only
 
     while pointer < total_lines and windows_tried < max_windows:
         window = []
@@ -1186,7 +1172,31 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
         if not window:
             break
 
-        user_prompt = _build_sequential_search_prompt(window, question_text, ref_label, extra_reminder)
+        # Re-show the tail of the PREVIOUS window as read-only lookback
+        # context (never as candidate start_line answers -- the model is
+        # told explicitly these lines are context only, not part of this
+        # window). This fixes the "opening line sat right at the window
+        # boundary and had no forward context to be recognized" failure,
+        # WITHOUT changing pointer advancement or introducing duplicate
+        # candidate lines that could be wrongly picked as false starts.
+        combined_window = prev_window_tail + window
+        context_note = None
+        if prev_window_tail:
+            context_note = (
+                f"NOTE: the first {len(prev_window_tail)} line(s) shown below (up to and "
+                f"including line [{prev_window_tail[-1][0]}]) are LOOKBACK CONTEXT from "
+                f"immediately before this window -- they were already checked in a previous "
+                f"pass and must NOT be reported as start_line even if they look relevant. "
+                f"Only lines from [{window[0][0]}] onward are valid candidates for start_line."
+            )
+        if extra_reminder and context_note:
+            combined_reminder = f"{extra_reminder}\n\n{context_note}"
+        elif context_note:
+            combined_reminder = context_note
+        else:
+            combined_reminder = extra_reminder
+
+        user_prompt = _build_sequential_search_prompt(combined_window, question_text, ref_label, combined_reminder)
         try:
             found, start_line = _call_groq_with_retries(
                 client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
@@ -1197,58 +1207,23 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
             found, start_line = False, None
 
         if found and start_line is not None:
-            valid_ids = {i for i, _ in window}
-            if start_line in valid_ids:
+            valid_new_ids = {i for i, _ in window}  # only THIS window's lines are acceptable
+            if start_line in valid_new_ids:
                 return start_line
             log(
-                f"WARNING: {ref_label} reported start_line {start_line}, which is outside "
-                f"this window's actual range {window[0][0]}-{window[-1][0]} -- ignoring and "
-                f"treating this window as a non-match"
+                f"WARNING: {ref_label} reported start_line {start_line}, which is either "
+                f"lookback context or outside this window's actual range "
+                f"{window[0][0]}-{window[-1][0]} -- ignoring and treating this window as a non-match"
             )
 
-        pointer = idx  # move forward to the next window, no overlap
+        prev_window_tail = window[-6:]  # carry forward a small tail as context for the NEXT window
+        pointer = idx  # advance with NO overlap in the real candidate set -- unchanged from before
         windows_tried += 1
 
     return None
 
-
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
-    """
-    RECOMMENDED default answer-mapping strategy (see module docstring
-    above the SEQUENTIAL_SEARCH_SYSTEM_PROMPT for the full rationale).
-
-    For each question in order:
-      1. Search forward from wherever the previous question's answer was
-         confirmed to start, for a line where THIS question's answer
-         begins.
-      2. Once found, the previous question's END is computed as
-         (this start - 1) -- never asked of the LLM.
-    The very last question's answer runs to the end of the document.
-
-    If a question's start can't be found anywhere from the search
-    pointer to the end of the document, it's recorded as unmatched, and
-    the search for the NEXT question continues from the SAME pointer
-    (its answer wasn't necessarily lost -- it may simply not exist, e.g.
-    the student skipped it).
-
-    Returns a LIST of dicts, one per question, each carrying:
-      - start_line / end_line: the exact 0-based indices into
-        answer_lines this answer was sliced from (so you can look them
-        up directly)
-      - start_page / end_page: the OCR page number(s) the answer spans,
-        if answer_line_pages was provided (lets you flip straight to the
-        right page(s) of the source PDF to eyeball it)
-      - answer_raw: the UNMODIFIED verbatim join of the sliced lines --
-        exactly what the OCR produced, before any cleanup
-      - answer: the same text after the (optional) restatement-stripping
-        cleanup -- so you can directly compare "raw" vs "cleaned" and
-        see precisely what, if anything, was removed and why. Nothing
-        is ever ADDED to answer_raw at this stage -- it is a plain
-        Python slice of the OCR text, never LLM-generated -- so if
-        answer_raw itself looks embellished/"enhanced", that happened
-        upstream in the OCR step (see notes in run_ocr), not here.
-    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -1267,7 +1242,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     total_lines = len(numbered_lines)
 
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
-    found_starts = {}  # ref -> start_line
+    found_starts = {}
     pointer = 0
 
     for i, q in enumerate(questions):
@@ -1278,17 +1253,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             client, numbered_lines, q, ref, pointer, budget, log
         )
 
-        # =================================================================
-        # FIX: retry once with an explicit reminder before giving up.
-        # Real failure pattern reported: the same definition/explanation
-        # can legitimately appear more than once across different answers
-        # (e.g. two related questions both require explaining the same
-        # concept). A model can be biased to read a repeated definition as
-        # "already covered, not a new start" and wrongly report found=false
-        # even though this occurrence genuinely IS a new answer. Since this
-        # retry happens BEFORE pointer is advanced, it's safe -- it can only
-        # recover a genuine match, never corrupt an already-confirmed range.
-        # =================================================================
         if start_line is None:
             log(f"  first pass found nothing for {ref} -- retrying once with an explicit reminder...")
             retry_reminder = (
@@ -1321,14 +1285,32 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 f"for over this same remaining text."
             )
 
-    # End of each answer = the next (in document order) confirmed
-    # answer's start, minus one. Computed purely in Python -- never
-    # asked of the LLM, so it can never be wrong in the way an
-    # LLM-guessed end line could be.
     ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
+
+    # =====================================================================
+    # FIX: previously the LAST answer's end was hardcoded to total_lines-1
+    # (end of document), on the assumption that nothing meaningful follows
+    # the last real answer. That's false whenever the document has a
+    # trailing non-answer section (e.g. an overall assignment conclusion,
+    # closing remarks, "thank you" note, institutional footer text) that
+    # wasn't classified as an admin/QP page upstream -- that trailing
+    # content silently got absorbed into the last answer's range.
+    #
+    # Fix: for the LAST confirmed answer only, explicitly ask the LLM
+    # (same sequential single-target style, so still just one focused
+    # judgment) whether the answer's OWN content ends before the true
+    # end of the document, and if so, where. This is a single extra call,
+    # only for the final ref, and never changes any other answer's
+    # boundaries -- so it can't introduce the earlier regressions.
+    # =====================================================================
     ranges = []
     for idx, (ref, start) in enumerate(ordered):
-        end = ordered[idx + 1][1] - 1 if idx + 1 < len(ordered) else total_lines - 1
+        if idx + 1 < len(ordered):
+            end = ordered[idx + 1][1] - 1
+        else:
+            end = _find_last_answer_true_end(
+                client, numbered_lines, ref_to_question[ref], ref, start, budget, log
+            )
         ranges.append({"ref": ref, "start_line": start, "end_line": end})
 
     log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
@@ -1341,15 +1323,10 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
         if r is None:
             results.append({
-                "ref": ref,
-                "question": q,
-                "matched": False,
-                "start_line": None,
-                "end_line": None,
-                "start_page": None,
-                "end_page": None,
-                "answer": "",
-                "answer_raw": "",
+                "ref": ref, "question": q, "matched": False,
+                "start_line": None, "end_line": None,
+                "start_page": None, "end_page": None,
+                "answer": "", "answer_raw": "",
             })
             continue
 
@@ -1366,20 +1343,88 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
 
         results.append({
-            "ref": ref,
-            "question": q,
-            "matched": True,
-            "start_line": s,
-            "end_line": e,
-            "start_page": start_page,
-            "end_page": end_page,
-            "answer": answer_clean,
-            "answer_raw": answer_raw,
+            "ref": ref, "question": q, "matched": True,
+            "start_line": s, "end_line": e,
+            "start_page": start_page, "end_page": end_page,
+            "answer": answer_clean, "answer_raw": answer_raw,
         })
 
     return results
 
 
+LAST_ANSWER_END_SYSTEM_PROMPT = """You are looking at the FINAL portion of a student's exam answer booklet (OCR'd, line-numbered), starting from where their LAST answer begins. This tail section may contain:
+1. The remainder of the student's genuine answer content (their own reasoning/explanation for the target question) -- this is the ONLY thing that should be included.
+2. AFTER the student's real answer content ends, there may be trailing material that is NOT part of the answer itself: e.g. an overall assignment/exam-level closing remark, general concluding statement about the whole assignment/course (not specific to this one question), an institutional footer, "thank you" notes, blank/signature lines, or similar wrap-up text.
+
+Your task: find the LAST line number that is still genuinely part of the student's answer to the target question -- i.e., the line right before any such trailing, non-answer-specific material begins (if any exists). If the entire text shown is genuine answer content with no trailing wrap-up material, the last line of the text IS the answer's end.
+
+Guidance:
+- Only exclude trailing content if it is clearly NOT part of answering this specific question -- e.g. it talks about the assignment/paper/course as a whole rather than continuing this answer's explanation, or it's a generic sign-off/closing statement.
+- Do NOT exclude a line just because it sounds like a summary or concluding sentence OF THIS ANSWER ITSELF (a student's own concluding sentence for their answer is normal and should be INCLUDED, not excluded).
+- If you are not confident there is any trailing non-answer material, default to including everything (report the last line of the text shown).
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{"end_line": 87}
+
+end_line MUST be one of the exact line numbers shown in [brackets] in the text below."""
+
+
+def _parse_last_answer_end_response(content: str) -> int:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+    data = json.loads(content)
+    if not isinstance(data, dict) or "end_line" not in data:
+        raise ValueError(f"Response missing 'end_line' key: {data!r}")
+    return int(data["end_line"])
+
+
+def _find_last_answer_true_end(client, numbered_lines: list, question_text: str, ref_label: str,
+                                 start_line: int, budget: "_TokenBudgetTracker", log,
+                                 max_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS) -> int:
+    total_lines = len(numbered_lines)
+    tail = []
+    chars = 0
+    idx = start_line
+    while idx < total_lines and (not tail or chars + len(numbered_lines[idx][1]) <= max_chars):
+        tail.append(numbered_lines[idx])
+        chars += len(numbered_lines[idx][1])
+        idx += 1
+
+    if not tail:
+        return total_lines - 1
+
+    default_end = tail[-1][0]  # safe fallback: include everything, as before
+
+    lines_block = "\n".join(f"[{i}] {t}" for i, t in tail)
+    user_prompt = f"TARGET QUESTION ({ref_label}): {question_text}\n\nTEXT (line-numbered, this is the tail of the document):\n{lines_block}"
+
+    try:
+        end_line = _call_groq_with_retries(
+            client, LAST_ANSWER_END_SYSTEM_PROMPT, user_prompt,
+            _parse_last_answer_end_response, budget, log, max_retries=2
+        )
+    except Exception as e:
+        log(f"WARNING: could not verify true end of last answer ({ref_label}), keeping full tail: {e}")
+        return default_end
+
+    valid_ids = {i for i, _ in tail}
+    if end_line not in valid_ids:
+        log(f"WARNING: last-answer end_line {end_line} out of range, keeping full tail as fallback")
+        return default_end
+
+    if end_line < default_end:
+        log(
+            f"Trimmed last answer ({ref_label}): document/document-tail content after line "
+            f"{end_line} was identified as trailing non-answer material (e.g. overall "
+            f"assignment conclusion) and excluded."
+        )
+
+    return end_line
+                                     
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
                                     carry_over_ref: str = None) -> str:
     questions_block = "\n".join(
