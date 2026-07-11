@@ -1080,20 +1080,42 @@ If NONE of the official questions' answers appear in the text shown, return {"an
 # until it either finds the start or reaches the end of the document.
 # =========================================================
 
-SEQUENTIAL_SEARCH_SYSTEM_PROMPT = """You are searching for exactly ONE thing in a block of line-numbered OCR text from a student's exam answer booklet: the line where the response to ONE SPECIFIC question begins.
+SEQUENTIAL_SEARCH_SYSTEM_PROMPT = """You are searching for exactly ONE thing in a block of line-numbered OCR text from a student's exam answer booklet: the EARLIEST line where the response to ONE SPECIFIC question begins.
 
 You are given:
 1. The exact text of the target question.
 2. A window of the student's answer text, with each line prefixed by its line number in [brackets]. This window may be a small slice of a much larger document -- the answer you're looking for might not be in this window at all, and that is a normal, expected outcome.
 
-Decide: does the student's response to THIS EXACT question begin somewhere in the window shown?
+Decide: does the student's response to THIS EXACT question begin somewhere in the window shown? If yes, find the VERY FIRST line of it.
 
-Guidance:
-- A response typically begins where the student restates or references the question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a matching question number) OR, if there's no such label, where the content clearly starts addressing this specific question's topic (matching its distinctive subject matter).
-- Do not confuse this with a DIFFERENT question's answer, even if it appears earlier in the window -- you are looking for this one specific question only.
-- CRITICAL -- do not skip the true beginning of the answer: if the answer opens with a short introductory or transitional sentence before it clearly states the topic (e.g. a lead-in sentence, a brief restatement, a general opening remark), that introductory line IS part of this answer and must be reported as start_line -- NOT a later, more obviously on-topic line. Always report the EARLIEST line at which this answer begins, never a later line just because it states the topic more explicitly. Skipping a genuine opening line/paragraph is a serious error.
-- CRITICAL -- content, definitions, or explanations CAN legitimately be repeated more than once across the document: the SAME fact or definition may correctly appear in more than one answer (e.g. two different questions both require explaining the same underlying concept), or a student may restate a definition again later as a recap within a long answer. Seeing similar wording earlier in the document does NOT disqualify a later occurrence from being a genuine, separate answer start for the target question -- judge each occurrence on whether IT is addressing the target question at that point in the document, not on whether the wording is "new."
-- If the target question's answer does not begin anywhere in this window, say so plainly. It is very common and expected for a window to not contain it -- do not force a match.
+===========================================================
+RULE 1 -- ALWAYS THE EARLIEST LINE, NEVER THE "CLEAREST" ONE
+===========================================================
+Many student answers do NOT launch straight into an obviously on-topic sentence. Before the part that clearly and unmistakably discusses the topic, an answer very often opens with one or more of the following -- and if present, these opening lines ARE part of the answer and MUST be included as the start:
+  - A short label ("Ans 5-", "उत्तर 6", "Q.5", "5)", "Answer:")
+  - A one-line restatement or paraphrase of the question itself
+  - A brief introductory/transitional sentence that does not yet name the specific topic (e.g. "This is an important concept.", "There are several aspects to consider here.", "To understand this, we must first look at...")
+  - An incomplete or fragment sentence carried over from a line/page break
+  - A definition-style opening sentence that only becomes clearly "on topic" a sentence or two later
+
+THE MOST COMMON MISTAKE is scanning past this opening material and reporting the line where the text FIRST becomes obviously, unambiguously on-topic -- that is WRONG whenever an earlier line already began the answer. Before you answer, explicitly ask yourself: "Is there an earlier line -- even a short, vague, or introductory one -- that could already be the true start of this same answer?" If there is ANY doubt between two candidate lines, always choose the EARLIER one. Reporting a start_line that is even one line later than the true beginning is a serious, common error you must actively guard against.
+
+===========================================================
+RULE 2 -- REPORT THE MOMENT THE TOPIC SHIFTS, NOT LATER
+===========================================================
+While scanning, you may pass through content that is still the tail end of a DIFFERENT, EARLIER question's answer. Do not report that as the target's start. But the instant the text shifts -- even by a single line -- to begin addressing THIS target question's own topic, that line is the true start. Do not wait for a "fuller," more explicit, or more confident statement further down before reporting it; report the first line of the shift itself. Waiting too long here is what causes an earlier answer to wrongly swallow content that actually belongs to this question.
+
+===========================================================
+RULE 3 -- IGNORE OCR ARTIFACT/ANNOTATION DESCRIPTIONS
+===========================================================
+Some lines in the OCR text are not student writing at all -- they are the OCR engine's own description of a visual element on the page, such as "[Logo]", "There is a red pen mark here", "Scribbled line", "Stamp in top corner", "Signature", underlines, doodles, or similar. These lines are NEVER part of a student's answer and must NEVER be reported as start_line, even if they happen to sit right where an answer begins. If the genuine answer text begins on the line immediately after such a description, report THAT line (the real content), not the artifact-description line itself, and do not let the artifact line's presence cause you to skip past the real content that follows it.
+
+===========================================================
+RULE 4 -- REPEATED CONTENT IS NORMAL
+===========================================================
+The SAME fact, definition, or explanation can legitimately appear more than once across the document (e.g. two different questions both require explaining the same underlying concept, or a student restates something as a recap). Seeing similar wording earlier in the document does NOT disqualify a later occurrence from being a genuine, separate answer start for the target question -- judge each occurrence on whether IT is addressing the target question at that point in the document.
+
+If the target question's answer does not begin anywhere in this window, say so plainly. It is common and expected for a window to not contain it -- do not force a match.
 
 Return ONLY valid JSON (no markdown fences, no commentary) in exactly one of these two shapes:
 
@@ -1155,10 +1177,24 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                                     window_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS,
                                     max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS,
                                     extra_reminder: str = None):
+    """
+    Slides forward through numbered_lines in NON-OVERLAPPING windows,
+    starting at search_from_idx, asking a single yes/no+line-number
+    question per window, until the target's start is found or the
+    document is exhausted. Returns the found start_line, or None.
+
+    NOTE: a trailing-line overlap between windows was tried here to fix a
+    reported "intro paragraph gets skipped" issue, but it was REVERTED --
+    combined with the "repeated content is OK" guidance in the system
+    prompt above, overlap increased false-positive early matches (a line
+    still belonging to the CURRENT open answer would get matched as the
+    NEXT answer's start), which caused a worse regression (mixed/missing
+    answers across most questions, not just an edge case). Back to the
+    original, more conservative zero-overlap behavior.
+    """
     total_lines = len(numbered_lines)
     pointer = search_from_idx
     windows_tried = 0
-    prev_window_tail = []  # last few (idx, text) lines from the PREVIOUS window, re-shown for context only
 
     while pointer < total_lines and windows_tried < max_windows:
         window = []
@@ -1172,31 +1208,7 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
         if not window:
             break
 
-        # Re-show the tail of the PREVIOUS window as read-only lookback
-        # context (never as candidate start_line answers -- the model is
-        # told explicitly these lines are context only, not part of this
-        # window). This fixes the "opening line sat right at the window
-        # boundary and had no forward context to be recognized" failure,
-        # WITHOUT changing pointer advancement or introducing duplicate
-        # candidate lines that could be wrongly picked as false starts.
-        combined_window = prev_window_tail + window
-        context_note = None
-        if prev_window_tail:
-            context_note = (
-                f"NOTE: the first {len(prev_window_tail)} line(s) shown below (up to and "
-                f"including line [{prev_window_tail[-1][0]}]) are LOOKBACK CONTEXT from "
-                f"immediately before this window -- they were already checked in a previous "
-                f"pass and must NOT be reported as start_line even if they look relevant. "
-                f"Only lines from [{window[0][0]}] onward are valid candidates for start_line."
-            )
-        if extra_reminder and context_note:
-            combined_reminder = f"{extra_reminder}\n\n{context_note}"
-        elif context_note:
-            combined_reminder = context_note
-        else:
-            combined_reminder = extra_reminder
-
-        user_prompt = _build_sequential_search_prompt(combined_window, question_text, ref_label, combined_reminder)
+        user_prompt = _build_sequential_search_prompt(window, question_text, ref_label, extra_reminder)
         try:
             found, start_line = _call_groq_with_retries(
                 client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
@@ -1207,23 +1219,315 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
             found, start_line = False, None
 
         if found and start_line is not None:
-            valid_new_ids = {i for i, _ in window}  # only THIS window's lines are acceptable
-            if start_line in valid_new_ids:
+            valid_ids = {i for i, _ in window}
+            if start_line in valid_ids:
                 return start_line
             log(
-                f"WARNING: {ref_label} reported start_line {start_line}, which is either "
-                f"lookback context or outside this window's actual range "
-                f"{window[0][0]}-{window[-1][0]} -- ignoring and treating this window as a non-match"
+                f"WARNING: {ref_label} reported start_line {start_line}, which is outside "
+                f"this window's actual range {window[0][0]}-{window[-1][0]} -- ignoring and "
+                f"treating this window as a non-match"
             )
 
-        prev_window_tail = window[-6:]  # carry forward a small tail as context for the NEXT window
-        pointer = idx  # advance with NO overlap in the real candidate set -- unchanged from before
+        pointer = idx  # move forward to the next window, no overlap
         windows_tried += 1
 
     return None
 
+
+# =========================================================
+# PASS 2 (NEW): NARROW BACKWARD-START VERIFICATION
+#
+# This targets the "answer is missing its opening paragraph" bug WITHOUT
+# touching the forward window search above (an earlier attempt added
+# overlap directly to the forward search and that caused a worse
+# regression -- mixed/missing answers across most questions -- because
+# combined with the "repeats are OK" guidance, overlapping windows
+# produced false-positive early matches).
+#
+# Instead, this is a single, narrow, ONE-TIME look-back check done AFTER
+# a start line is already confirmed: "given the small handful of lines
+# immediately before the confirmed start, does the answer actually begin
+# earlier?" This cannot cause the "quits early / false match" failure
+# mode the overlap change caused, because:
+#   - it only ever runs once per question (not repeatedly across many
+#     sliding windows)
+#   - it is strictly bounded from going earlier than the previous
+#     question's own (already adjusted) start line, so it can never eat
+#     into a different answer
+# =========================================================
+
+BACKWARD_EXTENSION_SYSTEM_PROMPT = """You are verifying the START of a student's answer to ONE SPECIFIC question, in a student's exam answer booklet (OCR'd, line-numbered).
+
+You are given:
+1. The target question text.
+2. A short window of text ending at a line CURRENTLY BELIEVED to be where this answer begins.
+
+Your task: check whether the true beginning of this answer is actually EARLIER than the believed line -- i.e. whether one or more lines immediately BEFORE the believed line are already part of this same answer (e.g. a short introductory or transitional sentence, a restatement of the question, or an opening remark) that were wrongly left out.
+
+Guidance:
+- Only report an earlier line if it is clearly part of THIS SAME answer's opening -- not part of a different, earlier answer, and not a page header/noise line.
+- If the believed line is already the correct, true beginning (nothing meaningful before it belongs to this answer), say so.
+- Prefer the EARLIEST correct line if multiple opening lines qualify.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{"earlier_start_found": true, "start_line": 37}
+
+or
+
+{"earlier_start_found": false}"""
+
+
+def _build_backward_check_prompt(window_lines: list, question_text: str, ref_label: str,
+                                   believed_start_line: int) -> str:
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
+    return (
+        f"TARGET QUESTION ({ref_label}): {question_text}\n\n"
+        f"We currently believe this answer begins at line {believed_start_line}.\n\n"
+        f"TEXT WINDOW (line-numbered), ending at the believed start line:\n{lines_block}"
+    )
+
+
+def _parse_backward_check_response(content: str) -> tuple:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM did not return valid JSON: {e}\nRaw (first 300 chars): {content[:300]!r}")
+
+    if not isinstance(data, dict) or "earlier_start_found" not in data:
+        raise ValueError(f"Response missing 'earlier_start_found' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    found = bool(data["earlier_start_found"])
+    if not found:
+        return False, None
+
+    if "start_line" not in data:
+        raise ValueError("Response has earlier_start_found=true but is missing 'start_line'")
+    try:
+        start_line = int(data["start_line"])
+    except (ValueError, TypeError):
+        raise ValueError(f"'start_line' must be an integer, got {data['start_line']!r}")
+
+    return True, start_line
+
+
+BACKWARD_CHECK_LOOKBACK_LINES = 25
+
+
+def _check_answer_starts_earlier(client, numbered_lines: list, question_text: str, ref_label: str,
+                                   believed_start: int, floor_idx: int, budget: "_TokenBudgetTracker",
+                                   log, lookback_lines: int = BACKWARD_CHECK_LOOKBACK_LINES) -> int:
+    """
+    Single, narrow look-back check: does this answer actually begin
+    earlier than `believed_start`? Never looks earlier than `floor_idx`
+    (the previous question's own confirmed/adjusted start line + 1), so
+    it can never bleed into a different answer. Returns the (possibly
+    unchanged) start line to use.
+    """
+    window_start = max(floor_idx, believed_start - lookback_lines)
+    if window_start >= believed_start:
+        return believed_start  # nothing meaningful to look back over
+
+    window = numbered_lines[window_start:believed_start + 1]
+    if not window:
+        return believed_start
+
+    prompt = _build_backward_check_prompt(window, question_text, ref_label, believed_start)
+    try:
+        earlier_found, new_start = _call_groq_with_retries(
+            client, BACKWARD_EXTENSION_SYSTEM_PROMPT, prompt,
+            _parse_backward_check_response, budget, log, max_retries=2
+        )
+    except Exception as e:
+        log(f"WARNING: backward-start check failed for {ref_label}: {e}")
+        return believed_start
+
+    if earlier_found and new_start is not None:
+        valid_ids = {i for i, _ in window}
+        if new_start in valid_ids and window_start <= new_start <= believed_start:
+            if new_start != believed_start:
+                log(f"  backward check: extended {ref_label} start earlier, from line {believed_start} to line {new_start}")
+            return new_start
+        log(
+            f"WARNING: backward check for {ref_label} returned out-of-range/invalid "
+            f"start_line {new_start} (window {window_start}-{believed_start}) -- ignoring"
+        )
+
+    return believed_start
+
+
+# =========================================================
+# PASS 3 (NEW): LAST-ANSWER-END VERIFICATION
+#
+# By construction, the chronologically LAST matched answer's end was
+# always set to (total_lines - 1) -- i.e. "runs to the end of the
+# document". This is usually correct, but breaks when the booklet ends
+# with a GENERAL closing section for the WHOLE assignment (e.g. a
+# standalone "Conclusion"/"Summary"/"Bibliography"/"Acknowledgement"
+# page that wraps up the entire submission, not the specific topic of
+# the last question) -- that trailing section was being silently
+# absorbed into the last answer.
+#
+# This check ONLY runs once, for whichever answer turns out to be last
+# in document order (not necessarily the last question in the list, if
+# later questions went unmatched), and only looks at the TAIL of the
+# document (bounded by a char budget so it stays cheap even for a very
+# long final answer).
+# =========================================================
+
+LAST_ANSWER_END_SYSTEM_PROMPT = """You are finding where ONE SPECIFIC student answer ENDS, at the very end of an exam answer booklet (OCR'd, line-numbered).
+
+You are given:
+1. The exact text of the target question (this is the LAST answer found in the booklet).
+2. The tail end of the document, from at or before where this answer begins, through the last line of the document.
+
+Most of the time, this answer simply continues until the last line of the document shown. However, sometimes a booklet ends with a GENERAL closing section for the WHOLE assignment/document that is NOT part of this specific answer -- for example a standalone "Conclusion", "Summary", "Bibliography", "References", or "Acknowledgement" section that wraps up the entire assignment/project as a whole, rather than continuing this specific question's topic.
+
+Your task: decide whether such a general, whole-assignment closing section appears anywhere in this text. If it does, report the LAST line number that is still genuinely part of the target answer (i.e. the line immediately before that general closing section begins). If no such general closing section exists and the answer genuinely continues to the end, report the last line number shown.
+
+Guidance:
+- Do NOT confuse the student's own concluding paragraph/sentence FOR THIS ANSWER's specific topic (which is legitimate answer content) with a general closing section for the whole assignment/document -- only exclude the latter.
+- A general closing section is usually clearly about wrapping up the ENTIRE assignment/project/document (e.g. thanking the reader, summarizing the whole submission, listing references/bibliography for the whole work) rather than continuing the specific topic of the target question.
+- If genuinely uncertain, prefer to INCLUDE the content in the answer rather than exclude it.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{"end_line": 210}"""
+
+
+def _build_last_answer_end_prompt(window_lines: list, question_text: str, ref_label: str) -> str:
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
+    return (
+        f"TARGET QUESTION ({ref_label}) -- this is the LAST answer found in the booklet:\n{question_text}\n\n"
+        f"TAIL OF THE DOCUMENT (line-numbered):\n{lines_block}"
+    )
+
+
+def _parse_last_answer_end_response(content: str) -> int:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM did not return valid JSON: {e}\nRaw (first 300 chars): {content[:300]!r}")
+
+    if not isinstance(data, dict) or "end_line" not in data:
+        raise ValueError(f"Response missing 'end_line' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    try:
+        return int(data["end_line"])
+    except (ValueError, TypeError):
+        raise ValueError(f"'end_line' must be an integer, got {data['end_line']!r}")
+
+
+LAST_ANSWER_END_TAIL_CHARS = 9000
+
+
+def _check_last_answer_end(client, numbered_lines: list, question_text: str, ref_label: str,
+                             start_line: int, budget: "_TokenBudgetTracker", log,
+                             tail_chars: int = LAST_ANSWER_END_TAIL_CHARS) -> int:
+    """
+    Looks only at the TAIL of the document (bounded by tail_chars, so
+    this stays cheap regardless of how long the final answer is -- a
+    trailing general closing section, if present, is always at the very
+    end) and asks whether a general whole-assignment closing section
+    should be excluded from this answer's end. Falls back to
+    (total_lines - 1) on any failure or invalid response, preserving the
+    original behavior.
+    """
+    total_lines = len(numbered_lines)
+    fallback_end = total_lines - 1
+
+    if start_line >= total_lines:
+        return fallback_end
+
+    chars = 0
+    idx = total_lines - 1
+    collected = []
+    while idx >= start_line and chars < tail_chars:
+        collected.append(numbered_lines[idx])
+        chars += len(numbered_lines[idx][1])
+        idx -= 1
+    collected.reverse()
+
+    if not collected:
+        return fallback_end
+
+    prompt = _build_last_answer_end_prompt(collected, question_text, ref_label)
+    try:
+        end_line = _call_groq_with_retries(
+            client, LAST_ANSWER_END_SYSTEM_PROMPT, prompt,
+            _parse_last_answer_end_response, budget, log, max_retries=2
+        )
+    except Exception as e:
+        log(f"WARNING: last-answer-end check failed for {ref_label}: {e}")
+        return fallback_end
+
+    valid_ids = {i for i, _ in collected}
+    if end_line in valid_ids and end_line >= start_line:
+        if end_line != fallback_end:
+            log(
+                f"  last-answer-end check: trimmed {ref_label}'s end from line {fallback_end} "
+                f"to line {end_line} (excluded a trailing general whole-assignment closing "
+                f"section, e.g. Conclusion/Bibliography/Acknowledgement, that is not part of "
+                f"this specific answer)"
+            )
+        return end_line
+
+    log(
+        f"WARNING: last-answer-end check for {ref_label} returned invalid end_line "
+        f"{end_line} -- falling back to end of document"
+    )
+    return fallback_end
+
+
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
+    """
+    RECOMMENDED default answer-mapping strategy (see module docstring
+    above the SEQUENTIAL_SEARCH_SYSTEM_PROMPT for the full rationale).
+
+    For each question in order:
+      1. Search forward from wherever the previous question's answer was
+         confirmed to start, for a line where THIS question's answer
+         begins.
+      2. Once found, the previous question's END is computed as
+         (this start - 1) -- never asked of the LLM.
+    The very last question's answer runs to the end of the document.
+
+    If a question's start can't be found anywhere from the search
+    pointer to the end of the document, it's recorded as unmatched, and
+    the search for the NEXT question continues from the SAME pointer
+    (its answer wasn't necessarily lost -- it may simply not exist, e.g.
+    the student skipped it).
+
+    Returns a LIST of dicts, one per question, each carrying:
+      - start_line / end_line: the exact 0-based indices into
+        answer_lines this answer was sliced from (so you can look them
+        up directly)
+      - start_page / end_page: the OCR page number(s) the answer spans,
+        if answer_line_pages was provided (lets you flip straight to the
+        right page(s) of the source PDF to eyeball it)
+      - answer_raw: the UNMODIFIED verbatim join of the sliced lines --
+        exactly what the OCR produced, before any cleanup
+      - answer: the same text after the (optional) restatement-stripping
+        cleanup -- so you can directly compare "raw" vs "cleaned" and
+        see precisely what, if anything, was removed and why. Nothing
+        is ever ADDED to answer_raw at this stage -- it is a plain
+        Python slice of the OCR text, never LLM-generated -- so if
+        answer_raw itself looks embellished/"enhanced", that happened
+        upstream in the OCR step (see notes in run_ocr), not here.
+    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -1242,7 +1546,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     total_lines = len(numbered_lines)
 
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
-    found_starts = {}
+    found_starts = {}  # ref -> start_line
     pointer = 0
 
     for i, q in enumerate(questions):
@@ -1253,6 +1557,17 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             client, numbered_lines, q, ref, pointer, budget, log
         )
 
+        # =================================================================
+        # FIX: retry once with an explicit reminder before giving up.
+        # Real failure pattern reported: the same definition/explanation
+        # can legitimately appear more than once across different answers
+        # (e.g. two related questions both require explaining the same
+        # concept). A model can be biased to read a repeated definition as
+        # "already covered, not a new start" and wrongly report found=false
+        # even though this occurrence genuinely IS a new answer. Since this
+        # retry happens BEFORE pointer is advanced, it's safe -- it can only
+        # recover a genuine match, never corrupt an already-confirmed range.
+        # =================================================================
         if start_line is None:
             log(f"  first pass found nothing for {ref} -- retrying once with an explicit reminder...")
             retry_reminder = (
@@ -1285,32 +1600,42 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 f"for over this same remaining text."
             )
 
-    ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
+    # =====================================================================
+    # PASS 2: narrow backward-start verification (see _check_answer_starts_
+    # earlier's docstring above for full rationale). Runs once per
+    # confirmed answer, in document order, and can never move a start
+    # earlier than the previous answer's own (already-adjusted) start --
+    # so it cannot bleed into a different answer's content.
+    # =====================================================================
+    ordered_by_start = sorted(found_starts.items(), key=lambda kv: kv[1])
+    adjusted_starts = dict(found_starts)
+    prev_floor = 0
+    for ref, start in ordered_by_start:
+        q = ref_to_question[ref]
+        new_start = _check_answer_starts_earlier(
+            client, numbered_lines, q, ref, start, prev_floor, budget, log
+        )
+        adjusted_starts[ref] = new_start
+        prev_floor = new_start + 1
+    found_starts = adjusted_starts
 
-    # =====================================================================
-    # FIX: previously the LAST answer's end was hardcoded to total_lines-1
-    # (end of document), on the assumption that nothing meaningful follows
-    # the last real answer. That's false whenever the document has a
-    # trailing non-answer section (e.g. an overall assignment conclusion,
-    # closing remarks, "thank you" note, institutional footer text) that
-    # wasn't classified as an admin/QP page upstream -- that trailing
-    # content silently got absorbed into the last answer's range.
-    #
-    # Fix: for the LAST confirmed answer only, explicitly ask the LLM
-    # (same sequential single-target style, so still just one focused
-    # judgment) whether the answer's OWN content ends before the true
-    # end of the document, and if so, where. This is a single extra call,
-    # only for the final ref, and never changes any other answer's
-    # boundaries -- so it can't introduce the earlier regressions.
-    # =====================================================================
+    # End of each answer = the next (in document order) confirmed
+    # answer's start, minus one. Computed purely in Python -- never
+    # asked of the LLM, so it can never be wrong in the way an
+    # LLM-guessed end line could be. The one exception is the
+    # chronologically LAST matched answer: instead of blindly assuming it
+    # runs to the end of the document, PASS 3 verifies whether a trailing
+    # general whole-assignment closing section (Conclusion/Bibliography/
+    # Acknowledgement, etc.) should be excluded from it -- see
+    # _check_last_answer_end's docstring above.
+    ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
     ranges = []
     for idx, (ref, start) in enumerate(ordered):
         if idx + 1 < len(ordered):
             end = ordered[idx + 1][1] - 1
         else:
-            end = _find_last_answer_true_end(
-                client, numbered_lines, ref_to_question[ref], ref, start, budget, log
-            )
+            q_last = ref_to_question[ref]
+            end = _check_last_answer_end(client, numbered_lines, q_last, ref, start, budget, log)
         ranges.append({"ref": ref, "start_line": start, "end_line": end})
 
     log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
@@ -1323,10 +1648,15 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
         if r is None:
             results.append({
-                "ref": ref, "question": q, "matched": False,
-                "start_line": None, "end_line": None,
-                "start_page": None, "end_page": None,
-                "answer": "", "answer_raw": "",
+                "ref": ref,
+                "question": q,
+                "matched": False,
+                "start_line": None,
+                "end_line": None,
+                "start_page": None,
+                "end_page": None,
+                "answer": "",
+                "answer_raw": "",
             })
             continue
 
@@ -1343,88 +1673,20 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
 
         results.append({
-            "ref": ref, "question": q, "matched": True,
-            "start_line": s, "end_line": e,
-            "start_page": start_page, "end_page": end_page,
-            "answer": answer_clean, "answer_raw": answer_raw,
+            "ref": ref,
+            "question": q,
+            "matched": True,
+            "start_line": s,
+            "end_line": e,
+            "start_page": start_page,
+            "end_page": end_page,
+            "answer": answer_clean,
+            "answer_raw": answer_raw,
         })
 
     return results
 
 
-LAST_ANSWER_END_SYSTEM_PROMPT = """You are looking at the FINAL portion of a student's exam answer booklet (OCR'd, line-numbered), starting from where their LAST answer begins. This tail section may contain:
-1. The remainder of the student's genuine answer content (their own reasoning/explanation for the target question) -- this is the ONLY thing that should be included.
-2. AFTER the student's real answer content ends, there may be trailing material that is NOT part of the answer itself: e.g. an overall assignment/exam-level closing remark, general concluding statement about the whole assignment/course (not specific to this one question), an institutional footer, "thank you" notes, blank/signature lines, or similar wrap-up text.
-
-Your task: find the LAST line number that is still genuinely part of the student's answer to the target question -- i.e., the line right before any such trailing, non-answer-specific material begins (if any exists). If the entire text shown is genuine answer content with no trailing wrap-up material, the last line of the text IS the answer's end.
-
-Guidance:
-- Only exclude trailing content if it is clearly NOT part of answering this specific question -- e.g. it talks about the assignment/paper/course as a whole rather than continuing this answer's explanation, or it's a generic sign-off/closing statement.
-- Do NOT exclude a line just because it sounds like a summary or concluding sentence OF THIS ANSWER ITSELF (a student's own concluding sentence for their answer is normal and should be INCLUDED, not excluded).
-- If you are not confident there is any trailing non-answer material, default to including everything (report the last line of the text shown).
-
-Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
-
-{"end_line": 87}
-
-end_line MUST be one of the exact line numbers shown in [brackets] in the text below."""
-
-
-def _parse_last_answer_end_response(content: str) -> int:
-    content = content.strip()
-    if content.startswith("```"):
-        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
-        content = re.sub(r'\n?```\s*$', '', content)
-        content = content.strip()
-    data = json.loads(content)
-    if not isinstance(data, dict) or "end_line" not in data:
-        raise ValueError(f"Response missing 'end_line' key: {data!r}")
-    return int(data["end_line"])
-
-
-def _find_last_answer_true_end(client, numbered_lines: list, question_text: str, ref_label: str,
-                                 start_line: int, budget: "_TokenBudgetTracker", log,
-                                 max_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS) -> int:
-    total_lines = len(numbered_lines)
-    tail = []
-    chars = 0
-    idx = start_line
-    while idx < total_lines and (not tail or chars + len(numbered_lines[idx][1]) <= max_chars):
-        tail.append(numbered_lines[idx])
-        chars += len(numbered_lines[idx][1])
-        idx += 1
-
-    if not tail:
-        return total_lines - 1
-
-    default_end = tail[-1][0]  # safe fallback: include everything, as before
-
-    lines_block = "\n".join(f"[{i}] {t}" for i, t in tail)
-    user_prompt = f"TARGET QUESTION ({ref_label}): {question_text}\n\nTEXT (line-numbered, this is the tail of the document):\n{lines_block}"
-
-    try:
-        end_line = _call_groq_with_retries(
-            client, LAST_ANSWER_END_SYSTEM_PROMPT, user_prompt,
-            _parse_last_answer_end_response, budget, log, max_retries=2
-        )
-    except Exception as e:
-        log(f"WARNING: could not verify true end of last answer ({ref_label}), keeping full tail: {e}")
-        return default_end
-
-    valid_ids = {i for i, _ in tail}
-    if end_line not in valid_ids:
-        log(f"WARNING: last-answer end_line {end_line} out of range, keeping full tail as fallback")
-        return default_end
-
-    if end_line < default_end:
-        log(
-            f"Trimmed last answer ({ref_label}): document/document-tail content after line "
-            f"{end_line} was identified as trailing non-answer material (e.g. overall "
-            f"assignment conclusion) and excluded."
-        )
-
-    return end_line
-                                     
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
                                     carry_over_ref: str = None) -> str:
     questions_block = "\n".join(
@@ -1969,7 +2231,12 @@ NOISE_RE = re.compile(
     r'(?:signature'
     r'|PAGE\s*NO'
     r'|^\s*DATE\b'
-    r'|^\s*\d{1,3}\s*$)',
+    r'|^\s*\d{1,3}\s*$'
+    r'|\blogo\b'
+    r'|\bwatermark\b'
+    r'|\bstamp\b'
+    r'|\bscribbl\w*\b'
+    r'|\bdoodle\w*\b)',
     re.IGNORECASE
 )
 
@@ -1983,12 +2250,56 @@ NOISE_RE = re.compile(
 NOISE_LINE_MAX_CHARS = 40
 
 
+# =========================================================
+# FIX (this round): the OCR engine (Datalab/Chandra) sometimes emits a
+# full descriptive SENTENCE for a non-text visual element on the scanned
+# page instead of transcribing actual student writing -- e.g. "There is
+# a logo in the top right corner.", "Scribbled line in red pen.", "Stamp
+# on the page.", markdown image placeholders, etc. These are OCR
+# metadata/commentary about the PAGE, not student answer content, and
+# were previously falling straight into answer_lines (and therefore into
+# extracted answers, and were even eligible to be picked as an answer's
+# start_line by the LLM). This pattern is checked regardless of line
+# length, unlike NOISE_RE above, because these descriptive sentences can
+# run longer than the short-label case NOISE_RE is designed for.
+# =========================================================
+_OCR_ARTIFACT_DESCRIPTION_RE = re.compile(
+    r'^\s*(?:'
+    r'\[\s*(?:image|figure|logo|stamp|watermark|photo|picture|diagram)\s*\]'
+    r'|<!--\s*image\s*-->'
+    r'|!\[[^\]]*\]\([^)]*\)'
+    r'|\(?\s*there\s+(?:is|are|seems?\s+to\s+be|appears?\s+to\s+be)\s+(?:a|an|some)?\s*'
+    r'(?:logo|stamp|watermark|scribbl\w*|doodle\w*|drawing|symbol|mark(?:ing)?s?|'
+    r'line|box|circle|underlin\w*|arrow|star|tick|cross|red\s*(?:pen|ink)\w*)'
+    r'|\(?\s*(?:handwritten|scribbled|marked|underlined|circled)\s+(?:in\s+)?red\s*(?:pen|ink)?\s*\)?'
+    r')',
+    re.IGNORECASE
+)
+
+
+def _is_ocr_artifact_description(line: str) -> bool:
+    """
+    Detects lines where the OCR engine described a VISUAL artifact on the
+    page (a logo, stamp, red-pen scribble/underline, stray mark, doodle,
+    etc.) in prose, instead of transcribing actual student writing. These
+    are OCR commentary about the page, never student answer content, and
+    must be excluded both from extracted answer text AND from candidate
+    answer-start lines.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return bool(_OCR_ARTIFACT_DESCRIPTION_RE.match(stripped))
+
+
 def is_noise(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
     if re.match(r'^\s*\d{1,3}\s*$', stripped):
         return True  # bare page-number line -- always noise regardless of length
+    if _is_ocr_artifact_description(stripped):
+        return True  # OCR's own description of a visual artifact, not student content
     if len(stripped) > NOISE_LINE_MAX_CHARS:
         return False
     return bool(NOISE_RE.search(stripped))
