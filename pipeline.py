@@ -1106,6 +1106,23 @@ or
 
 If found, start_line MUST be one of the exact line numbers shown in [brackets] in this window -- never estimate or invent a number, and always prefer the earliest correct line over a later one."""
 
+SEQUENTIAL_SEARCH_SYSTEM_PROMPT = SEQUENTIAL_SEARCH_SYSTEM_PROMPT.replace(
+    "If the target question's answer does not begin anywhere in this window, say so plainly.",
+    """===========================================================
+RULE 4 -- ERR TOWARD REPORTING A MATCH, NOT "NOT FOUND"
+===========================================================
+A false "not found" is a WORSE error than a slightly-early guess: if you say
+"not found" but the answer genuinely starts somewhere in this window, those
+opening lines get permanently lost from this answer and wrongly attributed
+to the wrong question -- they cannot be recovered later. Whereas if you
+report a start line that turns out to be a few lines earlier than ideal,
+that's a minor, low-cost error. So: if you have even MODERATE confidence
+(not just high confidence) that the answer begins somewhere in this window,
+report found=true with your best estimate of the earliest line -- do not
+withhold a match just because you're not 100% certain.
+
+If the target question's answer does not begin anywhere in this window, say so plainly."""
+)
 
 def _build_sequential_search_prompt(window_lines: list, question_text: str, ref_label: str,
                                       extra_reminder: str = None) -> str:
@@ -1147,9 +1164,34 @@ def _parse_sequential_search_response(content: str) -> tuple:
     return True, start_line
 
 
-SEQUENTIAL_SEARCH_WINDOW_CHARS = 11000  # same safe-per-call char budget used elsewhere in this module
+SEQUENTIAL_SEARCH_WINDOW_CHARS = 1500  # same safe-per-call char budget used elsewhere in this module
 SEQUENTIAL_SEARCH_MAX_WINDOWS = 200  # generous safety cap; a real document will exhaust far sooner
 
+def _retreat_pointer(numbered_lines, end_idx, start_idx, overlap_chars=SEARCH_WINDOW_OVERLAP_CHARS):
+    chars = 0
+    idx = end_idx - 1
+    while idx > start_idx and chars < overlap_chars:
+        chars += len(numbered_lines[idx][1])
+        idx -= 1
+    return max(idx + 1, start_idx + 1)
+
+
+# =========================================================
+# API KEYS
+# =========================================================
+
+def get_api_key(name):
+    try:
+        import streamlit as st
+        return st.secrets[name]
+    except Exception:
+        from dotenv import load_dotenv
+        load_dotenv()
+        return os.getenv(name)
+
+
+# =========================================================
+#
 
 def _find_answer_start_sequential(client, numbered_lines: list, question_text: str, ref_label: str,
                                     search_from_idx: int, budget: "_TokenBudgetTracker", log,
@@ -1200,7 +1242,7 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                 f"treating this window as a non-match"
             )
 
-        pointer = idx  # move forward to the next window, no overlap
+        pointer = _retreat_pointer(numbered_lines, idx, pointer)
         windows_tried += 1
 
     return None
