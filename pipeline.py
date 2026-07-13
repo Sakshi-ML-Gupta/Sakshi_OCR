@@ -1542,6 +1542,38 @@ _OVERALL_CLOSING_SECTION_RE = re.compile(
     re.IGNORECASE
 )
 
+# OCR frequently fuses the overall-assignment closing heading onto the
+# END of the previous answer's last sentence with NO newline in between
+# (e.g. "...resonate today. A red scribble or signature mark. ## Conclusion
+# This assignment represents..." all as ONE raw OCR line) -- the
+# line-anchored regex above only matches when the heading is the first
+# thing on a line, so it misses this fused case entirely. This second,
+# UNANCHORED pattern looks for the markdown heading marker "#{1,6}" plus
+# a closing-section word ANYWHERE within a line -- a literal "#" run is a
+# rare enough signal in genuine prose that searching anywhere in the
+# line (not just at its start) is safe from false positives.
+_OVERALL_CLOSING_SECTION_INLINE_RE = re.compile(
+    r'#{1,6}\s*(?:conclusion|summary|bibliography|references?|acknowledge?ments?)\b',
+    re.IGNORECASE
+)
+
+
+def _truncate_before_overall_closing_heading(line: str):
+    """
+    If an overall-assignment closing section heading is found ANYWHERE
+    within this line (fused onto real answer content with no newline),
+    returns (text_before_the_heading, True) -- the heading and
+    everything after it in this line is cut off. Otherwise returns
+    (line, False) unchanged. The caller uses the second value to stop
+    collecting ANY further lines at all: once the overall closing
+    section starts, everything from that point to the end of the
+    document is document-level wrap-up, never part of a specific answer.
+    """
+    m = _OVERALL_CLOSING_SECTION_INLINE_RE.search(line)
+    if not m:
+        return line, False
+    return line[:m.start()].strip(), True
+
 
 def _find_overall_closing_heading(numbered_lines: list, start_idx: int):
     """
@@ -2370,17 +2402,33 @@ def process_pdf(file_input, status_callback=None):
     # extracted answer text.
     answer_lines = []
     answer_line_pages = []
+    closing_section_reached = False
     for page in answer_pages:
+        if closing_section_reached:
+            log(
+                f"Skipping page {page['page_number']} entirely -- the overall assignment "
+                f"closing section (e.g. '## Conclusion') was already reached on an earlier "
+                f"page, so nothing after it is treated as answer content."
+            )
+            continue
         page_kept_any = False
         for line in page["raw_text"].split("\n"):
             cleaned_line = _strip_inline_ocr_artifacts(line)
-            if not cleaned_line.strip():
-                continue
-            if not is_noise(cleaned_line):
-                answer_lines.append(cleaned_line)
+            kept_text, hit_closing = _truncate_before_overall_closing_heading(cleaned_line)
+            if kept_text.strip() and not is_noise(kept_text):
+                answer_lines.append(kept_text)
                 answer_line_pages.append(page["page_number"])
                 page_kept_any = True
-        if not page_kept_any and page["raw_text"].strip():
+            if hit_closing:
+                log(
+                    f"Reached the overall assignment closing section (e.g. '## Conclusion') "
+                    f"on page {page['page_number']} -- stopping answer-line collection here. "
+                    f"Everything from this point onward is document-level wrap-up, never part "
+                    f"of any specific answer."
+                )
+                closing_section_reached = True
+                break
+        if not page_kept_any and page["raw_text"].strip() and not closing_section_reached:
             log(
                 f"WARNING: page {page['page_number']} produced ZERO usable answer "
                 f"lines after filtering, despite having {len(page['raw_text'])} chars "
