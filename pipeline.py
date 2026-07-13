@@ -1280,10 +1280,10 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
         if start_line is not None:
             if start_line is not None:
-            prev_start = found_starts.get(f"REF-{chr(65 + i - 1)}", -1) if i > 0 else -1
-            start_line = _verify_earliest_start(
-                client, numbered_lines, answer_line_pages, start_line, q, ref,
-                prev_start, budget, log
+                prev_start = found_starts.get(f"REF-{chr(65 + i - 1)}", -1) if i > 0 else -1
+                start_line = _verify_earliest_start(
+                     client, numbered_lines, answer_line_pages, start_line, q, ref,
+                     prev_start, budget, log
             )
             found_starts[ref] = start_line
             log(f"  found {ref} starting at line {start_line}")
