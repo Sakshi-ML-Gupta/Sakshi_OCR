@@ -1279,6 +1279,15 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 log(f"  retry recovered {ref} starting at line {start_line}")
 
         if start_line is not None:
+            if start_line is not None:
+            prev_start = found_starts.get(f"REF-{chr(65 + i - 1)}", -1) if i > 0 else -1
+            start_line = _verify_earliest_start(
+                client, numbered_lines, answer_line_pages, start_line, q, ref,
+                prev_start, budget, log
+            )
+            found_starts[ref] = start_line
+            log(f"  found {ref} starting at line {start_line}")
+            pointer = start_line + 1
             found_starts[ref] = start_line
             log(f"  found {ref} starting at line {start_line}")
             pointer = start_line + 1
@@ -1516,6 +1525,106 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
 # calls (proportional to the number of questions in the document).
 MAX_ANSWERS_PER_CHUNK = 1
 
+VERIFY_EARLIEST_START_SYSTEM_PROMPT = """You already found a CANDIDATE start line for a student's answer to a specific question. Your job now is ONLY to double-check: is there an EARLIER line, within the block shown, that should actually be the true start instead?
+
+This check exists because answers commonly begin with a label, a one-line restatement of the question, or a short transitional sentence -- and these earlier lines are sometimes missed on a first pass, especially when they fall right at an OCR page boundary (the block shown may span the END of the previous page and the START of the current page).
+
+You are given:
+1. The target question's exact text.
+2. The CANDIDATE start line number that was already found.
+3. A block of line-numbered text that ends at or after the candidate line, and begins earlier (potentially a full previous OCR page back) so you can check for missed earlier content.
+
+Look at every line BEFORE the candidate line in this block. Does the answer to THIS question genuinely begin earlier than the candidate? Only report an earlier line if it is clearly part of THIS answer (a label, restatement, or transition into this specific topic) -- not if it's still part of a different, previous answer, or noise/artifact text.
+
+Return ONLY valid JSON (no markdown fences, no commentary):
+
+{"earlier_start_found": true, "start_line": 118}
+
+or
+
+{"earlier_start_found": false}
+
+If unsure, prefer {"earlier_start_found": false} -- this is a safety-net check, not a re-search from scratch."""
+
+def _build_verify_earliest_prompt(block_lines: list, candidate_line: int, question_text: str, ref_label: str) -> str:
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in block_lines)
+    return (
+        f"TARGET QUESTION ({ref_label}): {question_text}\n\n"
+        f"CANDIDATE START LINE: {candidate_line}\n\n"
+        f"TEXT BLOCK (line-numbered):\n{lines_block}"
+    )
+
+def _parse_verify_earliest_response(content: str) -> tuple:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+    data = json.loads(content)
+    if not isinstance(data, dict) or "earlier_start_found" not in data:
+        raise ValueError(f"Response missing 'earlier_start_found': {data!r}")
+    if not data["earlier_start_found"]:
+        return False, None
+    if "start_line" not in data:
+        raise ValueError("earlier_start_found=true but missing 'start_line'")
+    return True, int(data["start_line"])
+
+
+VERIFY_EARLIEST_BACK_PAGES = 1  # how many full OCR pages back to include for context
+def _verify_earliest_start(client, numbered_lines: list, answer_line_pages: list,
+                             start_line: int, question_text: str, ref_label: str,
+                             min_allowed_line: int, budget: "_TokenBudgetTracker", log) -> int:
+    """
+    Page-boundary-aware backward check: re-examines the OCR page the
+    candidate start falls on, PLUS the previous VERIFY_EARLIEST_BACK_PAGES
+    full page(s), to catch cases where the true start was a few lines (or
+    a whole skipped page) earlier than what the forward search reported.
+    min_allowed_line prevents this from ever moving the start earlier
+    than the previous confirmed answer's boundary.
+    """
+    if start_line <= min_allowed_line or start_line >= len(numbered_lines):
+        return start_line
+
+    if answer_line_pages and start_line < len(answer_line_pages):
+        current_page = answer_line_pages[start_line]
+        target_pages = set()
+        seen_pages = []
+        for p in reversed(answer_line_pages[:start_line + 1]):
+            if p not in seen_pages:
+                seen_pages.append(p)
+            if len(seen_pages) > VERIFY_EARLIEST_BACK_PAGES:
+                break
+        target_pages = set(seen_pages)
+        block_start = start_line
+        for i in range(start_line, min_allowed_line, -1):
+            if i < len(answer_line_pages) and answer_line_pages[i] in target_pages:
+                block_start = i
+            else:
+                break
+    else:
+        block_start = max(min_allowed_line + 1, start_line - 40)
+
+    block = [numbered_lines[i] for i in range(block_start, start_line + 1)]
+    if len(block) <= 1:
+        return start_line
+
+    prompt = _build_verify_earliest_prompt(block, start_line, question_text, ref_label)
+    try:
+        found, earlier_line = _call_groq_with_retries(
+            client, VERIFY_EARLIEST_START_SYSTEM_PROMPT, prompt,
+            _parse_verify_earliest_response, budget, log, max_retries=2
+        )
+    except Exception as e:
+        log(f"WARNING: earliest-start verification failed for {ref_label}: {e}")
+        return start_line
+
+    if found and earlier_line is not None:
+        valid_ids = {i for i, _ in block}
+        if earlier_line in valid_ids and min_allowed_line < earlier_line <= start_line:
+            log(f"  earliest-start check: moved {ref_label} start from {start_line} back to {earlier_line}")
+            return earlier_line
+
+    return start_line
 
 def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
