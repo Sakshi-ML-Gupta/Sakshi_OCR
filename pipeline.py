@@ -359,27 +359,6 @@ Critical rules for telling question-paper pages apart from answer pages that hap
 - Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate.
 - Output ONLY the JSON object described above. No prose before or after it. No markdown code fences."""
 
-def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker",
-                          log, max_retries: int = 4) -> tuple:
-    user_prompt = _build_qp_user_prompt(pages_chunk)
-
-    # DEBUG: log which pages went into this chunk and a short preview,
-    # so a zero-QP-page result can be traced back to what the model
-    # actually saw.
-    page_nums = [p["page_number"] for p in pages_chunk]
-    log(f"  [debug] chunk pages {page_nums} -- previews:")
-    for p in pages_chunk:
-        preview = p["raw_text"][:150].replace("\n", " ")
-        log(f"  [debug]   page {p['page_number']}: {preview!r}")
-
-    def _debug_parser(content):
-        log(f"  [debug] raw LLM response for chunk pages {page_nums}: {content[:800]!r}")
-        return _parse_qp_llm_response(content)
-
-    return _call_groq_with_retries(
-        client, QP_SYSTEM_PROMPT, user_prompt, _debug_parser,
-        budget, log, max_retries
-    )
 
 def _chunk_pages_by_char_budget(pages: list, max_chars: int = MAX_CHARS_PER_CHUNK,
                                   overlap_pages: int = CHUNK_OVERLAP_PAGES) -> list:
@@ -717,104 +696,6 @@ def _normalize_question_key(q: str) -> str:
     text = re.sub(r'^\d+[\.\)]\s*[-–]?\s*', '', text)
     return text
 
-VERIFY_EARLIEST_START_SYSTEM_PROMPT = """You already found a CANDIDATE start line for a student's answer to a specific question. Your job now is ONLY to double-check: is there an EARLIER line, within the block shown, that should actually be the true start instead?
-
-This check exists because answers commonly begin with a label, a one-line restatement of the question, or a short transitional sentence -- and these earlier lines are sometimes missed on a first pass, especially when they fall right at an OCR page boundary (the block shown may span the END of the previous page and the START of the current page).
-
-You are given:
-1. The target question's exact text.
-2. The CANDIDATE start line number that was already found.
-3. A block of line-numbered text that ends at or after the candidate line, and begins earlier (potentially a full previous OCR page back) so you can check for missed earlier content.
-
-Look at every line BEFORE the candidate line in this block. Does the answer to THIS question genuinely begin earlier than the candidate? Only report an earlier line if it is clearly part of THIS answer (a label, restatement, or transition into this specific topic) -- not if it's still part of a different, previous answer, or noise/artifact text.
-
-Return ONLY valid JSON (no markdown fences, no commentary):
-
-{"earlier_start_found": true, "start_line": 118}
-
-or
-
-{"earlier_start_found": false}
-
-If unsure, prefer {"earlier_start_found": false} -- this is a safety-net check, not a re-search from scratch."""
-
-def _build_verify_earliest_prompt(block_lines: list, candidate_line: int, question_text: str, ref_label: str) -> str:
-    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in block_lines)
-    return (
-        f"TARGET QUESTION ({ref_label}): {question_text}\n\n"
-        f"CANDIDATE START LINE: {candidate_line}\n\n"
-        f"TEXT BLOCK (line-numbered):\n{lines_block}"
-    )
-
-def _parse_verify_earliest_response(content: str) -> tuple:
-    content = content.strip()
-    if content.startswith("```"):
-        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
-        content = re.sub(r'\n?```\s*$', '', content)
-        content = content.strip()
-    data = json.loads(content)
-    if not isinstance(data, dict) or "earlier_start_found" not in data:
-        raise ValueError(f"Response missing 'earlier_start_found': {data!r}")
-    if not data["earlier_start_found"]:
-        return False, None
-    if "start_line" not in data:
-        raise ValueError("earlier_start_found=true but missing 'start_line'")
-    return True, int(data["start_line"])
-
-def _verify_earliest_start(client, numbered_lines: list, answer_line_pages: list,
-                             start_line: int, question_text: str, ref_label: str,
-                             min_allowed_line: int, budget: "_TokenBudgetTracker", log) -> int:
-    """
-    Page-boundary-aware backward check: re-examines the OCR page the
-    candidate start falls on, PLUS the previous VERIFY_EARLIEST_BACK_PAGES
-    full page(s), to catch cases where the true start was a few lines (or
-    a whole skipped page) earlier than what the forward search reported.
-    min_allowed_line prevents this from ever moving the start earlier
-    than the previous confirmed answer's boundary.
-    """
-    if start_line <= min_allowed_line or start_line >= len(numbered_lines):
-        return start_line
-
-    if answer_line_pages and start_line < len(answer_line_pages):
-        current_page = answer_line_pages[start_line]
-        target_pages = set()
-        seen_pages = []
-        for p in reversed(answer_line_pages[:start_line + 1]):
-            if p not in seen_pages:
-                seen_pages.append(p)
-            if len(seen_pages) > VERIFY_EARLIEST_BACK_PAGES:
-                break
-        target_pages = set(seen_pages)
-        block_start = start_line
-        for i in range(start_line, min_allowed_line, -1):
-            if i < len(answer_line_pages) and answer_line_pages[i] in target_pages:
-                block_start = i
-            else:
-                break
-    else:
-        block_start = max(min_allowed_line + 1, start_line - 40)
-
-    block = [numbered_lines[i] for i in range(block_start, start_line + 1)]
-    if len(block) <= 1:
-        return start_line
-
-    prompt = _build_verify_earliest_prompt(block, start_line, question_text, ref_label)
-    try:
-        found, earlier_line = _call_groq_with_retries(
-            client, VERIFY_EARLIEST_START_SYSTEM_PROMPT, prompt,
-            _parse_verify_earliest_response, budget, log, max_retries=2
-        )
-    except Exception as e:
-        log(f"WARNING: earliest-start verification failed for {ref_label}: {e}")
-        return start_line
-
-    if found and earlier_line is not None:
-        valid_ids = {i for i, _ in block}
-        if earlier_line in valid_ids and min_allowed_line < earlier_line <= start_line:
-            log(f"  earliest-start check: moved {ref_label} start from {start_line} back to {earlier_line}")
-            return earlier_line
-
-    return start_line
 
 def _words_nearly_match(w1: str, w2: str) -> bool:
     if w1 == w2:
@@ -1204,23 +1085,6 @@ or
 
 If found, start_line MUST be one of the exact line numbers shown in [brackets] in this window -- never estimate or invent a number, and always prefer the earliest correct line over a later one."""
 
-SEQUENTIAL_SEARCH_SYSTEM_PROMPT = SEQUENTIAL_SEARCH_SYSTEM_PROMPT.replace(
-    "If the target question's answer does not begin anywhere in this window, say so plainly.",
-    """===========================================================
-RULE 4 -- ERR TOWARD REPORTING A MATCH, NOT "NOT FOUND"
-===========================================================
-A false "not found" is a WORSE error than a slightly-early guess: if you say
-"not found" but the answer genuinely starts somewhere in this window, those
-opening lines get permanently lost from this answer and wrongly attributed
-to the wrong question -- they cannot be recovered later. Whereas if you
-report a start line that turns out to be a few lines earlier than ideal,
-that's a minor, low-cost error. So: if you have even MODERATE confidence
-(not just high confidence) that the answer begins somewhere in this window,
-report found=true with your best estimate of the earliest line -- do not
-withhold a match just because you're not 100% certain.
-
-If the target question's answer does not begin anywhere in this window, say so plainly."""
-)
 
 def _build_sequential_search_prompt(window_lines: list, question_text: str, ref_label: str,
                                       extra_reminder: str = None) -> str:
@@ -1262,34 +1126,9 @@ def _parse_sequential_search_response(content: str) -> tuple:
     return True, start_line
 
 
-SEQUENTIAL_SEARCH_WINDOW_CHARS = 1500  # same safe-per-call char budget used elsewhere in this module
+SEQUENTIAL_SEARCH_WINDOW_CHARS = 11000  # same safe-per-call char budget used elsewhere in this module
 SEQUENTIAL_SEARCH_MAX_WINDOWS = 200  # generous safety cap; a real document will exhaust far sooner
 
-def _retreat_pointer(numbered_lines, end_idx, start_idx, overlap_chars=SEARCH_WINDOW_OVERLAP_CHARS):
-    chars = 0
-    idx = end_idx - 1
-    while idx > start_idx and chars < overlap_chars:
-        chars += len(numbered_lines[idx][1])
-        idx -= 1
-    return max(idx + 1, start_idx + 1)
-
-
-# =========================================================
-# API KEYS
-# =========================================================
-
-def get_api_key(name):
-    try:
-        import streamlit as st
-        return st.secrets[name]
-    except Exception:
-        from dotenv import load_dotenv
-        load_dotenv()
-        return os.getenv(name)
-
-
-# =========================================================
-#
 
 def _find_answer_start_sequential(client, numbered_lines: list, question_text: str, ref_label: str,
                                     search_from_idx: int, budget: "_TokenBudgetTracker", log,
@@ -1340,7 +1179,7 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                 f"treating this window as a non-match"
             )
 
-        pointer = _retreat_pointer(numbered_lines, idx, pointer)
+        pointer = idx  # move forward to the next window, no overlap
         windows_tried += 1
 
     return None
@@ -1659,15 +1498,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 client, numbered_lines, q, ref, pointer, budget, log
             )
             if start_line is None:
-                if start_line is not None:
-                     prev_start = found_starts.get(f"REF-{chr(65 + i - 1)}", -1) if i > 0 else -1
-                     start_line = _verify_earliest_start(
-                     client, numbered_lines, answer_line_pages, start_line, q, ref,
-                     prev_start, budget, log
-                     )
-            found_starts[ref] = start_line
-            log(f"  found {ref} starting at line {start_line}")
-            pointer = start_line + 1
                 log(f"  first pass found nothing for {ref} -- retrying once with an explicit reminder...")
                 start_line = _find_answer_start_sequential(
                     client, numbered_lines, q, ref, pointer, budget, log,
@@ -1864,38 +1694,19 @@ _OCR_ARTIFACT_DESCRIPTION_RE = re.compile(
 )
 
 
-_ANNOTATION_MARK_WORDS = re.compile(
-    r'\b(?:circl(?:e|ing|ed)|arrow|underlin\w*|scribbl\w*|doodle\w*|'
-    r'tick\s*mark|cross\s*mark|strike[\s-]?through)\b', re.IGNORECASE
-)
-_ANNOTATION_COLOR_WORDS = re.compile(r'\bred\s*(?:pen|ink|colou?r)?\b', re.IGNORECASE)
-_ANNOTATION_ACTION_WORDS = re.compile(
-    r'\b(?:originates?\s+from|points?\s+(?:diagonally|towards?|downwards?|upwards?|'
-    r'to\s+the\s+(?:left|right))|containing\s+the\s+number|blank\s+space\s+of\s+the\s+page|'
-    r'corner\s+of\s+the\s+page|across\s+the\s+page|drawn\s+(?:in|on)|marked?\s+(?:in|with))\b',
-    re.IGNORECASE
-)
-
 def _is_ocr_artifact_description(line: str) -> bool:
+    """
+    Detects lines where the OCR engine described a VISUAL artifact on the
+    page (a logo, stamp, red-pen scribble/underline, stray mark, doodle,
+    etc.) in prose, instead of transcribing actual student writing. These
+    are OCR commentary about the page, never student answer content, and
+    must be excluded both from extracted answer text AND from candidate
+    answer-start/transition lines.
+    """
     stripped = line.strip()
     if not stripped:
         return False
-    if _OCR_ARTIFACT_DESCRIPTION_RE.match(stripped):
-        return True
-    # Broader signature: OCR sometimes narrates an examiner's red-pen
-    # annotation (circle around a question number, arrow, tick, etc.) as
-    # a full descriptive sentence instead of transcribing real writing.
-    # These don't start with "there is", so the anchored regex above
-    # misses them. Require at least 2 of 3 signal categories together
-    # (mark-type + color/ink + description-action wording) so genuine
-    # academic content that happens to mention "arrow" or "circle" once
-    # isn't falsely flagged.
-    has_mark = bool(_ANNOTATION_MARK_WORDS.search(stripped))
-    has_color = bool(_ANNOTATION_COLOR_WORDS.search(stripped))
-    has_action = bool(_ANNOTATION_ACTION_WORDS.search(stripped))
-    if (has_mark + has_color + has_action) >= 2 and len(stripped) <= 300:
-        return True
-    return False
+    return bool(_OCR_ARTIFACT_DESCRIPTION_RE.match(stripped))
 
 
 def is_noise(line: str) -> bool:
@@ -2132,21 +1943,10 @@ def process_pdf(file_input, status_callback=None):
     answer_lines = []
     answer_line_pages = []
     for page in answer_pages:
-        page_kept_any = False
         for line in page["raw_text"].split("\n"):
             if not is_noise(line):
                 answer_lines.append(line)
                 answer_line_pages.append(page["page_number"])
-                page_kept_any = True
-        if not page_kept_any and page["raw_text"].strip():
-            log(
-                f"WARNING: page {page['page_number']} produced ZERO usable answer "
-                f"lines after filtering, despite having {len(page['raw_text'])} chars "
-                f"of raw OCR text. This usually means Chandra mis-transcribed the "
-                f"WHOLE page as an annotation description (red-pen marks etc.) instead "
-                f"of the actual handwriting -- real content may be LOST here, not just "
-                f"filtered. Manually check page {page['page_number']} in the source PDF."
-            )
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
