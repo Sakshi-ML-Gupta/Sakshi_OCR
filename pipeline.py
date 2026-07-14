@@ -1712,6 +1712,351 @@ def _check_last_answer_end(client, numbered_lines: list, question_text: str, ref
     return fallback_end
 
 
+# =========================================================
+# ANSWER MAPPING -- CLASSIFICATION STRATEGY (alternative to the
+# sequential/transition strategy below)
+#
+# Instead of walking forward per QUESTION with isolated/transition
+# sliding-window searches (map_answers_sequential), this shows the LLM
+# char-budgeted, OVERLAPPING CHUNKS of the full line-numbered answer
+# text alongside the COMPLETE list of questions, and asks a single
+# classification question per chunk: "which of these questions' answers
+# genuinely start somewhere in THIS chunk?" This is a simpler, more
+# stable task for an LLM (pick matches from a fixed list) than inferring
+# open-ended start/end boundaries one question at a time, and needs far
+# fewer LLM calls overall -- roughly one call per chunk, instead of one
+# or more calls per question.
+# =========================================================
+
+ANSWER_CLASSIFY_CHUNK_CHARS = 9000
+ANSWER_CLASSIFY_OVERLAP_CHARS = 1500
+
+
+def _ref_label(i: int) -> str:
+    return f"REF-{chr(65 + i)}"
+
+
+def _chunk_numbered_lines(numbered_lines: list, max_chars: int = ANSWER_CLASSIFY_CHUNK_CHARS,
+                            overlap_chars: int = ANSWER_CLASSIFY_OVERLAP_CHARS) -> list:
+    """
+    Splits numbered_lines (contiguous global (idx, text) pairs) into
+    char-budgeted chunks, with each chunk overlapping the TAIL of the
+    previous chunk by roughly overlap_chars -- so an answer start that
+    falls right at a chunk boundary is shown with full context in at
+    least one chunk, instead of being split across two chunks and
+    potentially missed by both.
+    """
+    if not numbered_lines:
+        return []
+
+    chunks = []
+    n = len(numbered_lines)
+    start = 0
+    while start < n:
+        chars = 0
+        end = start
+        while end < n and (end == start or chars + len(numbered_lines[end][1]) <= max_chars):
+            chars += len(numbered_lines[end][1])
+            end += 1
+        chunks.append(numbered_lines[start:end])
+
+        if end >= n:
+            break
+
+        back_chars = 0
+        back_idx = end - 1
+        while back_idx > start and back_chars < overlap_chars:
+            back_chars += len(numbered_lines[back_idx][1])
+            back_idx -= 1
+        start = max(back_idx + 1, start + 1)
+
+    return chunks
+
+
+ANSWER_CLASSIFY_SYSTEM_PROMPT = """You are analyzing a WINDOW (a portion, not the whole document) of line-numbered OCR text from a student's exam answer booklet. You are also given the COMPLETE list of official exam questions, each with a short reference code (REF-A, REF-B, ...).
+
+Your task: for EACH question in the list, decide whether the student's answer to THAT question genuinely BEGINS somewhere within this window. Most questions will NOT begin in any given window -- that is normal and expected. Only report a question if its answer's opening line is visible in this window.
+
+===========================================================
+RULE 1 -- REPORT A START, NOT A CONTINUATION
+===========================================================
+A window often shows the MIDDLE of an answer that already began earlier in the document, outside this window. If the text here reads as flowing prose clearly continuing an argument already in progress (no label, no restatement, no obvious topic-opening sentence), do NOT report it as a start -- it's a continuation.
+
+===========================================================
+RULE 2 -- WHAT A GENUINE START LOOKS LIKE
+===========================================================
+A genuine answer start is typically one of:
+  - A short label ("Ans 5-", "उत्तर 6", "Q.5", "5)", "(a)", "(b)", "(i)", "Answer:")
+  - A one-line restatement or paraphrase of the question, right before the real explanation begins
+  - A brief introductory/transitional sentence that clearly opens discussion of that specific topic, understandable without needing earlier context
+If there is genuine doubt between two nearby candidate lines for the SAME question, prefer the EARLIER one.
+
+===========================================================
+RULE 3 -- IGNORE OCR ARTIFACT/ANNOTATION DESCRIPTIONS
+===========================================================
+Some lines are the OCR engine's own description of a visual element (e.g. "[Logo]", "There is a red pen mark here", "Scribbled line", "Stamp", "Signature") rather than actual student writing. These are never a genuine answer start.
+
+===========================================================
+RULE 4 -- REPEATED CONTENT IS NORMAL, DON'T OVER-REPORT
+===========================================================
+The same fact/definition can legitimately appear more than once in the document. Be conservative: only report a question as starting here if THIS occurrence really reads like the beginning of a dedicated answer to it, not just a passing mention inside another answer.
+
+===========================================================
+RULE 5 -- A QUESTION CAN ONLY START ONCE
+===========================================================
+Report at most ONE start line per question for this window (the earliest, if multiple candidates exist here).
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{"found": [{"ref": "REF-B", "start_line": 202}, {"ref": "REF-E", "start_line": 340}]}
+
+If NO question's answer begins anywhere in this window, return {"found": []} -- this is a common and expected result. start_line MUST be one of the exact line numbers shown in [brackets] in this window."""
+
+
+def _build_answer_classify_prompt(chunk_lines: list, questions: list) -> str:
+    q_block = "\n".join(f"{_ref_label(i)}: {q}" for i, q in enumerate(questions))
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in chunk_lines)
+    return (
+        f"QUESTIONS (complete list, in order):\n{q_block}\n\n"
+        f"TEXT WINDOW (line-numbered):\n{lines_block}"
+    )
+
+
+def _parse_answer_classify_response(content: str) -> dict:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM did not return valid JSON: {e}\nRaw (first 400 chars): {content[:400]!r}")
+
+    if not isinstance(data, dict) or "found" not in data:
+        raise ValueError(f"Response missing 'found' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    found = data["found"]
+    if not isinstance(found, list):
+        raise ValueError(f"'found' must be a list, got: {type(found).__name__}")
+
+    result = {}
+    for item in found:
+        if not isinstance(item, dict) or "ref" not in item or "start_line" not in item:
+            continue
+        ref = str(item["ref"]).strip()
+        try:
+            start_line = int(item["start_line"])
+        except (ValueError, TypeError):
+            continue
+        result[ref] = start_line
+
+    return result
+
+
+def map_answers_classification(answer_lines: list, questions: list, status_callback=None,
+                                 answer_line_pages: list = None) -> list:
+    """
+    Classification-based answer-mapping strategy (default). Chunks are
+    processed in document order; for each ref, the FIRST chunk that
+    reports it wins (a later chunk reporting the same ref again -- e.g.
+    because the student briefly revisits the topic -- is ignored, since
+    the first genuine detection in document order is almost always the
+    true start).
+
+    Safety nets, reused from the sequential strategy:
+    - Monotonicity enforcement: a later question's start must come after
+      the previous question's -- an inconsistent match is discarded and
+      retried below, rather than silently producing overlapping/
+      out-of-order ranges.
+    - _verify_earliest_start backward check on every confirmed start.
+    - A bounded isolated fallback search for any question no chunk ever
+      flagged, scoped between its nearest confirmed neighbors.
+    - The same Python-computed ends and last-answer-end verification
+      used by map_answers_sequential.
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
+        raise Exception("GROQ_API_KEY not found in secrets or environment")
+
+    client = Groq(api_key=api_key)
+    budget = _TokenBudgetTracker()
+
+    numbered_lines = list(enumerate(answer_lines))
+    total_lines = len(numbered_lines)
+    ref_to_question = {_ref_label(i): q for i, q in enumerate(questions)}
+
+    chunks = _chunk_numbered_lines(numbered_lines)
+    log(f"Split {total_lines} answer line(s) into {len(chunks)} classification chunk(s)")
+
+    found_starts = {}  # ref -> global start_line
+
+    for ci, chunk in enumerate(chunks):
+        if len(found_starts) == len(questions):
+            log(f"All {len(questions)} question(s) already matched -- skipping remaining chunks")
+            break
+
+        log(f"Classifying chunk {ci + 1}/{len(chunks)} (lines {chunk[0][0]}-{chunk[-1][0]})...")
+        prompt = _build_answer_classify_prompt(chunk, questions)
+        try:
+            chunk_result = _call_groq_with_retries(
+                client, ANSWER_CLASSIFY_SYSTEM_PROMPT, prompt,
+                _parse_answer_classify_response, budget, log
+            )
+        except Exception as e:
+            log(f"WARNING: classification failed for chunk {ci + 1}/{len(chunks)}, skipping: {e}")
+            continue
+
+        valid_ids = {idx for idx, _ in chunk}
+        for ref, start_line in chunk_result.items():
+            if ref not in ref_to_question:
+                log(f"WARNING: chunk {ci + 1} reported unknown ref {ref!r} -- ignoring")
+                continue
+            if start_line not in valid_ids:
+                log(
+                    f"WARNING: chunk {ci + 1} reported {ref} at line {start_line}, outside "
+                    f"this chunk's actual range {chunk[0][0]}-{chunk[-1][0]} -- ignoring"
+                )
+                continue
+            if ref in found_starts:
+                continue
+            found_starts[ref] = start_line
+            log(f"  {ref} starts at line {start_line} (chunk {ci + 1})")
+
+    # Monotonicity enforcement (see docstring).
+    prev_start = -1
+    for i in range(len(questions)):
+        ref = _ref_label(i)
+        if ref not in found_starts:
+            continue
+        if found_starts[ref] <= prev_start:
+            log(
+                f"WARNING: {ref}'s classified start (line {found_starts[ref]}) is not after "
+                f"the previous question's confirmed start (line {prev_start}) -- discarding "
+                f"as inconsistent with document order; will retry with a bounded fallback search"
+            )
+            del found_starts[ref]
+            continue
+        prev_start = found_starts[ref]
+
+    # Backward verification, in QUESTION order so min_allowed_line is the
+    # previous QUESTION's confirmed start.
+    ordered_refs = [r for r in (_ref_label(i) for i in range(len(questions))) if r in found_starts]
+    prev_start = -1
+    for ref in ordered_refs:
+        q = ref_to_question[ref]
+        verified = _verify_earliest_start(
+            client, numbered_lines, answer_line_pages, found_starts[ref], q, ref,
+            prev_start, budget, log
+        )
+        found_starts[ref] = verified
+        prev_start = verified
+
+    # Bounded fallback search for any question no chunk ever flagged.
+    for i, q in enumerate(questions):
+        ref = _ref_label(i)
+        if ref in found_starts:
+            continue
+
+        later_start = None
+        for j in range(i + 1, len(questions)):
+            cand = _ref_label(j)
+            if cand in found_starts:
+                later_start = found_starts[cand]
+                break
+
+        earlier_start = 0
+        for j in range(i - 1, -1, -1):
+            cand = _ref_label(j)
+            if cand in found_starts:
+                earlier_start = found_starts[cand] + 1
+                break
+
+        hi = later_start if later_start is not None else total_lines
+        log(
+            f"Fallback: {ref} was not classified into any chunk -- retrying with a bounded "
+            f"isolated search restricted to lines {earlier_start}-{hi - 1}..."
+        )
+        gap_slice = numbered_lines[earlier_start:hi]
+        gap_start = _find_answer_start_sequential(client, gap_slice, q, ref, 0, budget, log)
+        if gap_start is not None:
+            gap_start = _verify_earliest_start(
+                client, numbered_lines, answer_line_pages, gap_start, q, ref,
+                earlier_start - 1, budget, log
+            )
+            found_starts[ref] = gap_start
+            log(f"  fallback recovered {ref} starting at line {gap_start}")
+        else:
+            log(f"  fallback could not find {ref} either -- leaving unmatched")
+
+    # Debug context (same as sequential strategy) for every confirmed start.
+    for ref, start_line in sorted(found_starts.items(), key=lambda kv: kv[1]):
+        ctx_lo = max(0, start_line - 4)
+        ctx_hi = min(total_lines, start_line + 3)
+        log(f"  [context] lines {ctx_lo}-{ctx_hi - 1} around {ref}'s confirmed start (>>> marks the chosen start line):")
+        for cix in range(ctx_lo, ctx_hi):
+            marker = ">>>" if cix == start_line else "   "
+            preview = answer_lines[cix][:180].replace("\n", " ")
+            log(f"  [context] {marker} [{cix}] {preview!r}")
+
+    ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
+    ranges = []
+    for idx, (ref, start) in enumerate(ordered):
+        if idx + 1 < len(ordered):
+            end = ordered[idx + 1][1] - 1
+        else:
+            q_last = ref_to_question[ref]
+            end = _check_last_answer_end(client, numbered_lines, q_last, ref, start, budget, log)
+        ranges.append({"ref": ref, "start_line": start, "end_line": end})
+
+    log(f"Classification mapping found {len(ranges)} of {len(questions)} question(s)")
+
+    ranges_by_ref = {r["ref"]: r for r in ranges}
+    results = []
+    for i, q in enumerate(questions):
+        ref = _ref_label(i)
+        r = ranges_by_ref.get(ref)
+
+        if r is None:
+            results.append({
+                "ref": ref, "question": q, "matched": False,
+                "start_line": None, "end_line": None,
+                "start_page": None, "end_page": None,
+                "answer": "", "answer_raw": "",
+            })
+            continue
+
+        s, e = r["start_line"], r["end_line"]
+        verbatim_lines = [
+            answer_lines[j] for j in range(s, e + 1)
+            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
+        ]
+        answer_raw = " ".join(verbatim_lines).strip()
+        answer_clean = strip_question_restatement(answer_raw)
+        answer_clean = strip_full_question_echo(answer_clean, q)
+        answer_clean = _strip_trailing_question_echo_sentences(answer_clean, questions)
+
+        start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
+        end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
+
+        results.append({
+            "ref": ref, "question": q, "matched": True,
+            "start_line": s, "end_line": e,
+            "start_page": start_page, "end_page": end_page,
+            "answer": answer_clean, "answer_raw": answer_raw,
+        })
+
+    return results
+
+
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
     """
@@ -2501,8 +2846,8 @@ def process_pdf(file_input, status_callback=None):
             "would be guaranteed to fail."
         )
 
-    log("Mapping each question to its answer (start search + comparative transition search)...")
-    qa_pairs = map_answers_sequential(
+    log("Mapping each question to its answer (classification-based: chunk + full question list)...")
+    qa_pairs = map_answers_classification(
         answer_lines, official_questions, status_callback,
         answer_line_pages=answer_line_pages
     )
