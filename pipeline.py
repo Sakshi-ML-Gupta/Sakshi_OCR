@@ -684,8 +684,15 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker",
                           log, max_retries: int = 4) -> tuple:
     user_prompt = _build_qp_user_prompt(pages_chunk)
+
+    page_nums = [p["page_number"] for p in pages_chunk]
+
+    def _debug_parser(content):
+        log(f"  [debug] raw QP-classification response for chunk pages {page_nums}: {content[:1000]!r}")
+        return _parse_qp_llm_response(content)
+
     return _call_groq_with_retries(
-        client, QP_SYSTEM_PROMPT, user_prompt, _parse_qp_llm_response,
+        client, QP_SYSTEM_PROMPT, user_prompt, _debug_parser,
         budget, log, max_retries
     )
 
@@ -877,6 +884,9 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     for i, chunk in enumerate(chunks):
         page_nums_in_chunk = [p["page_number"] for p in chunk]
         log(f"Asking LLM to analyze chunk {i+1}/{len(chunks)} (pages {page_nums_in_chunk})...")
+        for p in chunk:
+            preview = p["raw_text"][:120].replace("\n", " ")
+            log(f"  [debug] page {p['page_number']} preview: {preview!r}")
 
         try:
             qp_pages_1based, questions, admin_pages_1based = _call_groq_for_chunk(client, chunk, budget, log)
