@@ -75,32 +75,6 @@ def _coerce_name(name, default_name="document.pdf"):
         return default_name
 
 
-# =========================================================
-# DIAGNOSTIC GUARD
-#
-# This module's OWN code cannot produce the exact error
-# "expected str, bytes or os.PathLike object, not tuple" -- that precise
-# message is only ever raised by Python's os.fspath()/open() built-ins,
-# and this module contains zero raw open() calls; every Path()/read_bytes()
-# call here is already guarded by an isinstance() check before it runs
-# (see _normalize_file_input and _coerce_name above). This has been
-# verified directly: feeding every realistic tuple shape (filename+bytes,
-# enumerate-style, zip-style, nested tuples) into _normalize_file_input
-# produces a clear, different TypeError every time, never this one.
-#
-# That means if this exact error is still happening, it is occurring
-# OUTSIDE this module -- most likely in the calling app's own code
-# (e.g. a raw open(...) call on something that isn't a path) BEFORE
-# process_pdf()/process_reference() is ever reached.
-#
-# This decorator can't fix a bug in code it doesn't contain, but it
-# converts an ambiguous crash into an UNAMBIGUOUS one: if this exact
-# error somehow still surfaces while a call is genuinely inside this
-# module, the wrapped function catches it, attaches the literal type
-# and repr of whatever was passed in, and re-raises with a message
-# that makes the true source impossible to mistake next time.
-# =========================================================
-
 def _diagnose_tuple_errors(func):
     import functools
 
@@ -121,30 +95,6 @@ def _diagnose_tuple_errors(func):
 
     return wrapper
 
-
-# =========================================================
-# CONCURRENCY GUARD
-#
-# FIX: the real log showed TWO complete pipeline runs interleaved --
-# "Submitting document..." fired twice, OCR ran twice, chunk logs from
-# both runs were mixed together line by line. This is almost certainly
-# the calling app (e.g. Streamlit) invoking process_pdf() a second time
-# while the first call is still in flight (a common Streamlit rerun
-# behavior). Both runs then compete for the SAME shared 8000 TPM org
-# budget at once, which is the direct cause of the constant 429s seen
-# in that log -- it wasn't one document needing too many tokens, it was
-# two concurrent runs each burning the same shared budget simultaneously.
-#
-# This module cannot prevent the calling app from invoking it twice,
-# but a process-wide lock around the Groq-calling section ensures that
-# IF it is called concurrently in the same process, the calls serialize
-# instead of racing for the same token budget. This turns "two runs
-# fighting over 8000 TPM" into "two runs sharing 8000 TPM one after
-# the other," which is strictly better and removes one whole class of
-# the 429 storm seen in the log. If your app calls this from separate
-# processes (e.g. multiple server workers), you'd need a cross-process
-# lock (e.g. a file lock or Redis) instead -- ask if that's your setup.
-# =========================================================
 
 _groq_call_lock = threading.Lock()
 
@@ -372,31 +322,17 @@ def process_reference(file_input, status_callback=None):
 
 GROQ_MODEL = "openai/gpt-oss-120b"
 
-# FIX: a static character budget doesn't reliably predict actual token
-# usage (Devanagari-heavy text tokenizes denser and less predictably
-# than English). Instead of guessing a safe chunk size once, we now
-# keep a RUNNING ESTIMATE of tokens used in the current rolling window
-# and proactively wait BEFORE sending a chunk if we estimate we're
-# close to the 8000 TPM ceiling, using the actual Used/Requested/Limit
-# numbers Groq's own error messages report whenever we do go over, so
-# our internal estimate self-corrects against ground truth as we go.
 TPM_LIMIT = 8000
-TPM_SAFETY_FRACTION = 0.85  # treat the budget as slightly smaller than
-                              # the real limit to leave headroom for
-                              # estimation error
-CHARS_PER_TOKEN_ESTIMATE = 2.0  # conservative for Devanagari-heavy text;
-                                  # self-corrects via _record_actual_usage
+TPM_SAFETY_FRACTION = 0.85
+CHARS_PER_TOKEN_ESTIMATE = 2.0
 
-MAX_CHARS_PER_CHUNK = 6000  # smaller than before -- real-world 429s
-                              # showed our chars-per-token guess was
-                              # optimistic; smaller chunks reduce blast
-                              # radius of any single misestimate
+MAX_CHARS_PER_CHUNK = 6000
 CHUNK_OVERLAP_PAGES = 1
 
-QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet (e.g. IGNOU-style, India). The booklet mixes pages of different kinds, in no guaranteed order:
+QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam/assignment answer booklet. This could be from ANY institution, ANY subject, and ANY language (or a mix of languages/scripts) -- do not assume a specific country, university, or language. The booklet mixes pages of different kinds, in no guaranteed order:
 
-1. ADMINISTRATIVE/COVER pages: enrolment number, programme code, learner name, registration details, regional centre info. NEVER question paper pages.
-2. QUESTION PAPER pages: the official printed list of numbered exam questions the student must answer. These read as instructions/prompts DIRECTED AT the student (e.g. "Discuss X", "Explain Y with examples", "Write notes on the following:"). Mark allocations may appear (e.g. "10", "20").
+1. ADMINISTRATIVE/COVER pages: roll number/enrolment number, programme/course code, student name, registration details, institution letterhead, blank cover sheets. These contain NO exam question text and NO student answer content -- just identifying/bureaucratic information.
+2. QUESTION PAPER pages: the official printed list of numbered exam questions the student must answer. These read as instructions/prompts DIRECTED AT the student (e.g. "Discuss X", "Explain Y with examples", "Write notes on the following:", or the equivalent phrasing in whatever language this document uses). Mark allocations may appear (e.g. "10", "20").
 3. ANSWER pages: the student's own (handwritten, OCR'd) answers. These are typically long, restate or reference a question briefly then write an extended response, and may themselves contain numbered or bulleted sub-points as part of the student's OWN explanation. These numbered sub-points inside a long answer are NOT separate exam questions, even though superficially they look similar (number, period, text) -- they are part of the answer to ONE question.
 
 You are being shown only a PORTION of the document's pages at a time (a chunk), not the whole document. Some pages you see may be partial context carried over from a previous chunk -- still classify them normally based on their own content.
@@ -405,19 +341,21 @@ Your task: read the pages shown and return ONLY valid JSON (no markdown fences, 
 
 {
   "question_paper_pages": [14, 16, 18],
+  "admin_pages": [1, 2],
   "questions": ["1. Example question text. (10)", "2. Another example question. (10)"]
 }
 
-IMPORTANT formatting requirement: "question_paper_pages" must be a JSON array where EACH page number is a SEPARATE element separated by commas, like [14, 16, 18] -- NEVER merge multiple page numbers into one number like [141618]. Each integer in that array must be a single, individually valid page number from the pages shown.
+IMPORTANT formatting requirement: "question_paper_pages" and "admin_pages" must be JSON arrays where EACH page number is a SEPARATE element separated by commas, like [14, 16, 18] -- NEVER merge multiple page numbers into one number like [141618]. Each integer must be a single, individually valid page number from the pages shown. A page must never appear in both lists.
 
 Critical rules for telling question-paper pages apart from answer pages that happen to contain numbered content:
-- A genuine question paper question is a PROMPT directed at the student ("explain", "discuss", "describe", "write notes on", "compare", a question mark, etc.) -- it asks the student to DO something.
+- A genuine question paper question is a PROMPT directed at the student ("explain", "discuss", "describe", "write notes on", "compare", a question mark, etc., in whatever language is used) -- it asks the student to DO something.
 - A numbered point inside a long answer is typically a STATEMENT or FACT that is part of an explanation the student is giving -- it does not ask the reader to do anything; it's content, not an instruction.
-- If a page's numbered items closely follow words like "उत्तर" (answer), "Ans", "Ans-", or come after a long paragraph of explanatory prose in the same block, that page is almost certainly an ANSWER page, not a question paper page -- exclude it from question_paper_pages even if it has multiple numbered lines.
+- If a page's numbered items closely follow a label meaning "answer" (in whatever language/script the document uses -- e.g. "Ans", "Ans-", or its equivalent), or come after a long paragraph of explanatory prose in the same block, that page is almost certainly an ANSWER page, not a question paper page -- exclude it from question_paper_pages even if it has multiple numbered lines.
 - A real question paper is usually self-contained and concise per question (a question, maybe a mark allocation) -- not a long flowing essay with numbered sub-points woven into running prose.
 - CRITICAL TRAP TO AVOID: students very commonly RESTATE the question itself as the FIRST SENTENCE of their answer, before writing their actual response (e.g. an answer's opening page reads "Examine the theme of concealment in X. Discuss with reference to Y. The theme of concealment is central to..." where everything after the first sentence is the student's OWN original explanation, not more instructions). Such a page can superficially look like a question-paper page because it contains prompt-style verbs ("Examine", "Discuss") -- but it is the FIRST page of a long, multi-page ANSWER, not a question paper page. Signals that this is really an answer's opening page, not a real question paper page: (a) the page has noticeably MORE text than a typical printed question would need, especially if it keeps going well past where a concise instruction would end; (b) the prose quality looks like a developing argument/explanation rather than a terse instruction; (c) the SAME or very similar question text already appears verbatim on a page you are more confident is the genuine, concise question paper (in which case this longer, messier page is almost certainly the student's restatement -- exclude it). When uncertain whether a page is the real question paper or a student's restatement-then-answer, treat brevity and conciseness as the deciding signal: genuine question papers are short per question; answer pages (including their opening restatement) run much longer.
 - When genuinely uncertain whether a page is a question paper page, prefer NOT including it as one, and prefer NOT extracting its numbered items as separate questions.
-- If NONE of the pages shown in this chunk are question paper pages, return empty lists for both fields -- that is a valid and expected result for chunks that only contain answer/admin pages.
+- If a page is a cover/administrative page (roll number, letterhead, blank sheet with no question or answer content), put it in "admin_pages" so it is excluded from BOTH the question paper AND the student's answer text -- it should never be treated as answer content.
+- If NONE of the pages shown in this chunk are question paper pages, return an empty list for that field -- that is a valid and expected result for chunks that only contain answer/admin pages.
 - Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate.
 - Output ONLY the JSON object described above. No prose before or after it. No markdown code fences."""
 
@@ -457,48 +395,15 @@ def _build_qp_user_prompt(pages: list) -> str:
 
 
 def _estimate_tokens(text: str) -> int:
-    """Rough estimate using the current chars-per-token ratio."""
     return int(len(text) / CHARS_PER_TOKEN_ESTIMATE) + 1
 
 
-# =========================================================
-# Rolling token-budget tracker
-#
-# Tracks an estimate of tokens consumed within the current rolling
-# ~60s window. Before sending each chunk, if our estimated usage plus
-# the new request would exceed a safe fraction of TPM_LIMIT, we wait
-# out the remainder of the window BEFORE sending -- proactive pacing
-# instead of reactive retry-after-failure. Real 429 responses still
-# update our knowledge of actual usage (via parsed Used/Limit numbers)
-# so the estimate self-corrects over the course of a run.
-# =========================================================
-
 class _TokenBudgetTracker:
-    """
-    FIX (this round): the previous version used a single window_start +
-    window_tokens pair with an all-or-nothing reset. This had a real,
-    confirmed bug: _maybe_reset_window() ran BEFORE the wait-duration
-    calculation, so if the window had just been reset, `elapsed` was
-    ~0 and the computed wait was always close to the FULL 60 seconds --
-    never a partial wait reflecting how much of the window had already
-    naturally elapsed. Combined with token estimates that kept getting
-    added without properly expiring old ones in some call sequences,
-    this produced the exact symptom seen in real usage: every single
-    chunk reporting a climbing "estimated tokens" figure and forcing a
-    near-full 60s wait every time, even when the real Groq-reported
-    Requested values were far lower.
-
-    This version uses a sliding-window event log (deque of timestamped
-    token amounts) instead. "Tokens used in the last 60s" is always
-    computed by summing events younger than 60s -- which naturally and
-    continuously decays as old events age out, rather than jumping
-    between two states (full budget / empty budget) on a single timer.
-    """
     def __init__(self, tpm_limit=TPM_LIMIT, safety_fraction=TPM_SAFETY_FRACTION):
         import collections
         self.tpm_limit = tpm_limit
         self.safe_limit = tpm_limit * safety_fraction
-        self.events = collections.deque()  # (timestamp, tokens)
+        self.events = collections.deque()
 
     def _prune(self, now=None):
         now = now if now is not None else time.monotonic()
@@ -516,10 +421,8 @@ class _TokenBudgetTracker:
         projected = used + upcoming_tokens
 
         if projected <= self.safe_limit:
-            return  # comfortably under budget -- no wait
+            return
 
-        # Wait only as long as needed for enough OLD events to expire
-        # and make room -- not a blind full 60s.
         needed_to_free = projected - self.safe_limit
         freed = 0
         wait_s = 0.0
@@ -541,14 +444,6 @@ class _TokenBudgetTracker:
         self.events.append((time.monotonic(), tokens))
 
     def record_actual_from_error(self, used: int, limit: int):
-        """
-        Reconciles our estimate with Groq's ground-truth numbers. We
-        don't know the exact age distribution of Groq's "used" figure,
-        so the safest correction is to top up our tracked total to AT
-        LEAST match reality (added as one fresh event), rather than
-        blindly overwriting -- this avoids ever under-counting real
-        usage without compounding errors across repeated corrections.
-        """
         now = time.monotonic()
         current = self.used_in_window(now)
         if used > current:
@@ -558,22 +453,15 @@ class _TokenBudgetTracker:
             self.safe_limit = limit * TPM_SAFETY_FRACTION
 
     def reset_window(self):
-        """Clears all tracked events -- used right after a 429 retry
-        where we've already waited out Groq's own reported wait time,
-        so the window is genuinely clear and shouldn't be re-penalized
-        by a stale estimate."""
         self.events.clear()
 
-    # Backwards-compat no-op properties so any external code that may
-    # have referenced the old window_start/window_tokens attributes
-    # doesn't break.
     @property
     def window_start(self):
         return time.monotonic()
 
     @window_start.setter
     def window_start(self, value):
-        pass  # handled internally by the event deque now
+        pass
 
     @property
     def window_tokens(self):
@@ -585,22 +473,6 @@ class _TokenBudgetTracker:
             self.events.clear()
 
 
-# Parses Groq's rate-limit message for the real numbers it reports, so
-# retries and pacing are informed by ground truth, not guesses.
-#
-# FIX (this round): the previous regex only matched a plain-seconds wait
-# format (e.g. "try again in 8.5875s"), which is what Groq's TPM
-# (tokens-per-MINUTE) errors use. But Groq's TPD (tokens-per-DAY) errors
-# use a DIFFERENT duration format with minutes, e.g. "try again in
-# 10m7.392s" -- the old regex silently failed to match this (returned
-# None), causing the code to fall back to a generic short retry (a few
-# seconds) against what is actually a 10+ MINUTE wall. Retrying into a
-# daily quota wall is also fundamentally pointless in a way a per-minute
-# wait isn't -- once the day's budget is gone, no amount of waiting
-# seconds or pacing helps; only waiting out the actual reset (or
-# upgrading the tier) does. This version captures the optional minutes
-# component AND the limit type (TPM vs TPD) so the caller can react
-# correctly to each.
 _RATE_LIMIT_DETAIL_RE = re.compile(
     r'on\s+tokens\s+per\s+(minute|day)\s*\((TPM|TPD)\).*?'
     r'Limit\s+(\d+),\s*Used\s+(\d+),\s*Requested\s+(\d+).*?'
@@ -610,13 +482,6 @@ _RATE_LIMIT_DETAIL_RE = re.compile(
 
 
 def _parse_rate_limit_detail(message: str):
-    """
-    Returns a dict with keys: limit_type ("TPM" or "TPD"), limit, used,
-    requested, wait_seconds -- or None if the message doesn't match
-    Groq's known error format. Handles both the plain-seconds duration
-    format used by TPM errors and the minutes+seconds format used by
-    TPD errors (e.g. "10m7.392s").
-    """
     m = _RATE_LIMIT_DETAIL_RE.search(message)
     if not m:
         return None
@@ -657,43 +522,26 @@ def _parse_qp_llm_response(content: str) -> tuple:
 
     qp_pages = data["question_paper_pages"]
     questions = data["questions"]
+    admin_pages = data.get("admin_pages", [])  # optional, backward-compatible
 
     if not isinstance(qp_pages, list):
         raise ValueError(f"question_paper_pages must be a list, got: {type(qp_pages).__name__}")
     qp_pages = [int(x) for x in qp_pages]
 
+    if not isinstance(admin_pages, list):
+        raise ValueError(f"admin_pages must be a list, got: {type(admin_pages).__name__}")
+    admin_pages = [int(x) for x in admin_pages]
+
     if not isinstance(questions, list):
         raise ValueError(f"questions must be a list, got: {type(questions).__name__}")
     questions = [str(x).strip() for x in questions if str(x).strip()]
 
-    return qp_pages, questions
+    return qp_pages, questions, admin_pages
 
 
 def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_page: int) -> list:
-    """
-    FIX (this round): the previous version only attempted recovery when
-    n had MORE digits than max_page's digit-length (e.g. only tried for
-    3+ digit numbers in a 25-page document). This missed a real case
-    seen in production: page numbers 6 and 9 concatenated into 69 --
-    which has exactly 2 digits, the SAME as max_page (25), so the old
-    "len(s) <= len(str(max_page))" guard incorrectly treated it as
-    "plausible on its own" and skipped recovery entirely, silently
-    discarding two genuinely real question-paper pages.
-
-    The correct guard is not about digit-length at all: we should only
-    skip recovery when n is ALREADY a valid page number (nothing to
-    recover), not based on how many digits it happens to have.
-
-    A second fix: when multiple splits are mathematically possible
-    (e.g. 99 could split into [9, 9] since page 9 is valid), we reject
-    any split containing a REPEATED page number -- a genuine
-    concatenation bug merges DIFFERENT page numbers together; it would
-    not plausibly repeat the same page twice in one list. This prevents
-    a genuinely invalid number like 99 from being incorrectly "recovered"
-    into a nonsensical duplicate.
-    """
     if n in valid_page_numbers:
-        return []  # already valid -- nothing to recover
+        return []
 
     s = str(n)
     max_digits = len(str(max_page))
@@ -717,7 +565,7 @@ def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_pag
         if i != len(s):
             return None
         if len(set(result)) != len(result):
-            return None  # reject splits with a repeated page number
+            return None
         return result
 
     candidates = []
@@ -732,8 +580,6 @@ def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_pag
     if not candidates:
         return []
 
-    # Prefer the split with fewer parts when multiple are mathematically
-    # possible -- the more conservative recovery, less likely to overfit.
     candidates.sort(key=len)
     return candidates[0]
 
@@ -741,17 +587,6 @@ def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_pag
 def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                               response_parser, budget: "_TokenBudgetTracker",
                               log, max_retries: int = 4):
-    """
-    Generic Groq chat-completion caller with full retry/pacing/error
-    handling. Shared by BOTH question-identification and answer-mapping
-    calls, so the (carefully tuned, repeatedly bug-fixed) rate-limit
-    and auth-error handling lives in exactly one place instead of being
-    duplicated and risking drifting out of sync between the two callers.
-
-    `response_parser` is called with the raw response content string
-    and must return the parsed result, or raise on malformed output
-    (the same retry loop here also catches and retries parse failures).
-    """
     import groq
 
     estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
@@ -760,16 +595,6 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
     skip_next_proactive_check = False
 
     for attempt in range(1, max_retries + 2):
-        # Proactively pace BEFORE sending, based on our running estimate
-        # of tokens used in the current rolling window. Skipped exactly
-        # once, right after a 429/413 retry, since at that point we just
-        # waited the exact amount of time Groq itself told us was needed
-        # (record_actual_from_error + window reset already happened) --
-        # re-applying our own separate proactive wait on top of that would
-        # double-penalize the same window and stall far longer than
-        # necessary. Any OTHER retry (e.g. after a JSON-parse failure,
-        # which does NOT reset the window) still goes through the normal
-        # proactive check, since real token risk could still be present.
         if skip_next_proactive_check:
             skip_next_proactive_check = False
         else:
@@ -791,12 +616,6 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             return response_parser(content)
 
         except groq.AuthenticationError as e:
-            # A 401 "Invalid API Key" is an AUTH failure, not a rate
-            # limit -- it will NEVER succeed on retry, since the key
-            # itself is wrong/missing/revoked. Fail fast on the very
-            # first attempt with actionable next steps, instead of
-            # retrying pointlessly and burning several seconds before
-            # surfacing a confusing "failed after N attempts" message.
             raise Exception(
                 f"Groq API rejected the API key (401 Invalid API Key). "
                 f"This will NOT be fixed by retrying. Things to check:\n"
@@ -818,15 +637,6 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             detail = _parse_rate_limit_detail(str(e))
 
             if detail and detail["limit_type"] == "TPD":
-                # A daily token quota exhaustion is fundamentally
-                # different from a per-minute one. Retrying -- even with
-                # the correct wait time -- means stalling the whole run
-                # for 10+ minutes, and if the quota is THIS close to its
-                # daily ceiling, a successful retry would likely just
-                # exhaust it again on the very next chunk. Fail fast
-                # with a clear, actionable message instead of burning
-                # retries and the user's time against a wall that small
-                # waits can't clear.
                 raise Exception(
                     f"Groq daily token quota (TPD) exhausted: "
                     f"{detail['used']}/{detail['limit']} tokens used today, "
@@ -842,8 +652,6 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                 ) from e
 
             if detail:
-                # TPM (per-minute) limit -- genuinely recoverable by
-                # waiting out Groq's own reported duration.
                 budget.record_actual_from_error(detail["used"], detail["limit"])
                 log(
                     f"Chunk LLM call hit a rate/size limit (attempt {attempt}): "
@@ -875,8 +683,6 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 
 def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker",
                           log, max_retries: int = 4) -> tuple:
-    """Question-identification call -- thin wrapper around the shared
-    generic caller, using the QP-specific prompts and parser."""
     user_prompt = _build_qp_user_prompt(pages_chunk)
     return _call_groq_with_retries(
         client, QP_SYSTEM_PROMPT, user_prompt, _parse_qp_llm_response,
@@ -887,20 +693,11 @@ def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker
 def _normalize_question_key(q: str) -> str:
     text = q.lower().strip()
     text = re.sub(r'\s+', ' ', text)
-    # Strip leading numbering/punctuation noise that commonly differs
-    # between two OCR/LLM extractions of the SAME printed question
-    # (e.g. "1. - (i)" vs "1. (i)") -- formatting artifacts, not
-    # semantic differences.
     text = re.sub(r'^\d+[\.\)]\s*[-–]?\s*', '', text)
     return text
 
 
 def _words_nearly_match(w1: str, w2: str) -> bool:
-    """Two significant words count as 'the same' if identical OR if
-    they differ by only a small edit (e.g. an OCR misspelling like
-    'abhijnana' vs 'abhignana') -- but NOT if they're simply two
-    different real words (e.g. 'akam' vs 'puram'), which would have a
-    low character-similarity ratio despite similar length."""
     if w1 == w2:
         return True
     if abs(len(w1) - len(w2)) > 2:
@@ -909,29 +706,6 @@ def _words_nearly_match(w1: str, w2: str) -> bool:
 
 
 def _is_near_duplicate_question(q1: str, q2: str) -> bool:
-    """
-    FIX: exact-match-after-normalization dedup was too strict for real
-    OCR variance -- the SAME printed question, extracted by two
-    different LLM chunk calls, can come back with a stray inserted
-    dash, different capitalization, or a single misspelled letter
-    (all confirmed in real usage: "1. (i)" vs "1. - (i)", and
-    "Abhijnana" vs "Abhignana"). Exact matching let these through as
-    two SEPARATE questions, and since the duplicate's answer almost
-    never gets matched a second time, it always showed up as a
-    confusing extra "(no answer text matched)" entry in the final
-    output.
-
-    This fuzzy check requires BOTH a high overall character-similarity
-    ratio AND a high overlap of "significant" (4+ letter) words, where
-    word-level comparison itself tolerates small spelling differences.
-    The word-overlap check is essential: two DIFFERENT short questions
-    that share a sentence template (e.g. "...note on akam thinai..."
-    vs "...note on puram thinai...") can have a deceptively high raw
-    character-similarity ratio despite being genuinely different
-    questions -- the word-overlap check catches that the one
-    significant word that DOES differ ("akam" vs "puram") is not an
-    OCR-noise-level difference, so they are correctly kept distinct.
-    """
     k1, k2 = _normalize_question_key(q1), _normalize_question_key(q2)
     if k1 == k2:
         return True
@@ -940,16 +714,6 @@ def _is_near_duplicate_question(q1: str, q2: str) -> bool:
     if ratio < 0.90:
         return False
 
-    # FIX: minimum word length is 3, not 4. A 4+ letter cutoff was
-    # filtering out short-but-significant distinguishing words like
-    # spelled-out numbers ("one" vs "two"), which caused two genuinely
-    # DIFFERENT questions ("Real question one." / "Real question two.")
-    # to be wrongly merged -- everything else in the sentence matched,
-    # and the one word that actually differed was too short to be
-    # counted, leaving a perfect (but wrong) word-overlap score. 3
-    # letters still excludes pure function-word noise ("a", "of", "in",
-    # "to") that would otherwise inflate apparent overlap without
-    # carrying real distinguishing content.
     words1 = sorted(set(re.findall(r'[a-z]{3,}', k1)))
     words2 = sorted(set(re.findall(r'[a-z]{3,}', k2)))
     if not words1 or not words2:
@@ -962,9 +726,6 @@ def _is_near_duplicate_question(q1: str, q2: str) -> bool:
 
 
 def _dedup_questions(questions: list) -> list:
-    """Deduplicates a list of question strings using fuzzy near-duplicate
-    matching, preserving first-seen order. O(n^2) but n is always small
-    (a handful to a few dozen questions per document)."""
     unique = []
     for q in questions:
         if not any(_is_near_duplicate_question(q, existing) for existing in unique):
@@ -974,14 +735,16 @@ def _dedup_questions(questions: list) -> list:
 
 def _merge_chunk_results(chunk_results: list) -> tuple:
     all_qp_pages = set()
+    all_admin_pages = set()
     all_questions = []
 
-    for qp_pages, questions in chunk_results:
+    for qp_pages, questions, admin_pages in chunk_results:
         all_qp_pages.update(qp_pages)
+        all_admin_pages.update(admin_pages)
         all_questions.extend(questions)
 
     deduped_questions = _dedup_questions(all_questions)
-    return sorted(all_qp_pages), deduped_questions
+    return sorted(all_qp_pages), deduped_questions, sorted(all_admin_pages)
 
 
 QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are reading the OFFICIAL question paper pages of a student exam assignment booklet (the printed list of questions, NOT the student's answers). You are given the complete, exact text of these pages, in order.
@@ -994,6 +757,7 @@ Critical rules for multi-part questions:
 - Decide this ONCE, consistently, for the whole document -- you are seeing the COMPLETE question paper text in this single call, so there is no need to guess or produce different splits for different parts of the same question.
 - Preserve the EXACT original text of each part -- do not paraphrase, do not translate. You MAY prepend the parent question's numbering/label to each split-out sub-part for self-contained context, as described above.
 - Output entries in the SAME ORDER they appear on the question paper (monotonic, matching the printed sequence) -- sub-parts of the same parent question must stay together and in their own (i)/(ii)/(iii)/(iv) order; never reorder anything.
+- Do NOT output the same question or sub-part more than once, even if it appears to be printed twice (e.g. once in a table of contents/index and once in the body) -- include each distinct question exactly one time.
 
 Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
 
@@ -1035,38 +799,6 @@ def _parse_canonical_questions_response(content: str) -> list:
 
 
 def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
-    """
-    FIX: this is a NEW, dedicated SECOND stage of question
-    identification, addressing a real fragmentation bug confirmed in
-    production -- a single multi-part question (e.g. "(i)...(ii)...
-    (iii)...(iv)...") was sometimes extracted as ONE combined question
-    by one page-chunk, and as 4 SEPARATE standalone questions by
-    another chunk that happened to see the same question-paper page
-    (due to the 1-page overlap between chunks), or saw a truncated
-    view of it. The union-merge step then kept BOTH inconsistent
-    versions, since they don't textually deduplicate as "the same
-    question" -- producing exactly the Q1 vs Q6/Q7/Q8/Q9 duplication/
-    fragmentation seen in real output, where (i) ended up with no
-    answer at all (it was a phantom split) while the REAL combined
-    question separately got a (correctly matched) partial answer.
-
-    The fix: once stage 1 (identify_questions_with_llm's existing
-    chunked page-detection) has determined WHICH pages are question
-    paper pages, this function makes exactly ONE additional LLM call
-    with the COMPLETE text of just those pages together. Since
-    question-paper text is short (a list of printed questions, not
-    answer essays), this comfortably fits in a single call even for
-    long papers, and because the model sees the ENTIRE question paper
-    at once, it only has to make ONE consistent decision about how to
-    split multi-part questions -- there is no second, possibly
-    disagreeing, chunk to produce a conflicting alternative.
-
-    This also directly implements the "monotonic alignment" request:
-    the model is explicitly told to preserve printed order, and this
-    canonical list becomes the SINGLE source of truth for question
-    identity used by all downstream answer-mapping -- no other code
-    path independently invents or re-derives the question list.
-    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -1095,6 +827,25 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
     except Exception as e:
         log(f"WARNING: canonical question extraction failed: {e}")
         return []
+
+    # =====================================================================
+    # FIX: safety-net dedup. Even though the prompt above now explicitly
+    # instructs the model not to repeat a question, and this is a single
+    # consistent pass, duplicate/near-duplicate entries can still slip
+    # through in practice -- e.g. a question printed both in an index/TOC
+    # and in the body, or a sub-part emitted twice. A duplicate canonical
+    # question causes the SAME question to be searched for twice
+    # downstream, which is a confirmed, reproducible cause of "questions
+    # repeating" in the final Q&A output. This reuses the same
+    # near-duplicate detection already used elsewhere in this module.
+    # =====================================================================
+    deduped = _dedup_questions(questions)
+    if len(deduped) != len(questions):
+        log(
+            f"Removed {len(questions) - len(deduped)} duplicate/near-duplicate question(s) "
+            f"from the canonical list ({len(questions)} -> {len(deduped)})"
+        )
+    questions = deduped
 
     log(f"Canonical question list: {len(questions)} question(s), single consistent pass")
     return questions
@@ -1128,43 +879,45 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         log(f"Asking LLM to analyze chunk {i+1}/{len(chunks)} (pages {page_nums_in_chunk})...")
 
         try:
-            qp_pages_1based, questions = _call_groq_for_chunk(client, chunk, budget, log)
+            qp_pages_1based, questions, admin_pages_1based = _call_groq_for_chunk(client, chunk, budget, log)
         except Exception as e:
             log(f"WARNING: chunk {i+1}/{len(chunks)} question-identification failed, skipping: {e}")
             chunk_failures.append(str(e))
             continue
 
-        recovered_pages = []
-        truly_invalid = []
-        for pn in qp_pages_1based:
-            if pn in valid_page_numbers:
-                recovered_pages.append(pn)
-                continue
-            split_result = _try_split_concatenated_page_number(
-                pn, valid_page_numbers, max_page_number
-            )
-            if split_result:
-                log(f"Recovered concatenated page numbers: {pn} -> {split_result}")
-                recovered_pages.extend(split_result)
-            else:
-                truly_invalid.append(pn)
+        def _recover_pages(pages_1based, label):
+            recovered = []
+            truly_invalid = []
+            for pn in pages_1based:
+                if pn in valid_page_numbers:
+                    recovered.append(pn)
+                    continue
+                split_result = _try_split_concatenated_page_number(
+                    pn, valid_page_numbers, max_page_number
+                )
+                if split_result:
+                    log(f"Recovered concatenated {label} page numbers: {pn} -> {split_result}")
+                    recovered.extend(split_result)
+                else:
+                    truly_invalid.append(pn)
+            if truly_invalid:
+                log(f"WARNING: LLM returned out-of-range {label} page numbers, ignoring: {truly_invalid}")
+            return sorted(set(recovered))
 
-        if truly_invalid:
-            log(f"WARNING: LLM returned out-of-range page numbers, ignoring: {truly_invalid}")
+        qp_pages_1based = _recover_pages(qp_pages_1based, "question-paper")
+        admin_pages_1based = _recover_pages(admin_pages_1based, "admin")
 
-        qp_pages_1based = sorted(set(recovered_pages))
+        # A page can't legitimately be both -- if the model contradicted
+        # itself, keep it as a question-paper page (the more consequential
+        # classification to get right) and drop it from admin.
+        admin_pages_1based = [p for p in admin_pages_1based if p not in qp_pages_1based]
 
         log(
             f"Chunk {i+1}/{len(chunks)}: identified {len(qp_pages_1based)} question paper "
-            f"page(s) (questions from this stage are discarded -- see stage 2 below)"
+            f"page(s), {len(admin_pages_1based)} admin/cover page(s) "
+            f"(questions from this stage are discarded -- see stage 2 below)"
         )
-        # NOTE: this stage's own per-chunk `questions` are intentionally
-        # NOT collected anymore -- they are exactly the inconsistent,
-        # possibly-conflicting splits described above. Only the PAGE
-        # indices from this stage are kept; the actual question list
-        # comes from extract_canonical_questions() in a single pass,
-        # below, once we know which pages to look at.
-        chunk_results.append((qp_pages_1based, []))
+        chunk_results.append((qp_pages_1based, [], admin_pages_1based))
 
     if chunk_failures and not chunk_results:
         raise Exception(
@@ -1177,156 +930,193 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
             f"skipped -- question PAGE detection below is PARTIAL."
         )
 
-    qp_pages_1based_merged, _ = _merge_chunk_results(chunk_results)
+    qp_pages_1based_merged, _, admin_pages_1based_merged = _merge_chunk_results(chunk_results)
     qp_page_indices_0based = sorted(pn - 1 for pn in qp_pages_1based_merged)
+    admin_page_indices_0based = sorted(pn - 1 for pn in admin_pages_1based_merged)
 
     log(f"Question paper pages identified: {len(qp_page_indices_0based)} page(s)")
+    log(f"Admin/cover pages identified: {len(admin_page_indices_0based)} page(s) "
+        f"(these will be excluded from BOTH question and answer text)")
 
-    # FIX (this round): real-world failure confirmed -- a student's
-    # ANSWER often opens by restating the question itself ("Examine
-    # the theme of X. Discuss with reference to Y...") before writing
-    # their actual original explanation. That opening page can
-    # superficially look like a genuine question-paper page to the
-    # LLM, since it legitimately contains prompt-style verbs. If this
-    # happens, that page gets WRONGLY EXCLUDED from answer_lines
-    # entirely (since only non-question-paper pages become answer
-    # text), which silently deletes the FIRST page of that answer --
-    # exactly matching the real symptom reported ("one page skipped
-    # from the start" of an answer).
-    #
-    # A real question-paper page is reliably CONCISE (a question, maybe
-    # a mark allocation) -- a misclassified answer-opening page is
-    # reliably much LONGER (it's the start of a multi-page essay). This
-    # checks for length outliers among the pages classified as
-    # question-paper pages and logs a clear warning so the issue is
-    # immediately visible rather than silently losing content -- it
-    # does not auto-correct (since a genuinely long, dense question
-    # paper page is possible, e.g. one with many sub-parts), but makes
-    # the failure mode loud instead of silent.
+    # Length-outlier reclassification: only when a question-paper page is
+    # BOTH an outlier length AND contains an explicit answer-style marker
+    # near its start. This is deliberately narrow -- a broader
+    # "looks like flowing prose" heuristic was tried and reverted because
+    # it reclassified genuine long question-paper pages (e.g. lengthy
+    # closing instructions) as answers, leaking exam-paper text into the
+    # answer pool.
     if len(qp_page_indices_0based) >= 2:
         qp_page_lengths = [
             (i, len(pages[i]["raw_text"])) for i in qp_page_indices_0based
         ]
         lengths_only = [length for _, length in qp_page_lengths]
         median_length = sorted(lengths_only)[len(lengths_only) // 2]
-        for page_idx, length in qp_page_lengths:
-            # An outlier page 3x+ longer than the median AND absolutely
-            # long enough to plausibly be an essay opening (not just a
-            # naturally longer but still-concise question) is flagged.
-            if length > max(median_length * 3, 1500):
+
+        length_outliers = [
+            page_idx for page_idx, length in qp_page_lengths
+            if length > max(median_length * 3, 1500)
+        ]
+
+        def _looks_like_student_answer(page_idx: int) -> bool:
+            head = pages[page_idx]["raw_text"][:400]
+            return bool(_ANSWER_START_RE.search(head))
+
+        confirmed_outliers = [
+            page_idx for page_idx in length_outliers if _looks_like_student_answer(page_idx)
+        ]
+        rejected_outliers = [
+            page_idx for page_idx in length_outliers if page_idx not in confirmed_outliers
+        ]
+
+        if rejected_outliers:
+            for page_idx in rejected_outliers:
+                length = dict(qp_page_lengths)[page_idx]
                 log(
-                    f"WARNING: page {page_idx + 1} was classified as a question "
-                    f"paper page but is {length} chars long -- much longer than "
-                    f"the typical {median_length} chars for this document's other "
-                    f"question paper pages. This commonly means the page is "
-                    f"actually the OPENING of a student's answer (where they "
-                    f"restated the question before writing their real response), "
-                    f"which would cause that answer's first page to be silently "
-                    f"excluded. Check page {page_idx + 1} in the OCR output if an "
-                    f"answer appears to be missing its beginning."
+                    f"NOT reclassifying page {page_idx + 1}: length is an outlier "
+                    f"({length} chars vs median {median_length}), but no explicit "
+                    f"answer-marker was found -- treating this as genuine (if unusually "
+                    f"long) question-paper content, to avoid leaking exam-paper text "
+                    f"into a student's answer."
                 )
 
+        if confirmed_outliers and len(confirmed_outliers) <= len(qp_page_indices_0based) // 2:
+            for page_idx in confirmed_outliers:
+                length = dict(qp_page_lengths)[page_idx]
+                log(
+                    f"RECLASSIFYING page {page_idx + 1}: was detected as a question "
+                    f"paper page, is {length} chars long (median for this document's "
+                    f"other question paper pages is {median_length}), AND contains an "
+                    f"explicit answer-style marker (e.g. 'Ans'/'उत्तर') near its start. "
+                    f"Moving it to the answer pages so its content is not lost."
+                )
+            qp_page_indices_0based = [
+                i for i in qp_page_indices_0based if i not in confirmed_outliers
+            ]
+        elif confirmed_outliers:
+            log(
+                f"WARNING: {len(confirmed_outliers)} of {len(qp_page_indices_0based)} "
+                f"detected question-paper pages are unusually long AND contain an "
+                f"explicit answer-style marker. That's too large a fraction to "
+                f"auto-reclassify safely -- leaving them as question-paper pages, but "
+                f"this may mean the question/answer page split for this document is "
+                f"unreliable. Pages flagged: {[p+1 for p in confirmed_outliers]}"
+            )
+
     # Stage 2: single consistent pass over the CONFIRMED question-paper
-    # pages' full text, producing one canonical, non-fragmented question
-    # list -- this is the actual fix for the Q1/Q6/Q7/Q8/Q9-style
-    # fragmentation seen in production.
+    # pages' full text, producing one canonical, non-fragmented,
+    # deduplicated question list.
     qp_pages_full = [pages[i] for i in qp_page_indices_0based]
     questions = extract_canonical_questions(qp_pages_full, status_callback)
 
     log(
         f"Final result: {len(qp_page_indices_0based)} question paper "
-        f"page(s), {len(questions)} canonical question(s)"
+        f"page(s), {len(questions)} canonical question(s), "
+        f"{len(admin_page_indices_0based)} admin/cover page(s)"
     )
 
-    return qp_page_indices_0based, questions
+    return qp_page_indices_0based, questions, admin_page_indices_0based
 
 
 # =========================================================
-# LLM-BASED ANSWER MAPPING (Groq)
+# ANSWER MAPPING (Groq)
 #
-# FIX: the previous approach (find_question_boundaries_by_similarity +
-# slice_raw_answers_by_boundaries) used plain word-overlap similarity
-# on a sliding window of answer lines to guess where each question's
-# restatement appears, then sliced from there to the NEXT matched
-# question's restatement. This is fundamentally fragile on long,
-# free-form handwritten Hindi answers: if even ONE question in the
-# middle of the sequence fails to match cleanly (common with OCR noise,
-# reordered sub-parts, or answers that don't explicitly restate the
-# question), the similarity matcher silently skips it -- and the
-# PRECEDING matched question's slice then extends all the way to
-# whatever question matches NEXT, however far away that is. This is
-# exactly the bug seen in real usage: one question's answer absorbing
-# several subsequent questions' worth of content, while the skipped
-# questions get nothing.
+# DESIGN NOTE -- why a two-stage (start + transition) search is used,
+# not a single isolated "does X start here?" question repeated N times:
 #
-# This replaces that entire approach with an LLM call that reads the
-# actual answer text and identifies, independently per question, the
-# LINE-NUMBER RANGE where that answer appears. Critically, the LLM is
-# asked for line indices, NOT to retype the answer -- the actual
-# extraction is a plain Python slice of the ORIGINAL OCR'd text using
-# those indices, guaranteeing the output is verbatim (no paraphrasing,
-# no risk of subtle LLM rewording) while still getting LLM-quality
-# semantic boundary detection instead of brittle text-similarity
-# heuristics. A Python-side overlap-resolution pass provides a hard
-# guarantee against the swallowing bug even if the LLM's boundaries
-# are imperfect: no question's range can ever be allowed to extend
-# into territory a later-starting question's range claims.
+# An isolated yes/no search for one target question, asked in a vacuum
+# with no visibility into any OTHER question, has no reference point for
+# what "not this answer" looks like. In practice this caused two
+# confirmed, reproducible failures:
+#   1. Genuine opening lines (a label, a restatement, a short transition
+#      sentence) got skipped, because the model couldn't confidently
+#      confirm them as "the start" without more forward context.
+#   2. The next question's true start got reported too late (or missed),
+#      because the model had no signal for what the NEXT topic looks
+#      like -- so the CURRENT answer kept absorbing content that had
+#      already moved on to a different question ("mixed answers").
+#
+# The fix is architectural, not just prompt wording: for every boundary
+# AFTER the first, the LLM is shown BOTH the question whose answer is
+# already open AND the question that comes next, and asked directly
+# where the transition between them occurs. This gives it a genuine
+# contrast to reason about, instead of an isolated guess. Only the very
+# first question's start (which has no "previous answer" to contrast
+# against) still uses an isolated single-target search.
+#
+# FURTHER NOTE -- backward verification (_verify_earliest_start):
+# Even the contrastive transition search can still land a few lines (or
+# an entire skipped OCR page) LATE, because the forward-sliding window
+# search only ever moves forward and never re-checks what came right
+# before a reported start. Once a "not found" verdict is issued for a
+# window, those lines are effectively gone for that question -- this is
+# a confirmed, reproducible cause of answers missing their opening
+# paragraph/page. _verify_earliest_start() is a mandatory second pass,
+# run every time a start_line is confirmed, that re-examines the OCR
+# page the candidate falls on (plus the previous page, so a fully
+# skipped page boundary is also covered) and asks explicitly whether an
+# earlier line should actually be the true start.
 # =========================================================
 
-ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
-1. A numbered list of the OFFICIAL exam questions, each tagged with a reference label like [REF-A], [REF-B], etc.
-2. The student's answer text, with each line prefixed by its line number in [brackets].
+SEQUENTIAL_SEARCH_SYSTEM_PROMPT = """You are searching for exactly ONE thing in a block of line-numbered OCR text from a student's exam answer booklet: the EARLIEST line where the response to ONE SPECIFIC question begins.
 
-Your task: for EACH official question, find WHERE in the answer text the student's response to that specific question starts and ends, and return the LINE NUMBER RANGE (inclusive) for each, identified by its REF label.
+You are given:
+1. The exact text of the target question.
+2. A window of the student's answer text, with each line prefixed by its line number in [brackets]. This window may be a small slice of a much larger document -- the answer you're looking for might not be in this window at all, and that is a normal, expected outcome.
 
-Important guidance for finding boundaries correctly:
-- A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
-- An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins (whether or not the next answer is in your list of official questions).
-- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely from your output. It may appear in a different chunk of the document.
-- Each REF's range must NOT overlap with another REF's range. If you are unsure exactly where one answer ends and the next begins, prefer ending the EARLIER answer sooner rather than letting it swallow content that belongs to a later answer -- a short correct answer is far more useful than a long answer that incorrectly absorbed unrelated content.
-- Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
-- Use the EXACT REF label (e.g. "REF-A") to identify each question. Do NOT retype or paraphrase the question text itself -- the REF label is all that's needed.
+Decide: does the student's response to THIS EXACT question begin somewhere in the window shown? If yes, find the VERY FIRST line of it.
 
-Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+===========================================================
+RULE 1 -- ALWAYS THE EARLIEST LINE, NEVER THE "CLEAREST" ONE
+===========================================================
+Many student answers do NOT launch straight into an obviously on-topic sentence. Before the part that clearly and unmistakably discusses the topic, an answer very often opens with one or more of the following -- and if present, these opening lines ARE part of the answer and MUST be included as the start:
+  - A short label ("Ans 5-", "उत्तर 6", "Q.5", "5)", "Answer:", "(a)", "(b)", "(i)")
+  - A one-line restatement or paraphrase of the question itself
+  - A brief introductory/transitional sentence that does not yet name the specific topic
+  - An incomplete or fragment sentence carried over from a line/page break
 
-{
-  "answers": [
-    {"ref": "REF-A", "start_line": 12, "end_line": 18},
-    {"ref": "REF-B", "start_line": 19, "end_line": 25}
-  ]
-}
+If there is ANY doubt between two candidate lines, always choose the EARLIER one.
 
-If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any of these answers."""
+===========================================================
+RULE 2 -- IGNORE OCR ARTIFACT/ANNOTATION DESCRIPTIONS
+===========================================================
+Some lines are the OCR engine's own description of a visual element on the page (e.g. "[Logo]", "There is a red pen mark here", "Scribbled line", "Stamp", "Signature") rather than actual student writing. These are NEVER the start of an answer. If genuine answer content begins on the line right after such a description, report THAT real content line, not the artifact-description line.
+
+===========================================================
+RULE 3 -- REPEATED CONTENT IS NORMAL
+===========================================================
+The SAME fact or definition can legitimately appear more than once across the document. Seeing similar wording earlier does NOT disqualify a later occurrence from being a genuine, separate answer start for the target question.
+
+===========================================================
+RULE 4 -- ERR TOWARD REPORTING A MATCH, NOT "NOT FOUND"
+===========================================================
+A false "not found" is a WORSE error than a slightly-early guess: if you say "not found" but the answer genuinely starts somewhere in this window, those opening lines get permanently lost from this answer and wrongly attributed to the wrong question -- they cannot be recovered later. Whereas if you report a start line that turns out to be a few lines earlier than ideal, that's a minor, low-cost error. So: if you have even MODERATE confidence (not just high confidence) that the answer begins somewhere in this window, report found=true with your best estimate of the earliest line -- do not withhold a match just because you're not 100% certain.
+
+If the target question's answer does not begin anywhere in this window, say so plainly. It is common and expected for a window to not contain it -- do not force a match.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly one of these two shapes:
+
+{"found": true, "start_line": 42}
+
+or
+
+{"found": false}
+
+If found, start_line MUST be one of the exact line numbers shown in [brackets] in this window -- never estimate or invent a number, and always prefer the earliest correct line over a later one."""
 
 
-def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
-    # FIX: previously this prepended "1.", "2.", etc. directly in front
-    # of each question, e.g. "1. 5. प्रत्ययों...". Since most real
-    # questions ALREADY contain their own original numbering ("5.",
-    # "Q.8", "प्र. 6", etc.), this created confusing double-numbering
-    # that risked the LLM echoing back the WRONG (prompt-added) number,
-    # or the whole "1. 5. ..." string, neither of which would exactly
-    # match the canonical question text downstream. Using "REF-A",
-    # "REF-B" style reference labels instead avoids any visual or
-    # semantic collision with the question's own real numbering, making
-    # it unambiguous that these are just our own internal reference
-    # tags, not part of the question itself.
-    questions_block = "\n".join(
-        f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
-    )
-    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
+def _build_sequential_search_prompt(window_lines: list, question_text: str, ref_label: str,
+                                      extra_reminder: str = None) -> str:
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
+    reminder_block = f"{extra_reminder}\n\n" if extra_reminder else ""
     return (
-        f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label -- "
-        f"use the REF label, not retyped question text, to identify which "
-        f"question an answer belongs to):\n{questions_block}\n\n"
-        f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}"
+        f"{reminder_block}"
+        f"TARGET QUESTION ({ref_label}): {question_text}\n\n"
+        f"TEXT WINDOW (line-numbered):\n{lines_block}"
     )
 
 
-
-def _parse_answer_map_llm_response(content: str) -> list:
+def _parse_sequential_search_response(content: str) -> tuple:
     content = content.strip()
-
     if content.startswith("```"):
         content = re.sub(r'^```(?:json)?\s*\n?', '', content)
         content = re.sub(r'\n?```\s*$', '', content)
@@ -1335,336 +1125,1051 @@ def _parse_answer_map_llm_response(content: str) -> list:
     try:
         data = json.loads(content)
     except json.JSONDecodeError as e:
-        raise ValueError(
-            f"LLM did not return valid JSON: {e}\nRaw content (first 500 chars): {content[:500]!r}"
-        )
+        raise ValueError(f"LLM did not return valid JSON: {e}\nRaw (first 300 chars): {content[:300]!r}")
 
-    if not isinstance(data, dict) or "answers" not in data:
-        raise ValueError(f"LLM response missing 'answers' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+    if not isinstance(data, dict) or "found" not in data:
+        raise ValueError(f"Response missing 'found' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
 
-    answers = data["answers"]
-    if not isinstance(answers, list):
-        raise ValueError(f"'answers' must be a list, got: {type(answers).__name__}")
+    found = bool(data["found"])
+    if not found:
+        return False, None
 
-    result = []
-    for item in answers:
-        if not isinstance(item, dict):
-            continue
-        if "ref" not in item or "start_line" not in item or "end_line" not in item:
-            continue
+    if "start_line" not in data:
+        raise ValueError("Response has found=true but is missing 'start_line'")
+    try:
+        start_line = int(data["start_line"])
+    except (ValueError, TypeError):
+        raise ValueError(f"'start_line' must be an integer, got {data['start_line']!r}")
+
+    return True, start_line
+
+
+SEQUENTIAL_SEARCH_WINDOW_CHARS = 11000  # same safe-per-call char budget used elsewhere in this module
+SEQUENTIAL_SEARCH_MAX_WINDOWS = 200  # generous safety cap; a real document will exhaust far sooner
+SEARCH_WINDOW_OVERLAP_CHARS = 3000  # re-examine the tail of a "not found" window in the next pass,
+                                     # so a genuine boundary that fell right at the edge of a window
+                                     # (and was missed once) gets a second, fresh-eyes chance instead
+                                     # of being permanently skipped.
+
+
+def _retreat_pointer(numbered_lines: list, end_idx: int, start_idx: int,
+                       overlap_chars: int = SEARCH_WINDOW_OVERLAP_CHARS) -> int:
+    """
+    Given that a window [start_idx, end_idx) just came back "not found",
+    compute where the NEXT window should begin so it overlaps with the
+    tail of this one, instead of jumping straight to end_idx. This makes
+    a wrongly-missed boundary near the end of a window recoverable on the
+    next pass. Always advances by at least one line past start_idx so the
+    search cannot get stuck in an infinite loop.
+    """
+    chars = 0
+    idx = end_idx - 1
+    while idx > start_idx and chars < overlap_chars:
+        chars += len(numbered_lines[idx][1])
+        idx -= 1
+    return max(idx + 1, start_idx + 1)
+
+
+def _find_answer_start_sequential(client, numbered_lines: list, question_text: str, ref_label: str,
+                                    search_from_idx: int, budget: "_TokenBudgetTracker", log,
+                                    window_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS,
+                                    max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS,
+                                    extra_reminder: str = None):
+    """
+    Isolated single-target search: slides forward through numbered_lines
+    in (overlapping, on a "not found" verdict) windows, asking "does this
+    ONE question's answer start somewhere in this window?" Used ONLY for
+    the very first question (which has no previous answer to contrast
+    against) and as a fallback if a transition search (see
+    _find_transition_sequential) can't find a boundary.
+    """
+    total_lines = len(numbered_lines)
+    pointer = search_from_idx
+    windows_tried = 0
+
+    while pointer < total_lines and windows_tried < max_windows:
+        window = []
+        chars = 0
+        idx = pointer
+        while idx < total_lines and (not window or chars + len(numbered_lines[idx][1]) <= window_chars):
+            window.append(numbered_lines[idx])
+            chars += len(numbered_lines[idx][1])
+            idx += 1
+
+        if not window:
+            break
+
+        user_prompt = _build_sequential_search_prompt(window, question_text, ref_label, extra_reminder)
         try:
-            result.append({
-                "ref": str(item["ref"]).strip().upper(),
-                "start_line": int(item["start_line"]),
-                "end_line": int(item["end_line"]),
+            found, start_line = _call_groq_with_retries(
+                client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
+                _parse_sequential_search_response, budget, log
+            )
+        except Exception as e:
+            log(f"WARNING: search call failed for {ref_label} (lines {window[0][0]}-{window[-1][0]}): {e}")
+            found, start_line = False, None
+
+        if found and start_line is not None:
+            valid_ids = {i for i, _ in window}
+            if start_line in valid_ids:
+                return start_line
+            log(
+                f"WARNING: {ref_label} reported start_line {start_line}, which is outside "
+                f"this window's actual range {window[0][0]}-{window[-1][0]} -- ignoring and "
+                f"treating this window as a non-match"
+            )
+
+        pointer = _retreat_pointer(numbered_lines, idx, pointer)
+        windows_tried += 1
+
+    return None
+
+
+TRANSITION_SEARCH_SYSTEM_PROMPT = """You are analyzing a student's exam answer booklet (OCR'd, line-numbered) to find the exact TRANSITION POINT between two consecutive answers.
+
+You are given:
+1. CURRENT QUESTION: the question whose answer has ALREADY STARTED before or at the beginning of the window shown.
+2. NEXT QUESTION: the question that comes right after it in the question paper. Its answer has NOT started as of the beginning of the window, but MAY start somewhere within the window.
+3. A window of the student's answer text, line-numbered.
+
+Your task: find the FIRST line at which the student STOPS writing about the CURRENT question and STARTS writing about the NEXT question. Report that line number as next_start_line -- it is the first line belonging to the NEXT question's answer.
+
+Because you can see BOTH questions, use that contrast directly:
+
+===========================================================
+RULE 1 -- USE THE CONTRAST, DON'T GUESS IN ISOLATION
+===========================================================
+Compare each candidate line against BOTH question texts. A line belongs to the NEXT question if its subject matter matches the NEXT question specifically and is a genuine departure from what the CURRENT question is asking about -- not merely because it contains a number or a new paragraph. A single long answer often contains its own internal numbered or bulleted sub-points as part of ONE continuous explanation for the CURRENT question -- these are NOT the transition; do not report them.
+
+===========================================================
+RULE 2 -- REPORT THE EARLIEST PLAUSIBLE TRANSITION LINE
+===========================================================
+A transition is often marked by an explicit label ("Ans 6-", "उत्तर 7", "Q.7)") -- if present, that exact line is the transition. If there is no such label, the NEXT answer may still open with a short introductory/transitional sentence before it becomes obviously specific to its own topic (a restatement, a generic opening line, a brief lead-in). If such a line reads as the beginning of addressing the NEXT question -- even vaguely -- treat THAT line as next_start_line, not a later line that states the topic more explicitly. Always prefer the earliest plausible line over a later, "clearer" one.
+
+===========================================================
+RULE 3 -- REPEATED CONTENT IS NORMAL
+===========================================================
+The SAME concept or definition can legitimately appear in both the CURRENT and NEXT question's answers (e.g. both questions touch a related idea, or the student recaps something). Do not assume a line belongs to the NEXT question just because it repeats earlier wording -- judge it by whether IT is genuinely answering the NEXT question at that point in the document.
+
+===========================================================
+RULE 4 -- IGNORE OCR ARTIFACT/ANNOTATION DESCRIPTIONS
+===========================================================
+Some lines are the OCR engine's own description of a visual element on the page (e.g. "[Logo]", "There is a red pen mark here", "Scribbled line", "Stamp", "Signature", doodles, underlines) rather than actual student writing. These are never the transition line. If real content resumes right after such a description, evaluate that real content line instead.
+
+===========================================================
+RULE 5 -- ERR TOWARD REPORTING A TRANSITION, NOT "NOT FOUND"
+===========================================================
+A false "not found" is a WORSE error than a slightly-early guess: if you say "not found" but the transition genuinely occurs somewhere in this window, the NEXT question's opening lines get permanently absorbed into the CURRENT question's answer instead -- they cannot be recovered later. Whereas if you report a transition line that turns out to be a little earlier than ideal, that's a minor, low-cost error. So: if you have even MODERATE confidence (not just high confidence) that the transition occurs somewhere in this window, report found=true with your best estimate of the earliest plausible line -- do not withhold a match just because you're not 100% certain.
+
+If the transition does NOT occur anywhere within this window (i.e. the entire window shown is still part of the CURRENT question's answer), say so plainly -- this is common and expected for long answers.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly one of these two shapes:
+
+{"found": true, "next_start_line": 57}
+
+or
+
+{"found": false}
+
+If found, next_start_line MUST be one of the exact line numbers shown in [brackets] in this window."""
+
+
+def _build_transition_search_prompt(window_lines: list, current_q_text: str, next_q_text: str,
+                                      extra_reminder: str = None) -> str:
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
+    reminder_block = f"{extra_reminder}\n\n" if extra_reminder else ""
+    return (
+        f"{reminder_block}"
+        f"CURRENT QUESTION: {current_q_text}\n\n"
+        f"NEXT QUESTION: {next_q_text}\n\n"
+        f"TEXT WINDOW (line-numbered):\n{lines_block}"
+    )
+
+
+def _parse_transition_search_response(content: str) -> tuple:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM did not return valid JSON: {e}\nRaw (first 300 chars): {content[:300]!r}")
+
+    if not isinstance(data, dict) or "found" not in data:
+        raise ValueError(f"Response missing 'found' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+
+    found = bool(data["found"])
+    if not found:
+        return False, None
+
+    if "next_start_line" not in data:
+        raise ValueError("Response has found=true but is missing 'next_start_line'")
+    try:
+        next_start_line = int(data["next_start_line"])
+    except (ValueError, TypeError):
+        raise ValueError(f"'next_start_line' must be an integer, got {data['next_start_line']!r}")
+
+    return True, next_start_line
+
+
+def _find_transition_sequential(client, numbered_lines: list, current_q_text: str, next_q_text: str,
+                                  search_from_idx: int, budget: "_TokenBudgetTracker", log,
+                                  window_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS,
+                                  max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS,
+                                  extra_reminder: str = None):
+    """
+    Comparative search: slides forward through numbered_lines, showing
+    the LLM both the CURRENT (already-open) question and the NEXT
+    question together, and asking where the transition between them
+    occurs. This gives the model a genuine contrast to reason about,
+    instead of an isolated "does X start here?" guess -- see the module
+    docstring above SEQUENTIAL_SEARCH_SYSTEM_PROMPT for the full
+    rationale. On a "not found" verdict, the next window overlaps with
+    the tail of this one (see _retreat_pointer) so a boundary that fell
+    right at the edge isn't permanently lost.
+    """
+    total_lines = len(numbered_lines)
+    pointer = search_from_idx
+    windows_tried = 0
+
+    while pointer < total_lines and windows_tried < max_windows:
+        window = []
+        chars = 0
+        idx = pointer
+        while idx < total_lines and (not window or chars + len(numbered_lines[idx][1]) <= window_chars):
+            window.append(numbered_lines[idx])
+            chars += len(numbered_lines[idx][1])
+            idx += 1
+
+        if not window:
+            break
+
+        user_prompt = _build_transition_search_prompt(window, current_q_text, next_q_text, extra_reminder)
+        try:
+            found, next_start = _call_groq_with_retries(
+                client, TRANSITION_SEARCH_SYSTEM_PROMPT, user_prompt,
+                _parse_transition_search_response, budget, log
+            )
+        except Exception as e:
+            log(f"WARNING: transition search call failed (lines {window[0][0]}-{window[-1][0]}): {e}")
+            found, next_start = False, None
+
+        if found and next_start is not None:
+            valid_ids = {i for i, _ in window}
+            if next_start in valid_ids:
+                return next_start
+            log(
+                f"WARNING: transition search reported next_start_line {next_start}, outside "
+                f"this window's actual range {window[0][0]}-{window[-1][0]} -- ignoring and "
+                f"treating this window as a non-match"
+            )
+
+        pointer = _retreat_pointer(numbered_lines, idx, pointer)
+        windows_tried += 1
+
+    return None
+
+
+# =========================================================
+# BACKWARD VERIFICATION -- catches starts detected a few lines
+# (or a whole skipped OCR page) too LATE. See module note above
+# SEQUENTIAL_SEARCH_SYSTEM_PROMPT for why this is necessary even
+# with the overlap fix in the forward-sliding search above.
+# =========================================================
+
+VERIFY_EARLIEST_START_SYSTEM_PROMPT = """You already found a CANDIDATE start line for a student's answer to a specific question. Your job now is ONLY to double-check: is there an EARLIER line, within the block shown, that should actually be the true start instead?
+
+This check exists because answers commonly begin with a label, a one-line restatement of the question, or a short transitional sentence -- and these earlier lines are sometimes missed on a first pass, especially when they fall right at an OCR page boundary (the block shown may span the END of the previous page and the START of the current page).
+
+You are given:
+1. The target question's exact text.
+2. The CANDIDATE start line number that was already found.
+3. A block of line-numbered text that ends at or after the candidate line, and begins earlier (potentially a full previous OCR page back) so you can check for missed earlier content.
+
+Look at every line BEFORE the candidate line in this block. Does the answer to THIS question genuinely begin earlier than the candidate? Only report an earlier line if it is clearly part of THIS answer (a label, restatement, or transition into this specific topic) -- not if it's still part of a different, previous answer, or noise/artifact text.
+
+Return ONLY valid JSON (no markdown fences, no commentary):
+
+{"earlier_start_found": true, "start_line": 118}
+
+or
+
+{"earlier_start_found": false}
+
+If unsure, prefer {"earlier_start_found": false} -- this is a safety-net check, not a re-search from scratch."""
+
+
+def _build_verify_earliest_prompt(block_lines: list, candidate_line: int, question_text: str, ref_label: str) -> str:
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in block_lines)
+    return (
+        f"TARGET QUESTION ({ref_label}): {question_text}\n\n"
+        f"CANDIDATE START LINE: {candidate_line}\n\n"
+        f"TEXT BLOCK (line-numbered):\n{lines_block}"
+    )
+
+
+def _parse_verify_earliest_response(content: str) -> tuple:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+    data = json.loads(content)
+    if not isinstance(data, dict) or "earlier_start_found" not in data:
+        raise ValueError(f"Response missing 'earlier_start_found': {data!r}")
+    if not data["earlier_start_found"]:
+        return False, None
+    if "start_line" not in data:
+        raise ValueError("earlier_start_found=true but missing 'start_line'")
+    return True, int(data["start_line"])
+
+
+VERIFY_EARLIEST_BACK_PAGES = 2  # how many full OCR pages back to include for context
+
+# Deterministic safety net: an explicit numbered label ("Ans 5-", "Q.5",
+# "उत्तर 6", "5)") is an unambiguous, machine-checkable signal of where an
+# answer truly begins -- it does not depend on an LLM's confidence, and
+# is used to override/complement the LLM backward-check below whenever
+# one is found earlier than the candidate start.
+_EXPLICIT_ANSWER_LABEL_RE = re.compile(
+    r'^\s*(?:'
+    r'Ans(?:wer)?\s*\.?\s*\d+\s*[.\):\-]?'
+    r'|उत्तर\s*\d+\s*[\-\:]?'
+    r'|प्र[०.\s]*\d+[.\s:-]*'
+    r'|Q\.?\s*\d+\s*[.\):\-]?'
+    r'|\([a-z]\)'
+    r'|\([ivxlcdm]+\)'
+    r'|\([क-घ]\)'
+    r')',
+    re.IGNORECASE
+)
+
+
+def _find_deterministic_earlier_label(block: list, candidate_line: int) -> int:
+    """
+    Scans a backward-verification block (ascending order) for the
+    EARLIEST line matching an explicit numbered answer label, strictly
+    before candidate_line. Returns that line's index, or None.
+    """
+    for idx, text in block:
+        if idx >= candidate_line:
+            break
+        if _EXPLICIT_ANSWER_LABEL_RE.match(text.strip()):
+            return idx
+    return None
+
+
+def _verify_earliest_start(client, numbered_lines: list, answer_line_pages: list,
+                             start_line: int, question_text: str, ref_label: str,
+                             min_allowed_line: int, budget: "_TokenBudgetTracker", log) -> int:
+    """
+    Page-boundary-aware backward check: re-examines the OCR page the
+    candidate start falls on, PLUS the previous VERIFY_EARLIEST_BACK_PAGES
+    full page(s), to catch cases where the true start was a few lines (or
+    a whole skipped page) earlier than what the forward search reported.
+    min_allowed_line prevents this from ever moving the start earlier
+    than the previous confirmed answer's boundary (so answers can never
+    be made to overlap by this check).
+
+    Combines TWO independent signals and takes whichever is earlier:
+    1. A deterministic regex scan for an explicit numbered label (see
+       _EXPLICIT_ANSWER_LABEL_RE) -- immune to LLM under-confidence.
+    2. The LLM backward-check below, for restatement/transition openings
+       that have no explicit label.
+    """
+    if start_line <= min_allowed_line or start_line >= len(numbered_lines):
+        return start_line
+
+    if answer_line_pages and start_line < len(answer_line_pages):
+        seen_pages = []
+        for p in reversed(answer_line_pages[:start_line + 1]):
+            if p not in seen_pages:
+                seen_pages.append(p)
+            if len(seen_pages) > VERIFY_EARLIEST_BACK_PAGES:
+                break
+        target_pages = set(seen_pages)
+        block_start = start_line
+        for i in range(start_line, min_allowed_line, -1):
+            if i < len(answer_line_pages) and answer_line_pages[i] in target_pages:
+                block_start = i
+            else:
+                break
+    else:
+        block_start = max(min_allowed_line + 1, start_line - 40)
+
+    block = [numbered_lines[i] for i in range(block_start, start_line + 1)]
+    if len(block) <= 1:
+        return start_line
+
+    # Signal 1: deterministic explicit-label scan (cheap, no LLM call).
+    deterministic_earlier = _find_deterministic_earlier_label(block, start_line)
+
+    # Signal 2: LLM backward check, for restatement/transition openings
+    # that carry no explicit numbered label.
+    prompt = _build_verify_earliest_prompt(block, start_line, question_text, ref_label)
+    llm_earlier = None
+    try:
+        found, earlier_line = _call_groq_with_retries(
+            client, VERIFY_EARLIEST_START_SYSTEM_PROMPT, prompt,
+            _parse_verify_earliest_response, budget, log, max_retries=2
+        )
+        if found and earlier_line is not None:
+            valid_ids = {i for i, _ in block}
+            if earlier_line in valid_ids and min_allowed_line < earlier_line <= start_line:
+                llm_earlier = earlier_line
+    except Exception as e:
+        log(f"WARNING: earliest-start verification failed for {ref_label}: {e}")
+
+    candidates = [c for c in (deterministic_earlier, llm_earlier)
+                  if c is not None and min_allowed_line < c <= start_line]
+    if candidates:
+        final = min(candidates)
+        if final != start_line:
+            source = "explicit label" if final == deterministic_earlier else "LLM check"
+            log(f"  earliest-start check: moved {ref_label} start from {start_line} back to {final} ({source})")
+        return final
+
+    return start_line
+
+
+# Deterministic cap for the last answer's end: a markdown/plain-text
+# section heading that signals the OVERALL ASSIGNMENT's own closing
+# material (a document-level "Conclusion"/"Bibliography"/"References"
+# section printed after ALL answers) can never legitimately be part of
+# one specific answer -- regardless of what an LLM tail-check concludes.
+# This only matches clear HEADING-style lines (a markdown '#' prefix, or
+# a short standalone line that IS just the heading word), so a sentence
+# that merely uses the word "conclusion" mid-paragraph as part of the
+# student's own answer is never falsely matched and stays included.
+_OVERALL_CLOSING_SECTION_RE = re.compile(
+    r'^\s*#{1,6}\s*(?:conclusion|summary|bibliography|references?|acknowledge?ments?)\b'
+    r'|^\s*(?:conclusion|bibliography|references?|acknowledge?ments?)\s*[:\-]?\s*$',
+    re.IGNORECASE
+)
+
+# OCR frequently fuses ANY structural heading from the printed question
+# paper/document (not just an overall closing section -- e.g. a section
+# divider like "### SECTION-C") onto the tail of the preceding answer's
+# last OCR line, with no newline in between. A heading is NEVER genuine
+# answer content regardless of which section it marks, so it is always
+# stripped out of the line wherever it's found. Requiring 2+ consecutive
+# '#' characters keeps this safe from single stray '#' misreads.
+_INLINE_HEADING_MARKER_RE = re.compile(r'#{2,6}\s*')
+
+_CLOSING_HEADING_WORD_RE = re.compile(
+    r'^(?:conclusion|summary|bibliography|references?|acknowledge?ments?)\b',
+    re.IGNORECASE
+)
+
+
+def _truncate_before_overall_closing_heading(line: str):
+    """
+    Cuts a line at the first markdown heading marker ('##' through
+    '######') found ANYWHERE within it, dropping the heading and
+    everything after it (within this ONE raw line). Returns
+    (kept_text, is_overall_closing) -- is_overall_closing is True ONLY
+    when the heading text itself is a document-level closing section
+    (conclusion/summary/bibliography/references/acknowledgements). In
+    that case the caller should ALSO stop collecting any further lines
+    at all, since such a section marks the true end of the document. Any
+    OTHER heading (e.g. "### SECTION-C", a mid-document section divider)
+    is still stripped from the line, but does NOT stop collection --
+    there may be more answers after it.
+    """
+    m = _INLINE_HEADING_MARKER_RE.search(line)
+    if not m:
+        return line, False
+    heading_text = line[m.end():].strip()
+    is_closing = bool(_CLOSING_HEADING_WORD_RE.match(heading_text))
+    return line[:m.start()].strip(), is_closing
+
+
+def _find_overall_closing_heading(numbered_lines: list, start_idx: int):
+    """
+    Returns the index of the first OVERALL closing-section heading line
+    at or after start_idx, or None if none exists. Used to hard-cap the
+    chronologically last answer so a whole-assignment wrap-up section
+    can never be absorbed into it, independent of the LLM tail-check.
+    """
+    for idx, text in numbered_lines[start_idx:]:
+        stripped = text.strip()
+        if stripped and _OVERALL_CLOSING_SECTION_RE.match(stripped):
+            return idx
+    return None
+
+
+LAST_ANSWER_END_SYSTEM_PROMPT = """You are looking at the FINAL portion of a student's exam answer booklet (OCR'd, line-numbered), starting from where their LAST answer begins. This tail section may contain:
+1. The remainder of the student's genuine answer content for the target question -- this should be INCLUDED.
+2. AFTER the student's real answer content ends, there may be trailing material that is NOT part of the answer itself: e.g. an overall assignment/exam-level closing remark or conclusion (not specific to this one question), an institutional footer, "thank you" notes, or similar wrap-up text. This should be EXCLUDED.
+
+Your task: find the LAST line number that is still genuinely part of the student's answer to the target question -- the line right before any such trailing, non-answer-specific material begins (if any exists). If the entire text shown is genuine answer content with no trailing wrap-up material, the last line of the text IS the answer's end.
+
+Guidance:
+- Only exclude trailing content if it is clearly NOT part of answering this specific question -- e.g. it talks about the assignment/paper/course as a whole rather than continuing this answer's explanation.
+- Do NOT exclude a line just because it sounds like a summary or concluding sentence OF THIS ANSWER ITSELF -- a student's own concluding sentence for their answer is normal and should be INCLUDED.
+- If you are not confident there is any trailing non-answer material, default to including everything (report the last line of the text shown).
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{"end_line": 87}
+
+end_line MUST be one of the exact line numbers shown in [brackets] in the text below."""
+
+
+def _build_last_answer_end_prompt(tail_lines: list, question_text: str, ref_label: str) -> str:
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in tail_lines)
+    return f"TARGET QUESTION ({ref_label}): {question_text}\n\nTEXT (line-numbered, this is the tail of the document):\n{lines_block}"
+
+
+def _parse_last_answer_end_response(content: str) -> int:
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
+        content = re.sub(r'\n?```\s*$', '', content)
+        content = content.strip()
+    data = json.loads(content)
+    if not isinstance(data, dict) or "end_line" not in data:
+        raise ValueError(f"Response missing 'end_line' key: {data!r}")
+    return int(data["end_line"])
+
+
+LAST_ANSWER_END_TAIL_CHARS = 9000
+
+
+def _check_last_answer_end(client, numbered_lines: list, question_text: str, ref_label: str,
+                             start_line: int, budget: "_TokenBudgetTracker", log,
+                             tail_chars: int = LAST_ANSWER_END_TAIL_CHARS) -> int:
+    """
+    Verifies where the chronologically LAST matched answer actually ends,
+    instead of blindly assuming it runs to the very end of the document.
+    Two layers:
+    1. DETERMINISTIC cap: if an overall-assignment closing section
+       heading (e.g. "## Conclusion") exists anywhere after start_line,
+       the end can never be at or after it -- this is a hard ceiling,
+       independent of LLM judgment.
+    2. LLM tail-check within whatever remains after the deterministic
+       cap, for un-headed trailing wrap-up material (footers, "thank
+       you" notes, etc.) that has no clean heading marker.
+    Falls back to the deterministic (or full-document) end on any LLM
+    failure or invalid response.
+    """
+    total_lines = len(numbered_lines)
+    fallback_end = total_lines - 1
+
+    heading_idx = _find_overall_closing_heading(numbered_lines, start_line)
+    if heading_idx is not None:
+        capped_end = heading_idx - 1
+        if capped_end < fallback_end:
+            log(
+                f"  last-answer-end check: found an overall assignment closing section "
+                f"heading at line {heading_idx} (e.g. '## Conclusion') -- {ref_label}'s end "
+                f"is hard-capped at line {capped_end}, regardless of the LLM tail check below"
+            )
+        fallback_end = min(fallback_end, capped_end)
+
+    if start_line >= fallback_end:
+        return max(start_line, fallback_end)
+
+    chars = 0
+    idx = fallback_end
+    collected = []
+    while idx >= start_line and chars < tail_chars:
+        collected.append(numbered_lines[idx])
+        chars += len(numbered_lines[idx][1])
+        idx -= 1
+    collected.reverse()
+
+    if not collected:
+        return fallback_end
+
+    prompt = _build_last_answer_end_prompt(collected, question_text, ref_label)
+    try:
+        end_line = _call_groq_with_retries(
+            client, LAST_ANSWER_END_SYSTEM_PROMPT, prompt,
+            _parse_last_answer_end_response, budget, log, max_retries=2
+        )
+    except Exception as e:
+        log(f"WARNING: last-answer-end check failed for {ref_label}: {e}")
+        return fallback_end
+
+    valid_ids = {i for i, _ in collected}
+    if end_line in valid_ids and start_line <= end_line <= fallback_end:
+        if end_line != fallback_end:
+            log(
+                f"  last-answer-end check: trimmed {ref_label}'s end from line {fallback_end} "
+                f"to line {end_line} (excluded trailing non-answer content, e.g. an overall "
+                f"assignment conclusion, that is not part of this specific answer)"
+            )
+        return end_line
+
+    log(
+        f"WARNING: last-answer-end check for {ref_label} returned invalid end_line "
+        f"{end_line} -- falling back to line {fallback_end}"
+    )
+    return fallback_end
+
+
+def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
+                             answer_line_pages: list = None) -> list:
+    """
+    Default answer-mapping strategy.
+
+    Stage 1: find the start of the FIRST question via an isolated
+    single-target search (no previous answer exists to contrast against).
+
+    Stage 2: for every SUBSEQUENT question, find the TRANSITION from the
+    previous (already-open) question to this one, showing the LLM BOTH
+    question texts together for direct comparison. If a transition can't
+    be found (or the previous question's own start was never found, so
+    there's no anchor to search a transition from), fall back to an
+    isolated single-target search for this specific question. This
+    combination gives the accuracy benefit of contrastive search in the
+    normal case, with the resilience of isolated search when a question
+    was skipped or answered out of order.
+
+    Stage 3: EVERY confirmed start_line (whichever stage found it) is run
+    through _verify_earliest_start, a mandatory backward check that
+    re-examines the OCR page it falls on (plus the previous page) for a
+    missed earlier line. This is what catches the "answers missing their
+    opening paragraph/page" failure mode -- see the module note above
+    SEQUENTIAL_SEARCH_SYSTEM_PROMPT.
+
+    Every answer's END (except the chronologically last one) is computed
+    in Python as (next confirmed answer's start - 1) -- never asked of
+    the LLM, so it can never be wrong in the way an LLM-guessed end line
+    could be. The LAST matched answer's end is separately verified (see
+    _check_last_answer_end) instead of blindly assumed to run to the end
+    of the document, so a trailing whole-assignment conclusion/footer
+    doesn't get absorbed into it.
+
+    Returns a LIST of dicts, one per question, each carrying:
+      - start_line / end_line: the exact 0-based indices into
+        answer_lines this answer was sliced from
+      - start_page / end_page: the OCR page number(s) the answer spans,
+        if answer_line_pages was provided
+      - answer_raw: the UNMODIFIED verbatim join of the sliced lines
+      - answer: the same text after restatement-stripping cleanup
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
+        raise Exception("GROQ_API_KEY not found in secrets or environment")
+
+    client = Groq(api_key=api_key)
+    budget = _TokenBudgetTracker()
+
+    numbered_lines = list(enumerate(answer_lines))
+    total_lines = len(numbered_lines)
+
+    ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
+    found_starts = {}  # ref -> start_line
+    pointer = 0
+
+    REPEAT_RETRY_REMINDER = (
+        "REMINDER: a previous search pass over this exact text did not find this "
+        "question's answer. One common reason for a missed match: the same "
+        "definition/explanation legitimately appears more than once in this document. "
+        "Seeing similar-looking content earlier does NOT mean this occurrence isn't a "
+        "genuine, separate answer to THIS target question -- look again with that in "
+        "mind, and also double-check you are not missing a short introductory/"
+        "transitional line right at the true start of the answer."
+    )
+
+    for i, q in enumerate(questions):
+        ref = f"REF-{chr(65 + i)}"
+
+        if i == 0:
+            # Stage 1: the very first question has no previous answer to
+            # contrast against -- isolated single-target search is the
+            # only option here.
+            log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
+            start_line = _find_answer_start_sequential(
+                client, numbered_lines, q, ref, pointer, budget, log
+            )
+            if start_line is None:
+                log(f"  first pass found nothing for {ref} -- retrying once with an explicit reminder...")
+                start_line = _find_answer_start_sequential(
+                    client, numbered_lines, q, ref, pointer, budget, log,
+                    extra_reminder=REPEAT_RETRY_REMINDER
+                )
+                if start_line is not None:
+                    log(f"  retry recovered {ref} starting at line {start_line}")
+        else:
+            prev_ref = f"REF-{chr(65 + i - 1)}"
+            prev_q = questions[i - 1]
+
+            if prev_ref not in found_starts:
+                # No confirmed start for the previous question means
+                # there's no anchor point to search a transition FROM --
+                # fall back to an isolated search for this question
+                # instead.
+                log(
+                    f"  {prev_ref} has no confirmed start -- falling back to an isolated "
+                    f"search for {ref} ({q[:60]}...) from line {pointer} onward..."
+                )
+                start_line = _find_answer_start_sequential(
+                    client, numbered_lines, q, ref, pointer, budget, log
+                )
+                if start_line is None:
+                    start_line = _find_answer_start_sequential(
+                        client, numbered_lines, q, ref, pointer, budget, log,
+                        extra_reminder=REPEAT_RETRY_REMINDER
+                    )
+            else:
+                # Stage 2: comparative transition search -- shows the LLM
+                # BOTH questions together so it has a genuine contrast to
+                # reason about, instead of an isolated guess.
+                log(
+                    f"Searching for the transition from {prev_ref} to {ref} "
+                    f"({q[:60]}...) from line {pointer} onward..."
+                )
+                start_line = _find_transition_sequential(
+                    client, numbered_lines, prev_q, q, pointer, budget, log
+                )
+
+                if start_line is None:
+                    log(f"  transition search found nothing -- retrying once with an explicit reminder...")
+                    transition_retry_reminder = (
+                        "REMINDER: a previous search pass over this exact text did not find "
+                        "the transition to the NEXT question. Look again -- the same concept "
+                        "can legitimately appear in both answers, and the transition may begin "
+                        "with a short introductory line rather than an obviously on-topic "
+                        "sentence. Always prefer the earliest plausible transition line."
+                    )
+                    start_line = _find_transition_sequential(
+                        client, numbered_lines, prev_q, q, pointer, budget, log,
+                        extra_reminder=transition_retry_reminder
+                    )
+
+                if start_line is None:
+                    # The NEXT question's answer might not immediately
+                    # follow the previous one (e.g. the student skipped
+                    # it, or answered out of order) -- fall back to an
+                    # isolated single-target search for this specific
+                    # question over the same remaining text, rather than
+                    # giving up entirely.
+                    log(f"  transition search failed -- falling back to an isolated search for {ref}")
+                    start_line = _find_answer_start_sequential(
+                        client, numbered_lines, q, ref, pointer, budget, log
+                    )
+                else:
+                    log(f"  found transition -- {ref} starts at line {start_line}")
+
+        if start_line is not None:
+            # Stage 3: mandatory backward verification. Never moves the
+            # start earlier than the previous confirmed answer's start,
+            # so this can only recover genuinely-missed opening lines --
+            # it can never cause answers to overlap.
+            prev_start = found_starts.get(f"REF-{chr(65 + i - 1)}", -1) if i > 0 else -1
+            start_line = _verify_earliest_start(
+                client, numbered_lines, answer_line_pages, start_line, q, ref,
+                prev_start, budget, log
+            )
+            found_starts[ref] = start_line
+            log(f"  found {ref} starting at line {start_line}")
+
+            # DEBUG CONTEXT: print the lines immediately before and after
+            # the confirmed start, so a wrong/skipped start is directly
+            # visible in the run logs without needing a separate
+            # ocr.json download.
+            ctx_lo = max(0, start_line - 4)
+            ctx_hi = min(len(answer_lines), start_line + 3)
+            log(f"  [context] lines {ctx_lo}-{ctx_hi - 1} around {ref}'s confirmed start (>>> marks the chosen start line):")
+            for ci in range(ctx_lo, ctx_hi):
+                marker = ">>>" if ci == start_line else "   "
+                preview = answer_lines[ci][:180].replace("\n", " ")
+                log(f"  [context] {marker} [{ci}] {preview!r}")
+
+            pointer = start_line + 1
+        else:
+            log(
+                f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
+                f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
+                f"The search pointer is NOT advanced, so the next question is still searched "
+                f"for over this same remaining text."
+            )
+
+    # ---------------------------------------------------------------
+    # GAP-FILL PASS: a question the main forward pass could not match
+    # (isolated search AND transition search both failed) is not
+    # necessarily unanswered in the document -- it commonly means the
+    # search simply missed it while scanning past, and its content then
+    # silently got absorbed into the PREVIOUS matched answer's range
+    # (since that answer's end is computed as "next matched start - 1").
+    # If this question has a LATER question that WAS matched, we now
+    # know a hard upper bound for where its answer must be, and a hard
+    # lower bound from the previous matched question (or 0). Re-searching
+    # within that bounded gap is far more reliable than the original
+    # unbounded forward search, and -- critically -- cannot ever report
+    # a line inside a neighboring answer's territory, because the search
+    # is never even shown lines outside the gap.
+    # ---------------------------------------------------------------
+    for i, q in enumerate(questions):
+        ref = f"REF-{chr(65 + i)}"
+        if ref in found_starts:
+            continue
+
+        later_start = None
+        for j in range(i + 1, len(questions)):
+            cand_ref = f"REF-{chr(65 + j)}"
+            if cand_ref in found_starts:
+                later_start = found_starts[cand_ref]
+                break
+        if later_start is None:
+            continue  # no later anchor -- nothing to bound the gap with
+
+        earlier_start = 0
+        for j in range(i - 1, -1, -1):
+            cand_ref = f"REF-{chr(65 + j)}"
+            if cand_ref in found_starts:
+                earlier_start = found_starts[cand_ref] + 1
+                break
+
+        log(
+            f"Gap-fill: {ref} was not matched by the main pass -- retrying with a "
+            f"bounded search restricted to lines {earlier_start}-{later_start - 1} "
+            f"(bounded by the nearest matched questions on either side, so this "
+            f"cannot bleed into a neighbor's answer)..."
+        )
+        gap_slice = numbered_lines[earlier_start:later_start]
+        gap_start = _find_answer_start_sequential(
+            client, gap_slice, q, ref, 0, budget, log
+        )
+        if gap_start is not None:
+            gap_start = _verify_earliest_start(
+                client, numbered_lines, answer_line_pages, gap_start, q, ref,
+                earlier_start - 1, budget, log
+            )
+            found_starts[ref] = gap_start
+            log(f"  gap-fill recovered {ref} starting at line {gap_start}")
+        else:
+            log(f"  gap-fill could not find {ref} either -- leaving unmatched")
+
+    # End of each answer = the next (in document order) confirmed
+    # answer's start, minus one -- computed purely in Python. The
+    # exception is the chronologically LAST matched answer, whose end is
+    # separately verified instead of being blindly assumed to run to the
+    # end of the document (see _check_last_answer_end).
+    ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
+    ranges = []
+    for idx, (ref, start) in enumerate(ordered):
+        if idx + 1 < len(ordered):
+            end = ordered[idx + 1][1] - 1
+        else:
+            q_last = ref_to_question[ref]
+            end = _check_last_answer_end(client, numbered_lines, q_last, ref, start, budget, log)
+        ranges.append({"ref": ref, "start_line": start, "end_line": end})
+
+    log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
+
+    ranges_by_ref = {r["ref"]: r for r in ranges}
+    results = []
+    for i, q in enumerate(questions):
+        ref = f"REF-{chr(65 + i)}"
+        r = ranges_by_ref.get(ref)
+
+        if r is None:
+            results.append({
+                "ref": ref,
+                "question": q,
+                "matched": False,
+                "start_line": None,
+                "end_line": None,
+                "start_page": None,
+                "end_page": None,
+                "answer": "",
+                "answer_raw": "",
             })
-        except (ValueError, TypeError):
-            continue  # skip malformed entries rather than failing the whole batch
+            continue
 
-    return result
+        s, e = r["start_line"], r["end_line"]
+        verbatim_lines = [
+            answer_lines[j] for j in range(s, e + 1)
+            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
+        ]
+        answer_raw = " ".join(verbatim_lines).strip()
+        answer_clean = strip_question_restatement(answer_raw)
+        answer_clean = strip_full_question_echo(answer_clean, q)
+        answer_clean = _strip_trailing_question_echo_sentences(answer_clean, questions)
+
+        start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
+        end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
+
+        results.append({
+            "ref": ref,
+            "question": q,
+            "matched": True,
+            "start_line": s,
+            "end_line": e,
+            "start_page": start_page,
+            "end_page": end_page,
+            "answer": answer_clean,
+            "answer_raw": answer_raw,
+        })
+
+    return results
 
 
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 11000  # FIX (this round): increased
-# from 9000. The PREVIOUS truncation reports were not actually caused
-# by chunk size being too small -- they were caused by the answer-
-# start detector finding ZERO safe break points in documents where
-# students restate the question itself (no "Ans-"/"उत्तर-" label at
-# all), forcing a fallback to the hard cap on every chunk. Now that
-# _line_starts_new_answer() also recognizes question-content overlap
-# (see above), genuine safe break points exist in these documents too,
-# so chunk size can be raised again. 11000 chars is calculated to stay
-# safely under the free-tier 8000 TPM ceiling for a SINGLE request
-# (~11700 chars is the hard ceiling at a 2 chars/token estimate after
-# accounting for system prompt + JSON response overhead -- 11000 keeps
-# a small margin below that). Going meaningfully higher than this risks
-# reintroducing the 413/429-on-the-mapping-call failure mode from the
-# previous round, which produces the EXACT same "half answer" symptom
-# through a different mechanism (a failed chunk's answers never
-# appearing at all) -- so this is very close to the real ceiling on
-# the current Groq free tier, not an arbitrary number.
+NOISE_RE = re.compile(
+    r'(?:signature'
+    r'|PAGE\s*NO'
+    r'|^\s*DATE\b'
+    r'|^\s*\d{1,3}\s*$'
+    r'|\blogo\b'
+    r'|\bwatermark\b'
+    r'|\bstamp\b'
+    r'|\bscribbl\w*\b'
+    r'|\bdoodle\w*\b)',
+    re.IGNORECASE
+)
 
-ANSWER_MAP_ABSOLUTE_MAX_CHARS = 60000  # FIX (this round): replaces the
-# old 2x-multiplier hard cap (~22000 chars), which could still force a
-# break mid-answer purely on SIZE with no regard for safety. Real usage
-# confirmed single answers can legitimately span 5-6 pages of OCR'd
-# text. This is now a true last-resort ceiling, deliberately generous
-# (roughly 10-12 pages worth of text) so it should never be reached in
-# ordinary use -- a real single answer reaching even half this size
-# would be extraordinary. If a chunk does grow past the TPM-safe target
-# because a single long answer needed the room, the existing 413/429
-# retry-with-backoff logic (see _call_groq_with_retries) handles it by
-# retrying with backoff -- slower, but never loses real answer content.
+# A line is only treated as administrative noise if it's SHORT (a bare
+# label like "Teacher's Signature" or "Date: __") -- not if "signature"/
+# "date"/"page" merely appears as a word inside a much longer genuine
+# sentence (e.g. a computer-science answer discussing "digital
+# signature" is real content, not a label to strip). This length guard
+# is what makes the generic keyword match safe to use across ANY
+# document/subject instead of needing document-specific hardcoded names.
+NOISE_LINE_MAX_CHARS = 40
 
-# FIX (this round): detects a line that STARTS a new answer. The
-# previous version ONLY matched formal label patterns (Ans-, उत्तर-,
-# etc.) -- but real documents showed students who restate the FULL
-# QUESTION TEXT as their answer's opening sentence, with NO label at
-# all (e.g. "Examine the theme of Concealment in Abhignana
-# Shakuntalam..." as the literal first words of the answer). Against
-# such a document, the label-only regex matched ZERO lines, leaving
-# the chunker with no safe break points anywhere -- it then had no
-# choice but to fall back to the hard cap, producing oversized,
-# undifferentiated chunks that caused exactly the truncation and
-# duplicated-sentence artifacts seen in real output. This version adds
-# a SECOND detection path: a line counts as a new-answer start if its
-# opening words substantially overlap with the opening words of ANY
-# official question, regardless of whether a formal label is present.
+
+# =========================================================
+# OCR sometimes emits a full descriptive SENTENCE for a non-text visual
+# element on the scanned page instead of transcribing actual student
+# writing -- e.g. "There is a logo in the top right corner.",
+# "Scribbled line in red pen.", "Stamp on the page.", markdown image
+# placeholders, etc. These are OCR metadata/commentary about the PAGE,
+# not student answer content. This pattern is checked regardless of line
+# length, unlike NOISE_RE above, because these descriptive sentences can
+# run longer than the short-label case NOISE_RE is designed for.
+# =========================================================
 _ANSWER_START_RE = re.compile(
     r'^\s*(?:Ans(?:wer)?[.\s:-]+\d*|उत्तर\s*\d*\s*[\-\:]?|प्र[०.\s]*\d*|Q\.?\s*\d+[.\s:-])',
     re.IGNORECASE
 )
 
+_OCR_ARTIFACT_DESCRIPTION_RE = re.compile(
+    r'^\s*(?:'
+    r'\[\s*(?:image|figure|logo|stamp|watermark|photo|picture|diagram)\s*\]'
+    r'|<!--\s*image\s*-->'
+    r'|!\[[^\]]*\]\([^)]*\)'
+    r'|\(?\s*there\s+(?:is|are|seems?\s+to\s+be|appears?\s+to\s+be)\s+(?:a|an|some)?\s*'
+    r'(?:logo|stamp|watermark|scribbl\w*|doodle\w*|drawing|symbol|mark(?:ing)?s?|'
+    r'line|box|circle|underlin\w*|arrow|star|tick|cross|red\s*(?:pen|ink)\w*)'
+    r'|\(?\s*(?:handwritten|scribbled|marked|underlined|circled)\s+(?:in\s+)?red\s*(?:pen|ink)?\s*\)?'
+    r')',
+    re.IGNORECASE
+)
 
-def _normalize_for_overlap_match(text: str) -> str:
-    text = text.lower().strip()
-    text = re.sub(r'[^\w\s]', ' ', text, flags=re.UNICODE)
-    text = re.sub(r'\s+', ' ', text)
-    return text
+# Broader signature for OCR narrating an examiner's red-pen ANNOTATION
+# (a circle around a question number, an arrow, a tick mark, etc.) as a
+# full descriptive sentence, rather than transcribing real writing.
+# Unlike _OCR_ARTIFACT_DESCRIPTION_RE above, these sentences frequently
+# do NOT start with "there is" -- e.g. "A red circle containing the
+# number 11. A long red arrow originates from the circle and points
+# diagonally downwards..." -- so an anchored regex misses them. Instead,
+# require at least 2 of 3 independent signal categories (mark-type word,
+# color/ink word, description-action phrase) to co-occur in the same
+# line, so genuine academic content that happens to mention "arrow" or
+# "circle" once in passing is not falsely flagged.
+_ANNOTATION_MARK_WORDS_RE = re.compile(
+    r'\b(?:circl(?:e|ing|ed)|arrow|underlin\w*|scribbl\w*|doodle\w*|loop\w*|'
+    r'tick\s*mark|cross\s*mark|strike[\s-]?through)\b',
+    re.IGNORECASE
+)
+_ANNOTATION_COLOR_WORDS_RE = re.compile(r'\bred\s*(?:pen|ink|colou?r)?\b', re.IGNORECASE)
+_ANNOTATION_ACTION_WORDS_RE = re.compile(
+    r'\b(?:originates?\s+from|points?\s+(?:diagonally|towards?|downwards?|upwards?|'
+    r'to\s+the\s+(?:left|right))|containing\s+the\s+number|blank\s+space\s+of\s+the\s+page|'
+    r'corner\s+of\s+the\s+page|across\s+the\s+page|drawn\s+(?:in|on)|marked?\s+(?:in|with)|'
+    r'extending\s+(?:from|to|towards)|(?:bottom|top)\s+(?:left|right)\s+(?:corner|of\s+the\s+page)?|'
+    r'overlapping\s+loops?)\b',
+    re.IGNORECASE
+)
+_ANNOTATION_DESCRIPTION_MAX_CHARS = 300
 
 
-# FIX (this round): generic English question-phrasing words that
-# appear in almost every question regardless of topic ("how", "why",
-# "examine", "discuss", "comment", etc.). These must be filtered out
-# before computing word overlap, because a real answer's opening
-# sentence often only carries forward the QUESTION'S TOPIC-SPECIFIC
-# words (proper nouns, technical terms), not its generic instructional
-# phrasing -- a plain percentage-of-all-words overlap check was failing
-# on exactly this pattern in real documents (e.g. "How are the views of
-# the state integrated with the theme of X?" vs an answer opening with
-# "X is not just a..." shares almost nothing except "X" itself).
-_QUESTION_STOPWORDS = {
-    'how', 'are', 'the', 'views', 'state', 'with', 'theme', 'examine',
-    'write', 'detailed', 'note', 'their', 'corresponding', 'why', 'does',
-    'plot', 'plan', 'comment', 'discuss', 'explain', 'describe', 'and',
-    'what', 'when', 'where', 'which', 'who', 'integrated', 'analyse',
-    'analyze', 'critically', 'briefly', 'elaborate', 'illustrate', 'for',
-    'from', 'this', 'that', 'these', 'those', 'into', 'about', 'role',
-    'significance', 'importance', 'short', 'long', 'play', 'text',
-}
-
-
-def _distinctive_words(text: str, max_words: int = 20) -> list:
-    """Extracts the topic-specific (non-generic) significant words from
-    a question or line, used to find genuine content overlap while
-    ignoring common question-phrasing words that carry no
-    distinguishing signal."""
-    words = re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(text))[:max_words]
-    return sorted(set(w for w in words if w not in _QUESTION_STOPWORDS))
-
-
-def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.5):
+def _is_ocr_artifact_description(line: str) -> bool:
     """
-    FIX (this round): returns the INDEX of the question this line
-    appears to start a fresh answer for, or None if it doesn't look
-    like a new-answer start at all -- replacing the previous boolean-
-    only _line_starts_new_answer(). The boolean version had a real,
-    confirmed bug: a label-style match (e.g. "Q2 continues with...")
-    was treated as UNCONDITIONALLY a fresh start, even when it was
-    just a sentence WITHIN an answer that happened to mention its own
-    question number in passing -- causing a long multi-page answer to
-    be incorrectly chopped mid-way through its own content (exactly
-    matching the real-world symptom of "first page missing from the
-    start" / "last paragraph missing from the end": the chunker broke
-    INSIDE one answer, so neither resulting chunk's LLM call ever saw
-    the complete picture).
-
-    This version resolves a label match to a SPECIFIC question index
-    by extracting any number in the label (e.g. "5" from "Ans 5-", "2"
-    from "Q2") and matching it to a question whose own leading number
-    matches -- so the caller can tell "this label refers to the SAME
-    question we're already inside" (not a real new start) from "this
-    label refers to a DIFFERENT question" (a genuine new start). If
-    the label's number can't be resolved to any known question, -1 is
-    returned, signaling "ambiguous formal label -- treat cautiously as
-    a fresh start since we can't rule that out."
+    Detects lines where the OCR engine described a VISUAL artifact on the
+    page (a logo, stamp, red-pen scribble/underline/circle/arrow, stray
+    mark, doodle, etc.) in prose, instead of transcribing actual student
+    writing. These are OCR commentary about the page, never student
+    answer content, and must be excluded both from extracted answer text
+    AND from candidate answer-start/transition lines.
     """
-    label_match = _ANSWER_START_RE.match(line)
-    if label_match:
-        num_match = re.search(r'\d+', label_match.group(0))
-        if num_match:
-            label_num = num_match.group(0)
-            for i, q in enumerate(questions):
-                q_num_match = re.match(r'\s*(\d+)', q)
-                if q_num_match and q_num_match.group(1) == label_num:
-                    return i
-        return -1
+    stripped = line.strip()
+    if not stripped:
+        return False
 
-    line_words = sorted(set(re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(line))[:25]))
-    if not line_words:
-        return None
+    if _OCR_ARTIFACT_DESCRIPTION_RE.match(stripped):
+        return True
 
-    for i, q in enumerate(questions):
-        q_distinctive = _distinctive_words(q)
-        if not q_distinctive:
-            continue
-        matched = sum(
-            1 for w in q_distinctive
-            if any(_words_nearly_match(w, lw) for lw in line_words)
-        )
-        required = max(1, round(len(q_distinctive) * min_fraction))
-        if matched >= required:
-            return i
+    if len(stripped) <= _ANNOTATION_DESCRIPTION_MAX_CHARS:
+        has_mark = bool(_ANNOTATION_MARK_WORDS_RE.search(stripped))
+        has_color = bool(_ANNOTATION_COLOR_WORDS_RE.search(stripped))
+        has_action = bool(_ANNOTATION_ACTION_WORDS_RE.search(stripped))
+        if (has_mark + has_color + has_action) >= 2:
+            return True
 
-    return None
+    return False
 
 
-def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
-                                  max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
-                                  absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS) -> list:
+def _strip_inline_ocr_artifacts(line: str) -> str:
     """
-    Answer-boundary-aware chunking: a chunk break is only allowed at a
-    line that genuinely starts a DIFFERENT question's answer than the
-    one currently being accumulated.
-
-    FIX (this round): two real, confirmed bugs in the previous version,
-    both producing the same real-world symptom (an answer's start or
-    end going missing -- "first page gone from the start" / "last
-    paragraph gone from the end"):
-
-    1. The break condition only fired on the SAME line that crossed
-       max_chars, AND only if that exact line was itself an answer-
-       start. In practice, max_chars is usually crossed mid-answer
-       (somewhere in the MIDDLE of a long answer's own content, not
-       conveniently on a boundary line), so the real next answer-start
-       boundary could be 20-30+ lines later -- by which point a chunk
-       break finally fires, but only after already consuming a chunk's
-       worth of the WRONG answer's content alongside the start of the
-       next one, corrupting both. Fixed: `past_target` is now standing
-       state -- once max_chars is crossed, the chunker waits and breaks
-       at the VERY NEXT genuine answer-start, however many lines later
-       that turns out to be, rather than requiring it on the exact
-       threshold-crossing line.
-
-    2. A label-style match (e.g. text that happens to look like
-       "Q2 ...") was treated as UNCONDITIONALLY a fresh start, even
-       when it was just a sentence WITHIN an answer mentioning its own
-       question in passing. This could cause a long answer's own later
-       lines to incorrectly "restart" a chunk break against the SAME
-       question, slicing that one answer into two separate, incomplete
-       pieces. Fixed: `_line_starts_new_answer_for_question` now
-       resolves a label match to a specific question index via its
-       number, so a break only fires when the matched index genuinely
-       DIFFERS from the question currently being accumulated.
-
-    Beyond a safe boundary, a chunk is allowed to keep growing past
-    max_chars indefinitely (a single long, multi-page answer simply
-    makes its own larger chunk) -- absolute_max_chars is a true last-
-    resort ceiling that should essentially never be reached in
-    practice. A chunk occasionally exceeding the TPM-safe target size
-    is handled by the existing 413/429 retry-with-backoff logic already
-    in place (see _call_groq_with_retries) -- a slower retry cycle is a
-    vastly better outcome than ever silently truncating real content.
+    Some OCR lines mix genuine answer prose with an artifact-description
+    sentence in the SAME line -- e.g. "...enduring relevance. A red
+    scribble or signature mark. ## Conclusion..." -- which whole-line
+    noise filtering (is_noise / NOISE_LINE_MAX_CHARS) cannot safely
+    remove without also deleting real content, since the combined line
+    is long and the artifact sentence isn't the whole line. This splits
+    the line into sentences and drops ONLY the sentence(s) that look
+    like an OCR artifact/annotation description, keeping everything else
+    verbatim and in original order.
     """
-    if not numbered_lines:
-        return []
-
-    chunks = []
-    current_chunk = []
-    current_chars = 0
-    past_target = False
-    current_question_idx = None  # which question's answer we believe
-                                   # we're currently accumulating
-
-    for idx, text in numbered_lines:
-        line_chars = len(text)
-
-        if current_chunk and current_chars + line_chars > max_chars:
-            past_target = True
-
-        matched_q_idx = _line_starts_new_answer_for_question(text, questions)
-        # -1 means "ambiguous formal label, couldn't resolve to a known
-        # question" -- treated cautiously as a genuine fresh start,
-        # since we can't positively confirm it's the same question.
-        # A resolved index only counts as a genuinely NEW start if it
-        # differs from the question we believe we're already inside.
-        is_genuine_new_start = matched_q_idx is not None and (
-            matched_q_idx == -1 or matched_q_idx != current_question_idx
-        )
-
-        should_break_at_answer_start = past_target and is_genuine_new_start
-        should_force_break_absolute = (
-            current_chunk and current_chars + line_chars > absolute_max_chars
-        )
-
-        if should_break_at_answer_start or should_force_break_absolute:
-            chunks.append(current_chunk)
-            current_chunk = []
-            current_chars = 0
-            past_target = False
-
-        if is_genuine_new_start and matched_q_idx != -1:
-            current_question_idx = matched_q_idx
-
-        current_chunk.append((idx, text))
-        current_chars += line_chars
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
+    if not line.strip():
+        return line
+    sentences = re.split(r'(?<=[.!?])\s+', line)
+    kept = [s for s in sentences if not _is_ocr_artifact_description(s.strip())]
+    return " ".join(kept).strip()
 
 
-def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
-    """
-    HARD SAFETY NET against the answer-swallowing bug: sorts ranges by
-    start_line, then clips any range's end_line so it can never extend
-    into territory claimed by a later-starting range. This guarantees
-    the bug seen in real usage (one question's answer absorbing several
-    subsequent questions' worth of content) is structurally impossible
-    in the output, regardless of how the LLM's boundaries came out.
-    """
-    sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
-    resolved = []
-    for i, r in enumerate(sorted_ranges):
-        r = dict(r)
-        if i + 1 < len(sorted_ranges):
-            next_start = sorted_ranges[i + 1]["start_line"]
-            if r["end_line"] >= next_start:
-                r["end_line"] = next_start - 1
-        if r["end_line"] >= r["start_line"]:
-            resolved.append(r)
-    return resolved
+def is_noise(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if re.match(r'^\s*\d{1,3}\s*$', stripped):
+        return True  # bare page-number line -- always noise regardless of length
+    if _is_ocr_artifact_description(stripped):
+        return True  # OCR's own description of a visual artifact, not student content
+    if len(stripped) > NOISE_LINE_MAX_CHARS:
+        return False
+    return bool(NOISE_RE.search(stripped))
 
 
 QUESTION_PREFIX_RE = re.compile(
     r'^\s*(?:'
-    # FIX: a real bug confirmed in testing -- the previous pattern
-    # "Ans(?:wer)?[.\s:-]+..." matched the BARE WORD "answer" even when
-    # it was legitimate content (e.g. "Ans 1- answer one content."
-    # correctly stripped "Ans 1- " on the first pass, but the function's
-    # own up-to-2-times retry loop then matched "answer" AGAIN on the
-    # second pass, since "answer one content." also starts with
-    # "Ans(?:wer)?" followed by whitespace -- silently eating real
-    # content down to "one content."). The fix requires either a DIGIT
-    # or an explicit punctuation marker (-,:,.) immediately after
-    # "Ans"/"Answer" -- a genuine label always has one of these right
-    # after it ("Ans 5-", "Ans-", "Answer:"), while the bare word
-    # "answer" followed by ordinary prose does not.
-    r'Ans(?:wer)?\s*\d+\s*[.:\-]?\s*'        # "Ans 5-", "Ans5.", "Answer 5:"
-    r'|Ans(?:wer)?\s*[.:\-]\s*'              # "Ans-", "Ans:", "Answer." (punctuation required, no digit needed)
-    r'|उत्तर\s*\d*\s*[\-\:]\s*'                # "उत्तर-", "उत्तर 5-" (dash/colon required)
-    r'|प्र[०.\s]+\d+[.\s:-]*'                   # "प्र. 8." (number required)
-    r'|प्रश्न[.\s]+\d+[.\s:-]*'                 # "प्रश्न. 2." (number required)
-    r'|Q\.?\s*\d+[.\s:-]*'                      # "Q.8", "Q5-"
+    r'Ans(?:wer)?\s*\d+\s*[.:\-]?\s*'
+    r'|Ans(?:wer)?\s*[.:\-]\s*'
+    r'|उत्तर\s*\d*\s*[\-\:]\s*'
+    r'|प्र[०.\s]+\d+[.\s:-]*'
+    r'|प्रश्न[.\s]+\d+[.\s:-]*'
+    r'|Q\.?\s*\d+[.\s:-]*'
     r')',
     re.IGNORECASE
 )
 
 
 def strip_question_restatement(answer_text: str) -> str:
-    """
-    FIX: real verbatim answers were starting with the student's own
-    restatement/label of the question (e.g. "Ans 5-", "उत्तर-",
-    "प्र. 8.") -- legitimate raw OCR content, but redundant once shown
-    alongside the question field in the final output, and confirmed in
-    real usage to read as "the question repeating at the start of the
-    answer." This strips ONLY a leading restatement label from the
-    very start of the text -- it never touches a restatement that
-    might legitimately appear mid-answer (e.g. a student referencing a
-    different sub-question within their own response). Repeats the
-    strip up to 2 times in case of doubled prefixes from messy OCR
-    (e.g. "उत्तर- Ans 5-"), then stops.
-    """
     text = answer_text
     for _ in range(2):
         new_text = QUESTION_PREFIX_RE.sub('', text, count=1).strip()
@@ -1681,16 +2186,6 @@ def _normalize_for_echo_compare(text: str) -> str:
     return text
 
 
-# FIX (this round): when a labeled sub-part question now carries its
-# parent instruction forward for self-contained context (e.g. "1.(i)
-# Identify and explain the following: <quote>"), the STUDENT'S answer
-# only echoes the sub-part's own distinctive content (the quote
-# itself) -- never the parent instruction phrase. Comparing against
-# the FULL question text (including that instruction phrase) inflates
-# the expected echo length and similarity search window, causing real
-# echoes to go undetected entirely. This regex strips known parent-
-# instruction lead-ins before comparison, isolating just the sub-
-# part's own distinctive text to search for.
 _PARENT_INSTRUCTION_PREFIX_RE = re.compile(
     r'^\s*\d+[\.\)]?\s*(?:\([ivx]+\)|\([a-z]\)|\([क-घ]\))?\s*'
     r'(?:identify and explain the following|write (?:short )?notes? on|'
@@ -1700,38 +2195,9 @@ _PARENT_INSTRUCTION_PREFIX_RE = re.compile(
 
 
 def strip_full_question_echo(answer_text: str, question_text: str) -> str:
-    """
-    FIX: real verbatim answers were confirmed to start with the
-    student's FULL restatement of the question -- not just a short
-    label like "Ans 5-" (already handled by strip_question_restatement
-    above), but the entire question sentence re-copied before the
-    actual answer begins (e.g. an answer literally opening with
-    "Examine the theme of Concealment in Abhignana Shakuntalam / The
-    Loom of Time." before any original content). This detects that
-    pattern by comparing a window of the answer's leading words against
-    the question text itself, and strips exactly that window if the
-    similarity is high enough.
-
-    Deliberately conservative: searches only a TIGHT window around the
-    question's own word count (70%-130%, not a loose multiplier) and
-    requires a high similarity threshold (0.75). An earlier looser
-    version was caught during testing eating into genuine answer
-    content that merely shared topical vocabulary with the question
-    (e.g. an answer's second sentence reusing words like "theme" and
-    "concealment") -- this tighter window and threshold avoid that.
-    Returns the original text unchanged if no sufficiently strong echo
-    is found, so answers that never restate the question are never
-    touched.
-
-    Strips a common parent-instruction PREFIX from the question before
-    comparing (see _PARENT_INSTRUCTION_PREFIX_RE above) -- needed since
-    sub-part questions now carry parent context forward for self-
-    contained readability, but students never echo that parent
-    instruction phrase itself, only the sub-part's own distinctive text.
-    """
     question_core = _PARENT_INSTRUCTION_PREFIX_RE.sub('', question_text).strip()
     if not question_core:
-        question_core = question_text  # fallback if stripping ate everything
+        question_core = question_text
 
     q_norm = _normalize_for_echo_compare(question_core)
     q_word_count = len(q_norm.split())
@@ -1764,194 +2230,58 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
     return answer_text
 
 
-def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
+def _split_into_sentences(text: str) -> list:
+    parts = re.split(r'(?<=[.!?।])\s+', text.strip())
+    return [p for p in parts if p.strip()]
+
+
+def _strip_trailing_question_echo_sentences(answer_text: str, all_questions: list,
+                                              ratio_threshold: float = 0.82,
+                                              max_sentences_to_check: int = 3) -> str:
     """
-    Maps each official question to its verbatim answer text, extracted
-    INDEPENDENTLY per question via LLM-identified line boundaries.
-
-    FIX: this used to key the result dict on whatever question TEXT the
-    LLM echoed back, then rely on that text matching the ORIGINAL
-    question string later in process_pdf()'s qa_map.get(q, "") lookup --
-    a plain, EXACT dict lookup. Any discrepancy between the echoed text
-    and the original (different punctuation, the prompt's own added
-    numbering accidentally retyped, subtle rewording despite
-    instructions not to) meant the answer was built correctly but
-    silently became UNREACHABLE under the original question's key,
-    making it disappear from the final output. This was confirmed as
-    a real, structural cause of badly incomplete Q&A mapping in
-    production.
-
-    This version has the LLM identify questions by an unambiguous
-    REF-A/REF-B/... label (assigned by US, not retyped by the model)
-    instead of by echoing question text at all. Resolving a REF label
-    back to its question is a deterministic Python list index lookup
-    with zero text-matching ambiguity -- the LLM's only job is finding
-    line boundaries, never identifying *which* question by text.
-
-    Returns {question_text: answer_text} for every question whose
-    answer was found, using the EXACT original question strings from
-    `questions` as keys -- guaranteed to match downstream lookups.
+    Deterministic (non-LLM), pure-string-similarity safety net for
+    boundary leakage where a QUESTION's printed text (often the NEXT
+    question, sometimes pre-printed at the bottom of an answer sheet)
+    ends up appended at the TAIL of an extracted answer. Checks only the
+    last few sentences (leakage of this kind is always at the tail, and
+    is bounded so a genuinely long answer that happens to end with a
+    sentence resembling a question is not over-trimmed) against EVERY
+    question in the canonical question paper, using difflib string
+    similarity only -- no LLM involved, so this can never rewrite or
+    paraphrase real answer content, only remove a sentence that is a
+    near-exact match to a question that was independently extracted
+    from the actual printed question paper.
     """
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
+    if not answer_text.strip() or not all_questions:
+        return answer_text
 
-    from groq import Groq
+    sentences = _split_into_sentences(answer_text)
+    if len(sentences) <= 1:
+        return answer_text
 
-    api_key = get_api_key("GROQ_API_KEY")
-    if not api_key:
-        raise Exception("GROQ_API_KEY not found in secrets or environment")
+    normalized_questions = [_normalize_for_echo_compare(q) for q in all_questions if q.strip()]
+    if not normalized_questions:
+        return answer_text
 
-    client = Groq(api_key=api_key)
-    budget = _TokenBudgetTracker()
+    checks_done = 0
+    while sentences and checks_done < max_sentences_to_check:
+        checks_done += 1
+        last_norm = _normalize_for_echo_compare(sentences[-1])
+        if len(last_norm.split()) < 3:
+            break  # too short to reliably judge against a question -- stop trimming
 
-    # Deterministic REF label <-> question index mapping, built once
-    # here and never touched by anything the LLM returns.
-    ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
+        matched = False
+        for q_norm in normalized_questions:
+            if q_norm and difflib.SequenceMatcher(None, last_norm, q_norm).ratio() >= ratio_threshold:
+                matched = True
+                break
 
-    numbered_lines = list(enumerate(answer_lines))
-    chunks = _chunk_lines_by_char_budget(numbered_lines, questions)
-    log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
+        if not matched:
+            break
+        sentences.pop()
 
-    all_ranges = []  # list of {ref, start_line, end_line}
-    chunk_failures = []
-    chunk_zero_matches = 0
+    return " ".join(sentences).strip()
 
-    for i, chunk in enumerate(chunks):
-        line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
-        log(f"Asking LLM to map answers in chunk {i+1}/{len(chunks)} (lines {line_range})...")
-
-        user_prompt = _build_answer_map_user_prompt(chunk, questions)
-        try:
-            chunk_ranges = _call_groq_with_retries(
-                client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
-                _parse_answer_map_llm_response, budget, log
-            )
-        except Exception as e:
-            log(f"WARNING: chunk {i+1}/{len(chunks)} answer-mapping failed, skipping: {e}")
-            chunk_failures.append(str(e))
-            continue
-
-        if not chunk_ranges:
-            chunk_zero_matches += 1
-
-        # Validate BOTH that the ref label is one we actually issued
-        # AND that line numbers are within THIS chunk's actual range
-        # (defends against the LLM hallucinating either).
-        valid_indices = {idx for idx, _ in chunk}
-        min_idx, max_idx = min(valid_indices), max(valid_indices)
-        for r in chunk_ranges:
-            if r["ref"] not in ref_to_question:
-                log(f"WARNING: discarding answer mapping with unknown ref {r['ref']!r}")
-                continue
-            if min_idx <= r["start_line"] <= max_idx and min_idx <= r["end_line"] <= max_idx:
-                all_ranges.append(r)
-            else:
-                log(
-                    f"WARNING: discarding out-of-range answer mapping for "
-                    f"{r['ref']}: lines {r['start_line']}-{r['end_line']} "
-                    f"outside this chunk's range {min_idx}-{max_idx}"
-                )
-
-        log(f"Chunk {i+1}/{len(chunks)}: mapped {len(chunk_ranges)} answer(s)")
-
-    # Deduplicate: if overlapping chunks both found the same REF
-    # (possible due to line overlap between chunks), keep the one with
-    # the longer range (more complete capture). This is now a trivial
-    # exact-match on the ref label -- no text fuzziness involved at all.
-    best_by_ref = {}
-    for r in all_ranges:
-        existing = best_by_ref.get(r["ref"])
-        if existing is None or (r["end_line"] - r["start_line"]) > (existing["end_line"] - existing["start_line"]):
-            best_by_ref[r["ref"]] = r
-
-    deduped_ranges = list(best_by_ref.values())
-
-    # HARD SAFETY NET: resolve any remaining overlaps so no answer can
-    # ever swallow another's content, regardless of LLM output quality.
-    resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
-
-    log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
-
-    # FIX: this function previously had NO failure path at all -- if
-    # every chunk's call raised an exception, OR every chunk's call
-    # succeeded but genuinely found zero answers (a strong signal the
-    # "answer pages" don't actually contain real answers -- e.g. the
-    # question-paper/answer-page split upstream misclassified pages),
-    # it silently returned an empty dict. The real cause then surfaced
-    # several steps downstream in process_pdf() as a generic
-    # "Could not match any questions to answers" error, with none of
-    # the specific diagnostic information available here. This raises
-    # immediately with the actual cause and enough context to act on.
-    if not resolved_ranges:
-        if chunk_failures and len(chunk_failures) == len(chunks):
-            raise Exception(
-                f"Answer mapping failed: ALL {len(chunks)} chunk(s) raised an "
-                f"error (none succeeded). First failure: {chunk_failures[0]}"
-            )
-        elif chunk_zero_matches == len(chunks):
-            sample_lines = [l for l in answer_lines[:15] if l.strip()][:8]
-            raise Exception(
-                f"Answer mapping found ZERO matches across all {len(chunks)} chunk(s), "
-                f"even though the LLM calls themselves succeeded. This usually means "
-                f"the 'answer pages' passed in do NOT actually contain the student's "
-                f"answers -- most likely the question-paper/answer-page page split "
-                f"upstream misclassified pages (e.g. real answer pages were wrongly "
-                f"identified as question-paper pages, leaving only cover/admin pages "
-                f"as 'answers'). Sample of the answer text actually searched: "
-                f"{sample_lines}"
-            )
-
-    # Slice the ORIGINAL answer_lines verbatim using the resolved ranges
-    # -- this is the only place the actual answer text is produced, and
-    # it is a pure Python slice, guaranteeing no LLM paraphrasing risk.
-    # The dict is keyed on the ORIGINAL canonical question text (looked
-    # up deterministically via ref_to_question), guaranteeing it matches
-    # whatever process_pdf() looks it up with later.
-    qa_map = {}
-    for r in resolved_ranges:
-        start, end = r["start_line"], r["end_line"]
-        verbatim_lines = [
-            answer_lines[j] for j in range(start, end + 1)
-            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ]
-        original_question = ref_to_question[r["ref"]]
-        answer_text = " ".join(verbatim_lines).strip()
-        # Apply both fixes in sequence: short label prefixes ("Ans 5-")
-        # first, then a full question-sentence echo if the student
-        # re-copied the entire question before their actual answer.
-        answer_text = strip_question_restatement(answer_text)
-        answer_text = strip_full_question_echo(answer_text, original_question)
-        qa_map[original_question] = answer_text
-
-    return qa_map
-
-
-NOISE_RE = re.compile(
-    r'(?:Teacher\'?s?\s*Signature'
-    r'|Tancher\'?s?\s*Signature'
-    r'|Facebook\'?s?\s*Signature'
-    r'|PAGE\s*NO'
-    r'|^\s*DATE\b'
-    r'|Neel?\s*Kamal'
-    r'|Neal?\s*Kamal'
-    r'|Need?\s*Komal'
-    r'|Nod\s*Komal'
-    r'|TAKMA\s*SINAN'
-    r'|^\s*\d{1,3}\s*$)',
-    re.IGNORECASE
-)
-
-
-def is_noise(line: str) -> bool:
-    return bool(NOISE_RE.search(line))
-
-
-# =========================================================
-# FIND QUESTION BOUNDARIES IN ANSWER PAGES -- similarity based
-# UNCHANGED.
-# =========================================================
 
 def normalize(text: str) -> str:
     text = text.lower()
@@ -1960,125 +2290,10 @@ def normalize(text: str) -> str:
     return text.strip()
 
 
-def similarity(a: str, b: str) -> float:
-    wa = set(normalize(a).split())
-    wb = set(normalize(b).split())
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / max(len(wa), len(wb))
-
-
-def strip_leading_label(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r'^(?:Ans(?:wer)?[.\s]+)', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^(?:उत्तर)\s*[\-\:\s]*', '', text)
-    text = re.sub(r'^(?:प्र|प्रो|प्रश्न)[\.\s]*\d*[\.\s]*', '', text)
-    text = re.sub(r'^[१-९०][०-९]*[\.\-\s]*', '', text)
-    text = re.sub(r'^(?:Q\.?\s*)?\d+[.)]\s*', '', text)
-    text = re.sub(r'^\(?[a-z]\)\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^\(?[क-घ]\)\s*', '', text)
-    return text.strip()
-
-
-def find_question_boundaries_by_similarity(
-    answer_lines: list,
-    questions: list,
-    similarity_threshold: float = 0.30,
-    window: int = 4
-) -> list:
-    candidates_by_question = {}
-
-    for i in range(len(answer_lines)):
-        line_i = answer_lines[i].strip()
-        if len(line_i) < 8:
-            continue
-
-        for w in range(1, window + 1):
-            if i + w > len(answer_lines):
-                break
-
-            combined = " ".join(
-                answer_lines[i + k].strip()
-                for k in range(w) if answer_lines[i + k].strip()
-            )
-            if len(combined) < 10:
-                continue
-
-            combined_clean = strip_leading_label(combined)
-
-            for q in questions:
-                q_clean = strip_leading_label(q)
-                s1 = similarity(combined, q)
-                s2 = similarity(combined_clean, q_clean)
-                score = max(s1, s2)
-
-                if score >= similarity_threshold:
-                    candidates_by_question.setdefault(q, []).append({
-                        "question":   q,
-                        "line_index": i,
-                        "span":       w,
-                        "score":      score
-                    })
-
-    for q in candidates_by_question:
-        candidates_by_question[q].sort(key=lambda c: -c["score"])
-
-    final = []
-    last_line_index = -1
-
-    for q in questions:
-        cands = candidates_by_question.get(q, [])
-        chosen = None
-        for c in cands:
-            if c["line_index"] > last_line_index:
-                chosen = c
-                break
-        if chosen is not None:
-            final.append(chosen)
-            last_line_index = chosen["line_index"]
-
-    return final
-
-
-def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> list:
-    qa_pairs = []
-    for i, b in enumerate(boundaries):
-        span    = b.get("span", 1)
-        a_start = b["line_index"] + span
-        a_end   = boundaries[i + 1]["line_index"] if i + 1 < len(boundaries) else len(answer_lines)
-
-        raw = [
-            answer_lines[j] for j in range(a_start, a_end)
-            if answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ]
-
-        qa_pairs.append({
-            "question": b["question"],
-            "answer":   " ".join(raw).strip()
-        })
-
-    return qa_pairs
-
-
 def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print) -> bool:
-    """
-    FIX: catches a real failure mode confirmed in production -- the
-    question-paper/answer-page split misclassified pages, leaving only
-    cover/admin/letterhead pages (e.g. "IGNOU logo...", "THE PEOPLE'S
-    UNIVERSITY") as the "answer pages." This is detectable BEFORE
-    spending any answer-mapping LLM calls at all: real essay-style
-    answers run well over a thousand characters EACH for substantive
-    responses, so if the total available answer text is implausibly
-    small relative to the number of questions, something already went
-    wrong upstream. Catching this here means the failure is reported
-    immediately and cheaply, with a clear pointer to the real cause,
-    instead of running a full (doomed) round of answer-mapping calls
-    that burn tokens and time before surfacing a generic
-    "could not match any questions" error several steps later.
-    """
     total_chars = sum(len(l) for l in answer_lines)
     avg_chars_per_question = total_chars / max(num_questions, 1)
-    MIN_PLAUSIBLE_CHARS_PER_QUESTION = 200  # conservative floor
+    MIN_PLAUSIBLE_CHARS_PER_QUESTION = 200
 
     if avg_chars_per_question < MIN_PLAUSIBLE_CHARS_PER_QUESTION:
         log(
@@ -2092,6 +2307,88 @@ def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print
         )
         return False
     return True
+
+
+def _flag_suspiciously_short_answers(qa_pairs: list, log=print) -> None:
+    """
+    Lightweight, always-on diagnostic (not a hard failure) that flags
+    matched answers which are suspiciously short compared to the rest of
+    the document's answers -- a strong signal of truncation (start or end
+    clipped) even when a range WAS found.
+    """
+    matched_lengths = [len(p["answer"]) for p in qa_pairs if p.get("matched") and p["answer"].strip()]
+    if len(matched_lengths) < 2:
+        return
+    matched_lengths.sort()
+    median_len = matched_lengths[len(matched_lengths) // 2]
+    if median_len < 50:
+        return  # too short a document overall to say anything meaningful
+    for p in qa_pairs:
+        if not p.get("matched"):
+            continue
+        length = len(p["answer"])
+        if length < median_len * 0.25 and length < 300:
+            log(
+                f"WARNING: possible truncated answer for '{p['question'][:60]}...' "
+                f"-- only {length} chars vs this document's median matched answer "
+                f"length of {median_len} chars. Worth spot-checking against the OCR."
+            )
+
+
+def _flag_duplicate_matched_answers(qa_pairs: list, log=print) -> None:
+    """
+    Diagnostic safety net for "questions repeating" symptoms: flags any
+    two MATCHED answers whose extracted text is near-identical, or whose
+    line ranges overlap. This can happen if two distinct (but
+    near-duplicate) canonical questions slipped past the dedup step, or
+    if two refs were assigned overlapping ranges by the search stages.
+    This never modifies the output -- it only surfaces the problem
+    loudly in the log so it can be spotted immediately.
+    """
+    matched = [p for p in qa_pairs if p.get("matched") and p["answer"].strip()]
+    for i in range(len(matched)):
+        for j in range(i + 1, len(matched)):
+            a, b = matched[i], matched[j]
+            # Overlapping line ranges (should be impossible by construction,
+            # but flag loudly if it ever happens).
+            if a["start_line"] is not None and b["start_line"] is not None:
+                if not (a["end_line"] < b["start_line"] or b["end_line"] < a["start_line"]):
+                    log(
+                        f"WARNING: overlapping answer ranges detected between "
+                        f"'{a['question'][:50]}...' (lines {a['start_line']}-{a['end_line']}) "
+                        f"and '{b['question'][:50]}...' (lines {b['start_line']}-{b['end_line']})"
+                    )
+            # Near-identical extracted answer text for two different
+            # questions -- likely a duplicate-question slip-through.
+            ratio = difflib.SequenceMatcher(None, a["answer"], b["answer"]).ratio()
+            if ratio >= 0.9:
+                log(
+                    f"WARNING: near-identical answer text found for two different "
+                    f"questions -- likely a duplicate/near-duplicate canonical question: "
+                    f"'{a['question'][:50]}...' and '{b['question'][:50]}...'"
+                )
+                continue
+
+            # SUBSTRING overlap check: catches a chunk of ONE answer's
+            # content leaking into another's HEAD or TAIL, which the
+            # whole-answer ratio check above misses whenever the leaked
+            # portion is small relative to each answer's total length
+            # (e.g. answer D is mostly genuine content of its own, but
+            # ends with a paragraph that's actually answer B's content).
+            # Uses the longest common contiguous substring between the
+            # two answers as the signal, ignoring very short/generic
+            # matches.
+            matcher = difflib.SequenceMatcher(None, a["answer"], b["answer"])
+            match = matcher.find_longest_match(0, len(a["answer"]), 0, len(b["answer"]))
+            if match.size >= 150:
+                shared = a["answer"][match.a:match.a + match.size]
+                log(
+                    f"WARNING: a {match.size}-character chunk of text is shared verbatim "
+                    f"between '{a['question'][:50]}...' and '{b['question'][:50]}...' -- "
+                    f"this usually means content from one answer's range leaked into the "
+                    f"other's (a boundary/search bug), OR the source document genuinely "
+                    f"repeats this passage twice. Shared text starts: {shared[:100]!r}"
+                )
 
 
 # =========================================================
@@ -2113,9 +2410,10 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    qp_page_indices, official_questions = identify_questions_with_llm(pages, status_callback)
+    qp_page_indices, official_questions, admin_page_indices = identify_questions_with_llm(pages, status_callback)
 
     log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
+    log(f"Admin/cover pages detected: {[p+1 for p in admin_page_indices] if admin_page_indices else 'none'}")
     log(f"Official questions extracted: {len(official_questions)}")
 
     if not qp_page_indices:
@@ -2130,22 +2428,67 @@ def process_pdf(file_input, status_callback=None):
             f"Detected pages: {[p+1 for p in qp_page_indices]}"
         )
 
-    answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
+    # Admin/cover pages (roll number, letterhead, etc.) are explicitly
+    # excluded here too, not just question-paper pages. Otherwise ANY
+    # page that wasn't classified as a question-paper page would fall
+    # into "answer pages" by elimination -- including cover sheets -- so
+    # their content (names, roll numbers, institution letterhead text)
+    # could leak into an answer's range.
+    excluded_indices = set(qp_page_indices) | set(admin_page_indices)
+    answer_page_indices = [i for i in range(len(pages)) if i not in excluded_indices]
     answer_pages = [pages[i] for i in answer_page_indices]
 
     log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
 
+    # answer_line_pages[i] records which OCR page answer_lines[i] came
+    # from -- kept in lockstep with answer_lines so every mapped answer
+    # can report exactly which page(s) of the source PDF it was sliced
+    # from, for direct manual verification against the scanned document.
+    # Lines flagged as noise (bare page numbers, admin labels, OCR
+    # artifact/annotation descriptions like a logo or a red-pen scribble)
+    # are excluded here, at the source -- so they can never be picked as
+    # a candidate answer-start/transition line, nor appear in any
+    # extracted answer text.
     answer_lines = []
+    answer_line_pages = []
+    closing_section_reached = False
     for page in answer_pages:
+        if closing_section_reached:
+            log(
+                f"Skipping page {page['page_number']} entirely -- the overall assignment "
+                f"closing section (e.g. '## Conclusion') was already reached on an earlier "
+                f"page, so nothing after it is treated as answer content."
+            )
+            continue
+        page_kept_any = False
         for line in page["raw_text"].split("\n"):
-            if not is_noise(line):
-                answer_lines.append(line)
+            cleaned_line = _strip_inline_ocr_artifacts(line)
+            kept_text, hit_closing = _truncate_before_overall_closing_heading(cleaned_line)
+            if kept_text.strip() and not is_noise(kept_text):
+                answer_lines.append(kept_text)
+                answer_line_pages.append(page["page_number"])
+                page_kept_any = True
+            if hit_closing:
+                log(
+                    f"Reached the overall assignment closing section (e.g. '## Conclusion') "
+                    f"on page {page['page_number']} -- stopping answer-line collection here. "
+                    f"Everything from this point onward is document-level wrap-up, never part "
+                    f"of any specific answer."
+                )
+                closing_section_reached = True
+                break
+        if not page_kept_any and page["raw_text"].strip() and not closing_section_reached:
+            log(
+                f"WARNING: page {page['page_number']} produced ZERO usable answer "
+                f"lines after filtering, despite having {len(page['raw_text'])} chars "
+                f"of raw OCR text. This usually means Chandra mis-transcribed the "
+                f"WHOLE page as an annotation description (red-pen marks etc.) instead "
+                f"of the actual handwriting -- real content may be LOST here, not just "
+                f"filtered. Manually check page {page['page_number']} in the source PDF."
+            )
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
-    # FIX: catches a misclassified page split BEFORE spending any
-    # answer-mapping LLM calls, rather than discovering it only after
-    # a full (doomed) round of calls produces zero matches.
     pages_look_plausible = _sanity_check_answer_pages(answer_lines, len(official_questions), log)
     if not pages_look_plausible:
         raise Exception(
@@ -2158,61 +2501,59 @@ def process_pdf(file_input, status_callback=None):
             "would be guaranteed to fail."
         )
 
-    # FIX: replaces the old similarity-based sliding-window matching
-    # (which could let one question's answer swallow several others --
-    # the exact bug seen in real usage) with LLM-based, per-question
-    # INDEPENDENT answer extraction. Each question's answer boundary is
-    # identified on its own merits by the LLM reading the actual text,
-    # with a hard Python-side overlap-resolution safety net guaranteeing
-    # no answer can ever absorb another's content.
-    log("Mapping each question to its answer independently (LLM-based)...")
-    qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
+    log("Mapping each question to its answer (start search + comparative transition search)...")
+    qa_pairs = map_answers_sequential(
+        answer_lines, official_questions, status_callback,
+        answer_line_pages=answer_line_pages
+    )
 
-    matched_count = sum(1 for q in official_questions if q in qa_map)
+    matched_count = sum(1 for p in qa_pairs if p["matched"])
     log(f"Matched {matched_count} of {len(official_questions)} questions")
 
-    for q in official_questions:
-        if q not in qa_map:
-            log(f"WARNING: No match found for: {q[:60]}")
+    for p in qa_pairs:
+        if not p["matched"]:
+            log(f"WARNING: No match found for: {p['question'][:60]}")
 
-    if not qa_map:
+    if matched_count == 0:
         raise Exception(
             "Could not match any questions to answers.\n"
             f"Official questions: {official_questions}\n"
             f"First 10 answer lines: {answer_lines[:10]}"
         )
 
-    # Build the Q&A pairs list, preserving the official question order
-    # and explicitly marking unmatched questions rather than silently
-    # dropping them -- this makes it clear in the output which
-    # questions were genuinely not found versus matched-but-empty.
-    qa_pairs = []
-    for q in official_questions:
-        qa_pairs.append({
-            "question": q,
-            "answer": qa_map.get(q, ""),
-            "matched": q in qa_map,
-        })
+    # =====================================================================
+    # INTEGRITY CHECK: every answer_raw field above was built by a plain
+    # Python slice of answer_lines (see map_answers_sequential) -- the LLM
+    # is never given the opportunity to write or rephrase answer text, it
+    # only ever returns a single line-number. This assertion makes that
+    # guarantee mechanically verifiable rather than just a design claim.
+    # =====================================================================
+    for p in qa_pairs:
+        if not p["matched"]:
+            continue
+        s, e = p["start_line"], p["end_line"]
+        expected_raw = " ".join(
+            answer_lines[j] for j in range(s, e + 1)
+            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
+        ).strip()
+        if expected_raw != p["answer_raw"]:
+            log(
+                f"CRITICAL: verbatim-integrity check FAILED for '{p['question'][:60]}...' -- "
+                f"the reported answer_raw does not match a fresh re-slice of answer_lines "
+                f"[{s}:{e}]. This indicates a real bug in the extraction code, not an LLM "
+                f"hallucination -- please report this."
+            )
+
+    _flag_suspiciously_short_answers(qa_pairs, log)
+    _flag_duplicate_matched_answers(qa_pairs, log)
 
     log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
 
-    # Returns BOTH requested outputs separately:
-    # - ocr_json: the complete raw OCR of the whole PDF, every page
-    # - qa_pairs: the clean, independently-mapped question -> answer
-    #   pairs, in official question order
-    # The caller is responsible for writing these to two separate
-    # files (see save_outputs() below for a ready-made helper).
     return ocr_json, qa_pairs
 
 
 def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
                   base_name: str = "document") -> tuple:
-    """
-    Convenience helper: writes the two requested output files to disk
-    and returns their paths.
-    - {base_name}_ocr.json: the complete raw OCR of the whole PDF
-    - {base_name}_qa_pairs.json: the mapped question -> answer pairs
-    """
     ocr_path = os.path.join(output_dir, f"{base_name}_ocr.json")
     qa_path = os.path.join(output_dir, f"{base_name}_qa_pairs.json")
 
