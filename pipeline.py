@@ -1423,6 +1423,25 @@ def _enforce_monotonic_anchors(confirmed: dict, num_questions: int, log) -> tupl
     return ordered_valid, invalid_qidxs
 
 
+# =====================================================================
+# FIX: Stage 7's retry was originally an ISOLATED single-target search
+# ("does X start here?") with no visibility into the question whose
+# answer is already open right before this gap. This is a confirmed,
+# reproducible bug: when a trailing question's anchor can't be found by
+# regex/similarity/validation, the isolated retry search can also fail
+# to spot the transition -- especially between two long, similarly-
+# styled essay answers -- and the PREVIOUS confirmed answer then
+# silently absorbs the target question's entire content, because
+# check_last_answer_end() only knows how to trim a whole-assignment
+# closing remark, not split off a second, distinct, still-unmatched
+# answer. The fix mirrors the same lesson learned earlier in this
+# project: give the LLM a genuine CONTRAST to reason about. Whenever a
+# preceding confirmed question exists (true for every gap except one
+# that precedes the very first question), the retry is framed as a
+# comparative transition search between that known previous question and
+# the target question, instead of an isolated guess.
+# =====================================================================
+
 RETRY_SEARCH_SYSTEM_PROMPT = """You are searching for exactly ONE thing in a block of line-numbered OCR text from a student's exam answer booklet: the EARLIEST line where the response to ONE SPECIFIC question begins.
 
 You are given the exact text of the target question and a bounded window of text -- this window is known to sit between two OTHER already-confirmed answers, so the target answer (if present at all) is somewhere in this exact stretch, or is entirely absent (the student may have skipped this question).
@@ -1432,6 +1451,31 @@ RULE -- ALWAYS THE EARLIEST LINE: an answer's true start includes any opening la
 RULE -- IGNORE OCR ARTIFACT/ANNOTATION DESCRIPTIONS: lines describing a visual mark on the page (a red circle, an arrow, a stamp, a scribble) are never the start of an answer.
 
 If the target question's answer is genuinely not present anywhere in this window, say so plainly -- that is a valid, expected outcome (the student may have skipped the question).
+
+Return ONLY valid JSON (no markdown fences, no commentary):
+
+{"found": true, "start_line": 42}
+or
+{"found": false}
+
+If found, start_line MUST be one of the exact line numbers shown in [brackets]."""
+
+RETRY_TRANSITION_SYSTEM_PROMPT = """You are analyzing a student's exam answer booklet (OCR'd, line-numbered) to find the exact TRANSITION POINT between two answers.
+
+You are given:
+1. PREVIOUS QUESTION: the question whose answer is ALREADY OPEN and has been running through everything before this window (its true start was already confirmed elsewhere -- you are not looking for that).
+2. TARGET QUESTION: the question whose answer you need to locate the START of. It has NOT started as of the beginning of this window, but MAY start somewhere within it. This window is bounded to sit between two already-confirmed answers, so if the target's answer exists at all, it is somewhere in this exact stretch.
+3. A window of line-numbered student answer text.
+
+Your task: find the FIRST line at which the student STOPS writing about the PREVIOUS question and STARTS writing about the TARGET question. This is the target's start_line.
+
+RULE -- USE THE CONTRAST: compare candidate lines against BOTH questions. A line belongs to the TARGET question if its subject matter specifically matches the TARGET question and is a genuine departure from the PREVIOUS question's topic -- not merely because it's a new paragraph or contains a number. Two long essay-style answers can read similarly in tone; rely on SUBJECT MATTER (names, works, concepts each question specifically asks about), not writing style, to tell them apart.
+
+RULE -- EARLIEST PLAUSIBLE LINE: a transition is often marked by an explicit label ("Ans 6-", "3.", "Q.3)"). If present, that line is the transition. Otherwise, the target's answer may open with a short introductory/restating line before it becomes obviously specific to its own topic -- treat that earliest line as the start, not a later, clearer one.
+
+RULE -- IGNORE OCR ARTIFACT/ANNOTATION DESCRIPTIONS: lines describing a visual mark on the page (a red circle, an arrow, a stamp, a scribble) are never real content and never the transition line.
+
+If the transition does NOT occur anywhere within this window (the entire window is still part of the PREVIOUS question's answer, or the target question was skipped entirely), say so plainly.
 
 Return ONLY valid JSON (no markdown fences, no commentary):
 
@@ -1459,14 +1503,25 @@ RETRY_WINDOW_CHARS = 11000
 
 def retry_failed_region(client, line_records: list, question_text: str,
                           region_start: int, region_end: int,
-                          budget: "_TokenBudgetTracker", log) -> int:
+                          budget: "_TokenBudgetTracker", log,
+                          prev_question_text: str = None) -> int:
     """
     STAGE 7: targeted retry, bounded to [region_start, region_end]
     inclusive -- i.e. only the gap between two already-confirmed
     neighboring anchors (or the document edges), never the whole
     document. This is what makes the retry cheap and safe: even if the
-    LLM's isolated judgment is imperfect here, it can't reach into
+    LLM's judgment is imperfect here, it can't reach into
     already-confirmed territory and corrupt it.
+
+    If prev_question_text is provided (the question immediately BEFORE
+    this gap, whose answer is already open), the search is framed as a
+    COMPARATIVE transition search between that question and the target
+    -- giving the LLM a genuine contrast to reason about instead of an
+    isolated guess. This is what prevents the previous answer from
+    silently absorbing the target's entire content when the target's
+    anchor can't be found any other way. Falls back to an isolated
+    search only when there is no previous question to contrast against
+    (i.e. this gap precedes the very first question).
     """
     if region_start > region_end or region_start >= len(line_records):
         return None
@@ -1475,8 +1530,6 @@ def retry_failed_region(client, line_records: list, question_text: str,
     if not window:
         return None
 
-    # If the region is large, slide through it in sub-windows; otherwise
-    # a single call covers it.
     pos = 0
     while pos < len(window):
         sub = []
@@ -1488,11 +1541,21 @@ def retry_failed_region(client, line_records: list, question_text: str,
             i += 1
 
         lines_block = "\n".join(f"[{r['gidx']}] {r['text']}" for r in sub)
-        prompt = f"TARGET QUESTION: {question_text}\n\nTEXT WINDOW (line-numbered):\n{lines_block}"
+
+        if prev_question_text:
+            prompt = (
+                f"PREVIOUS QUESTION: {prev_question_text}\n\n"
+                f"TARGET QUESTION: {question_text}\n\n"
+                f"TEXT WINDOW (line-numbered):\n{lines_block}"
+            )
+            system_prompt = RETRY_TRANSITION_SYSTEM_PROMPT
+        else:
+            prompt = f"TARGET QUESTION: {question_text}\n\nTEXT WINDOW (line-numbered):\n{lines_block}"
+            system_prompt = RETRY_SEARCH_SYSTEM_PROMPT
 
         try:
             found, start_line = _call_groq_with_retries(
-                client, RETRY_SEARCH_SYSTEM_PROMPT, prompt,
+                client, system_prompt, prompt,
                 _parse_retry_search_response, budget, log, max_retries=2
             )
         except Exception as e:
@@ -1713,11 +1776,18 @@ def map_answers_anchor_based(answer_pages: list, questions: list, status_callbac
             ref = f"REF-{chr(65 + qi)}"
             # bound the retry window using the nearest CONFIRMED neighbors
             # in question order (not just document order), so the retry
-            # never overlaps already-confirmed territory.
+            # never overlaps already-confirmed territory. Also remember
+            # WHICH question index the previous confirmed anchor belongs
+            # to, so its exact text can be given to the retry search as
+            # comparative context (see retry_failed_region docstring for
+            # why this matters -- without it, a failed retry lets the
+            # previous answer silently absorb this question's content).
             prev_gidx = -1
+            prev_qidx = None
             for pj in range(qi - 1, -1, -1):
                 if pj in anchor_map:
                     prev_gidx = anchor_map[pj]
+                    prev_qidx = pj
                     break
             next_gidx = total_lines  # exclusive upper bound if no later anchor found
             for nj in range(qi + 1, len(questions)):
@@ -1731,13 +1801,25 @@ def map_answers_anchor_based(answer_pages: list, questions: list, status_callbac
                 log(f"  {ref}: no room between neighboring confirmed anchors -- leaving unmatched")
                 continue
 
-            log(f"  {ref}: retrying within lines [{region_start}, {region_end}]...")
-            gidx = retry_failed_region(client, line_records, questions[qi], region_start, region_end, budget, log)
+            prev_question_text = questions[prev_qidx] if prev_qidx is not None else None
+            mode = "comparative (vs previous confirmed question)" if prev_question_text else "isolated (no previous question to contrast against)"
+            log(f"  {ref}: retrying within lines [{region_start}, {region_end}] -- {mode}...")
+            gidx = retry_failed_region(
+                client, line_records, questions[qi], region_start, region_end, budget, log,
+                prev_question_text=prev_question_text
+            )
             if gidx is not None:
                 anchor_map[qi] = gidx
                 log(f"    recovered at line {gidx}")
             else:
                 log(f"    still not found -- marking unmatched")
+                if prev_qidx is not None:
+                    log(
+                        f"    NOTE: {ref} remains unmatched and directly follows a confirmed answer "
+                        f"(REF-{chr(65 + prev_qidx)}) with no confirmed boundary after it. If {ref}'s "
+                        f"content genuinely exists in the document, it may still be absorbed into "
+                        f"REF-{chr(65 + prev_qidx)}'s answer -- check that answer's tail if this happens."
+                    )
 
         ordered_valid = sorted(anchor_map.items(), key=lambda kv: kv[1])
 
