@@ -1864,6 +1864,19 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             )
             found_starts[ref] = start_line
             log(f"  found {ref} starting at line {start_line}")
+
+            # DEBUG CONTEXT: print the lines immediately before and after
+            # the confirmed start, so a wrong/skipped start is directly
+            # visible in the run logs without needing a separate
+            # ocr.json download.
+            ctx_lo = max(0, start_line - 4)
+            ctx_hi = min(len(answer_lines), start_line + 3)
+            log(f"  [context] lines {ctx_lo}-{ctx_hi - 1} around {ref}'s confirmed start (>>> marks the chosen start line):")
+            for ci in range(ctx_lo, ctx_hi):
+                marker = ">>>" if ci == start_line else "   "
+                preview = answer_lines[ci][:180].replace("\n", " ")
+                log(f"  [context] {marker} [{ci}] {preview!r}")
+
             pointer = start_line + 1
         else:
             log(
