@@ -611,6 +611,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                     ],
                     response_format={"type": "json_object"},
                     temperature=0.0,
+                    max_tokens=8000,
                 )
             budget.record_usage(estimated_tokens)
             content = response.choices[0].message.content
