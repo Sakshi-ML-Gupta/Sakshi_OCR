@@ -321,13 +321,13 @@ def process_reference(file_input, status_callback=None):
 # =========================================================
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-LLM_MODEL = "google/gemini-3.1-flash-lite-preview"
+LLM_MODEL = "meta-llama/llama-3.3-70b-instruct:free"  # free tier, 131K context -- see note below
 
 TPM_LIMIT = 800000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 
-MAX_CHARS_PER_CHUNK = 150000
+MAX_CHARS_PER_CHUNK = 90000
 CHUNK_OVERLAP_PAGES = 1
 
 QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam/assignment answer booklet. This could be from ANY institution, ANY subject, and ANY language (or a mix of languages/scripts) -- do not assume a specific country, university, or language. The booklet mixes pages of different kinds, in no guaranteed order:
@@ -1740,7 +1740,7 @@ def _check_last_answer_end(client, numbered_lines: list, question_text: str, ref
 # or more calls per question.
 # =========================================================
 
-ANSWER_CLASSIFY_CHUNK_CHARS = 150000
+ANSWER_CLASSIFY_CHUNK_CHARS = 90000
 ANSWER_CLASSIFY_OVERLAP_CHARS = 1500
 
 
@@ -2749,6 +2749,124 @@ def _flag_duplicate_matched_answers(qa_pairs: list, log=print) -> None:
 
 
 # =========================================================
+# BOUNDARY CORRECTION -- distinctive-topic-anchor sanity check
+#
+# All the safety nets above (backward verification, gap-fill, monotonic
+# checks) operate on WHERE a boundary was placed. This one is different:
+# it's a content sanity check, applied AFTER all boundaries are final,
+# that asks "does this answer's own text actually discuss what its own
+# question asks about?" It is deliberately conservative -- it only
+# fires when a distinctive term from the question is completely absent
+# near the start of the answer but genuinely present later in the SAME
+# assigned range, and it only ever corrects ADJACENT answer pairs (never
+# creates a gap or an overlap). This is what catches cases like a
+# reference-passage explanation for one question bleeding into the next
+# question's range because the true topic shift happened a bit later
+# than where the boundary was drawn.
+# =========================================================
+
+_ANCHOR_GENERIC_WORDS = {
+    'The', 'Write', 'Discuss', 'Comment', 'Explain', 'Describe', 'Answer',
+    'Critically', 'Analyse', 'Analyze', 'Following', 'Short', 'Notes',
+    'About', 'Words', 'Each', 'Reference', 'Context', 'Significance',
+    'Themes', 'Theme', 'Role', 'Play', 'Poem', 'Note', 'Given', 'Passage',
+    'Lines', 'State', 'Views', 'Detailed', 'Their', 'Corresponding',
+    'Why', 'Does', 'Plot', 'Plan', 'What', 'When', 'Where', 'Which',
+    'Who', 'Integrated', 'Briefly', 'Elaborate', 'Illustrate', 'For',
+    'From', 'This', 'That', 'These', 'Those', 'Into', 'Importance',
+    'Long', 'Text', 'Examine', 'Identify', 'Compare',
+}
+
+
+def _extract_topic_anchors(question_text: str) -> list:
+    """
+    Extracts distinctive capitalized terms (proper nouns, titles) from a
+    question's text -- e.g. 'Faustus', 'Macbeth', 'Renaissance',
+    'Amoretti' -- to use as a cheap, deterministic sanity-check anchor
+    for whether a mapped answer's TEXT actually discusses what its
+    QUESTION asks about. Generic instructional words (even if
+    capitalized at a sentence start) are filtered out.
+    """
+    words = re.findall(r"\b[A-Z][a-zA-Z']{2,}\b", question_text)
+    return [w.strip('.,;:') for w in words if w.strip('.,;:') not in _ANCHOR_GENERIC_WORDS]
+
+
+def _correct_boundaries_using_topic_anchors(qa_pairs: list, answer_lines: list,
+                                              answer_line_pages: list, log=print) -> None:
+    """
+    Deterministic, non-LLM safety net applied AFTER answer mapping is
+    otherwise complete. For each matched answer (after the first),
+    checks whether it mentions a distinctive term from ITS OWN question
+    near its start. If not, but the term genuinely appears later within
+    the SAME assigned range, that's strong evidence a boundary was
+    misplaced -- the opening lines of this answer actually still belong
+    to the PREVIOUS question. When the previous answer is immediately
+    adjacent (its end_line is exactly this answer's start_line - 1), the
+    boundary is corrected: the previous answer's range is extended up to
+    (but not including) the anchor line, and this answer's range is
+    shrunk to start there. This can only ever move a boundary LATER
+    within the same two-answer span -- it never creates a gap or an
+    overlap, so it cannot introduce new corruption; it only reclaims
+    content that content-evidence shows was misplaced.
+    """
+    questions = [p['question'] for p in qa_pairs]
+
+    for i, p in enumerate(qa_pairs):
+        if not p.get('matched') or i == 0:
+            continue
+        prev = qa_pairs[i - 1]
+        if not prev.get('matched'):
+            continue
+        if prev['end_line'] != p['start_line'] - 1:
+            continue  # not adjacent (a gap exists) -- don't touch
+
+        anchors = _extract_topic_anchors(p['question'])
+        if not anchors:
+            continue
+
+        s, e = p['start_line'], p['end_line']
+        head = (p.get('answer_raw') or '')[:250].lower()
+        if any(a.lower() in head for a in anchors):
+            continue  # topic is mentioned near the start -- looks fine
+
+        found_at = None
+        for j in range(s, e + 1):
+            line = answer_lines[j] if 0 <= j < len(answer_lines) else ''
+            if any(a.lower() in line.lower() for a in anchors):
+                found_at = j
+                break
+
+        if found_at is None or found_at <= s:
+            continue  # anchor never appears, or appears right at the start -- nothing to fix
+
+        log(
+            f"BOUNDARY CORRECTION: '{p['question'][:50]}...' didn't mention its own "
+            f"distinctive term(s) {anchors} near its start (line {s}), but they first "
+            f"appear at line {found_at}. Reassigning lines {s}-{found_at - 1} back to the "
+            f"PREVIOUS answer ('{prev['question'][:50]}...'), since content-wise they don't "
+            f"belong to '{p['question'][:30]}...'."
+        )
+
+        prev['end_line'] = found_at - 1
+        p['start_line'] = found_at
+
+        for target in (prev, p):
+            s2, e2 = target['start_line'], target['end_line']
+            verbatim = [
+                answer_lines[j] for j in range(s2, e2 + 1)
+                if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
+            ]
+            raw = " ".join(verbatim).strip()
+            clean = strip_question_restatement(raw)
+            clean = strip_full_question_echo(clean, target['question'])
+            clean = _strip_trailing_question_echo_sentences(clean, questions)
+            target['answer_raw'] = raw
+            target['answer'] = clean
+            target['start_page'] = answer_line_pages[s2] if answer_line_pages and 0 <= s2 < len(answer_line_pages) else None
+            target['end_page'] = answer_line_pages[e2] if answer_line_pages and 0 <= e2 < len(answer_line_pages) else None
+
+
+# =========================================================
 # COMPLETE PIPELINE
 # =========================================================
 
@@ -2863,6 +2981,9 @@ def process_pdf(file_input, status_callback=None):
         answer_lines, official_questions, status_callback,
         answer_line_pages=answer_line_pages
     )
+
+    log("Running topic-anchor boundary sanity check...")
+    _correct_boundaries_using_topic_anchors(qa_pairs, answer_lines, answer_line_pages, log)
 
     matched_count = sum(1 for p in qa_pairs if p["matched"])
     log(f"Matched {matched_count} of {len(official_questions)} questions")
