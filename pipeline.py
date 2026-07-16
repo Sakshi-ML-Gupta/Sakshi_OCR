@@ -232,7 +232,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
 
     result = None
     for attempt in range(max_polls):
-        poll_resp = httpx.get(check_url, headers=headers, timeout=120)
+        poll_resp = httpx.get(check_url, headers=headers, timeout=60)
 
         if poll_resp.status_code != 200:
             raise Exception(f"Datalab poll error {poll_resp.status_code}: {poll_resp.text}")
@@ -608,6 +608,23 @@ def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_pag
     return candidates[0]
 
 
+# Fallback chain: if the PRIMARY free model is congested (repeated 429
+# rate-limit errors), automatically move on to the next model in this
+# list rather than failing the whole run. Each entry is hosted by a
+# different underlying provider/company, so a capacity crunch on one
+# (e.g. Venice hosting Llama 3.3) is unlikely to affect the others at
+# the same time. All are free (":free" suffix) as of July 2026 -- if
+# any of these get retired from OpenRouter's free tier in the future,
+# simply edit this list (check current options at
+# https://openrouter.ai/models?fmt=cards&order=top-weekly&max_price=0).
+LLM_MODEL_FALLBACKS = [
+    LLM_MODEL,
+    "openai/gpt-oss-120b:free",
+    "z-ai/glm-4.5-air:free",
+    "openrouter/free",  # OpenRouter's own auto-router across whatever free models are currently up
+]
+
+
 def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                               response_parser, budget: "_TokenBudgetTracker",
                               log, max_retries: int = 7):
@@ -616,97 +633,138 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
     estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
     last_error = None
 
-    skip_next_proactive_check = False
+    # Split total retry budget across the fallback chain so overall
+    # patience stays similar to before, but the caller isn't stuck
+    # hammering ONE congested model the whole time.
+    models_to_try = LLM_MODEL_FALLBACKS
+    retries_per_model = max(2, max_retries // len(models_to_try))
 
-    for attempt in range(1, max_retries + 2):
-        if skip_next_proactive_check:
-            skip_next_proactive_check = False
-        else:
-            budget.wait_if_needed(estimated_tokens, log=log)
+    for model_idx, model_name in enumerate(models_to_try):
+        is_last_model = model_idx == len(models_to_try) - 1
+        skip_next_proactive_check = False
+        model_rate_limited_out = False
 
-        try:
-            with _groq_call_lock:
-                response = client.chat.completions.create(
-                    model=LLM_MODEL,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.0,
-                    max_tokens=8000,
-                )
-            budget.record_usage(estimated_tokens)
-            content = response.choices[0].message.content
-            return response_parser(content)
+        for attempt in range(1, retries_per_model + 2):
+            if skip_next_proactive_check:
+                skip_next_proactive_check = False
+            else:
+                budget.wait_if_needed(estimated_tokens, log=log)
 
-        except openai.AuthenticationError as e:
-            raise Exception(
-                f"OpenRouter API rejected the API key (401 Invalid API Key). "
-                f"This will NOT be fixed by retrying. Things to check:\n"
-                f"  1. Is OPENROUTER_API_KEY actually set in your environment or "
-                f"st.secrets? (A missing key often falls back to None or "
-                f"an empty string, which OpenRouter also rejects as invalid.)\n"
-                f"  2. Does the key have any extra whitespace, quotes, or "
-                f"a line break copied in by accident?\n"
-                f"  3. Has the key been revoked or rotated in your OpenRouter "
-                f"dashboard (https://openrouter.ai/keys)?\n"
-                f"  4. If using st.secrets, did you restart the Streamlit "
-                f"app after adding/changing the secret? Streamlit does "
-                f"not always hot-reload secrets.toml changes.\n"
-                f"Original error: {e}"
-            ) from e
+            try:
+                with _groq_call_lock:
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        response_format={"type": "json_object"},
+                        temperature=0.0,
+                        max_tokens=8000,
+                    )
+                budget.record_usage(estimated_tokens)
+                content = response.choices[0].message.content
+                if model_idx > 0:
+                    log(f"  (recovered using fallback model {model_name!r} after {models_to_try[0]!r} was unavailable)")
+                return response_parser(content)
 
-        except (openai.RateLimitError, openai.BadRequestError) as e:
-            last_error = e
-            detail = _parse_rate_limit_detail(str(e))
-
-            if detail and detail["limit_type"] == "TPD":
+            except openai.AuthenticationError as e:
+                # A bad API key fails identically for every model --
+                # trying the rest of the fallback chain would just waste
+                # time, so raise immediately.
                 raise Exception(
-                    f"Daily token quota (TPD) exhausted: "
-                    f"{detail['used']}/{detail['limit']} tokens used today, "
-                    f"{detail['requested']} more requested. This will reset "
-                    f"in approximately {detail['wait_seconds']/60:.0f} minute(s). "
-                    f"Retrying within this run will not help -- either wait "
-                    f"for the daily reset, or add more credits / upgrade your "
-                    f"OpenRouter plan at https://openrouter.ai/settings/credits. "
-                    f"(If you're processing the same document more than once "
-                    f"per click/run, check for duplicate calls -- that doubles "
-                    f"daily token consumption and exhausts this quota twice "
-                    f"as fast.)"
+                    f"OpenRouter API rejected the API key (401 Invalid API Key). "
+                    f"This will NOT be fixed by retrying. Things to check:\n"
+                    f"  1. Is OPENROUTER_API_KEY actually set in your environment or "
+                    f"st.secrets? (A missing key often falls back to None or "
+                    f"an empty string, which OpenRouter also rejects as invalid.)\n"
+                    f"  2. Does the key have any extra whitespace, quotes, or "
+                    f"a line break copied in by accident?\n"
+                    f"  3. Has the key been revoked or rotated in your OpenRouter "
+                    f"dashboard (https://openrouter.ai/keys)?\n"
+                    f"  4. If using st.secrets, did you restart the Streamlit "
+                    f"app after adding/changing the secret? Streamlit does "
+                    f"not always hot-reload secrets.toml changes.\n"
+                    f"Original error: {e}"
                 ) from e
 
-            if detail:
-                if detail["used"] is not None and detail["limit"] is not None:
-                    budget.record_actual_from_error(detail["used"], detail["limit"])
-                usage_desc = (
-                    f"used={detail['used']}, requested={detail['requested']}"
-                    if detail["used"] is not None else "provider-side capacity limit"
-                )
-                log(
-                    f"Chunk LLM call hit a rate/size limit (attempt {attempt}): "
-                    f"{detail['limit_type']} limit={detail['limit']}, {usage_desc}. "
-                    f"Waiting {detail['wait_seconds'] + 0.5:.1f}s (provider-reported) "
-                    f"before retrying..."
-                )
-                time.sleep(detail["wait_seconds"] + 0.5)
-                budget.reset_window()
-                skip_next_proactive_check = True
-            else:
-                wait_s = 5.0 * attempt
-                log(
-                    f"Chunk LLM call hit a rate/size limit (attempt {attempt}): {e}. "
-                    f"Waiting {wait_s:.1f}s before retrying..."
-                )
-                time.sleep(wait_s)
+            except (openai.RateLimitError, openai.BadRequestError) as e:
+                last_error = e
+                detail = _parse_rate_limit_detail(str(e))
 
-        except Exception as e:
-            last_error = e
-            log(f"Chunk LLM call/parse attempt {attempt} failed: {e}")
-            time.sleep(1)
+                if detail and detail["limit_type"] == "TPD":
+                    raise Exception(
+                        f"Daily token quota (TPD) exhausted: "
+                        f"{detail['used']}/{detail['limit']} tokens used today, "
+                        f"{detail['requested']} more requested. This will reset "
+                        f"in approximately {detail['wait_seconds']/60:.0f} minute(s). "
+                        f"Retrying within this run will not help -- either wait "
+                        f"for the daily reset, or add more credits / upgrade your "
+                        f"OpenRouter plan at https://openrouter.ai/settings/credits. "
+                        f"(If you're processing the same document more than once "
+                        f"per click/run, check for duplicate calls -- that doubles "
+                        f"daily token consumption and exhausts this quota twice "
+                        f"as fast.)"
+                    ) from e
+
+                if detail:
+                    if detail["used"] is not None and detail["limit"] is not None:
+                        budget.record_actual_from_error(detail["used"], detail["limit"])
+                    usage_desc = (
+                        f"used={detail['used']}, requested={detail['requested']}"
+                        if detail["used"] is not None else "provider-side capacity limit"
+                    )
+
+                    if attempt > retries_per_model and not is_last_model:
+                        # Exhausted this model's share of retries -- move
+                        # to the next model in the fallback chain instead
+                        # of continuing to wait on a congested one.
+                        log(
+                            f"  {model_name!r} still rate-limited after {attempt} attempt(s) "
+                            f"({detail['limit_type']}, {usage_desc}) -- switching to the next "
+                            f"fallback model instead of waiting further..."
+                        )
+                        model_rate_limited_out = True
+                        break
+
+                    log(
+                        f"Chunk LLM call hit a rate/size limit on {model_name!r} "
+                        f"(attempt {attempt}): {detail['limit_type']} limit={detail['limit']}, "
+                        f"{usage_desc}. Waiting {detail['wait_seconds'] + 0.5:.1f}s "
+                        f"(provider-reported) before retrying..."
+                    )
+                    time.sleep(detail["wait_seconds"] + 0.5)
+                    budget.reset_window()
+                    skip_next_proactive_check = True
+                else:
+                    if attempt > retries_per_model and not is_last_model:
+                        log(
+                            f"  {model_name!r} still failing after {attempt} attempt(s) -- "
+                            f"switching to the next fallback model instead of retrying further..."
+                        )
+                        model_rate_limited_out = True
+                        break
+                    wait_s = 5.0 * attempt
+                    log(
+                        f"Chunk LLM call hit a rate/size limit on {model_name!r} "
+                        f"(attempt {attempt}): {e}. Waiting {wait_s:.1f}s before retrying..."
+                    )
+                    time.sleep(wait_s)
+
+            except Exception as e:
+                last_error = e
+                log(f"Chunk LLM call/parse attempt {attempt} on {model_name!r} failed: {e}")
+                time.sleep(1)
+
+        if not model_rate_limited_out and not is_last_model:
+            # This model exhausted its retries for a non-rate-limit
+            # reason (e.g. repeated parse failures) -- still worth
+            # trying the next model in the chain rather than giving up.
+            log(f"  {model_name!r} exhausted its retry budget -- trying the next fallback model...")
 
     raise Exception(
-        f"Chunk LLM call failed after {max_retries + 1} attempts. Last error: {last_error}"
+        f"Chunk LLM call failed after trying all {len(models_to_try)} model(s) in the "
+        f"fallback chain ({models_to_try}). Last error: {last_error}"
     )
 
 
