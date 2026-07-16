@@ -232,7 +232,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
 
     result = None
     for attempt in range(max_polls):
-        poll_resp = httpx.get(check_url, headers=headers, timeout=60)
+        poll_resp = httpx.get(check_url, headers=headers, timeout=120)
 
         if poll_resp.status_code != 200:
             raise Exception(f"Datalab poll error {poll_resp.status_code}: {poll_resp.text}")
