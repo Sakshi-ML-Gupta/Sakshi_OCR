@@ -481,21 +481,44 @@ _RATE_LIMIT_DETAIL_RE = re.compile(
     re.IGNORECASE | re.DOTALL
 )
 
+# OpenRouter's own 429 errors (e.g. a free model's upstream provider,
+# like Venice for llama-3.3-70b-instruct:free, being temporarily
+# congested) use a completely different message shape than Groq's --
+# there's no "Limit/Used/Requested" breakdown, just a
+# 'retry_after_seconds' field embedded in the error metadata. The Groq
+# regex above never matches this, which meant the advised wait time was
+# silently ignored and a shorter, less patient generic backoff was used
+# instead -- retrying too soon, again and again, against a limit that
+# hadn't cleared yet.
+_OPENROUTER_RETRY_AFTER_RE = re.compile(r"'retry_after_seconds':\s*([\d.]+)")
+
 
 def _parse_rate_limit_detail(message: str):
     m = _RATE_LIMIT_DETAIL_RE.search(message)
-    if not m:
-        return None
-    period, limit_type, limit, used, requested, minutes, seconds = m.groups()
-    wait_seconds = (int(minutes) * 60 if minutes else 0) + float(seconds)
-    return {
-        "limit_type": limit_type.upper(),
-        "period": period.lower(),
-        "limit": int(limit),
-        "used": int(used),
-        "requested": int(requested),
-        "wait_seconds": wait_seconds,
-    }
+    if m:
+        period, limit_type, limit, used, requested, minutes, seconds = m.groups()
+        wait_seconds = (int(minutes) * 60 if minutes else 0) + float(seconds)
+        return {
+            "limit_type": limit_type.upper(),
+            "period": period.lower(),
+            "limit": int(limit),
+            "used": int(used),
+            "requested": int(requested),
+            "wait_seconds": wait_seconds,
+        }
+
+    m2 = _OPENROUTER_RETRY_AFTER_RE.search(message)
+    if m2:
+        return {
+            "limit_type": "RPM",
+            "period": "minute",
+            "limit": None,
+            "used": None,
+            "requested": None,
+            "wait_seconds": float(m2.group(1)),
+        }
+
+    return None
 
 
 def _parse_qp_llm_response(content: str) -> tuple:
@@ -587,7 +610,7 @@ def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_pag
 
 def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                               response_parser, budget: "_TokenBudgetTracker",
-                              log, max_retries: int = 4):
+                              log, max_retries: int = 7):
     import openai
 
     estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
@@ -654,11 +677,15 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                 ) from e
 
             if detail:
-                budget.record_actual_from_error(detail["used"], detail["limit"])
+                if detail["used"] is not None and detail["limit"] is not None:
+                    budget.record_actual_from_error(detail["used"], detail["limit"])
+                usage_desc = (
+                    f"used={detail['used']}, requested={detail['requested']}"
+                    if detail["used"] is not None else "provider-side capacity limit"
+                )
                 log(
                     f"Chunk LLM call hit a rate/size limit (attempt {attempt}): "
-                    f"{detail['limit_type']} limit={detail['limit']}, "
-                    f"used={detail['used']}, requested={detail['requested']}. "
+                    f"{detail['limit_type']} limit={detail['limit']}, {usage_desc}. "
                     f"Waiting {detail['wait_seconds'] + 0.5:.1f}s (provider-reported) "
                     f"before retrying..."
                 )
