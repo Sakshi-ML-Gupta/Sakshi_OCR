@@ -1271,13 +1271,15 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
     pointer = search_from_idx
     windows_tried = 0
     
-    # FIX 1: Track the last line we've actually covered, not just pointer
+    # Track the last line we've actually covered
     last_covered_line = search_from_idx - 1
 
     while pointer < total_lines and windows_tried < max_windows:
         window = []
         chars = 0
         idx = pointer
+        
+        # Build window with generous character budget
         while idx < total_lines and (not window or chars + len(numbered_lines[idx][1]) <= window_chars):
             window.append(numbered_lines[idx])
             chars += len(numbered_lines[idx][1])
@@ -1286,10 +1288,10 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
         if not window:
             break
 
-        # FIX 2: Add context from BEFORE pointer, not just lookback
+        # Add context from BEFORE pointer
         context_before = numbered_lines[max(0, pointer - context_lookback):pointer] if pointer > 0 else None
 
-        # Patch 4 hint hook -- bare-label candidates
+        # Bare-label candidates hint
         label_hint = None
         candidates = _find_bare_label_candidates(window, question_text)
         if candidates:
@@ -1323,20 +1325,28 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                 f"treating this window as a non-match"
             )
 
-        # FIX 3: Track the last line we've actually covered
+        # Track the last line we've covered
         last_covered_line = max(last_covered_line, window[-1][0])
 
         if idx >= total_lines:
             break
 
-        # FIX 4: Move pointer with overlap, but ensure we don't skip lines
-        # The overlap should be at least 5 lines to catch boundary-straddling starts
-        overlap = min(SEQUENTIAL_SEARCH_OVERLAP_LINES, len(window) // 3)
-        pointer = max(pointer + 1, idx - overlap)
+        # CRITICAL FIX: Move pointer forward by at least 1 line, but with overlap
+        # to catch boundary-straddling starts
+        overlap = min(SEQUENTIAL_SEARCH_OVERLAP_LINES, max(1, len(window) // 4))
+        pointer = idx - overlap
+        
+        # Ensure we actually make progress
+        if pointer <= last_covered_line - overlap:
+            pointer = last_covered_line + 1
+        
         windows_tried += 1
+        
+        # Safety: if we're not making progress, force forward
+        if pointer <= search_from_idx and windows_tried > 2:
+            pointer = last_covered_line + 1
 
     return None
-
 
 # =========================================================
 # SUB-PART LABEL AWARENESS
@@ -1772,30 +1782,118 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
     found_starts = {}
     pointer = 0
-    
-    # FIX 5: Track the last question that was successfully found
-    last_found_ref = None
-    last_found_line = -1
+    last_successful_pointer = -1
 
     i = 0
     n = len(questions)
 
     while i < n:
         if i in sibling_groups:
-            # ... sibling group handling code remains the same ...
-            pass
+            # ... sibling group handling code remains the same (but fix pointer advancement there too) ...
+            group_indices = sibling_groups[i]
+            group_refs = [f"REF-{chr(65 + j)}" for j in group_indices]
+            group_questions = [(f"REF-{chr(65 + j)}", questions[j]) for j in group_indices]
+            log(f"Detected sibling sub-part group {group_refs} -- resolving as a bounded batch...")
+
+            first_ref, first_q = group_questions[0]
+            group_search_from = pointer
+            group_start = _find_answer_start_sequential(client, numbered_lines, first_q, first_ref, pointer, budget, log)
+
+            attempt = 1
+            while group_start is None and attempt <= 2:
+                reminder = (
+                    "REMINDER: a previous search pass did not find this answer. The same "
+                    "definition/explanation can legitimately repeat across the document -- "
+                    "that does not disqualify a genuine match. Also check for a short "
+                    "introductory line at the true start."
+                )
+                group_start = _find_answer_start_sequential(
+                    client, numbered_lines, first_q, first_ref, pointer, budget, log,
+                    extra_reminder=reminder
+                )
+                attempt += 1
+
+            if group_start is None:
+                log(f"WARNING: could not find the start of sibling group {group_refs} at all -- marking all as unmatched.")
+                # CRITICAL FIX: Advance pointer even when group not found
+                pointer = min(pointer + 50, total_lines - 1)  # Skip ahead to avoid infinite loop
+                i = group_indices[-1] + 1
+                continue
+
+            group_start = _verify_earliest_start(
+                client, numbered_lines, first_q, first_ref, group_search_from, group_start, budget, log
+            )
+            if i > 0:
+                group_start = _confirm_boundary(
+                    client, numbered_lines, questions[i - 1], first_q, group_start, budget, log
+                )
+
+            found_starts[first_ref] = group_start
+            log(f"  found {first_ref} (group start) at line {group_start}")
+
+            # Find where the group as a WHOLE ends
+            next_index = group_indices[-1] + 1
+            group_end_bound = None
+            if next_index < n:
+                next_ref = f"REF-{chr(65 + next_index)}"
+                next_q = questions[next_index]
+                group_end_bound = _find_answer_start_sequential(
+                    client, numbered_lines, next_q, next_ref, group_start + 1, budget, log
+                )
+                if group_end_bound is not None:
+                    group_end_bound = _verify_earliest_start(
+                        client, numbered_lines, next_q, next_ref, group_start + 1, group_end_bound, budget, log
+                    )
+                    group_end_bound = _confirm_boundary(
+                        client, numbered_lines, first_q, next_q, group_end_bound, budget, log
+                    )
+
+            upper = (group_end_bound - 1) if group_end_bound is not None else (total_lines - 1)
+
+            # Narrow, bounded batch call
+            if len(group_questions) > 1:
+                sibling_starts = _resolve_sibling_group_batch(
+                    client, numbered_lines, group_questions, group_start, upper, budget, log
+                )
+                for ref, sl in sibling_starts.items():
+                    found_starts[ref] = sl
+                    log(f"  found {ref} (sibling) at line {sl}")
+
+            unresolved = [ref for ref in group_refs[1:] if ref not in found_starts]
+            if unresolved:
+                log(
+                    f"NOTE: sibling(s) {unresolved} were not confidently separated within "
+                    f"the group's bounded region (lines {group_start}-{upper}) -- their content "
+                    f"stays folded into the preceding sibling's answer rather than risking a "
+                    f"wrong split."
+                )
+
+            # CRITICAL FIX: Always advance pointer past the group
+            if group_end_bound is not None:
+                pointer = group_end_bound + 1
+            else:
+                pointer = upper + 1
+            
+            i = next_index if next_index < n else n
+            continue
 
         # ---- Standalone question: strict single-target search ----
         ref = f"REF-{chr(65 + i)}"
         q = questions[i]
 
         if ref in found_starts:
-            # FIX 6: Advance pointer beyond this found start
             pointer = found_starts[ref] + 1
             i += 1
             continue
 
         log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
+        
+        # CRITICAL FIX: If pointer is stuck (not advancing), force it forward
+        if pointer == last_successful_pointer and pointer > 0:
+            log(f"  WARNING: pointer is stuck at {pointer}, forcing advance by 10 lines")
+            pointer = min(pointer + 10, total_lines - 1)
+        last_successful_pointer = pointer
+        
         sub_part_hint = _build_sub_part_hint(questions, i)
         search_from_idx = pointer
 
@@ -1804,7 +1902,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             extra_reminder=sub_part_hint
         )
 
-        # Retry logic with reminders
         attempt = 1
         while start_line is None and attempt <= 2:
             log(f"  pass {attempt} found nothing for {ref} -- retrying with a stronger reminder...")
@@ -1846,28 +1943,21 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             
             found_starts[ref] = start_line
             log(f"  found {ref} starting at line {start_line}")
-            
-            # FIX 7: Always advance pointer past the found line, but ensure we don't skip over content
             pointer = start_line + 1
-            last_found_ref = ref
-            last_found_line = start_line
         else:
             log(
                 f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
-                f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
-                f"The search pointer is NOT advanced, so the next question is still searched "
-                f"for over this same remaining text."
+                f"to the end of the document ({total_lines} lines) -- marking as unmatched."
             )
-            # FIX 8: If we can't find this question, still advance pointer slightly to avoid infinite loop
-            # but only if we've made progress
-            if pointer < total_lines - 1:
-                pointer += 1
+            # CRITICAL FIX: Advance pointer by a significant amount to avoid infinite loop
+            # We skip at least 20 lines or 10% of remaining, whichever is larger
+            skip_amount = max(20, int((total_lines - pointer) * 0.1))
+            pointer = min(pointer + skip_amount, total_lines - 1)
+            log(f"  Advancing pointer by {skip_amount} lines to {pointer}")
 
         i += 1
 
-    # The rest of the function remains the same...
-
-    # End of each answer = the next (in document order) confirmed
+    # ... rest of the function remains the same ...    # End of each answer = the next (in document order) confirmed
     # answer's start, minus one. Computed purely in Python -- never
     # asked of the LLM, so it can never be wrong in the way an
     # LLM-guessed end line could be.
