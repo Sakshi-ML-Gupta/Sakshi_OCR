@@ -1,206 +1,170 @@
 """
-Streamlit front-end for pipeline.py
+Streamlit app for OCR'ing mixed printed/handwritten assignment PDFs
+and extracting clean Question -> Answer pairs.
 
-KEY DESIGN CHOICES (these directly fix the bugs from the previous crash):
+Run with:
+    streamlit run app.py
 
-1. NO background threads for process_pdf(). It's called synchronously,
-   inside the same script-run that the button click triggers. Streamlit's
-   ScriptRunner already gives each run its own thread; spawning ANOTHER
-   thread for a long network job is what caused the previous
-   "RuntimeError: Event loop is closed" crash -- when the user re-ran the
-   the script (e.g. by touching a widget) while the OCR polling was still
-   running in a leftover thread, that old thread eventually tried to talk
-   to a Streamlit event loop that had already been torn down.
+Requires these files in the SAME folder:
+    - pipeline_llm_v4.py          (the OCR + LLM pipeline module)
+    - tuple_error_diagnostic.py   (diagnostic instrumentation)
 
-2. A file-hash + session_state guard prevents the SAME uploaded file from
-   being submitted to Datalab more than once across reruns. This is what
-   caused "Submitting document... (9.4MB)" to print three times for one
-   click -- Streamlit re-executes the whole script on every rerun, and
-   without a guard, process_pdf() was being called again each time.
-
-3. The "Process" button is disabled (via session_state) while a job is
-   already in flight for the current file, so a double-click / accidental
-   re-click cannot fire a second, overlapping run.
+Required environment variables / st.secrets entries:
+    - DATALAB_API_KEY
+    - GROQ_API_KEY
 """
 
-import hashlib
-import json
-import traceback
+# THIS MUST BE THE VERY FIRST IMPORT -- before streamlit, before
+# anything else. It installs diagnostic instrumentation that will
+# print the exact file/line responsible if the
+# "expected str, bytes or os.PathLike object, not tuple" error ever
+# occurs anywhere in this process, instead of it surfacing as an
+# unexplained crash deep inside Streamlit's own error handling.
+import tuple_error_diagnostic  # noqa: F401  (imported for its side effect)
 
 import streamlit as st
-
-import pipeline
-
-
-st.set_page_config(page_title="Answer Booklet OCR + Mapper", layout="wide")
-st.title("Answer Booklet OCR + Question Mapper")
+from pipeline import process_pdf
 
 
-# ---------------------------------------------------------------------
-# Session state defaults
-# ---------------------------------------------------------------------
-if "file_hash" not in st.session_state:
-    st.session_state.file_hash = None          # hash of the last-processed file
+st.set_page_config(page_title="Assignment OCR + Q&A Extractor", layout="wide")
+st.title("Assignment OCR + Question/Answer Extractor")
+st.caption(
+    "Upload a scanned assignment PDF (mixed printed questions + "
+    "handwritten answers). The pipeline OCRs the document, identifies "
+    "the real exam questions, and matches them to the student's answers."
+)
+
+# =========================================================
+# SESSION STATE -- THE RERUN GUARD
+#
+# Streamlit reruns the ENTIRE script top-to-bottom on almost any
+# interaction (button click, widget change, even a websocket
+# reconnect in some environments). Without this guard, a rerun that
+# happens WHILE process_pdf() is still running (it can take minutes:
+# OCR + several paced LLM calls) would start a SECOND, fully
+# independent run -- both competing for the same shared Groq token
+# budget at once. This is the exact cause of the doubled log lines
+# seen in earlier debugging sessions ("Asking LLM to analyze chunk
+# 2/8" printed twice back-to-back) and the reason the daily token
+# quota got burned twice as fast as it should have.
+#
+# st.session_state persists across reruns WITHIN one user's session,
+# so this flag correctly blocks a second run from starting no matter
+# what triggers the rerun -- not just a second click of the button.
+# =========================================================
+
+if "is_processing" not in st.session_state:
+    st.session_state.is_processing = False
 if "result" not in st.session_state:
-    st.session_state.result = None             # (ocr_json, qa_pairs) once done
-if "processing" not in st.session_state:
-    st.session_state.processing = False        # true while a job is in flight
+    st.session_state.result = None
 if "error" not in st.session_state:
     st.session_state.error = None
-if "logs" not in st.session_state:
-    st.session_state.logs = []
+if "pending_file_bytes" not in st.session_state:
+    st.session_state.pending_file_bytes = None
+if "pending_file_name" not in st.session_state:
+    st.session_state.pending_file_name = None
 
 
-def _hash_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+# =========================================================
+# FILE UPLOAD
+# =========================================================
 
+uploaded_file = st.file_uploader(
+    "Upload assignment PDF",
+    type=["pdf"],
+    disabled=st.session_state.is_processing,
+)
 
-def _reset_for_new_file():
+process_clicked = st.button(
+    "Process document",
+    disabled=st.session_state.is_processing or uploaded_file is None,
+)
+
+# Step 1: button click -- capture the file's bytes NOW (while we still
+# have direct access to the upload widget's value) and set the
+# processing flag, then rerun immediately so the disabled button state
+# renders before the long-running call starts.
+if process_clicked and not st.session_state.is_processing:
+    st.session_state.pending_file_bytes = uploaded_file.getvalue()
+    st.session_state.pending_file_name = uploaded_file.name
+    st.session_state.is_processing = True
     st.session_state.result = None
     st.session_state.error = None
-    st.session_state.logs = []
-    st.session_state.processing = False
+    st.rerun()
 
+# Step 2: the ACTUAL long-running call, gated purely on the
+# is_processing flag (not on the button's one-shot click state) --
+# this is what makes the guard effective against ANY rerun trigger,
+# not just the button itself.
+if (
+    st.session_state.is_processing
+    and st.session_state.result is None
+    and st.session_state.error is None
+):
+    status_box = st.empty()
+    log_lines = []
 
-# ---------------------------------------------------------------------
-# Upload
-# ---------------------------------------------------------------------
-uploaded_file = st.file_uploader(
-    "Upload the scanned answer booklet (PDF)",
-    type=["pdf"],
-    key="uploader",
-)
+    def status_callback(msg):
+        log_lines.append(msg)
+        # Show the last several lines so the box doesn't grow unbounded
+        status_box.text("\n".join(log_lines[-12:]))
 
-reference_file = st.file_uploader(
-    "Optional: reference book / marking scheme (PDF)",
-    type=["pdf"],
-    key="reference_uploader",
-)
+    try:
+        file_bytes = st.session_state.pending_file_bytes
+        file_name = st.session_state.pending_file_name
 
-if uploaded_file is not None:
-    current_hash = _hash_bytes(uploaded_file.getvalue())
-
-    # A genuinely NEW file was uploaded -- clear any old result/job state
-    # for the previous file so we don't accidentally show stale results
-    # or think a job is still running for a file that's no longer selected.
-    if st.session_state.file_hash != current_hash:
-        st.session_state.file_hash = current_hash
-        _reset_for_new_file()
-
-    already_done = st.session_state.result is not None
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        process_clicked = st.button(
-            "Process document",
-            disabled=st.session_state.processing or already_done,
+        # process_pdf accepts (filename, bytes) tuples directly --
+        # this matches pipeline_llm_v4.py's documented input shapes
+        # exactly, so no manual file-handle juggling is needed here.
+        ocr_json, qa_pairs = process_pdf(
+            (file_name, file_bytes),
+            status_callback=status_callback,
         )
-    with col2:
-        if st.session_state.processing:
-            st.info("A job is already running for this file -- please wait for it to finish.")
-        elif already_done:
-            st.success("This file has already been processed below. Upload a different file to run again.")
+        st.session_state.result = (ocr_json, qa_pairs)
 
-    # ---------------------------------------------------------------
-    # Run the pipeline SYNCHRONOUSLY (no thread) exactly once per file.
-    # ---------------------------------------------------------------
-    if process_clicked and not st.session_state.processing and not already_done:
-        st.session_state.processing = True
-        st.session_state.error = None
-        st.session_state.logs = []
+    except Exception as e:
+        import traceback
+        st.session_state.error = f"{e}\n\n```\n{traceback.format_exc()}\n```"
 
-        log_box = st.status("Processing document...", expanded=True)
-
-        def _status_callback(msg: str):
-            st.session_state.logs.append(msg)
-            log_box.write(msg)
-
-        try:
-            file_bytes = uploaded_file.getvalue()
-            file_name = uploaded_file.name
-
-            ocr_json, qa_pairs = pipeline.process_pdf(
-                (file_name, file_bytes),
-                status_callback=_status_callback,
-            )
-            st.session_state.result = (ocr_json, qa_pairs)
-            log_box.update(label="Processing complete", state="complete", expanded=False)
-
-        except Exception as e:
-            st.session_state.error = f"{e}\n\n{traceback.format_exc()}"
-            log_box.update(label="Processing failed", state="error", expanded=True)
-
-        finally:
-            st.session_state.processing = False
-            # Trigger a clean rerun now that state is settled, so the
-            # button/result UI above reflects the final state immediately.
-            st.rerun()
-
-    # ---------------------------------------------------------------
-    # Reference book (independent of the main pipeline; also synchronous)
-    # ---------------------------------------------------------------
-    if reference_file is not None:
-        ref_hash_key = f"ref_hash_{_hash_bytes(reference_file.getvalue())}"
-        if ref_hash_key not in st.session_state:
-            if st.button("Process reference book"):
-                try:
-                    with st.spinner("Running OCR on reference book..."):
-                        ref_json = pipeline.process_reference(
-                            (reference_file.name, reference_file.getvalue()),
-                            status_callback=st.write,
-                        )
-                    st.session_state[ref_hash_key] = ref_json
-                    st.success(f"Reference OCR complete -- {ref_json['total_pages']} page(s)")
-                except Exception as e:
-                    st.error(f"Reference OCR failed: {e}")
-        else:
-            st.success("Reference book already processed.")
+    finally:
+        st.session_state.is_processing = False
+        st.session_state.pending_file_bytes = None
+        st.session_state.pending_file_name = None
+        st.rerun()  # final rerun: show results/error, re-enable controls
 
 
-# ---------------------------------------------------------------------
-# Error display
-# ---------------------------------------------------------------------
+# =========================================================
+# RESULTS / ERROR DISPLAY
+# =========================================================
+
 if st.session_state.error:
-    st.error("Processing failed. See details below.")
-    with st.expander("Error details"):
-        st.code(st.session_state.error)
+    st.error(st.session_state.error)
+    if st.button("Dismiss"):
+        st.session_state.error = None
+        st.rerun()
 
-
-# ---------------------------------------------------------------------
-# Results display
-# ---------------------------------------------------------------------
 if st.session_state.result:
     ocr_json, qa_pairs = st.session_state.result
 
-    matched = sum(1 for p in qa_pairs if p["matched"])
-    st.subheader(f"Results -- {matched} / {len(qa_pairs)} questions matched")
+    st.success(f"Done — {len(qa_pairs)} Q&A pair(s) extracted "
+               f"from {ocr_json['total_pages']} page(s).")
 
-    for p in qa_pairs:
-        with st.expander(f"{p['ref']}: {p['question'][:90]}", expanded=not p["matched"]):
-            if p["matched"]:
-                st.markdown(f"**Lines:** {p['start_line']}–{p['end_line']}  "
-                            f"**Pages:** {p.get('start_page')}–{p.get('end_page')}")
-                st.write(p["answer"])
-            else:
-                st.warning("No answer text was matched for this question.")
+    for i, qa in enumerate(qa_pairs, start=1):
+        with st.expander(f"Q{i}: {qa['question'][:90]}"):
+            st.markdown("**Question:**")
+            st.write(qa["question"])
+            st.markdown("**Answer:**")
+            st.write(qa["answer"] if qa["answer"] else "_(no answer text matched)_")
 
-    st.divider()
-    st.subheader("Downloads")
+    import json
+    result_json = json.dumps(qa_pairs, ensure_ascii=False, indent=2)
+    st.download_button(
+        "Download Q&A pairs as JSON",
+        data=result_json,
+        file_name="qa_pairs.json",
+        mime="application/json",
+    )
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.download_button(
-            "Download OCR JSON",
-            data=json.dumps(ocr_json, ensure_ascii=False, indent=2),
-            file_name="document_ocr.json",
-            mime="application/json",
-        )
-    with col_b:
-        st.download_button(
-            "Download Q&A JSON",
-            data=json.dumps(qa_pairs, ensure_ascii=False, indent=2),
-            file_name="document_qa_pairs.json",
-            mime="application/json",
-        )
-
-    with st.expander("Full processing log"):
-        st.code("\n".join(st.session_state.logs))
+    if st.button("Process another file"):
+        st.session_state.result = None
+        st.rerun()
