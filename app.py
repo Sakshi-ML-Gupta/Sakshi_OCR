@@ -168,3 +168,10 @@ if st.session_state.result:
     if st.button("Process another file"):
         st.session_state.result = None
         st.rerun()
+
+if "processed" not in st.session_state:
+    st.session_state.processed = False
+
+if st.button("Process") and not st.session_state.processed:
+    st.session_state.processed = True
+    ocr_json, qa_pairs = process_pdf(uploaded_file, status_callback=st.write)
