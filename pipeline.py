@@ -1270,16 +1270,11 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
     total_lines = len(numbered_lines) if end_idx is None else min(len(numbered_lines), end_idx)
     pointer = search_from_idx
     windows_tried = 0
-    
-    # Track the last line we've actually covered
-    last_covered_line = search_from_idx - 1
 
     while pointer < total_lines and windows_tried < max_windows:
         window = []
         chars = 0
         idx = pointer
-        
-        # Build window with generous character budget
         while idx < total_lines and (not window or chars + len(numbered_lines[idx][1]) <= window_chars):
             window.append(numbered_lines[idx])
             chars += len(numbered_lines[idx][1])
@@ -1288,10 +1283,9 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
         if not window:
             break
 
-        # Add context from BEFORE pointer
         context_before = numbered_lines[max(0, pointer - context_lookback):pointer] if pointer > 0 else None
 
-        # Bare-label candidates hint
+        # Patch 4 hint hook -- bare-label candidates (see Patch 4 below)
         label_hint = None
         candidates = _find_bare_label_candidates(window, question_text)
         if candidates:
@@ -1325,28 +1319,14 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                 f"treating this window as a non-match"
             )
 
-        # Track the last line we've covered
-        last_covered_line = max(last_covered_line, window[-1][0])
-
         if idx >= total_lines:
             break
 
-        # CRITICAL FIX: Move pointer forward by at least 1 line, but with overlap
-        # to catch boundary-straddling starts
-        overlap = min(SEQUENTIAL_SEARCH_OVERLAP_LINES, max(1, len(window) // 4))
-        pointer = idx - overlap
-        
-        # Ensure we actually make progress
-        if pointer <= last_covered_line - overlap:
-            pointer = last_covered_line + 1
-        
+        pointer = max(pointer + 1, idx - SEQUENTIAL_SEARCH_OVERLAP_LINES)
         windows_tried += 1
-        
-        # Safety: if we're not making progress, force forward
-        if pointer <= search_from_idx and windows_tried > 2:
-            pointer = last_covered_line + 1
 
     return None
+
 
 # =========================================================
 # SUB-PART LABEL AWARENESS
@@ -1757,8 +1737,105 @@ def _rescue_unmatched_questions(client, numbered_lines: list, questions: list, r
     return ranges
 
 
+def _ref_to_question_index(ref: str) -> int:
+    return int(ord(ref.split("-")[-1]) - ord("A"))
+
+
+def _reanalyze_and_repair_boundaries(client, numbered_lines: list, questions: list, ranges: list,
+                                       budget: "_TokenBudgetTracker", log, max_passes: int = 3) -> list:
+    """
+    See call site in map_answers_sequential for the full rationale. This
+    is the "reanalyze the final mapping and fix a wrong/skipped answer
+    right where it is, without restarting the whole document" pass --
+    it reuses the existing, already-tested _confirm_boundary Groq call
+    (question-vs-question, tight local window) rather than inventing a
+    brand-new prompt, and only ever touches the ONE boundary it's
+    currently checking. If a boundary is judged wrong, the fix is
+    applied immediately: the earlier range's end_line and the later
+    range's start_line are both updated to the corrected split point --
+    nothing is deleted, nothing else in the document is re-searched.
+    """
+    if len(ranges) < 2:
+        return ranges
+
+    for pass_num in range(1, max_passes + 1):
+        changed_this_pass = False
+        ordered = sorted(ranges, key=lambda r: r["start_line"])
+
+        for pos in range(1, len(ordered)):
+            prev_r = ordered[pos - 1]
+            curr_r = ordered[pos]
+
+            prev_q_idx = _ref_to_question_index(prev_r["ref"])
+            curr_q_idx = _ref_to_question_index(curr_r["ref"])
+
+            proposed = curr_r["start_line"]
+            corrected = _confirm_boundary(
+                client, numbered_lines, questions[prev_q_idx], questions[curr_q_idx],
+                proposed, budget, log, radius=20
+            )
+
+            # Only accept a correction that stays strictly between the
+            # previous range's own start and this range's own end --
+            # i.e. it can only move the split point, never let one
+            # range swallow a THIRD range's content or go negative.
+            if (corrected != proposed
+                    and prev_r["start_line"] < corrected <= curr_r["end_line"]):
+                log(
+                    f"  REANALYZE (pass {pass_num}): boundary between {prev_r['ref']} and "
+                    f"{curr_r['ref']} corrected -- start moved {proposed} -> {corrected}"
+                )
+                prev_r["end_line"] = corrected - 1
+                curr_r["start_line"] = corrected
+                changed_this_pass = True
+
+        if not changed_this_pass:
+            break
+
+    return ranges
+
+
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
+    """
+    RECOMMENDED default answer-mapping strategy (see module docstring
+    above the SEQUENTIAL_SEARCH_SYSTEM_PROMPT for the full rationale).
+
+    For each question in order:
+      1. Search forward from wherever the previous question's answer was
+         confirmed to start, for a line where THIS question's answer
+         begins.
+      2. Once found, the previous question's END is computed as
+         (this start - 1) -- never asked of the LLM.
+    The very last question's answer runs to the end of the document.
+
+    If a question's start can't be found anywhere from the search
+    pointer to the end of the document, it's recorded as unmatched, and
+    the search for the NEXT question continues from the SAME pointer
+    (its answer wasn't necessarily lost -- it may simply not exist, e.g.
+    the student skipped it).
+
+    FIX (this round): previously returned only a plain {question: text}
+    dict, giving you no way to see WHERE each answer actually came from
+    -- which is exactly the trust problem you flagged ("I don't know
+    from where the Q-A is paired"). This now returns a LIST of dicts,
+    one per question, each carrying:
+      - start_line / end_line: the exact 0-based indices into
+        answer_lines this answer was sliced from (so you can look them
+        up directly)
+      - start_page / end_page: the OCR page number(s) the answer spans,
+        if answer_line_pages was provided (lets you flip straight to the
+        right page(s) of the source PDF to eyeball it)
+      - answer_raw: the UNMODIFIED verbatim join of the sliced lines --
+        exactly what the OCR produced, before any cleanup
+      - answer: the same text after the (optional) restatement-stripping
+        cleanup -- so you can directly compare "raw" vs "cleaned" and
+        see precisely what, if anything, was removed and why. Nothing
+        is ever ADDED to answer_raw at this stage -- it is a plain
+        Python slice of the OCR text, never LLM-generated -- so if
+        answer_raw itself looks embellished/"enhanced", that happened
+        upstream in the OCR step (see notes in run_ocr), not here.
+    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -1777,19 +1854,16 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     total_lines = len(numbered_lines)
 
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
-    sibling_groups = _detect_sibling_groups(questions)
+    sibling_groups = _detect_sibling_groups(questions)  # {first_idx: [indices]}
     group_member_of = {idx: first_idx for first_idx, members in sibling_groups.items() for idx in members}
 
     found_starts = {}
     pointer = 0
-    last_successful_pointer = -1
-
     i = 0
     n = len(questions)
 
     while i < n:
         if i in sibling_groups:
-            # ... sibling group handling code remains the same (but fix pointer advancement there too) ...
             group_indices = sibling_groups[i]
             group_refs = [f"REF-{chr(65 + j)}" for j in group_indices]
             group_questions = [(f"REF-{chr(65 + j)}", questions[j]) for j in group_indices]
@@ -1815,11 +1889,20 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
             if group_start is None:
                 log(f"WARNING: could not find the start of sibling group {group_refs} at all -- marking all as unmatched.")
-                # CRITICAL FIX: Advance pointer even when group not found
-                pointer = min(pointer + 50, total_lines - 1)  # Skip ahead to avoid infinite loop
                 i = group_indices[-1] + 1
                 continue
 
+            # Patch: the group's own start needs exactly the same two
+            # boundary safeguards as a standalone question --
+            # (a) deep backward-check for a missed intro line/page, and
+            # (b) bidirectional local confirm against the PREVIOUS
+            # question, to catch a too-early false match that would
+            # truncate the previous answer. This block was previously
+            # mis-pasted using undefined variables (start_line/q/ref/
+            # search_from_idx) inside this branch, which would raise a
+            # NameError the first time a document with sibling sub-parts
+            # hit this path -- fixed here to use the correct group_*
+            # variables and to actually run.
             group_start = _verify_earliest_start(
                 client, numbered_lines, first_q, first_ref, group_search_from, group_start, budget, log
             )
@@ -1831,7 +1914,9 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             found_starts[first_ref] = group_start
             log(f"  found {first_ref} (group start) at line {group_start}")
 
-            # Find where the group as a WHOLE ends
+            # Find where the group as a WHOLE ends: the next, non-sibling
+            # question's start (single-target search, same precision as
+            # the default path).
             next_index = group_indices[-1] + 1
             group_end_bound = None
             if next_index < n:
@@ -1850,7 +1935,8 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
             upper = (group_end_bound - 1) if group_end_bound is not None else (total_lines - 1)
 
-            # Narrow, bounded batch call
+            # Narrow, bounded batch call -- ONLY this group's own siblings,
+            # ONLY within [group_start, upper].
             if len(group_questions) > 1:
                 sibling_starts = _resolve_sibling_group_batch(
                     client, numbered_lines, group_questions, group_start, upper, budget, log
@@ -1868,13 +1954,15 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                     f"wrong split."
                 )
 
-            # CRITICAL FIX: Always advance pointer past the group
-            if group_end_bound is not None:
+            if next_index < n and group_end_bound is not None:
+                found_starts[f"REF-{chr(65 + next_index)}"] = group_end_bound
+                log(f"  found REF-{chr(65 + next_index)} at line {group_end_bound}")
                 pointer = group_end_bound + 1
+                i = next_index + 1
             else:
-                pointer = upper + 1
-            
-            i = next_index if next_index < n else n
+                pointer = total_lines
+                i = next_index
+
             continue
 
         # ---- Standalone question: strict single-target search ----
@@ -1887,13 +1975,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             continue
 
         log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
-        
-        # CRITICAL FIX: If pointer is stuck (not advancing), force it forward
-        if pointer == last_successful_pointer and pointer > 0:
-            log(f"  WARNING: pointer is stuck at {pointer}, forcing advance by 10 lines")
-            pointer = min(pointer + 10, total_lines - 1)
-        last_successful_pointer = pointer
-        
         sub_part_hint = _build_sub_part_hint(questions, i)
         search_from_idx = pointer
 
@@ -1933,31 +2014,39 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             attempt += 1
 
         if start_line is not None:
+            # (a) deep backward-check: never miss an earlier genuine start
+            # (fixes "1 line/page skipped at the START of an answer").
             start_line = _verify_earliest_start(
                 client, numbered_lines, q, ref, search_from_idx, start_line, budget, log
             )
+            # (b) bidirectional local confirm against the PREVIOUS
+            # question: catches a boundary set TOO EARLY (which silently
+            # truncates the previous answer's last page/lines and lets
+            # this answer swallow content that belongs to the previous
+            # one) as well as a boundary that's still slightly too LATE
+            # after (a). This is the fix for both "next Q's page ended up
+            # inside the previous answer" and "an answer's last page got
+            # cut off".
             if i > 0:
                 start_line = _confirm_boundary(
                     client, numbered_lines, questions[i - 1], q, start_line, budget, log
                 )
-            
+
+        if start_line is not None:
             found_starts[ref] = start_line
             log(f"  found {ref} starting at line {start_line}")
             pointer = start_line + 1
         else:
             log(
                 f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
-                f"to the end of the document ({total_lines} lines) -- marking as unmatched."
+                f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
+                f"The search pointer is NOT advanced, so the next question is still searched "
+                f"for over this same remaining text."
             )
-            # CRITICAL FIX: Advance pointer by a significant amount to avoid infinite loop
-            # We skip at least 20 lines or 10% of remaining, whichever is larger
-            skip_amount = max(20, int((total_lines - pointer) * 0.1))
-            pointer = min(pointer + skip_amount, total_lines - 1)
-            log(f"  Advancing pointer by {skip_amount} lines to {pointer}")
 
         i += 1
 
-    # ... rest of the function remains the same ...    # End of each answer = the next (in document order) confirmed
+    # End of each answer = the next (in document order) confirmed
     # answer's start, minus one. Computed purely in Python -- never
     # asked of the LLM, so it can never be wrong in the way an
     # LLM-guessed end line could be.
@@ -1982,6 +2071,22 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     # across where the missing one should be, and splits that range if
     # found.
     ranges = _rescue_unmatched_questions(client, numbered_lines, questions, ranges, budget, log)
+
+    # FINAL REANALYSIS / REPAIR PASS: everything above is built
+    # incrementally as the sequential walk progresses, so a mistake made
+    # early (or a question recovered later by the rescue pass) never
+    # gets re-checked against its FINAL neighbors once the whole
+    # document's mapping is settled. This pass re-examines every
+    # adjacent pair of matched ranges ONE MORE TIME, using the same
+    # _confirm_boundary check (question text vs question text, tight
+    # local window) -- if a boundary looks wrong (too early -> missing
+    # starting lines folded into the previous answer; too late -> stray
+    # content from the previous answer glued onto the front of this
+    # one), it is corrected IN PLACE for just that one boundary, without
+    # re-running the search for the rest of the document. Runs a few
+    # passes since fixing one boundary can occasionally reveal that its
+    # neighbor also needs adjusting.
+    ranges = _reanalyze_and_repair_boundaries(client, numbered_lines, questions, ranges, budget, log)
 
     ranges_by_ref = {r["ref"]: r for r in ranges}
     results = []
