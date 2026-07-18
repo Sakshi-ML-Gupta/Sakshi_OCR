@@ -1789,6 +1789,100 @@ def _reanalyze_and_repair_boundaries(client, numbered_lines: list, questions: li
     return ranges
 
 
+def _remap_incomplete_answers(client, numbered_lines: list, questions: list, ranges: list,
+                                budget: "_TokenBudgetTracker", log, max_passes: int = 2) -> list:
+    """
+    Runs AFTER _rescue_unmatched_questions and _reanalyze_and_repair_boundaries,
+    once the whole document's mapping has settled. Those two passes fix
+    boundary placement (start too early/late by a small amount) and
+    recover fully-missing questions, but neither one catches a question
+    whose range ended up suspiciously SHORT even though it IS "matched"
+    -- e.g. its true answer starts a page later than what got mapped, or
+    it got cut short and the rest silently ended up folded into a
+    neighbor. This is the concrete "answer half/skip hua" case.
+
+    For every such short range, this does a FULL re-search bounded
+    strictly between its immediate neighbors (so it can never swallow a
+    third question's content), and if a better start is found, updates
+    THIS range's start/end AND its neighbors' start/end in place.
+
+    CRITICAL: this never appends a new entry to `ranges` and never
+    changes which question a ref refers to -- it only mutates the
+    start_line/end_line of the SAME existing range dict for that ref.
+    The `questions` list itself is never touched, so this cannot ever
+    cause a question to be repeated/duplicated in the final output.
+    """
+    if len(ranges) < 2:
+        return ranges
+
+    max_line = max((nl[0] for nl in numbered_lines), default=0)
+
+    for pass_num in range(1, max_passes + 1):
+        ordered = sorted(ranges, key=lambda r: r["start_line"])
+        lengths = [r["end_line"] - r["start_line"] + 1 for r in ordered]
+        if len(lengths) < 2:
+            break
+        median_len = sorted(lengths)[len(lengths) // 2]
+        if median_len < 4:
+            break  # document itself is too short to judge "suspiciously short"
+
+        changed = False
+        for pos, r in enumerate(ordered):
+            length = r["end_line"] - r["start_line"] + 1
+            if length >= max(median_len * 0.25, 3):
+                continue  # not suspiciously short -- leave alone
+
+            q_idx = _ref_to_question_index(r["ref"])
+            log(
+                f"  REMAP (pass {pass_num}): {r['ref']} looks half/incomplete "
+                f"({length} line(s) vs this document's median of {median_len}) "
+                f"-- re-searching it specifically, without touching any other question..."
+            )
+
+            lower = ordered[pos - 1]["start_line"] + 1 if pos > 0 else 0
+            upper = ordered[pos + 1]["end_line"] if pos + 1 < len(ordered) else max_line
+            if upper <= lower:
+                continue
+
+            new_start = _find_answer_start_sequential(
+                client, numbered_lines, questions[q_idx], r["ref"], lower, budget, log,
+                end_idx=upper + 1,
+                extra_reminder=(
+                    "REMINDER: an earlier pass mapped this question's answer to a "
+                    "suspiciously short span -- this usually means the wrong (too short) "
+                    "occurrence was matched, or the answer's true start was missed. Search "
+                    "carefully across this whole window for the genuine, complete answer to "
+                    "this exact question."
+                )
+            )
+            if new_start is None or not (lower <= new_start <= upper) or new_start == r["start_line"]:
+                continue
+
+            new_end = upper
+            if pos + 1 < len(ordered):
+                next_q_idx = _ref_to_question_index(ordered[pos + 1]["ref"])
+                confirmed_next_start = _confirm_boundary(
+                    client, numbered_lines, questions[q_idx], questions[next_q_idx],
+                    ordered[pos + 1]["start_line"], budget, log, radius=20
+                )
+                if new_start < confirmed_next_start <= upper + 1:
+                    new_end = confirmed_next_start - 1
+                    ordered[pos + 1]["start_line"] = confirmed_next_start
+
+            if pos > 0:
+                ordered[pos - 1]["end_line"] = new_start - 1
+
+            r["start_line"] = new_start
+            r["end_line"] = new_end
+            log(f"  REMAP (pass {pass_num}): {r['ref']} corrected to lines {new_start}-{new_end}")
+            changed = True
+
+        if not changed:
+            break
+
+    return ranges
+
+
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
     """
@@ -2012,6 +2106,13 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     # across the WHOLE finalized mapping one more time and self-correct
     # any wrong one, fixing just that specific answer in place.
     ranges = _reanalyze_and_repair_boundaries(client, numbered_lines, questions, ranges, budget, log)
+
+    # REMAP PASS: catch answers that are "matched" but ended up half or
+    # skipped (suspiciously short compared to the rest of the document)
+    # -- re-search THAT specific question's range in place, without ever
+    # adding a new question or touching the questions list, so Q-A pairs
+    # can never repeat/duplicate in the final output.
+    ranges = _remap_incomplete_answers(client, numbered_lines, questions, ranges, budget, log)
 
     ranges_by_ref = {r["ref"]: r for r in ranges}
     results = []
