@@ -339,7 +339,7 @@ TPM_LIMIT = 30000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 
-MAX_CHARS_PER_CHUNK = 9000  # increased from 6000 -- fewer chunks means fewer calls, each paying the ~500-token system-prompt overhead only once per (larger) chunk instead of once per (smaller) chunk
+MAX_CHARS_PER_CHUNK = 12000  # increased from 6000 -- fewer chunks means fewer calls, each paying the ~500-token system-prompt overhead only once per (larger) chunk instead of once per (smaller) chunk
 CHUNK_OVERLAP_PAGES = 1
 
 QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam/assignment answer booklet. This could be from ANY institution, ANY subject, and ANY language (or a mix of languages/scripts) -- do not assume a specific country, university, or language. The booklet mixes pages of different kinds, in no guaranteed order:
@@ -500,6 +500,43 @@ _RATE_LIMIT_DETAIL_RE = re.compile(
     re.IGNORECASE | re.DOTALL
 )
 
+class _GroqClientPool:
+    """
+    Manages one or more Groq API clients (a primary key + optional
+    fallback key(s)) and transparently switches to the next available
+    client the INSTANT the current one's daily quota (TPD) is
+    exhausted -- mid-call, mid-document. Since all pipeline state
+    (search pointer, found_starts, ranges, etc.) lives in the calling
+    code and never inside the client itself, swapping clients and
+    simply retrying the SAME request resumes exactly where processing
+    left off -- zero restart, zero lost work.
+    """
+    def __init__(self, api_keys: list, log=print):
+        from groq import Groq
+        self.log = log
+        self._keys = [k for k in api_keys if k]
+        if not self._keys:
+            raise Exception("No GROQ_API_KEY (or fallback) found in secrets or environment")
+        self._clients = [Groq(api_key=k) for k in self._keys]
+        self._current = 0
+
+    @property
+    def client(self):
+        return self._clients[self._current]
+
+    def advance(self) -> bool:
+        """Switch to the next available client. Returns True if a
+        fallback was available and switched to; False if already on
+        the last configured key (truly out of keys)."""
+        if self._current + 1 < len(self._clients):
+            self._current += 1
+            self.log(
+                f"Groq API key #{self._current} exhausted its daily quota -- "
+                f"switching to fallback key #{self._current + 1} and resuming "
+                f"from exactly where processing left off (no restart, no lost work)."
+            )
+            return True
+        return False
 
 def _parse_rate_limit_detail(message: str):
     m = _RATE_LIMIT_DETAIL_RE.search(message)
@@ -607,14 +644,20 @@ def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_pag
 def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                               response_parser, budget: "_TokenBudgetTracker",
                               log, max_retries: int = 2):
+    """
+    `client` here is a _GroqClientPool, not a raw Groq client -- this is
+    the ONLY function that needs to know about the pool; every other
+    caller just passes it through opaquely.
+    """
     import groq
 
     estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
     last_error = None
 
     skip_next_proactive_check = False
+    attempt = 1
 
-    for attempt in range(1, max_retries + 2):
+    while attempt <= max_retries + 1:
         if skip_next_proactive_check:
             skip_next_proactive_check = False
         else:
@@ -622,7 +665,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 
         try:
             with _groq_call_lock:
-                response = client.chat.completions.create(
+                response = client.client.chat.completions.create(   # <-- .client added
                     model=GROQ_MODEL,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -636,38 +679,41 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             return response_parser(content)
 
         except groq.AuthenticationError as e:
-            if detail and detail["limit_type"] == "TPD":
-                raise GroqQuotaExhausted(
-                    f"Groq daily token quota (TPD) exhausted: "
-                    f"{detail['used']}/{detail['limit']} tokens used today, "
-                    f"{detail['requested']} more requested. This will reset "
-                    f"in approximately {detail['wait_seconds']/60:.0f} minute(s). "
-                    f"Retrying within this run will not help -- either wait "
-                    f"for the daily reset, or upgrade your Groq tier at "
-                    f"https://console.groq.com/settings/billing. "
-                    f"(If you're processing the same document more than once "
-                    f"per click/run, check for duplicate calls -- that doubles "
-                    f"daily token consumption and exhausts this quota twice "
-                    f"as fast.)"
-                ) from e
+            raise Exception(
+                f"Groq API rejected the API key (401 Invalid API Key). "
+                f"This will NOT be fixed by retrying. Things to check:\n"
+                f"  1. Is GROQ_API_KEY actually set in your environment or "
+                f"st.secrets? (A missing key often falls back to None or "
+                f"an empty string, which Groq also rejects as invalid.)\n"
+                f"  2. Does the key have any extra whitespace, quotes, or "
+                f"a line break copied in by accident?\n"
+                f"  3. Has the key been revoked or rotated in your Groq "
+                f"console (https://console.groq.com/keys)?\n"
+                f"  4. If using st.secrets, did you restart the Streamlit "
+                f"app after adding/changing the secret? Streamlit does "
+                f"not always hot-reload secrets.toml changes.\n"
+                f"Original error: {e}"
+            ) from e
 
         except (groq.RateLimitError, groq.BadRequestError) as e:
             last_error = e
             detail = _parse_rate_limit_detail(str(e))
 
             if detail and detail["limit_type"] == "TPD":
-                raise Exception(
-                    f"Groq daily token quota (TPD) exhausted: "
-                    f"{detail['used']}/{detail['limit']} tokens used today, "
-                    f"{detail['requested']} more requested. This will reset "
-                    f"in approximately {detail['wait_seconds']/60:.0f} minute(s). "
-                    f"Retrying within this run will not help -- either wait "
-                    f"for the daily reset, or upgrade your Groq tier at "
-                    f"https://console.groq.com/settings/billing. "
-                    f"(If you're processing the same document more than once "
-                    f"per click/run, check for duplicate calls -- that doubles "
-                    f"daily token consumption and exhausts this quota twice "
-                    f"as fast.)"
+                if client.advance():
+                    # Switched to a fallback key -- reset the (per-key)
+                    # token budget tracker and retry the SAME request
+                    # without consuming a retry slot. Completely free.
+                    budget.reset_window()
+                    continue
+                raise GroqQuotaExhausted(
+                    f"Groq daily token quota (TPD) exhausted on ALL configured API "
+                    f"key(s): {detail['used']}/{detail['limit']} tokens used today "
+                    f"on the last key, {detail['requested']} more requested. This "
+                    f"will reset in approximately {detail['wait_seconds']/60:.0f} "
+                    f"minute(s). Add a GROQ_API_KEY2 (or further keys) to "
+                    f"secrets/environment for automatic fallback, or wait for the "
+                    f"daily reset."
                 ) from e
 
             if detail:
@@ -689,16 +735,17 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                     f"Waiting {wait_s:.1f}s before retrying..."
                 )
                 time.sleep(wait_s)
+            attempt += 1
 
         except Exception as e:
             last_error = e
             log(f"Chunk LLM call/parse attempt {attempt} failed: {e}")
             time.sleep(1)
+            attempt += 1
 
     raise Exception(
         f"Chunk LLM call failed after {max_retries + 1} attempts. Last error: {last_error}"
     )
-
 
 def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker",
                           log, max_retries: int = 4) -> tuple:
@@ -827,11 +874,12 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
 
     from groq import Groq
 
-    api_key = get_api_key("GROQ_API_KEY")
-    if not api_key:
-        raise Exception("GROQ_API_KEY not found in secrets or environment")
+    #api_key = get_api_key("GROQ_API_KEY")
+    #if not api_key:
+        #raise Exception("GROQ_API_KEY not found in secrets or environment")
 
-    client = Groq(api_key=api_key)
+    api_key2 = get_api_key("GROQ_API_KEY2")
+    client = _GroqClientPool([api_key, api_key2], log=log)
     budget = _TokenBudgetTracker()
 
     user_prompt = _build_canonical_questions_prompt(qp_pages)
@@ -1288,7 +1336,8 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                                     max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS,
                                     extra_reminder: str = None,
                                     end_idx: int = None,
-                                    context_lookback: int = 6):
+                                    context_lookback: int = 6,
+                                    cache: dict = None,cache=cache):
     """
     Slides forward through numbered_lines in overlapping windows,
     starting at search_from_idx, asking a single yes/no+line-number
@@ -1334,17 +1383,23 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
             )
         combined_reminder = "\n\n".join(filter(None, [extra_reminder, label_hint])) or None
 
-        user_prompt = _build_sequential_search_prompt(window, question_text, ref_label, combined_reminder, context_before)
-        try:
-            found, start_line = _call_groq_with_retries(
-                client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
-                _parse_sequential_search_response, budget, log
-            )
-        except GroqQuotaExhausted:
-            raise
-        except Exception as e:
-            log(f"WARNING: search call failed for {ref_label} (lines {window[0][0]}-{window[-1][0]}): {e}")
-            found, start_line = False, None
+        cache_key = (ref_label, window[0][0], window[-1][0], combined_reminder)
+        if cache is not None and cache_key in cache:
+            found, start_line = cache[cache_key]
+        else:
+            user_prompt = _build_sequential_search_prompt(window, question_text, ref_label, combined_reminder, context_before)
+            try:
+                found, start_line = _call_groq_with_retries(
+                    client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
+                    _parse_sequential_search_response, budget, log
+                )
+            except GroqQuotaExhausted:
+                raise
+            except Exception as e:
+                log(f"WARNING: search call failed for {ref_label} (lines {window[0][0]}-{window[-1][0]}): {e}")
+                found, start_line = False, None
+            if cache is not None:
+                cache[cache_key] = (found, start_line)
 
         if found and start_line is not None:
             valid_ids = {i for i, _ in window}
@@ -1731,8 +1786,8 @@ def _resolve_sibling_group_batch(client, numbered_lines: list, group_questions: 
     return found
 
 
-def _rescue_unmatched_questions(client, numbered_lines: list, questions: list, ranges: list,
-                                  budget: "_TokenBudgetTracker", log) -> list:
+def _remap_incomplete_answers(client, numbered_lines: list, questions: list, ranges: list,
+                                budget: "_TokenBudgetTracker", log, cache: dict = None, max_passes: int = 1) -> list:
     """
     A question can end up unmatched even though its content genuinely
     exists in the document -- it just got silently absorbed into a
@@ -2190,6 +2245,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(numbered_lines)
+    search_cache = {}   # shared across every search call for this document
 
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
     sibling_groups = _detect_sibling_groups(questions)
@@ -2326,9 +2382,9 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         if gemini_executor else {}
     )
 
-    ranges = _rescue_unmatched_questions(client, numbered_lines, questions, ranges, budget, log)
+    ranges = _rescue_unmatched_questions(client, numbered_lines, questions, ranges, budget, log, cache=search_cache)
     ranges = _reanalyze_and_repair_boundaries(client, numbered_lines, questions, ranges, budget, log)
-    ranges = _remap_incomplete_answers(client, numbered_lines, questions, ranges, budget, log)
+    ranges = _remap_incomplete_answers(client, numbered_lines, questions, ranges, budget, log, cache=search_cache)
 
     if gemini_executor:
         gemini_verdicts = _collect_gemini_results(gemini_futures, log)
