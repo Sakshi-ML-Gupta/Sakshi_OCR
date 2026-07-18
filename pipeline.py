@@ -975,18 +975,56 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         else:
             page_clusters.append([p])
 
+    # =====================================================================
+    # FIX: a confirmed, reproduced bug -- when question-paper page
+    # detection produced MULTIPLE non-contiguous clusters (almost always
+    # because an answer page that restates a long question got
+    # misclassified as a question-paper page somewhere else in the
+    # document), the PREVIOUS version of this code extracted EACH
+    # cluster SEPARATELY and concatenated all their questions together.
+    # For a document that genuinely has only ONE real question paper,
+    # this meant the real 8 questions from the true cluster got joined
+    # with several extra/partial/near-duplicate questions extracted from
+    # the spurious cluster(s) -- producing e.g. 14 "questions" instead of
+    # 8. Those extra fake questions then also corrupted the sequential
+    # answer-search downstream (the pointer gets dragged around chasing
+    # non-existent answers for the fake questions), which is the same
+    # root cause behind real answers' starting lines getting skipped.
+    #
+    # Fix: when there is more than one cluster, treat ONLY the LARGEST
+    # cluster (by page count, tie-broken by total character count) as
+    # the genuine question paper -- this matches the common real-world
+    # case of "there is only one question paper" in the document. Every
+    # OTHER cluster is reclassified straight to the answer-page pool
+    # WITHOUT ever calling extract_canonical_questions on it, so it can
+    # never contribute a single extra/duplicate question.
+    # =====================================================================
+    reclassified_as_answer_pages = []
+
     if len(page_clusters) > 1:
+        def _cluster_size_key(cluster):
+            return (len(cluster), sum(len(p["raw_text"]) for p in cluster))
+
+        chosen_cluster = max(page_clusters, key=_cluster_size_key)
+        discarded_clusters = [c for c in page_clusters if c is not chosen_cluster]
+
         log(
             f"WARNING: question-paper pages form {len(page_clusters)} separate, "
             f"non-contiguous cluster(s): "
-            f"{[[p['page_number'] for p in c] for c in page_clusters]}. A large gap between "
-            f"clusters often means one of them was misclassified (e.g. an answer page that "
-            f"superficially reads like a question list). Extracting each cluster's questions "
-            f"SEPARATELY so a bad cluster can't wipe out a good one."
+            f"{[[p['page_number'] for p in c] for c in page_clusters]}. This document is "
+            f"treated as having a SINGLE question paper -- only the largest cluster "
+            f"(pages {[p['page_number'] for p in chosen_cluster]}) is used as the real "
+            f"question paper. The other {len(discarded_clusters)} cluster(s) are moved "
+            f"to the answer-page pool without extraction, so they cannot contribute "
+            f"duplicate/extra questions."
         )
 
+        for cluster in discarded_clusters:
+            reclassified_as_answer_pages.extend(p["page_number"] - 1 for p in cluster)  # back to 0-based
+
+        page_clusters = [chosen_cluster]
+
     questions = []
-    reclassified_as_answer_pages = []
     for cluster in page_clusters:
         cluster_page_nums = [p["page_number"] for p in cluster]
         cluster_questions = extract_canonical_questions(cluster, status_callback)
@@ -1005,24 +1043,13 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         qp_page_indices_0based = [i for i in qp_page_indices_0based if i not in reclassified_as_answer_pages]
         log(
             f"Reclassified {len(reclassified_as_answer_pages)} page(s) as answer pages "
-            f"(1-based): {[i + 1 for i in reclassified_as_answer_pages]}"
+            f"(1-based): {[i + 1 for i in sorted(set(reclassified_as_answer_pages))]}"
         )
 
-    # =====================================================================
-    # FIX: when question-paper pages form MULTIPLE clusters (e.g. because
-    # of a misclassification gap), each cluster is extracted SEPARATELY
-    # above -- which is correct for robustness (one bad cluster can't wipe
-    # out a good one), but it also means the SAME question paper can get
-    # extracted TWICE if two clusters actually cover overlapping/duplicate
-    # content (this happens most often when there is really only ONE true
-    # question paper but page classification split it into more than one
-    # cluster). Previously the per-cluster question lists were just
-    # concatenated with no final dedup, so duplicate questions -- and
-    # therefore duplicate Q-A pairs downstream -- could slip through even
-    # though _dedup_questions() already existed and was used for the
-    # page-level merge earlier in this function. Applying the same dedup
-    # here, once, over the FINAL combined question list, closes that gap.
-    # =====================================================================
+    # Safety-net dedup: even a SINGLE cluster's own extraction call could
+    # in principle repeat a question (e.g. if it appears twice verbatim
+    # on the question paper itself) -- keep this cheap final pass as a
+    # last line of defense so Q-A pairs can never repeat downstream.
     before_dedup = len(questions)
     questions = _dedup_questions(questions)
     if len(questions) != before_dedup:
