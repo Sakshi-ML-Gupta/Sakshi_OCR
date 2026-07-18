@@ -339,7 +339,7 @@ TPM_LIMIT = 30000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 
-MAX_CHARS_PER_CHUNK = 6000
+MAX_CHARS_PER_CHUNK = 9000  # increased from 6000 -- fewer chunks means fewer calls, each paying the ~500-token system-prompt overhead only once per (larger) chunk instead of once per (smaller) chunk
 CHUNK_OVERLAP_PAGES = 1
 
 QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam/assignment answer booklet. This could be from ANY institution, ANY subject, and ANY language (or a mix of languages/scripts) -- do not assume a specific country, university, or language. The booklet mixes pages of different kinds, in no guaranteed order:
@@ -1227,7 +1227,7 @@ def _parse_sequential_search_response(content: str) -> tuple:
     return True, start_line
 
 
-SEQUENTIAL_SEARCH_WINDOW_CHARS = 11000  # same safe-per-call char budget used elsewhere in this module
+SEQUENTIAL_SEARCH_WINDOW_CHARS = 16000  # increased from 11000 -- larger windows mean fewer calls to scan the same document, cutting repeated system-prompt token overhead (the biggest fixed cost per call)
 SEQUENTIAL_SEARCH_MAX_WINDOWS = 200  # generous safety cap; a real document will exhaust far sooner
 
 # Windows slide forward with a small overlap so an answer's true start
@@ -1421,26 +1421,38 @@ def _build_sub_part_hint(questions: list, i: int) -> str:
 
 def _verify_earliest_start(client, numbered_lines: list, question_text: str, ref_label: str,
                              search_from_idx: int, found_start: int, budget: "_TokenBudgetTracker",
-                             log) -> int:
+                             log, max_scan_lines: int = 40) -> int:
     """
-    Re-scans the ENTIRE gap between search_from_idx and found_start for an
-    earlier genuine start of this answer, using the same forward-windowed
-    search (with lookback context). Only ever moves the start EARLIER,
-    never later -- the mirror-image "too early" case is handled
-    separately by _confirm_boundary.
+    Checks for an earlier genuine start of this answer, but ONLY within a
+    small local radius (max_scan_lines) before found_start -- not the
+    entire gap back to search_from_idx.
+
+    COST NOTE: a genuinely missed intro line/paragraph is essentially
+    always within a few lines of the reported start (the model just
+    picked the "topic sentence" instead of the lead-in sentence right
+    before it). A gap of hundreds of lines almost always just means the
+    PREVIOUS answer was legitimately long -- re-scanning that whole gap
+    every single time (as earlier versions of this function did) was the
+    single largest source of wasted tokens/time in this pipeline, since
+    it could trigger several extra multi-window searches per question
+    for zero practical benefit. Bounding the check to a small window
+    keeps the real bug fix (catching a missed opening line) while
+    cutting that cost to at most one extra call in the common case.
     """
     gap = found_start - search_from_idx
     if gap <= 0:
         return found_start
 
+    bounded_search_from = max(search_from_idx, found_start - max_scan_lines)
+
     earlier = _find_answer_start_sequential(
         client, numbered_lines, question_text, ref_label,
-        search_from_idx, budget, log,
+        bounded_search_from, budget, log,
         end_idx=found_start + 1
     )
 
     if earlier is not None and earlier < found_start:
-        log(f"  deep backward-check moved {ref_label}'s start earlier: {found_start} -> {earlier}")
+        log(f"  backward-check moved {ref_label}'s start earlier: {found_start} -> {earlier}")
         return earlier
 
     return found_start
@@ -1725,7 +1737,7 @@ def _rescue_unmatched_questions(client, numbered_lines: list, questions: list, r
 
     changed = True
     passes = 0
-    while changed and passes < 4:
+    while changed and passes < 2:
         changed = False
         passes += 1
         matched_refs = {r["ref"] for r in ranges}
@@ -1770,16 +1782,20 @@ def _ref_to_question_index(ref: str) -> int:
 
 
 def _reanalyze_and_repair_boundaries(client, numbered_lines: list, questions: list, ranges: list,
-                                       budget: "_TokenBudgetTracker", log, max_passes: int = 3) -> list:
+                                       budget: "_TokenBudgetTracker", log, max_passes: int = 1) -> list:
     """
-    Final reanalysis/repair pass over the FULLY assembled mapping. Every
-    adjacent pair of matched ranges is re-checked ONE MORE TIME with
-    _confirm_boundary -- if a boundary looks wrong (too early -> missing
-    starting lines folded into the previous answer; too late -> stray
-    content from the previous answer glued onto the front of this one),
-    it is corrected IN PLACE for just that one boundary. Multiple passes
-    since fixing one boundary can occasionally reveal that its neighbor
-    also needs adjusting.
+    Final reanalysis/repair pass over the FULLY assembled mapping.
+
+    COST NOTE: checking EVERY adjacent boundary again here is mostly
+    redundant -- the main search walk already ran _confirm_boundary once
+    for almost every standalone question's boundary. Re-spending a full
+    Groq call on boundaries that already look completely normal wastes
+    tokens for no real benefit. This pass now only re-checks a boundary
+    when at least one of its two neighboring ranges is anomalously SHORT
+    compared to the rest of the document -- exactly the signature of a
+    truncated/swallowed answer, i.e. the case actually worth spending a
+    call to double-check. Boundaries between two normal-length ranges
+    are skipped entirely.
     """
     if len(ranges) < 2:
         return ranges
@@ -1787,10 +1803,17 @@ def _reanalyze_and_repair_boundaries(client, numbered_lines: list, questions: li
     for pass_num in range(1, max_passes + 1):
         changed_this_pass = False
         ordered = sorted(ranges, key=lambda r: r["start_line"])
+        lengths = [r["end_line"] - r["start_line"] + 1 for r in ordered]
+        median_len = sorted(lengths)[len(lengths) // 2] if lengths else 0
 
         for pos in range(1, len(ordered)):
             prev_r = ordered[pos - 1]
             curr_r = ordered[pos]
+
+            prev_len = prev_r["end_line"] - prev_r["start_line"] + 1
+            curr_len = curr_r["end_line"] - curr_r["start_line"] + 1
+            if median_len >= 4 and prev_len >= median_len * 0.4 and curr_len >= median_len * 0.4:
+                continue  # both neighbors look like plausible, normal-length answers -- skip
 
             prev_q_idx = _ref_to_question_index(prev_r["ref"])
             curr_q_idx = _ref_to_question_index(curr_r["ref"])
@@ -1818,7 +1841,7 @@ def _reanalyze_and_repair_boundaries(client, numbered_lines: list, questions: li
 
 
 def _remap_incomplete_answers(client, numbered_lines: list, questions: list, ranges: list,
-                                budget: "_TokenBudgetTracker", log, max_passes: int = 2) -> list:
+                                budget: "_TokenBudgetTracker", log, max_passes: int = 1) -> list:
     """
     Runs AFTER _rescue_unmatched_questions and _reanalyze_and_repair_boundaries,
     once the whole document's mapping has settled. Those two passes fix
@@ -2179,7 +2202,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             group_start = _find_answer_start_sequential(client, numbered_lines, first_q, first_ref, pointer, budget, log)
 
             attempt = 1
-            while group_start is None and attempt <= 2:
+            while group_start is None and attempt <= 1:
                 reminder = (
                     "REMINDER: a previous search pass did not find this answer. The same "
                     "definition/explanation can legitimately repeat across the document -- "
@@ -2276,27 +2299,16 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         )
 
         attempt = 1
-        while start_line is None and attempt <= 2:
+        while start_line is None and attempt <= 1:
             log(f"  pass {attempt} found nothing for {ref} -- retrying with a stronger reminder...")
             reminder_parts = [
-                "REMINDER: a previous search pass over this exact text did not find this "
-                "question's answer. One common reason for a missed match: the same "
-                "definition/explanation legitimately appears more than once in this document "
-                "(e.g. two different questions both touch on the same underlying concept, or "
-                "the student restates something they already explained elsewhere). Seeing "
-                "similar-looking content earlier does NOT mean this occurrence isn't a genuine, "
-                "separate answer to THIS target question -- look again with that in mind, and "
-                "also double-check you are not missing a short introductory/transitional line "
-                "right at the true start of the answer."
+                "REMINDER: a previous pass did not find this answer. The same "
+                "definition/explanation can legitimately repeat across the document -- "
+                "that does not disqualify a genuine match. Also check for a short "
+                "introductory line at the true start."
             ]
             if sub_part_hint:
                 reminder_parts.append(sub_part_hint)
-            if attempt == 2:
-                reminder_parts.append(
-                    "This is a SECOND retry -- scan very carefully, line by line, from the "
-                    "start of this window. If the answer genuinely is not present, that is a "
-                    "valid conclusion, but make sure you have not dismissed a real match."
-                )
             start_line = _find_answer_start_sequential(
                 client, numbered_lines, q, ref, pointer, budget, log,
                 extra_reminder="\n\n".join(reminder_parts)
