@@ -5,6 +5,7 @@ import json
 import time
 import difflib
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import fitz
 import httpx
 from pathlib import Path
@@ -1883,6 +1884,214 @@ def _remap_incomplete_answers(client, numbered_lines: list, questions: list, ran
     return ranges
 
 
+# =========================================================
+# PARALLEL GEMINI VERIFICATION (optional, runs alongside Groq)
+#
+# Purpose: an INDEPENDENT second opinion on every mapped answer, from a
+# different model/provider, running in BACKGROUND THREADS so it costs
+# no extra wall-clock time -- verification is dispatched for every
+# range the moment the initial sequential walk finishes, and those
+# background calls run WHILE Groq is still doing its own rescue /
+# reanalyze / remap passes in the main thread. Results are only
+# collected and applied at the very end, after Groq's own passes have
+# already run (Gemini acts as one more safety net layered on top, not
+# a replacement for the Groq-based checks).
+#
+# Entirely OPTIONAL: if GEMINI_API_KEY isn't set, none of this runs and
+# the pipeline behaves exactly as before -- get_api_key() already
+# returns None gracefully for a missing key/secret.
+#
+# SAFETY: _apply_gemini_corrections() only ever MUTATES the
+# start_line/end_line of an EXISTING range dict for a ref that's
+# already in `ranges` -- it never appends a new range and never touches
+# the `questions` list, so this can never cause a question to be
+# duplicated in the final output.
+# =========================================================
+
+GEMINI_MODEL = "gemini-2.0-flash"  # fast/cheap model, good fit for a lightweight verification pass; update the name here if this model is retired
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_VERIFY_MAX_WORKERS = 4
+GEMINI_VERIFY_CONTEXT_RADIUS = 8  # lines of context shown before/after the mapped range
+
+
+def _call_gemini_json(api_key: str, prompt: str, log, max_retries: int = 2, timeout: float = 30.0):
+    """
+    Minimal Gemini REST call (generateContent) asking for a
+    structured-JSON response. Deliberately low-retry and fail-soft --
+    this is a verification NICE-TO-HAVE, so any failure here should
+    just skip that one item's verification rather than affect the main
+    Groq-based mapping pipeline in any way.
+    """
+    url = f"{GEMINI_BASE_URL}/{GEMINI_MODEL}:generateContent?key={api_key}"
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
+    }
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = httpx.post(url, json=body, timeout=timeout)
+            if resp.status_code != 200:
+                raise Exception(f"Gemini API error {resp.status_code}: {resp.text[:300]}")
+            data = resp.json()
+            candidates = data.get("candidates") or []
+            if not candidates:
+                raise Exception(f"Gemini returned no candidates: {str(data)[:300]}")
+            text = candidates[0]["content"]["parts"][0]["text"]
+            return json.loads(text)
+        except Exception as e:
+            last_error = e
+            time.sleep(0.5)
+    log(f"  Gemini verify call failed after {max_retries} attempt(s), skipping verification for this item: {last_error}")
+    return None
+
+
+GEMINI_VERIFY_INSTRUCTIONS = """You are an independent, second-opinion QA checker verifying whether a mapped answer range correctly and completely captures a student's response to ONE exam question, in a line-numbered OCR transcript.
+
+You are given:
+1. The exact target question text.
+2. A window of line-numbered text that includes a few lines of CONTEXT BEFORE and AFTER the currently-mapped answer, with the mapped range itself marked using >>> at its first line and <<< at its last line.
+
+Check for exactly these problems:
+- "missing_start": the mapped answer is missing its true opening line(s) -- the real start is earlier, among the CONTEXT BEFORE lines shown.
+- "contains_other": the mapped range includes content that actually belongs to a DIFFERENT question (two answers got merged) -- report the line where THIS question's own content should instead end.
+- "too_short": the mapped range is implausibly short for a real answer to this question, and the CONTEXT AFTER lines look like they genuinely continue this same answer's topic.
+- "ok": none of the above -- the mapped range looks correct and complete as shown.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{"status": "ok", "suggested_start_line": null, "suggested_end_line": null}
+
+Only set suggested_start_line/suggested_end_line (to an exact line number shown in the window) when status is not "ok". If you cannot confidently identify a better line within this window, return status "ok" rather than guessing -- a missed problem can still be caught by another check, but a wrong guess here could corrupt a correct answer."""
+
+
+def _build_gemini_verify_prompt(question_text: str, ref_label: str, numbered_lines: list,
+                                  start_line: int, end_line: int,
+                                  context_radius: int = GEMINI_VERIFY_CONTEXT_RADIUS) -> str:
+    lo = max(0, start_line - context_radius)
+    hi = min(numbered_lines[-1][0], end_line + context_radius) if numbered_lines else end_line
+
+    lines_block_parts = []
+    for idx, text in numbered_lines:
+        if idx < lo or idx > hi:
+            continue
+        prefix = ">>> " if idx == start_line else ""
+        suffix = " <<<" if idx == end_line else ""
+        lines_block_parts.append(f"[{idx}]{prefix} {text}{suffix}")
+    lines_block = "\n".join(lines_block_parts)
+
+    return (
+        f"{GEMINI_VERIFY_INSTRUCTIONS}\n\n"
+        f"TARGET QUESTION ({ref_label}): {question_text}\n\n"
+        f"MAPPED RANGE: lines {start_line}-{end_line} (marked with >>> ... <<< below)\n\n"
+        f"TEXT WINDOW (line-numbered, with context before/after):\n{lines_block}"
+    )
+
+
+def _call_gemini_verify_answer(api_key: str, question_text: str, ref_label: str,
+                                 numbered_lines: list, start_line: int, end_line: int, log):
+    prompt = _build_gemini_verify_prompt(question_text, ref_label, numbered_lines, start_line, end_line)
+    result = _call_gemini_json(api_key, prompt, log)
+    if not isinstance(result, dict) or result.get("status") not in ("ok", "missing_start", "contains_other", "too_short"):
+        return None
+
+    def _safe_int(v):
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "ref": ref_label,
+        "status": result["status"],
+        "suggested_start_line": _safe_int(result.get("suggested_start_line")),
+        "suggested_end_line": _safe_int(result.get("suggested_end_line")),
+    }
+
+
+def _dispatch_gemini_verifications(executor: "ThreadPoolExecutor", api_key: str,
+                                     numbered_lines: list, questions: list, ranges: list, log) -> dict:
+    futures = {}
+    for r in ranges:
+        q_idx = _ref_to_question_index(r["ref"])
+        futures[r["ref"]] = executor.submit(
+            _call_gemini_verify_answer, api_key, questions[q_idx], r["ref"],
+            numbered_lines, r["start_line"], r["end_line"], log
+        )
+    log(f"Dispatched {len(futures)} Gemini verification call(s) in the background (running alongside Groq's own checks)...")
+    return futures
+
+
+def _collect_gemini_results(futures: dict, log, timeout: float = 90.0) -> dict:
+    results = {}
+    flagged = 0
+    for ref, fut in futures.items():
+        try:
+            verdict = fut.result(timeout=timeout)
+        except Exception as e:
+            log(f"  Gemini verification for {ref} did not complete in time / failed: {e}")
+            continue
+        if verdict:
+            results[ref] = verdict
+            if verdict["status"] != "ok":
+                flagged += 1
+    log(f"Gemini verification collected: {len(results)} result(s), {flagged} flagged as needing a correction")
+    return results
+
+
+def _apply_gemini_corrections(ranges: list, verdicts: dict, log) -> list:
+    """
+    Applies Gemini-flagged corrections IN PLACE. Only ever mutates an
+    EXISTING range dict's start_line/end_line (and, symmetrically, its
+    immediate neighbor's) -- never appends a new range, so this cannot
+    cause a question to be duplicated in the output. A suggested line
+    is only accepted if it stays strictly within this range's immediate
+    neighbors' bounds, so one range can never swallow a THIRD
+    question's content.
+    """
+    if not verdicts:
+        return ranges
+
+    ordered = sorted(ranges, key=lambda r: r["start_line"])
+    ref_to_pos = {r["ref"]: pos for pos, r in enumerate(ordered)}
+
+    for ref, verdict in verdicts.items():
+        if verdict["status"] == "ok":
+            continue
+        pos = ref_to_pos.get(ref)
+        if pos is None:
+            continue
+        r = ordered[pos]
+
+        lower = ordered[pos - 1]["start_line"] + 1 if pos > 0 else 0
+        upper = ordered[pos + 1]["end_line"] if pos + 1 < len(ordered) else r["end_line"]
+
+        sug_start = verdict.get("suggested_start_line")
+        sug_end = verdict.get("suggested_end_line")
+        applied = False
+
+        if verdict["status"] in ("missing_start", "contains_other") and sug_start is not None:
+            if lower <= sug_start <= r["end_line"]:
+                log(f"  GEMINI: {ref} status={verdict['status']} -- moving start {r['start_line']} -> {sug_start}")
+                if pos > 0:
+                    ordered[pos - 1]["end_line"] = sug_start - 1
+                r["start_line"] = sug_start
+                applied = True
+
+        if verdict["status"] in ("too_short", "contains_other") and sug_end is not None:
+            if r["start_line"] <= sug_end <= upper:
+                log(f"  GEMINI: {ref} status={verdict['status']} -- moving end {r['end_line']} -> {sug_end}")
+                r["end_line"] = sug_end
+                if pos + 1 < len(ordered) and sug_end + 1 <= ordered[pos + 1]["end_line"]:
+                    ordered[pos + 1]["start_line"] = max(ordered[pos + 1]["start_line"], sug_end + 1)
+                applied = True
+
+        if not applied:
+            log(f"  GEMINI: {ref} flagged status={verdict['status']} but no valid/boundable suggestion was applied")
+
+    return ranges
+
+
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
     """
@@ -1911,6 +2120,13 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
+
+    # Optional parallel Gemini verification -- entirely skipped (no
+    # behavior change at all) if GEMINI_API_KEY isn't configured.
+    gemini_api_key = get_api_key("GEMINI_API_KEY")
+    gemini_executor = ThreadPoolExecutor(max_workers=GEMINI_VERIFY_MAX_WORKERS) if gemini_api_key else None
+    if gemini_api_key:
+        log("Gemini verification enabled -- will run in the background alongside Groq's own checks.")
 
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(numbered_lines)
@@ -2098,6 +2314,16 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
     log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
 
+    # Dispatch Gemini verification for EVERY currently-mapped range right
+    # now, in background threads -- these run CONCURRENTLY with the
+    # Groq-based passes below, so verification costs no extra wall-clock
+    # time (by the time we're ready to collect results, most/all of them
+    # have likely already finished in the background).
+    gemini_futures = (
+        _dispatch_gemini_verifications(gemini_executor, gemini_api_key, numbered_lines, questions, ranges, log)
+        if gemini_executor else {}
+    )
+
     # RESCUE PASS: recover any question whose content silently got
     # absorbed into a neighboring matched question's range.
     ranges = _rescue_unmatched_questions(client, numbered_lines, questions, ranges, budget, log)
@@ -2113,6 +2339,14 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     # adding a new question or touching the questions list, so Q-A pairs
     # can never repeat/duplicate in the final output.
     ranges = _remap_incomplete_answers(client, numbered_lines, questions, ranges, budget, log)
+
+    # Collect the (by now likely-finished) Gemini results and apply any
+    # flagged corrections as one more independent safety net, layered on
+    # top of everything Groq already fixed above.
+    if gemini_executor:
+        gemini_verdicts = _collect_gemini_results(gemini_futures, log)
+        ranges = _apply_gemini_corrections(ranges, gemini_verdicts, log)
+        gemini_executor.shutdown(wait=False)
 
     ranges_by_ref = {r["ref"]: r for r in ranges}
     results = []
