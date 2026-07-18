@@ -485,6 +485,13 @@ class _TokenBudgetTracker:
         if value == 0:
             self.events.clear()
 
+class GroqQuotaExhausted(Exception):
+    """Raised when Groq's DAILY token quota (TPD) is exhausted -- never
+    caught by generic except blocks, always propagates immediately so
+    the pipeline stops the instant the quota runs out instead of
+    grinding through guaranteed-to-fail retries."""
+    pass
+
 
 _RATE_LIMIT_DETAIL_RE = re.compile(
     r'on\s+tokens\s+per\s+(minute|day)\s*\((TPM|TPD)\).*?'
@@ -599,7 +606,7 @@ def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_pag
 
 def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                               response_parser, budget: "_TokenBudgetTracker",
-                              log, max_retries: int = 4):
+                              log, max_retries: int = 2):
     import groq
 
     estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
@@ -629,21 +636,20 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             return response_parser(content)
 
         except groq.AuthenticationError as e:
-            raise Exception(
-                f"Groq API rejected the API key (401 Invalid API Key). "
-                f"This will NOT be fixed by retrying. Things to check:\n"
-                f"  1. Is GROQ_API_KEY actually set in your environment or "
-                f"st.secrets? (A missing key often falls back to None or "
-                f"an empty string, which Groq also rejects as invalid.)\n"
-                f"  2. Does the key have any extra whitespace, quotes, or "
-                f"a line break copied in by accident?\n"
-                f"  3. Has the key been revoked or rotated in your Groq "
-                f"console (https://console.groq.com/keys)?\n"
-                f"  4. If using st.secrets, did you restart the Streamlit "
-                f"app after adding/changing the secret? Streamlit does "
-                f"not always hot-reload secrets.toml changes.\n"
-                f"Original error: {e}"
-            ) from e
+            if detail and detail["limit_type"] == "TPD":
+                raise GroqQuotaExhausted(
+                    f"Groq daily token quota (TPD) exhausted: "
+                    f"{detail['used']}/{detail['limit']} tokens used today, "
+                    f"{detail['requested']} more requested. This will reset "
+                    f"in approximately {detail['wait_seconds']/60:.0f} minute(s). "
+                    f"Retrying within this run will not help -- either wait "
+                    f"for the daily reset, or upgrade your Groq tier at "
+                    f"https://console.groq.com/settings/billing. "
+                    f"(If you're processing the same document more than once "
+                    f"per click/run, check for duplicate calls -- that doubles "
+                    f"daily token consumption and exhausts this quota twice "
+                    f"as fast.)"
+                ) from e
 
         except (groq.RateLimitError, groq.BadRequestError) as e:
             last_error = e
@@ -1334,6 +1340,8 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                 client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
                 _parse_sequential_search_response, budget, log
             )
+        except GroqQuotaExhausted:
+            raise
         except Exception as e:
             log(f"WARNING: search call failed for {ref_label} (lines {window[0][0]}-{window[-1][0]}): {e}")
             found, start_line = False, None
@@ -1502,7 +1510,7 @@ def _parse_boundary_confirm_response(content: str) -> int:
 
 def _confirm_boundary(client, numbered_lines: list, prev_question: str, curr_question: str,
                         proposed_line: int, budget: "_TokenBudgetTracker", log,
-                        radius: int = 15) -> int:
+                        radius: int = 35) -> int:
     """
     Tight, LOCAL, bidirectional re-check around a proposed boundary line --
     unlike _verify_earliest_start (which only ever moves a start earlier),
@@ -1516,12 +1524,14 @@ def _confirm_boundary(client, numbered_lines: list, prev_question: str, curr_que
     if not window:
         return proposed_line
 
-    user_prompt = _build_boundary_confirm_prompt(window, prev_question, curr_question, proposed_line)
+    user_prompt = _build_boundary_confirm_prompt(window_lines, prev_question, curr_question, proposed_line)
     try:
         corrected = _call_groq_with_retries(
             client, BOUNDARY_CONFIRM_SYSTEM_PROMPT, user_prompt,
             _parse_boundary_confirm_response, budget, log, max_retries=1
         )
+    except GroqQuotaExhausted:
+        raise
     except Exception as e:
         log(f"  boundary confirm failed for line {proposed_line} (keeping original): {e}")
         return proposed_line
@@ -1698,6 +1708,8 @@ def _resolve_sibling_group_batch(client, numbered_lines: list, group_questions: 
             client, WINDOWED_MULTI_TARGET_SYSTEM_PROMPT, user_prompt,
             _parse_windowed_multi_target_response, budget, log
         )
+    except GroqQuotaExhausted:
+        raise
     except Exception as e:
         log(f"WARNING: sibling-group batch resolution failed for lines {lower}-{upper}: {e}")
         return {}
@@ -2171,8 +2183,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
-    # Optional parallel Gemini verification -- entirely skipped (no
-    # behavior change at all) if GEMINI_API_KEY isn't configured.
     gemini_api_key = get_api_key("GEMINI_API_KEY")
     gemini_executor = ThreadPoolExecutor(max_workers=GEMINI_VERIFY_MAX_WORKERS) if gemini_api_key else None
     if gemini_api_key:
@@ -2190,160 +2200,118 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     i = 0
     n = len(questions)
 
-    while i < n:
-        if i in sibling_groups:
-            group_indices = sibling_groups[i]
-            group_refs = [f"REF-{chr(65 + j)}" for j in group_indices]
-            group_questions = [(f"REF-{chr(65 + j)}", questions[j]) for j in group_indices]
-            log(f"Detected sibling sub-part group {group_refs} -- resolving as a bounded batch...")
+    try:
+        while i < n:
+            if i in sibling_groups:
+                group_indices = sibling_groups[i]
+                group_refs = [f"REF-{chr(65 + j)}" for j in group_indices]
+                group_questions = [(f"REF-{chr(65 + j)}", questions[j]) for j in group_indices]
+                log(f"Detected sibling sub-part group {group_refs} -- resolving as a bounded batch...")
 
-            first_ref, first_q = group_questions[0]
-            group_search_from = pointer
-            group_start = _find_answer_start_sequential(client, numbered_lines, first_q, first_ref, pointer, budget, log)
+                first_ref, first_q = group_questions[0]
+                group_start = _find_answer_start_sequential(client, numbered_lines, first_q, first_ref, pointer, budget, log)
 
-            attempt = 1
-            while group_start is None and attempt <= 1:
-                reminder = (
-                    "REMINDER: a previous search pass did not find this answer. The same "
-                    "definition/explanation can legitimately repeat across the document -- "
-                    "that does not disqualify a genuine match. Also check for a short "
-                    "introductory line at the true start."
-                )
-                group_start = _find_answer_start_sequential(
-                    client, numbered_lines, first_q, first_ref, pointer, budget, log,
-                    extra_reminder=reminder
-                )
-                attempt += 1
+                if group_start is None:
+                    log(f"WARNING: could not find the start of sibling group {group_refs} at all -- marking all as unmatched.")
+                    # pointer intentionally NOT advanced -- next question
+                    # still searched over this same remaining text.
+                    i = group_indices[-1] + 1
+                    continue
 
-            if group_start is None:
-                log(f"WARNING: could not find the start of sibling group {group_refs} at all -- marking all as unmatched.")
-                # NOTE: pointer is intentionally NOT advanced here -- the
-                # next question is still searched for over this same
-                # remaining text, so nothing is silently skipped.
-                i = group_indices[-1] + 1
+                if i > 0:
+                    group_start = _confirm_boundary(
+                         client, numbered_lines, questions[i - 1], first_q, group_start, budget, log
+                    )
+
+                found_starts[first_ref] = group_start
+                log(f"  found {first_ref} (group start) at line {group_start}")
+
+                next_index = group_indices[-1] + 1
+                group_end_bound = None
+                if next_index < n:
+                    next_ref = f"REF-{chr(65 + next_index)}"
+                    next_q = questions[next_index]
+                    group_end_bound = _find_answer_start_sequential(
+                        client, numbered_lines, next_q, next_ref, group_start + 1, budget, log
+                    )
+                    if group_end_bound is not None:
+                        group_end_bound = _confirm_boundary(
+                            client, numbered_lines, first_q, next_q, group_end_bound, budget, log
+                        )
+
+                upper = (group_end_bound - 1) if group_end_bound is not None else (total_lines - 1)
+
+                if len(group_questions) > 1:
+                    sibling_starts = _resolve_sibling_group_batch(
+                        client, numbered_lines, group_questions, group_start, upper, budget, log
+                    )
+                    for ref, sl in sibling_starts.items():
+                        found_starts[ref] = sl
+                        log(f"  found {ref} (sibling) at line {sl}")
+
+                unresolved = [ref for ref in group_refs[1:] if ref not in found_starts]
+                if unresolved:
+                    log(
+                        f"NOTE: sibling(s) {unresolved} were not confidently separated within "
+                        f"the group's bounded region (lines {group_start}-{upper}) -- their content "
+                        f"stays folded into the preceding sibling's answer rather than risking a "
+                        f"wrong split."
+                    )
+
+                if next_index < n and group_end_bound is not None:
+                    found_starts[f"REF-{chr(65 + next_index)}"] = group_end_bound
+                    log(f"  found REF-{chr(65 + next_index)} at line {group_end_bound}")
+                    pointer = group_end_bound + 1
+                    i = next_index + 1
+                else:
+                    pointer = total_lines
+                    i = next_index
+
                 continue
 
-            group_start = _verify_earliest_start(
-                client, numbered_lines, first_q, first_ref, group_search_from, group_start, budget, log
-            )
-            if i > 0:
-                group_start = _confirm_boundary(
-                    client, numbered_lines, questions[i - 1], first_q, group_start, budget, log
-                )
+            # ---- Standalone question: strict single-target search ----
+            ref = f"REF-{chr(65 + i)}"
+            q = questions[i]
 
-            found_starts[first_ref] = group_start
-            log(f"  found {first_ref} (group start) at line {group_start}")
+            if ref in found_starts:
+                pointer = found_starts[ref] + 1
+                i += 1
+                continue
 
-            next_index = group_indices[-1] + 1
-            group_end_bound = None
-            if next_index < n:
-                next_ref = f"REF-{chr(65 + next_index)}"
-                next_q = questions[next_index]
-                group_end_bound = _find_answer_start_sequential(
-                    client, numbered_lines, next_q, next_ref, group_start + 1, budget, log
-                )
-                if group_end_bound is not None:
-                    group_end_bound = _verify_earliest_start(
-                        client, numbered_lines, next_q, next_ref, group_start + 1, group_end_bound, budget, log
-                    )
-                    group_end_bound = _confirm_boundary(
-                        client, numbered_lines, first_q, next_q, group_end_bound, budget, log
-                    )
+            log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
+            sub_part_hint = _build_sub_part_hint(questions, i)
 
-            upper = (group_end_bound - 1) if group_end_bound is not None else (total_lines - 1)
-
-            if len(group_questions) > 1:
-                sibling_starts = _resolve_sibling_group_batch(
-                    client, numbered_lines, group_questions, group_start, upper, budget, log
-                )
-                for ref, sl in sibling_starts.items():
-                    found_starts[ref] = sl
-                    log(f"  found {ref} (sibling) at line {sl}")
-
-            unresolved = [ref for ref in group_refs[1:] if ref not in found_starts]
-            if unresolved:
-                log(
-                    f"NOTE: sibling(s) {unresolved} were not confidently separated within "
-                    f"the group's bounded region (lines {group_start}-{upper}) -- their content "
-                    f"stays folded into the preceding sibling's answer rather than risking a "
-                    f"wrong split."
-                )
-
-            if next_index < n and group_end_bound is not None:
-                found_starts[f"REF-{chr(65 + next_index)}"] = group_end_bound
-                log(f"  found REF-{chr(65 + next_index)} at line {group_end_bound}")
-                pointer = group_end_bound + 1
-                i = next_index + 1
-            else:
-                pointer = total_lines
-                i = next_index
-
-            continue
-
-        # ---- Standalone question: strict single-target search ----
-        ref = f"REF-{chr(65 + i)}"
-        q = questions[i]
-
-        if ref in found_starts:
-            pointer = found_starts[ref] + 1
-            i += 1
-            continue
-
-        log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
-        sub_part_hint = _build_sub_part_hint(questions, i)
-        search_from_idx = pointer
-
-        start_line = _find_answer_start_sequential(
-            client, numbered_lines, q, ref, pointer, budget, log,
-            extra_reminder=sub_part_hint
-        )
-
-        attempt = 1
-        while start_line is None and attempt <= 1:
-            log(f"  pass {attempt} found nothing for {ref} -- retrying with a stronger reminder...")
-            reminder_parts = [
-                "REMINDER: a previous pass did not find this answer. The same "
-                "definition/explanation can legitimately repeat across the document -- "
-                "that does not disqualify a genuine match. Also check for a short "
-                "introductory line at the true start."
-            ]
-            if sub_part_hint:
-                reminder_parts.append(sub_part_hint)
             start_line = _find_answer_start_sequential(
                 client, numbered_lines, q, ref, pointer, budget, log,
-                extra_reminder="\n\n".join(reminder_parts)
+                extra_reminder=sub_part_hint
             )
-            if start_line is not None:
-                log(f"  retry (pass {attempt + 1}) recovered {ref} starting at line {start_line}")
-            attempt += 1
 
-        if start_line is not None:
-            # (a) deep backward-check: never miss an earlier genuine start
-            # (fixes "1 line/page skipped at the START of an answer").
-            start_line = _verify_earliest_start(
-                client, numbered_lines, q, ref, search_from_idx, start_line, budget, log
-            )
-            # (b) bidirectional local confirm against the PREVIOUS
-            # question: catches a boundary set TOO EARLY as well as a
-            # boundary that's still slightly too LATE after (a).
+            if start_line is not None:
+            # NOTE: _verify_earliest_start call REMOVED -- _confirm_boundary
+            # (radius increased to 35 above) is bidirectional and now
+            # covers both "too early" and "too late" in a SINGLE call.
             if i > 0:
                 start_line = _confirm_boundary(
                     client, numbered_lines, questions[i - 1], q, start_line, budget, log
                 )
 
-        if start_line is not None:
-            found_starts[ref] = start_line
-            log(f"  found {ref} starting at line {start_line}")
-            pointer = start_line + 1
-        else:
-            log(
-                f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
-                f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
-                f"The search pointer is NOT advanced, so the next question is still searched "
-                f"for over this same remaining text."
-            )
+            if start_line is not None:
+                found_starts[ref] = start_line
+                log(f"  found {ref} starting at line {start_line}")
+                pointer = start_line + 1
+            else:
+                log(
+                    f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
+                    f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
+                    f"The search pointer is NOT advanced, so the next question is still searched "
+                    f"for over this same remaining text."
+                )
 
-        i += 1
+            i += 1
+
+    except GroqQuotaExhausted as e:
+        log(f"STOPPING: {e}")
+        raise
 
     ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
     ranges = []
@@ -2353,35 +2321,15 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
     log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
 
-    # Dispatch Gemini verification for EVERY currently-mapped range right
-    # now, in background threads -- these run CONCURRENTLY with the
-    # Groq-based passes below, so verification costs no extra wall-clock
-    # time (by the time we're ready to collect results, most/all of them
-    # have likely already finished in the background).
     gemini_futures = (
         _dispatch_gemini_verifications(gemini_executor, gemini_api_key, numbered_lines, questions, ranges, log)
         if gemini_executor else {}
     )
 
-    # RESCUE PASS: recover any question whose content silently got
-    # absorbed into a neighboring matched question's range.
     ranges = _rescue_unmatched_questions(client, numbered_lines, questions, ranges, budget, log)
-
-    # FINAL REANALYSIS / REPAIR PASS: re-check every adjacent boundary
-    # across the WHOLE finalized mapping one more time and self-correct
-    # any wrong one, fixing just that specific answer in place.
     ranges = _reanalyze_and_repair_boundaries(client, numbered_lines, questions, ranges, budget, log)
-
-    # REMAP PASS: catch answers that are "matched" but ended up half or
-    # skipped (suspiciously short compared to the rest of the document)
-    # -- re-search THAT specific question's range in place, without ever
-    # adding a new question or touching the questions list, so Q-A pairs
-    # can never repeat/duplicate in the final output.
     ranges = _remap_incomplete_answers(client, numbered_lines, questions, ranges, budget, log)
 
-    # Collect the (by now likely-finished) Gemini results and apply any
-    # flagged corrections as one more independent safety net, layered on
-    # top of everything Groq already fixed above.
     if gemini_executor:
         gemini_verdicts = _collect_gemini_results(gemini_futures, log)
         ranges = _apply_gemini_corrections(ranges, gemini_verdicts, log)
@@ -3187,7 +3135,7 @@ def process_pdf(file_input, status_callback=None):
 
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
 
-    pages = run_ocr(file_bytes, file_name, status_callback)
+    pages = run_ocr_cached(file_bytes, file_name, status_callback)
 
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
@@ -3260,10 +3208,17 @@ def process_pdf(file_input, status_callback=None):
         )
 
     log("Mapping each question to its answer (sequential single-target search)...")
-    qa_pairs = map_answers_sequential(
-        answer_lines, official_questions, status_callback,
-        answer_line_pages=answer_line_pages
-    )
+    try:
+        qa_pairs = map_answers_sequential(
+            answer_lines, official_questions, status_callback,
+            answer_line_pages=answer_line_pages
+        )
+    except GroqQuotaExhausted as e:
+        raise Exception(
+            f"Processing stopped: {e}\n\n"
+            f"Wait for the daily quota reset, then re-run -- OCR results are "
+            f"cached, so re-run resumes quickly."
+        ) from e
 
     matched_count = sum(1 for p in qa_pairs if p["matched"])
     log(f"Matched {matched_count} of {len(official_questions)} questions")
