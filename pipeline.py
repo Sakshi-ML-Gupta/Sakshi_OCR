@@ -5,6 +5,7 @@ import json
 import time
 import difflib
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import fitz
 import httpx
 from pathlib import Path
@@ -493,61 +494,6 @@ _RATE_LIMIT_DETAIL_RE = re.compile(
 )
 
 
-class GroqQuotaExhausted(Exception):
-    """Raised when Groq's DAILY token quota (TPD) is exhausted on ALL
-    configured keys -- never caught by generic except blocks, always
-    propagates immediately."""
-    pass
-
-
-class _GroqClientPool:
-    """
-    Manages GROQ_API_KEY plus any GROQ_API_KEY2, GROQ_API_KEY3, ... found
-    in secrets/environment, and transparently switches to the next
-    available key the INSTANT the current one's daily quota (TPD) is
-    exhausted -- mid-call, mid-document. All pipeline state (search
-    pointer, found_starts, ranges) lives outside the client, so swapping
-    clients and retrying the SAME request resumes exactly where
-    processing left off.
-    """
-    def __init__(self, log=print):
-        from groq import Groq
-        self.log = log
-        keys = []
-        primary = get_api_key("GROQ_API_KEY")
-        if primary:
-            keys.append(primary)
-        n = 2
-        while True:
-            k = get_api_key(f"GROQ_API_KEY{n}")
-            if not k:
-                break
-            keys.append(k)
-            n += 1
-        if not keys:
-            raise Exception("No GROQ_API_KEY (or GROQ_API_KEY2, GROQ_API_KEY3, ...) found in secrets or environment")
-        self._keys = keys
-        self._clients = [Groq(api_key=k) for k in keys]
-        self._current = 0
-        if len(keys) > 1:
-            self.log(f"Groq fallback enabled: {len(keys)} API key(s) configured.")
-
-    @property
-    def client(self):
-        return self._clients[self._current]
-
-    def advance(self) -> bool:
-        if self._current + 1 < len(self._clients):
-            self._current += 1
-            self.log(
-                f"Groq API key #{self._current} exhausted its daily quota -- "
-                f"switching to fallback key #{self._current + 1} and resuming "
-                f"from exactly where processing left off."
-            )
-            return True
-        return False
-
-
 def _parse_rate_limit_detail(message: str):
     m = _RATE_LIMIT_DETAIL_RE.search(message)
     if not m:
@@ -562,128 +508,6 @@ def _parse_rate_limit_detail(message: str):
         "requested": int(requested),
         "wait_seconds": wait_seconds,
     }
-
-
-# =========================================================
-# MULTI-KEY GROQ ROTATION (fallback across several Groq accounts)
-#
-# Add as many keys as you have to secrets.toml / the environment:
-#
-#   GROQ_API_KEY   = "key-from-account-1"
-#   GROQ_API_KEY_2 = "key-from-account-2"
-#   GROQ_API_KEY_3 = "key-from-account-3"
-#   GROQ_API_KEY_4 = "key-from-account-4"
-#
-# _collect_groq_api_keys() picks up every one of these that's set (up
-# to _MAX_GROQ_KEYS), in order. _RotatingGroqClient is a drop-in stand-
-# in for a real groq.Groq client -- every existing call site in this
-# file that does `client.chat.completions.create(...)` keeps working
-# completely unchanged. Internally, when the CURRENTLY ACTIVE key's
-# daily quota (TPD) is exhausted, or the key is invalid/revoked, it
-# transparently switches to the NEXT key in the list and retries the
-# EXACT SAME request -- so a search/verify call continues from exactly
-# the window it was already on, never restarting the document or
-# losing place. Only once EVERY configured key has been exhausted does
-# it finally raise, at which point _call_groq_with_retries's existing
-# "Daily token quota (TPD) exhausted" error message is shown as before.
-# =========================================================
-
-_MAX_GROQ_KEYS = 10
-
-
-def _collect_groq_api_keys(env_prefix: str = "GROQ_API_KEY") -> list:
-    keys = []
-    primary = get_api_key(env_prefix)
-    if primary:
-        keys.append(primary)
-    for n in range(2, _MAX_GROQ_KEYS + 1):
-        k = get_api_key(f"{env_prefix}_{n}")
-        if k:
-            keys.append(k)
-    return keys
-
-
-class _RotatingCompletions:
-    def __init__(self, pool: "_RotatingGroqClient"):
-        self._pool = pool
-
-    def create(self, **kwargs):
-        import groq
-        while True:
-            try:
-                return self._pool.client.chat.completions.create(**kwargs)
-            except groq.AuthenticationError:
-                # This key is invalid/revoked -- try the next one
-                # rather than failing the whole pipeline immediately.
-                if self._pool.rotate(reason="was rejected as invalid (401)"):
-                    continue
-                raise
-            except (groq.RateLimitError, groq.BadRequestError) as e:
-                detail = _parse_rate_limit_detail(str(e))
-                if detail and detail["limit_type"] == "TPD":
-                if client.advance():
-                    budget.reset_window()
-                    continue
-                raise GroqQuotaExhausted(
-                    f"Groq daily token quota (TPD) exhausted on ALL configured API "
-                    f"key(s): {detail['used']}/{detail['limit']} tokens used today "
-                    f"on the last key. This will reset in approximately "
-                    f"{detail['wait_seconds']/60:.0f} minute(s). Add GROQ_API_KEY2 "
-                    f"(and further) to secrets/environment for more fallback capacity."
-                ) from e
-                # TPM limits and everything else are left to
-                # _call_groq_with_retries's own pacing/backoff logic,
-                # exactly as before -- only a genuinely EXHAUSTED daily
-                # quota or a dead key triggers a key swap.
-                raise
-
-
-class _RotatingChat:
-    def __init__(self, pool: "_RotatingGroqClient"):
-        self.completions = _RotatingCompletions(pool)
-
-
-class _RotatingGroqClient:
-    def __init__(self, api_keys: list, budget: "_TokenBudgetTracker" = None, log=print):
-        if not api_keys:
-            raise Exception("No Groq API key(s) configured")
-        from groq import Groq
-        self._Groq = Groq
-        self._keys = api_keys
-        self._index = 0
-        self._budget = budget
-        self._log = log
-        self._client = self._Groq(api_key=self._keys[0])
-        self.chat = _RotatingChat(self)
-
-        if len(api_keys) > 1:
-            log(f"Groq key rotation enabled: {len(api_keys)} key(s) configured -- will fall back key-to-key on quota exhaustion.")
-
-    @property
-    def client(self):
-        return self._client
-
-    @property
-    def key_count(self) -> int:
-        return len(self._keys)
-
-    def rotate(self, reason: str = "") -> bool:
-        if self._index + 1 >= len(self._keys):
-            self._log(
-                f"WARNING: Groq key #{self._index + 1} of {len(self._keys)} (the LAST configured "
-                f"key) also {reason or 'hit its limit'} -- no more keys left to fall back to."
-            )
-            return False
-        self._index += 1
-        self._client = self._Groq(api_key=self._keys[self._index])
-        if self._budget is not None:
-            self._budget.reset_window()
-        self._log(
-            f"Groq key #{self._index} of {len(self._keys)} {reason or 'hit its limit'} -- "
-            f"switching to key #{self._index + 1} and continuing the SAME request from exactly "
-            f"where it stopped (no restart, no lost progress)."
-        )
-        return True
 
 
 def _parse_qp_llm_response(content: str) -> tuple:
@@ -783,8 +607,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 
     skip_next_proactive_check = False
 
-    attempt = 1
-    while attempt <= max_retries + 1:
+    for attempt in range(1, max_retries + 2):
         if skip_next_proactive_check:
             skip_next_proactive_check = False
         else:
@@ -792,7 +615,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 
         try:
             with _groq_call_lock:
-                response = client.client.chat.completions.create(
+                response = client.chat.completions.create(
                     model=GROQ_MODEL,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -827,14 +650,13 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             detail = _parse_rate_limit_detail(str(e))
 
             if detail and detail["limit_type"] == "TPD":
-                raise GroqQuotaExhaustedError(
-                    f"Groq daily token quota (TPD) exhausted on ALL configured key(s): "
+                raise Exception(
+                    f"Groq daily token quota (TPD) exhausted: "
                     f"{detail['used']}/{detail['limit']} tokens used today, "
                     f"{detail['requested']} more requested. This will reset "
                     f"in approximately {detail['wait_seconds']/60:.0f} minute(s). "
                     f"Retrying within this run will not help -- either wait "
-                    f"for the daily reset, add more backup keys (GROQ_API_KEY_2, "
-                    f"GROQ_API_KEY_3, ...), or upgrade your Groq tier at "
+                    f"for the daily reset, or upgrade your Groq tier at "
                     f"https://console.groq.com/settings/billing. "
                     f"(If you're processing the same document more than once "
                     f"per click/run, check for duplicate calls -- that doubles "
@@ -861,14 +683,11 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                     f"Waiting {wait_s:.1f}s before retrying..."
                 )
                 time.sleep(wait_s)
-                attempt += 1
-                
 
         except Exception as e:
             last_error = e
             log(f"Chunk LLM call/parse attempt {attempt} failed: {e}")
             time.sleep(1)
-            attempt += 1
 
     raise Exception(
         f"Chunk LLM call failed after {max_retries + 1} attempts. Last error: {last_error}"
@@ -1000,8 +819,13 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
     if not qp_pages:
         return []
 
-    groq_keys = _collect_groq_api_keys()
-    client = _GroqClientPool(log=log)
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
+        raise Exception("GROQ_API_KEY not found in secrets or environment")
+
+    client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
     user_prompt = _build_canonical_questions_prompt(qp_pages)
@@ -1012,8 +836,6 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
             client, QUESTION_PAPER_ONLY_SYSTEM_PROMPT, user_prompt,
             _parse_canonical_questions_response, budget, log
         )
-    except GroqQuotaExhaustedError:
-        raise
     except Exception as e:
         log(f"WARNING: canonical question extraction failed: {e}")
         return []
@@ -1028,12 +850,14 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         if status_callback:
             status_callback(msg)
 
-    groq_keys = _collect_groq_api_keys()
-    if not groq_keys:
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
         raise Exception("GROQ_API_KEY not found in secrets or environment")
 
+    client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
-    client = _RotatingGroqClient(groq_keys, budget=budget, log=log)
 
     chunks = _chunk_pages_by_char_budget(pages)
     log(f"Split {len(pages)} page(s) into {len(chunks)} LLM chunk(s) to respect token limits")
@@ -1049,8 +873,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
         try:
             qp_pages_1based, questions, admin_pages_1based = _call_groq_for_chunk(client, chunk, budget, log)
-        except GroqQuotaExhaustedError:
-            raise
         except Exception as e:
             log(f"WARNING: chunk {i+1}/{len(chunks)} question-identification failed, skipping: {e}")
             chunk_failures.append(str(e))
@@ -1418,14 +1240,6 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                 client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
                 _parse_sequential_search_response, budget, log
             )
-        except GroqQuotaExhaustedError:
-            # CRITICAL: do NOT swallow this as "window didn't match" --
-            # every remaining window would fail identically, and
-            # treating it as a genuine non-match is exactly what caused
-            # unrelated questions' content to silently pile up into an
-            # earlier answer's range. Propagate so the whole pipeline
-            # stops with one clear error instead.
-            raise
         except Exception as e:
             log(f"WARNING: search call failed for {ref_label} (lines {window[0][0]}-{window[-1][0]}): {e}")
             found, start_line = False, None
@@ -1822,8 +1636,6 @@ def _resolve_sibling_group_batch(client, numbered_lines: list, group_questions: 
             client, WINDOWED_MULTI_TARGET_SYSTEM_PROMPT, user_prompt,
             _parse_windowed_multi_target_response, budget, log
         )
-    except GroqQuotaExhaustedError:
-        raise
     except Exception as e:
         log(f"WARNING: sibling-group batch resolution failed for lines {lower}-{upper}: {e}")
         return {}
@@ -1852,7 +1664,7 @@ def _rescue_unmatched_questions(client, numbered_lines: list, questions: list, r
 
     changed = True
     passes = 0
-    while changed and passes < 3:
+    while changed and passes < 2:
         changed = False
         passes += 1
         matched_refs = {r["ref"] for r in ranges}
@@ -1881,18 +1693,6 @@ def _rescue_unmatched_questions(client, numbered_lines: list, questions: list, r
                 client, numbered_lines, q, ref, lower, budget, log,
                 end_idx=upper + 1
             )
-            if split_line is None:
-                split_line = _find_answer_start_sequential(
-                    client, numbered_lines, q, ref, lower, budget, log,
-                    end_idx=upper + 1,
-                    extra_reminder=(
-                        "REMINDER: this question's content may be hiding inside a "
-                        "neighboring answer's mapped range because the boundary was "
-                        "originally missed. Scan carefully -- similar wording to a "
-                        "nearby answer does NOT disqualify a genuine separate match "
-                        "for THIS specific question."
-                    )
-                )
 
             if split_line is not None and lower < split_line <= upper:
                 log(f"  RESCUE: recovered {ref} at line {split_line} (was absorbed into {candidate['ref']})")
@@ -2026,34 +1826,38 @@ def _remap_incomplete_answers(client, numbered_lines: list, questions: list, ran
     return ranges
 
 
-# =========================================================
-# SECOND-OPINION VERIFICATION PASS (Groq, not Gemini)
-#
-# Runs AFTER rescue/reanalyze/remap, one more independent check per
-# mapped answer, catching: a missed opening line (missing_start), two
-# answers merged together (contains_other), or an implausibly short
-# range (too_short). This replaces the previous Gemini-based version --
-# same three-way check, but against Groq so there's only one provider/
-# API key to manage.
-#
-# NOTE ON CONCURRENCY: all Groq calls in this module share the single
-# module-level `_groq_call_lock`, so submitting these to a thread pool
-# would NOT actually run them concurrently with the main mapping calls
-# -- the lock serializes every real network request regardless of how
-# many threads are waiting on it. Rather than pretend this is "free"
-# background work (as the Gemini version could genuinely claim, since
-# Gemini used a separate lock-free HTTP call), this runs as a plain
-# sequential pass, which is an honest description of its actual cost.
-#
-# Set GROQ_API_KEY_VERIFY in secrets/environment to a SECOND Groq API
-# key (e.g. a different account) to give this pass its own independent
-# rate-limit pool, so it never competes with or gets throttled by the
-# main mapping calls above. If unset, it reuses the main client/budget.
-# =========================================================
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_VERIFY_MAX_WORKERS = 4
+GEMINI_VERIFY_CONTEXT_RADIUS = 8
 
-GROQ_VERIFY_CONTEXT_RADIUS = 8
 
-GROQ_VERIFY_SYSTEM_PROMPT = """You are an independent, second-opinion QA checker verifying whether a mapped answer range correctly and completely captures a student's response to ONE exam question, in a line-numbered OCR transcript.
+def _call_gemini_json(api_key: str, prompt: str, log, max_retries: int = 2, timeout: float = 30.0):
+    url = f"{GEMINI_BASE_URL}/{GEMINI_MODEL}:generateContent?key={api_key}"
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
+    }
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = httpx.post(url, json=body, timeout=timeout)
+            if resp.status_code != 200:
+                raise Exception(f"Gemini API error {resp.status_code}: {resp.text[:300]}")
+            data = resp.json()
+            candidates = data.get("candidates") or []
+            if not candidates:
+                raise Exception(f"Gemini returned no candidates: {str(data)[:300]}")
+            text = candidates[0]["content"]["parts"][0]["text"]
+            return json.loads(text)
+        except Exception as e:
+            last_error = e
+            time.sleep(0.5)
+    log(f"  Gemini verify call failed after {max_retries} attempt(s), skipping verification for this item: {last_error}")
+    return None
+
+
+GEMINI_VERIFY_INSTRUCTIONS = """You are an independent, second-opinion QA checker verifying whether a mapped answer range correctly and completely captures a student's response to ONE exam question, in a line-numbered OCR transcript.
 
 You are given:
 1. The exact target question text.
@@ -2072,9 +1876,9 @@ Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape
 Only set suggested_start_line/suggested_end_line (to an exact line number shown in the window) when status is not "ok". If you cannot confidently identify a better line within this window, return status "ok" rather than guessing -- a missed problem can still be caught by another check, but a wrong guess here could corrupt a correct answer."""
 
 
-def _build_groq_verify_prompt(question_text: str, ref_label: str, numbered_lines: list,
-                                start_line: int, end_line: int,
-                                context_radius: int = GROQ_VERIFY_CONTEXT_RADIUS) -> str:
+def _build_gemini_verify_prompt(question_text: str, ref_label: str, numbered_lines: list,
+                                  start_line: int, end_line: int,
+                                  context_radius: int = GEMINI_VERIFY_CONTEXT_RADIUS) -> str:
     lo = max(0, start_line - context_radius)
     hi = min(numbered_lines[-1][0], end_line + context_radius) if numbered_lines else end_line
 
@@ -2088,22 +1892,19 @@ def _build_groq_verify_prompt(question_text: str, ref_label: str, numbered_lines
     lines_block = "\n".join(lines_block_parts)
 
     return (
+        f"{GEMINI_VERIFY_INSTRUCTIONS}\n\n"
         f"TARGET QUESTION ({ref_label}): {question_text}\n\n"
         f"MAPPED RANGE: lines {start_line}-{end_line} (marked with >>> ... <<< below)\n\n"
         f"TEXT WINDOW (line-numbered, with context before/after):\n{lines_block}"
     )
 
 
-def _parse_groq_verify_response(content: str) -> dict:
-    content = content.strip()
-    if content.startswith("```"):
-        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
-        content = re.sub(r'\n?```\s*$', '', content)
-        content = content.strip()
-
-    data = json.loads(content)
-    if not isinstance(data, dict) or data.get("status") not in ("ok", "missing_start", "contains_other", "too_short"):
-        raise ValueError(f"Unexpected verify response shape: {data!r}")
+def _call_gemini_verify_answer(api_key: str, question_text: str, ref_label: str,
+                                 numbered_lines: list, start_line: int, end_line: int, log):
+    prompt = _build_gemini_verify_prompt(question_text, ref_label, numbered_lines, start_line, end_line)
+    result = _call_gemini_json(api_key, prompt, log)
+    if not isinstance(result, dict) or result.get("status") not in ("ok", "missing_start", "contains_other", "too_short"):
+        return None
 
     def _safe_int(v):
         try:
@@ -2112,62 +1913,44 @@ def _parse_groq_verify_response(content: str) -> dict:
             return None
 
     return {
-        "status": data["status"],
-        "suggested_start_line": _safe_int(data.get("suggested_start_line")),
-        "suggested_end_line": _safe_int(data.get("suggested_end_line")),
+        "ref": ref_label,
+        "status": result["status"],
+        "suggested_start_line": _safe_int(result.get("suggested_start_line")),
+        "suggested_end_line": _safe_int(result.get("suggested_end_line")),
     }
 
 
-def _groq_verify_answer(client, question_text: str, ref_label: str, numbered_lines: list,
-                          start_line: int, end_line: int, budget: "_TokenBudgetTracker", log):
-    prompt = _build_groq_verify_prompt(question_text, ref_label, numbered_lines, start_line, end_line)
-    try:
-        result = _call_groq_with_retries(
-            client, GROQ_VERIFY_SYSTEM_PROMPT, prompt, _parse_groq_verify_response,
-            budget, log, max_retries=1
-        )
-    except GroqQuotaExhaustedError:
-        raise
-    except Exception as e:
-        log(f"  verify pass failed for {ref_label} (keeping range as-is): {e}")
-        return None
-    return {"ref": ref_label, **result}
-
-
-def _run_groq_verification_pass(client, numbered_lines: list, questions: list, ranges: list,
-                                  budget: "_TokenBudgetTracker", log) -> list:
-    if not ranges:
-        return ranges
-
-    log(f"Running second-opinion verification pass over {len(ranges)} mapped answer(s)...")
-    verdicts = {}
-    flagged = 0
+def _dispatch_gemini_verifications(executor: "ThreadPoolExecutor", api_key: str,
+                                     numbered_lines: list, questions: list, ranges: list, log) -> dict:
+    futures = {}
     for r in ranges:
         q_idx = _ref_to_question_index(r["ref"])
+        futures[r["ref"]] = executor.submit(
+            _call_gemini_verify_answer, api_key, questions[q_idx], r["ref"],
+            numbered_lines, r["start_line"], r["end_line"], log
+        )
+    log(f"Dispatched {len(futures)} Gemini verification call(s) in the background (running alongside Groq's own checks)...")
+    return futures
+
+
+def _collect_gemini_results(futures: dict, log, timeout: float = 90.0) -> dict:
+    results = {}
+    flagged = 0
+    for ref, fut in futures.items():
         try:
-            verdict = _groq_verify_answer(
-                client, questions[q_idx], r["ref"], numbered_lines,
-                r["start_line"], r["end_line"], budget, log
-            )
-        except GroqQuotaExhaustedError as e:
-            # Verification is a nice-to-have final check running AFTER
-            # the actual mapping is already complete -- unlike the
-            # search stage, letting this abort the whole pipeline would
-            # throw away an otherwise-good, fully-mapped result just
-            # because there's no quota left for double-checking it.
-            # Stop verifying further answers and return what we have.
-            log(f"  Verification pass stopped early: {e}")
-            break
+            verdict = fut.result(timeout=timeout)
+        except Exception as e:
+            log(f"  Gemini verification for {ref} did not complete in time / failed: {e}")
+            continue
         if verdict:
-            verdicts[r["ref"]] = verdict
+            results[ref] = verdict
             if verdict["status"] != "ok":
                 flagged += 1
-    log(f"Verification pass: {len(verdicts)} result(s), {flagged} flagged as needing a correction")
+    log(f"Gemini verification collected: {len(results)} result(s), {flagged} flagged as needing a correction")
+    return results
 
-    return _apply_verification_corrections(ranges, verdicts, log)
 
-
-def _apply_verification_corrections(ranges: list, verdicts: dict, log) -> list:
+def _apply_gemini_corrections(ranges: list, verdicts: dict, log) -> list:
     if not verdicts:
         return ranges
 
@@ -2191,7 +1974,7 @@ def _apply_verification_corrections(ranges: list, verdicts: dict, log) -> list:
 
         if verdict["status"] in ("missing_start", "contains_other") and sug_start is not None:
             if lower <= sug_start <= r["end_line"]:
-                log(f"  VERIFY: {ref} status={verdict['status']} -- moving start {r['start_line']} -> {sug_start}")
+                log(f"  GEMINI: {ref} status={verdict['status']} -- moving start {r['start_line']} -> {sug_start}")
                 if pos > 0:
                     ordered[pos - 1]["end_line"] = sug_start - 1
                 r["start_line"] = sug_start
@@ -2199,14 +1982,14 @@ def _apply_verification_corrections(ranges: list, verdicts: dict, log) -> list:
 
         if verdict["status"] in ("too_short", "contains_other") and sug_end is not None:
             if r["start_line"] <= sug_end <= upper:
-                log(f"  VERIFY: {ref} status={verdict['status']} -- moving end {r['end_line']} -> {sug_end}")
+                log(f"  GEMINI: {ref} status={verdict['status']} -- moving end {r['end_line']} -> {sug_end}")
                 r["end_line"] = sug_end
                 if pos + 1 < len(ordered) and sug_end + 1 <= ordered[pos + 1]["end_line"]:
                     ordered[pos + 1]["start_line"] = max(ordered[pos + 1]["start_line"], sug_end + 1)
                 applied = True
 
         if not applied:
-            log(f"  VERIFY: {ref} flagged status={verdict['status']} but no valid/boundable suggestion was applied")
+            log(f"  GEMINI: {ref} flagged status={verdict['status']} but no valid/boundable suggestion was applied")
 
     return ranges
 
@@ -2218,26 +2001,19 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         if status_callback:
             status_callback(msg)
 
-    groq_keys = _collect_groq_api_keys()
-    if not groq_keys:
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
         raise Exception("GROQ_API_KEY not found in secrets or environment")
 
+    client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
-    client = _RotatingGroqClient(groq_keys, budget=budget, log=log)
 
-    # Optional SEPARATE key pool for the verification pass, so it
-    # doesn't compete with the main mapping calls' rate limit. Supports
-    # its own fallback chain too: GROQ_API_KEY_VERIFY, then
-    # GROQ_API_KEY_VERIFY_2, GROQ_API_KEY_VERIFY_3, ... Falls back to
-    # reusing the main client/budget if none of these are set.
-    verify_keys = _collect_groq_api_keys(env_prefix="GROQ_API_KEY_VERIFY")
-    if verify_keys:
-        verify_budget = _TokenBudgetTracker()
-        verify_client = _RotatingGroqClient(verify_keys, budget=verify_budget, log=log)
-        log(f"Verification pass will use {len(verify_keys)} SEPARATE Groq API key(s) (GROQ_API_KEY_VERIFY*) with its own rate-limit pool.")
-    else:
-        verify_client = client
-        verify_budget = budget
+    gemini_api_key = get_api_key("GEMINI_API_KEY")
+    gemini_executor = ThreadPoolExecutor(max_workers=GEMINI_VERIFY_MAX_WORKERS) if gemini_api_key else None
+    if gemini_api_key:
+        log("Gemini verification enabled -- will run in the background alongside Groq's own checks.")
 
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(numbered_lines)
@@ -2323,51 +2099,13 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                     found_starts[ref] = sl
                     log(f"  found {ref} (sibling) at line {sl}")
 
-                # FIX: sub-question merge bug -- previously, if the batch
-                # call above didn't confidently separate a LATER sibling,
-                # its content silently stayed folded into whichever
-                # sibling precedes it (the visible symptom: a sub-
-                # question's answer appears merged into the answer
-                # above it). Recover any still-unresolved sibling with a
-                # dedicated, well-tested single-target search (the same
-                # search used for every standalone question) instead of
-                # accepting the batch call's silence as final. Bounded
-                # strictly within [previous confirmed sibling's start,
-                # upper] so it can never reach into a DIFFERENT
-                # question's territory outside this group.
-                search_floor = group_start
-                for gi in group_indices[1:]:
-                    gref = f"REF-{chr(65 + gi)}"
-                    if gref in found_starts:
-                        search_floor = found_starts[gref]
-                        continue
-                    if search_floor >= upper:
-                        continue
-                    gq = questions[gi]
-                    log(
-                        f"  sibling {gref} not separated by the batch call -- retrying with a "
-                        f"dedicated targeted search (lines {search_floor + 1}-{upper})..."
-                    )
-                    recovered = _find_answer_start_sequential(
-                        client, numbered_lines, gq, gref, search_floor + 1, budget, log,
-                        end_idx=upper + 1,
-                        extra_reminder=_build_sub_part_hint(questions, gi)
-                    )
-                    if recovered is not None and search_floor < recovered <= upper:
-                        found_starts[gref] = recovered
-                        search_floor = recovered
-                        log(
-                            f"  RECOVERED sibling {gref} at line {recovered} -- it would otherwise "
-                            f"have been silently merged into the sibling above it"
-                        )
-
             unresolved = [ref for ref in group_refs[1:] if ref not in found_starts]
             if unresolved:
                 log(
                     f"NOTE: sibling(s) {unresolved} were not confidently separated within "
-                    f"the group's bounded region (lines {group_start}-{upper}) even after a "
-                    f"dedicated retry -- their content stays folded into the preceding "
-                    f"sibling's answer rather than risking a wrong split."
+                    f"the group's bounded region (lines {group_start}-{upper}) -- their content "
+                    f"stays folded into the preceding sibling's answer rather than risking a "
+                    f"wrong split."
                 )
 
             if next_index < n and group_end_bound is not None:
@@ -2400,9 +2138,12 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         # smaller and search calls fewer, and also prevents this search
         # from ever overshooting into territory already claimed by a
         # later question.
+        future_anchor_lines = [v for k, v in found_starts.items() if _ref_to_question_index(k) > i]
+        bound_end_idx = (min(future_anchor_lines) + 1) if future_anchor_lines else None
+
         start_line = _find_answer_start_sequential(
             client, numbered_lines, q, ref, pointer, budget, log,
-            extra_reminder=sub_part_hint
+            extra_reminder=sub_part_hint, end_idx=bound_end_idx
         )
 
         attempt = 1
@@ -2418,7 +2159,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 reminder_parts.append(sub_part_hint)
             start_line = _find_answer_start_sequential(
                 client, numbered_lines, q, ref, pointer, budget, log,
-                extra_reminder="\n\n".join(reminder_parts)
+                extra_reminder="\n\n".join(reminder_parts), end_idx=bound_end_idx
             )
             if start_line is not None:
                 log(f"  retry (pass {attempt + 1}) recovered {ref} starting at line {start_line}")
@@ -2452,13 +2193,21 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
     log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
 
+    gemini_futures = (
+        _dispatch_gemini_verifications(gemini_executor, gemini_api_key, numbered_lines, questions, ranges, log)
+        if gemini_executor else {}
+    )
+
     ranges = _rescue_unmatched_questions(client, numbered_lines, questions, ranges, budget, log)
 
     ranges = _reanalyze_and_repair_boundaries(client, numbered_lines, questions, ranges, budget, log)
 
     ranges = _remap_incomplete_answers(client, numbered_lines, questions, ranges, budget, log)
 
-    ranges = _run_groq_verification_pass(verify_client, numbered_lines, questions, ranges, verify_budget, log)
+    if gemini_executor:
+        gemini_verdicts = _collect_gemini_results(gemini_futures, log)
+        ranges = _apply_gemini_corrections(ranges, gemini_verdicts, log)
+        gemini_executor.shutdown(wait=False)
 
     ranges_by_ref = {r["ref"]: r for r in ranges}
     results = []
@@ -2856,12 +2605,14 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         if status_callback:
             status_callback(msg)
 
-    groq_keys = _collect_groq_api_keys()
-    if not groq_keys:
+    from groq import Groq
+
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
         raise Exception("GROQ_API_KEY not found in secrets or environment")
 
+    client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
-    client = _RotatingGroqClient(groq_keys, budget=budget, log=log)
 
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
 
@@ -2890,8 +2641,6 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
                 client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
                 _parse_answer_map_llm_response, budget, log
             )
-        except GroqQuotaExhaustedError:
-            raise
         except Exception as e:
             log(f"WARNING: chunk {i+1}/{len(chunks_with_carry)} answer-mapping failed, skipping: {e}")
             chunk_failures.append(str(e))
@@ -3242,21 +2991,13 @@ def process_pdf(file_input, status_callback=None):
 
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
 
-    pages = run_ocr_cached(file_bytes, file_name, status_callback)
+    pages = run_ocr(file_bytes, file_name, status_callback)
 
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    try:
-        qp_page_indices, official_questions, admin_page_indices = identify_questions_with_llm(pages, status_callback)
-    except GroqQuotaExhaustedError as e:
-        raise Exception(
-            f"Stopped processing during question-paper identification: every configured "
-            f"Groq API key's daily quota is exhausted. {e}\n\n"
-            f"Add more backup keys (GROQ_API_KEY_2, GROQ_API_KEY_3, ...) in secrets, or "
-            f"wait for the daily reset, then reprocess this document."
-        ) from e
+    qp_page_indices, official_questions, admin_page_indices = identify_questions_with_llm(pages, status_callback)
 
     log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
     log(f"Admin/cover pages detected: {[p+1 for p in admin_page_indices] if admin_page_indices else 'none'}")
@@ -3323,19 +3064,10 @@ def process_pdf(file_input, status_callback=None):
         )
 
     log("Mapping each question to its answer (sequential single-target search)...")
-    try:
-        qa_pairs = map_answers_sequential(
-            answer_lines, official_questions, status_callback,
-            answer_line_pages=answer_line_pages
-        )
-    except GroqQuotaExhaustedError as e:
-        raise Exception(
-            f"Stopped processing partway through answer-mapping: every configured Groq API "
-            f"key's daily quota is exhausted. {e}\n\n"
-            f"This document was NOT fully mapped, and no partial/corrupted results are "
-            f"returned -- add more backup keys (GROQ_API_KEY_2, GROQ_API_KEY_3, ...) in "
-            f"secrets, or wait for the daily reset, then reprocess this document."
-        ) from e
+    qa_pairs = map_answers_sequential(
+        answer_lines, official_questions, status_callback,
+        answer_line_pages=answer_line_pages
+    )
 
     matched_count = sum(1 for p in qa_pairs if p["matched"])
     log(f"Matched {matched_count} of {len(official_questions)} questions")
