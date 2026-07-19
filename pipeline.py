@@ -509,6 +509,120 @@ def _parse_rate_limit_detail(message: str):
     }
 
 
+# =========================================================
+# MULTI-KEY GROQ ROTATION (fallback across several Groq accounts)
+#
+# Add as many keys as you have to secrets.toml / the environment:
+#
+#   GROQ_API_KEY   = "key-from-account-1"
+#   GROQ_API_KEY_2 = "key-from-account-2"
+#   GROQ_API_KEY_3 = "key-from-account-3"
+#   GROQ_API_KEY_4 = "key-from-account-4"
+#
+# _collect_groq_api_keys() picks up every one of these that's set (up
+# to _MAX_GROQ_KEYS), in order. _RotatingGroqClient is a drop-in stand-
+# in for a real groq.Groq client -- every existing call site in this
+# file that does `client.chat.completions.create(...)` keeps working
+# completely unchanged. Internally, when the CURRENTLY ACTIVE key's
+# daily quota (TPD) is exhausted, or the key is invalid/revoked, it
+# transparently switches to the NEXT key in the list and retries the
+# EXACT SAME request -- so a search/verify call continues from exactly
+# the window it was already on, never restarting the document or
+# losing place. Only once EVERY configured key has been exhausted does
+# it finally raise, at which point _call_groq_with_retries's existing
+# "Daily token quota (TPD) exhausted" error message is shown as before.
+# =========================================================
+
+_MAX_GROQ_KEYS = 10
+
+
+def _collect_groq_api_keys(env_prefix: str = "GROQ_API_KEY") -> list:
+    keys = []
+    primary = get_api_key(env_prefix)
+    if primary:
+        keys.append(primary)
+    for n in range(2, _MAX_GROQ_KEYS + 1):
+        k = get_api_key(f"{env_prefix}_{n}")
+        if k:
+            keys.append(k)
+    return keys
+
+
+class _RotatingCompletions:
+    def __init__(self, pool: "_RotatingGroqClient"):
+        self._pool = pool
+
+    def create(self, **kwargs):
+        import groq
+        while True:
+            try:
+                return self._pool.client.chat.completions.create(**kwargs)
+            except groq.AuthenticationError:
+                # This key is invalid/revoked -- try the next one
+                # rather than failing the whole pipeline immediately.
+                if self._pool.rotate(reason="was rejected as invalid (401)"):
+                    continue
+                raise
+            except (groq.RateLimitError, groq.BadRequestError) as e:
+                detail = _parse_rate_limit_detail(str(e))
+                if detail and detail["limit_type"] == "TPD":
+                    if self._pool.rotate(reason="hit its daily token quota (TPD)"):
+                        continue
+                # TPM limits and everything else are left to
+                # _call_groq_with_retries's own pacing/backoff logic,
+                # exactly as before -- only a genuinely EXHAUSTED daily
+                # quota or a dead key triggers a key swap.
+                raise
+
+
+class _RotatingChat:
+    def __init__(self, pool: "_RotatingGroqClient"):
+        self.completions = _RotatingCompletions(pool)
+
+
+class _RotatingGroqClient:
+    def __init__(self, api_keys: list, budget: "_TokenBudgetTracker" = None, log=print):
+        if not api_keys:
+            raise Exception("No Groq API key(s) configured")
+        from groq import Groq
+        self._Groq = Groq
+        self._keys = api_keys
+        self._index = 0
+        self._budget = budget
+        self._log = log
+        self._client = self._Groq(api_key=self._keys[0])
+        self.chat = _RotatingChat(self)
+
+        if len(api_keys) > 1:
+            log(f"Groq key rotation enabled: {len(api_keys)} key(s) configured -- will fall back key-to-key on quota exhaustion.")
+
+    @property
+    def client(self):
+        return self._client
+
+    @property
+    def key_count(self) -> int:
+        return len(self._keys)
+
+    def rotate(self, reason: str = "") -> bool:
+        if self._index + 1 >= len(self._keys):
+            self._log(
+                f"WARNING: Groq key #{self._index + 1} of {len(self._keys)} (the LAST configured "
+                f"key) also {reason or 'hit its limit'} -- no more keys left to fall back to."
+            )
+            return False
+        self._index += 1
+        self._client = self._Groq(api_key=self._keys[self._index])
+        if self._budget is not None:
+            self._budget.reset_window()
+        self._log(
+            f"Groq key #{self._index} of {len(self._keys)} {reason or 'hit its limit'} -- "
+            f"switching to key #{self._index + 1} and continuing the SAME request from exactly "
+            f"where it stopped (no restart, no lost progress)."
+        )
+        return True
+
+
 def _parse_qp_llm_response(content: str) -> tuple:
     content = content.strip()
 
@@ -818,14 +932,12 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
     if not qp_pages:
         return []
 
-    from groq import Groq
-
-    api_key = get_api_key("GROQ_API_KEY")
-    if not api_key:
+    groq_keys = _collect_groq_api_keys()
+    if not groq_keys:
         raise Exception("GROQ_API_KEY not found in secrets or environment")
 
-    client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
+    client = _RotatingGroqClient(groq_keys, budget=budget, log=log)
 
     user_prompt = _build_canonical_questions_prompt(qp_pages)
     log(f"Extracting canonical question list from {len(qp_pages)} question-paper page(s) in a single pass...")
@@ -849,14 +961,12 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         if status_callback:
             status_callback(msg)
 
-    from groq import Groq
-
-    api_key = get_api_key("GROQ_API_KEY")
-    if not api_key:
+    groq_keys = _collect_groq_api_keys()
+    if not groq_keys:
         raise Exception("GROQ_API_KEY not found in secrets or environment")
 
-    client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
+    client = _RotatingGroqClient(groq_keys, budget=budget, log=log)
 
     chunks = _chunk_pages_by_char_budget(pages)
     log(f"Split {len(pages)} page(s) into {len(chunks)} LLM chunk(s) to respect token limits")
@@ -2005,23 +2115,23 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         if status_callback:
             status_callback(msg)
 
-    from groq import Groq
-
-    api_key = get_api_key("GROQ_API_KEY")
-    if not api_key:
+    groq_keys = _collect_groq_api_keys()
+    if not groq_keys:
         raise Exception("GROQ_API_KEY not found in secrets or environment")
 
-    client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
+    client = _RotatingGroqClient(groq_keys, budget=budget, log=log)
 
-    # Optional SEPARATE Groq client/key for the verification pass, so it
-    # doesn't compete with the main mapping calls' rate limit. Falls back
-    # to reusing the main client/budget if GROQ_API_KEY_VERIFY isn't set.
-    verify_api_key = get_api_key("GROQ_API_KEY_VERIFY")
-    if verify_api_key and verify_api_key != api_key:
-        verify_client = Groq(api_key=verify_api_key)
+    # Optional SEPARATE key pool for the verification pass, so it
+    # doesn't compete with the main mapping calls' rate limit. Supports
+    # its own fallback chain too: GROQ_API_KEY_VERIFY, then
+    # GROQ_API_KEY_VERIFY_2, GROQ_API_KEY_VERIFY_3, ... Falls back to
+    # reusing the main client/budget if none of these are set.
+    verify_keys = _collect_groq_api_keys(env_prefix="GROQ_API_KEY_VERIFY")
+    if verify_keys:
         verify_budget = _TokenBudgetTracker()
-        log("Verification pass will use a SEPARATE Groq API key (GROQ_API_KEY_VERIFY) with its own rate-limit pool.")
+        verify_client = _RotatingGroqClient(verify_keys, budget=verify_budget, log=log)
+        log(f"Verification pass will use {len(verify_keys)} SEPARATE Groq API key(s) (GROQ_API_KEY_VERIFY*) with its own rate-limit pool.")
     else:
         verify_client = client
         verify_budget = budget
@@ -2646,14 +2756,12 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         if status_callback:
             status_callback(msg)
 
-    from groq import Groq
-
-    api_key = get_api_key("GROQ_API_KEY")
-    if not api_key:
+    groq_keys = _collect_groq_api_keys()
+    if not groq_keys:
         raise Exception("GROQ_API_KEY not found in secrets or environment")
 
-    client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
+    client = _RotatingGroqClient(groq_keys, budget=budget, log=log)
 
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
 
