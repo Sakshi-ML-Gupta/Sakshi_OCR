@@ -339,7 +339,7 @@ TPM_LIMIT = 30000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 
-MAX_CHARS_PER_CHUNK = 12000  # increased from 6000 -- fewer chunks means fewer calls, each paying the ~500-token system-prompt overhead only once per (larger) chunk instead of once per (smaller) chunk
+MAX_CHARS_PER_CHUNK = 9000  # increased from 6000 -- fewer chunks means fewer calls, each paying the ~500-token system-prompt overhead only once per (larger) chunk instead of once per (smaller) chunk
 CHUNK_OVERLAP_PAGES = 1
 
 QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam/assignment answer booklet. This could be from ANY institution, ANY subject, and ANY language (or a mix of languages/scripts) -- do not assume a specific country, university, or language. The booklet mixes pages of different kinds, in no guaranteed order:
@@ -485,13 +485,6 @@ class _TokenBudgetTracker:
         if value == 0:
             self.events.clear()
 
-class GroqQuotaExhausted(Exception):
-    """Raised when Groq's DAILY token quota (TPD) is exhausted -- never
-    caught by generic except blocks, always propagates immediately so
-    the pipeline stops the instant the quota runs out instead of
-    grinding through guaranteed-to-fail retries."""
-    pass
-
 
 _RATE_LIMIT_DETAIL_RE = re.compile(
     r'on\s+tokens\s+per\s+(minute|day)\s*\((TPM|TPD)\).*?'
@@ -500,43 +493,6 @@ _RATE_LIMIT_DETAIL_RE = re.compile(
     re.IGNORECASE | re.DOTALL
 )
 
-class _GroqClientPool:
-    """
-    Manages one or more Groq API clients (a primary key + optional
-    fallback key(s)) and transparently switches to the next available
-    client the INSTANT the current one's daily quota (TPD) is
-    exhausted -- mid-call, mid-document. Since all pipeline state
-    (search pointer, found_starts, ranges, etc.) lives in the calling
-    code and never inside the client itself, swapping clients and
-    simply retrying the SAME request resumes exactly where processing
-    left off -- zero restart, zero lost work.
-    """
-    def __init__(self, api_keys: list, log=print):
-        from groq import Groq
-        self.log = log
-        self._keys = [k for k in api_keys if k]
-        if not self._keys:
-            raise Exception("No GROQ_API_KEY (or fallback) found in secrets or environment")
-        self._clients = [Groq(api_key=k) for k in self._keys]
-        self._current = 0
-
-    @property
-    def client(self):
-        return self._clients[self._current]
-
-    def advance(self) -> bool:
-        """Switch to the next available client. Returns True if a
-        fallback was available and switched to; False if already on
-        the last configured key (truly out of keys)."""
-        if self._current + 1 < len(self._clients):
-            self._current += 1
-            self.log(
-                f"Groq API key #{self._current} exhausted its daily quota -- "
-                f"switching to fallback key #{self._current + 1} and resuming "
-                f"from exactly where processing left off (no restart, no lost work)."
-            )
-            return True
-        return False
 
 def _parse_rate_limit_detail(message: str):
     m = _RATE_LIMIT_DETAIL_RE.search(message)
@@ -643,21 +599,15 @@ def _try_split_concatenated_page_number(n: int, valid_page_numbers: set, max_pag
 
 def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                               response_parser, budget: "_TokenBudgetTracker",
-                              log, max_retries: int = 2):
-    """
-    `client` here is a _GroqClientPool, not a raw Groq client -- this is
-    the ONLY function that needs to know about the pool; every other
-    caller just passes it through opaquely.
-    """
+                              log, max_retries: int = 4):
     import groq
 
     estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
     last_error = None
 
     skip_next_proactive_check = False
-    attempt = 1
 
-    while attempt <= max_retries + 1:
+    for attempt in range(1, max_retries + 2):
         if skip_next_proactive_check:
             skip_next_proactive_check = False
         else:
@@ -665,7 +615,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 
         try:
             with _groq_call_lock:
-                response = client.client.chat.completions.create(   # <-- .client added
+                response = client.chat.completions.create(
                     model=GROQ_MODEL,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -700,20 +650,18 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             detail = _parse_rate_limit_detail(str(e))
 
             if detail and detail["limit_type"] == "TPD":
-                if client.advance():
-                    # Switched to a fallback key -- reset the (per-key)
-                    # token budget tracker and retry the SAME request
-                    # without consuming a retry slot. Completely free.
-                    budget.reset_window()
-                    continue
-                raise GroqQuotaExhausted(
-                    f"Groq daily token quota (TPD) exhausted on ALL configured API "
-                    f"key(s): {detail['used']}/{detail['limit']} tokens used today "
-                    f"on the last key, {detail['requested']} more requested. This "
-                    f"will reset in approximately {detail['wait_seconds']/60:.0f} "
-                    f"minute(s). Add a GROQ_API_KEY2 (or further keys) to "
-                    f"secrets/environment for automatic fallback, or wait for the "
-                    f"daily reset."
+                raise Exception(
+                    f"Groq daily token quota (TPD) exhausted: "
+                    f"{detail['used']}/{detail['limit']} tokens used today, "
+                    f"{detail['requested']} more requested. This will reset "
+                    f"in approximately {detail['wait_seconds']/60:.0f} minute(s). "
+                    f"Retrying within this run will not help -- either wait "
+                    f"for the daily reset, or upgrade your Groq tier at "
+                    f"https://console.groq.com/settings/billing. "
+                    f"(If you're processing the same document more than once "
+                    f"per click/run, check for duplicate calls -- that doubles "
+                    f"daily token consumption and exhausts this quota twice "
+                    f"as fast.)"
                 ) from e
 
             if detail:
@@ -735,17 +683,16 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                     f"Waiting {wait_s:.1f}s before retrying..."
                 )
                 time.sleep(wait_s)
-            attempt += 1
 
         except Exception as e:
             last_error = e
             log(f"Chunk LLM call/parse attempt {attempt} failed: {e}")
             time.sleep(1)
-            attempt += 1
 
     raise Exception(
         f"Chunk LLM call failed after {max_retries + 1} attempts. Last error: {last_error}"
     )
+
 
 def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker",
                           log, max_retries: int = 4) -> tuple:
@@ -874,12 +821,11 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
 
     from groq import Groq
 
-    #api_key = get_api_key("GROQ_API_KEY")
-    #if not api_key:
-        #raise Exception("GROQ_API_KEY not found in secrets or environment")
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
+        raise Exception("GROQ_API_KEY not found in secrets or environment")
 
-    api_key2 = get_api_key("GROQ_API_KEY2")
-    client = _GroqClientPool([api_key, api_key2], log=log)
+    client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
     user_prompt = _build_canonical_questions_prompt(qp_pages)
@@ -1029,30 +975,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         else:
             page_clusters.append([p])
 
-    # =====================================================================
-    # FIX: a confirmed, reproduced bug -- when question-paper page
-    # detection produced MULTIPLE non-contiguous clusters (almost always
-    # because an answer page that restates a long question got
-    # misclassified as a question-paper page somewhere else in the
-    # document), the PREVIOUS version of this code extracted EACH
-    # cluster SEPARATELY and concatenated all their questions together.
-    # For a document that genuinely has only ONE real question paper,
-    # this meant the real 8 questions from the true cluster got joined
-    # with several extra/partial/near-duplicate questions extracted from
-    # the spurious cluster(s) -- producing e.g. 14 "questions" instead of
-    # 8. Those extra fake questions then also corrupted the sequential
-    # answer-search downstream (the pointer gets dragged around chasing
-    # non-existent answers for the fake questions), which is the same
-    # root cause behind real answers' starting lines getting skipped.
-    #
-    # Fix: when there is more than one cluster, treat ONLY the LARGEST
-    # cluster (by page count, tie-broken by total character count) as
-    # the genuine question paper -- this matches the common real-world
-    # case of "there is only one question paper" in the document. Every
-    # OTHER cluster is reclassified straight to the answer-page pool
-    # WITHOUT ever calling extract_canonical_questions on it, so it can
-    # never contribute a single extra/duplicate question.
-    # =====================================================================
     reclassified_as_answer_pages = []
 
     if len(page_clusters) > 1:
@@ -1100,10 +1022,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
             f"(1-based): {[i + 1 for i in sorted(set(reclassified_as_answer_pages))]}"
         )
 
-    # Safety-net dedup: even a SINGLE cluster's own extraction call could
-    # in principle repeat a question (e.g. if it appears twice verbatim
-    # on the question paper itself) -- keep this cheap final pass as a
-    # last line of defense so Q-A pairs can never repeat downstream.
     before_dedup = len(questions)
     questions = _dedup_questions(questions)
     if len(questions) != before_dedup:
@@ -1158,46 +1076,6 @@ If NONE of the official questions' answers appear in the text shown, return {"an
 
 # =========================================================
 # SEQUENTIAL SINGLE-TARGET ANSWER MAPPING (recommended, default)
-#
-# This replaces the multi-answer-per-call chunking above with a much
-# simpler and more reliable design, built around three ideas:
-#
-#   1. Only ever ask the LLM to find ONE thing per call: "does REF-X's
-#      answer begin somewhere in this window of text, and if so, on
-#      which line?" A single yes/no + one integer is a task a model
-#      essentially cannot "give up halfway through" -- there is no
-#      halfway. This directly eliminates the "does 2-3 answers then
-#      stops" failure mode, because no call is ever asked to do more
-#      than one thing.
-#
-#   2. A question's answer START is always searched for beginning
-#      exactly where the PREVIOUS question's answer was confirmed to
-#      start (never independently re-guessed), so there's no gap where
-#      a page/paragraph could be silently skipped between two answers.
-#
-#   3. A question's answer END is NEVER asked of the LLM at all. It is
-#      always computed in plain Python as
-#      (next confirmed answer's start_line - 1), or end-of-document for
-#      the last question. This removes the entire class of bugs where
-#      the LLM invents a wrong or truncated end line -- there is
-#      structurally no way for one answer to swallow or lose part of
-#      another, because ranges are built by construction to be
-#      contiguous and non-overlapping.
-#
-# CRITICAL INVARIANT (this is what keeps answers from silently losing
-# their opening lines): when a question's answer CANNOT be found, the
-# search pointer must NOT be advanced. The next question is then
-# searched for starting from the SAME position, over the SAME
-# unclaimed text -- so nothing is ever skipped past just because one
-# search came back empty. The only thing that ever advances `i` (the
-# question index) is finishing the check for that question, one way or
-# the other; there is no risk of an infinite loop because `i` always
-# increases by at least 1 every iteration regardless of whether a match
-# was found, so the outer loop is guaranteed to terminate in at most
-# `n` iterations. Do NOT "helpfully" force the pointer forward when a
-# search fails -- that silently deletes real content (this was a
-# confirmed, reproduced bug in an earlier revision of this file and
-# must not be reintroduced).
 # =========================================================
 
 SEQUENTIAL_SEARCH_SYSTEM_PROMPT = """You are searching for exactly ONE thing in a block of line-numbered OCR text from a student's exam answer booklet: the line where the response to ONE SPECIFIC question begins.
@@ -1284,10 +1162,6 @@ def _parse_sequential_search_response(content: str) -> tuple:
 SEQUENTIAL_SEARCH_WINDOW_CHARS = 16000  # increased from 11000 -- larger windows mean fewer calls to scan the same document, cutting repeated system-prompt token overhead (the biggest fixed cost per call)
 SEQUENTIAL_SEARCH_MAX_WINDOWS = 200  # generous safety cap; a real document will exhaust far sooner
 
-# Windows slide forward with a small overlap so an answer's true start
-# line, if it happens to fall right at the boundary between two
-# windows, still gets a chance to be seen (with surrounding context) in
-# at least one window.
 SEQUENTIAL_SEARCH_OVERLAP_LINES = 5
 
 _BARE_LABEL_RE = re.compile(
@@ -1298,14 +1172,6 @@ _BARE_LABEL_RE = re.compile(
 
 
 def _find_bare_label_candidates(window_lines: list, question_text: str) -> list:
-    """
-    Deterministic (non-LLM) scan for BARE numeric/roman labels (e.g. "Q1",
-    "Q.i", "(ii)", "1)") that match the target question's own number or
-    sub-part label, on lines with little/no other text. Used only to
-    generate a HINT for the LLM search -- never to decide the boundary
-    itself -- since bare-label documents (no restated question, direct
-    answer follows) are otherwise very hard for the model to anchor on.
-    """
     q_num = _extract_leading_number(question_text)
     q_label = _extract_sub_part_label(question_text)
     if not q_num and not q_label:
@@ -1315,7 +1181,7 @@ def _find_bare_label_candidates(window_lines: list, question_text: str) -> list:
     for idx, text in window_lines:
         stripped = text.strip()
         if len(stripped) > 15:
-            continue  # bare labels are short; skip lines with real content
+            continue
         m = _BARE_LABEL_RE.match(stripped)
         if not m:
             continue
@@ -1336,22 +1202,7 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                                     max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS,
                                     extra_reminder: str = None,
                                     end_idx: int = None,
-                                    context_lookback: int = 6,
-                                    cache: dict = None,cache=cache):
-    """
-    Slides forward through numbered_lines in overlapping windows,
-    starting at search_from_idx, asking a single yes/no+line-number
-    question per window, until the target's start is found or the
-    search region is exhausted. Returns the found start_line, or None
-    if it genuinely isn't found in [search_from_idx, end_idx).
-
-    Pointer advancement is deliberately simple and monotonic: each
-    window always ends strictly further than the previous one started
-    (idx > pointer is guaranteed by the inner while loop building the
-    window), so windows_tried always increases and the loop always
-    terminates -- no "stuck pointer" detection or forced skip-ahead is
-    needed or used.
-    """
+                                    context_lookback: int = 6):
     total_lines = len(numbered_lines) if end_idx is None else min(len(numbered_lines), end_idx)
     pointer = search_from_idx
     windows_tried = 0
@@ -1383,23 +1234,15 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
             )
         combined_reminder = "\n\n".join(filter(None, [extra_reminder, label_hint])) or None
 
-        cache_key = (ref_label, window[0][0], window[-1][0], combined_reminder)
-        if cache is not None and cache_key in cache:
-            found, start_line = cache[cache_key]
-        else:
-            user_prompt = _build_sequential_search_prompt(window, question_text, ref_label, combined_reminder, context_before)
-            try:
-                found, start_line = _call_groq_with_retries(
-                    client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
-                    _parse_sequential_search_response, budget, log
-                )
-            except GroqQuotaExhausted:
-                raise
-            except Exception as e:
-                log(f"WARNING: search call failed for {ref_label} (lines {window[0][0]}-{window[-1][0]}): {e}")
-                found, start_line = False, None
-            if cache is not None:
-                cache[cache_key] = (found, start_line)
+        user_prompt = _build_sequential_search_prompt(window, question_text, ref_label, combined_reminder, context_before)
+        try:
+            found, start_line = _call_groq_with_retries(
+                client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
+                _parse_sequential_search_response, budget, log
+            )
+        except Exception as e:
+            log(f"WARNING: search call failed for {ref_label} (lines {window[0][0]}-{window[-1][0]}): {e}")
+            found, start_line = False, None
 
         if found and start_line is not None:
             valid_ids = {i for i, _ in window}
@@ -1412,32 +1255,13 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
             )
 
         if idx >= total_lines:
-            break  # reached the end of the search region -- nothing left to overlap into
+            break
 
-        # Advance with a small overlap instead of jumping straight past
-        # this window's last few lines -- guarantees forward progress
-        # (idx always > pointer, so pointer strictly increases every
-        # iteration) while still catching boundary-straddling starts on
-        # the next call.
         pointer = max(pointer + 1, idx - SEQUENTIAL_SEARCH_OVERLAP_LINES)
         windows_tried += 1
 
     return None
 
-
-# =========================================================
-# SUB-PART LABEL AWARENESS
-#
-# FIX: multi-part questions (e.g. "1.(i) ... (ii) ... (iii) ...") produce
-# several sibling questions that share almost all their context (the same
-# parent instruction/topic), differing only in their own small label. This
-# makes them the hardest case for the sequential search: a sibling
-# sub-part's answer can look "close enough" topically that the model
-# attributes it to the wrong sibling. Detecting that a target question IS
-# a labeled sub-part, and explicitly naming its siblings in the prompt,
-# gives the model a concrete thing to check for (the exact label) instead
-# of relying purely on topical similarity.
-# =========================================================
 
 _LEADING_NUMBER_RE = re.compile(r'^\s*(\d+)[\.\)]')
 _SUB_PART_LABEL_RE = re.compile(r'\(([ivxlcdm]{1,5}|[a-zA-Z]|[\u0900-\u097F])\)', re.IGNORECASE)
@@ -1480,45 +1304,6 @@ def _build_sub_part_hint(questions: list, i: int) -> str:
         f"not match content that is actually the student's response to a DIFFERENT sibling "
         f"sub-part just because it discusses a closely related aspect of the same topic."
     )
-
-
-def _verify_earliest_start(client, numbered_lines: list, question_text: str, ref_label: str,
-                             search_from_idx: int, found_start: int, budget: "_TokenBudgetTracker",
-                             log, max_scan_lines: int = 40) -> int:
-    """
-    Checks for an earlier genuine start of this answer, but ONLY within a
-    small local radius (max_scan_lines) before found_start -- not the
-    entire gap back to search_from_idx.
-
-    COST NOTE: a genuinely missed intro line/paragraph is essentially
-    always within a few lines of the reported start (the model just
-    picked the "topic sentence" instead of the lead-in sentence right
-    before it). A gap of hundreds of lines almost always just means the
-    PREVIOUS answer was legitimately long -- re-scanning that whole gap
-    every single time (as earlier versions of this function did) was the
-    single largest source of wasted tokens/time in this pipeline, since
-    it could trigger several extra multi-window searches per question
-    for zero practical benefit. Bounding the check to a small window
-    keeps the real bug fix (catching a missed opening line) while
-    cutting that cost to at most one extra call in the common case.
-    """
-    gap = found_start - search_from_idx
-    if gap <= 0:
-        return found_start
-
-    bounded_search_from = max(search_from_idx, found_start - max_scan_lines)
-
-    earlier = _find_answer_start_sequential(
-        client, numbered_lines, question_text, ref_label,
-        bounded_search_from, budget, log,
-        end_idx=found_start + 1
-    )
-
-    if earlier is not None and earlier < found_start:
-        log(f"  backward-check moved {ref_label}'s start earlier: {found_start} -> {earlier}")
-        return earlier
-
-    return found_start
 
 
 BOUNDARY_CONFIRM_SYSTEM_PROMPT = """You are double-checking a proposed boundary line between two consecutive answers in a student's exam booklet.
@@ -1565,28 +1350,19 @@ def _parse_boundary_confirm_response(content: str) -> int:
 
 def _confirm_boundary(client, numbered_lines: list, prev_question: str, curr_question: str,
                         proposed_line: int, budget: "_TokenBudgetTracker", log,
-                        radius: int = 35) -> int:
-    """
-    Tight, LOCAL, bidirectional re-check around a proposed boundary line --
-    unlike _verify_earliest_start (which only ever moves a start earlier),
-    this catches the mirror-image bug: a boundary set TOO EARLY, which
-    silently truncates the end of the PREVIOUS answer while stealing that
-    content into the following answer.
-    """
+                        radius: int = 15) -> int:
     lo = max(0, proposed_line - radius)
     hi = min(len(numbered_lines) - 1, proposed_line + radius)
     window = [nl for nl in numbered_lines if lo <= nl[0] <= hi]
     if not window:
         return proposed_line
 
-    user_prompt = _build_boundary_confirm_prompt(window_lines, prev_question, curr_question, proposed_line)
+    user_prompt = _build_boundary_confirm_prompt(window, prev_question, curr_question, proposed_line)
     try:
         corrected = _call_groq_with_retries(
             client, BOUNDARY_CONFIRM_SYSTEM_PROMPT, user_prompt,
             _parse_boundary_confirm_response, budget, log, max_retries=1
         )
-    except GroqQuotaExhausted:
-        raise
     except Exception as e:
         log(f"  boundary confirm failed for line {proposed_line} (keeping original): {e}")
         return proposed_line
@@ -1596,6 +1372,135 @@ def _confirm_boundary(client, numbered_lines: list, prev_question: str, curr_que
         log(f"  boundary confirm adjusted start: {proposed_line} -> {corrected}")
         return corrected
 
+    return proposed_line
+
+
+# =========================================================
+# TOKEN/TIME OPTIMIZATION 1: deterministic (zero-LLM-cost) label
+# pre-pass. Scans the whole document ONCE with a regex for lines
+# carrying an explicit answer label ("Ans 5-", "उत्तर 6-", "Q.7", etc.)
+# whose number matches a STANDALONE question's own leading number, in
+# strictly increasing document order. Any question resolved this way
+# skips BOTH the LLM search AND the boundary-check call entirely --
+# on a labeled document this can eliminate the large majority of Groq
+# calls (and their tokens) the sequential search would otherwise spend,
+# and turns what used to be several network round-trips per question
+# into a single O(total_lines) regex scan (a huge wall-clock win too).
+# Deliberately excludes sibling sub-part questions (i)/(ii)/(iii) --
+# they share the same parent number, so this simple per-number match
+# can't safely tell them apart; those keep going through the existing
+# group-handling logic untouched.
+# =========================================================
+
+def _build_label_anchor_index(answer_lines: list, questions: list, exclude_indices: set, log=print) -> dict:
+    q_number_to_indices = {}
+    for qi, q in enumerate(questions):
+        if qi in exclude_indices:
+            continue
+        qn = _extract_leading_number(q)
+        if qn is not None:
+            q_number_to_indices.setdefault(qn, []).append(qi)
+
+    if not q_number_to_indices:
+        return {}
+
+    raw_hits = {}
+    for i, line in enumerate(answer_lines):
+        m = _ANSWER_START_RE.match(line)
+        if not m:
+            continue
+        num_match = re.search(r'\d+', m.group(0))
+        if not num_match:
+            continue
+        qis = q_number_to_indices.get(num_match.group(0))
+        if not qis:
+            continue
+        for qi in qis:
+            raw_hits.setdefault(qi, []).append(i)
+
+    anchors = {}
+    last_line = -1
+    for qi in sorted(raw_hits.keys()):
+        candidates = sorted(l for l in raw_hits[qi] if l > last_line)
+        if candidates:
+            anchors[qi] = candidates[0]
+            last_line = candidates[0]
+
+    if anchors:
+        log(
+            f"Label pre-pass (zero-LLM-cost): anchored {len(anchors)}/{len(questions)} "
+            f"question(s) via explicit labels (Ans/उत्तर/Q. etc.) -- skipping LLM search "
+            f"and boundary-check calls entirely for these."
+        )
+    return anchors
+
+
+# =========================================================
+# TOKEN/TIME OPTIMIZATION 2: this ONE call replaces what used to be
+# TWO separate Groq calls per question boundary (a backward-only
+# "verify_earliest_start" check, plus a separate "_confirm_boundary"
+# check) -- it looks both backward (missed opening line) and
+# forward/local (boundary set too early, stealing the previous
+# answer's tail) in a single window, in one call. This cuts the
+# boundary-check cost for every standalone question's start in half.
+# =========================================================
+
+COMBINED_BOUNDARY_CHECK_SYSTEM_PROMPT = """You are checking the boundary at the start of one answer in a student's exam booklet, in ONE pass that covers both possible mistakes at once.
+
+You are given:
+1. The text of the PREVIOUS question (whose answer should end right before the true boundary), or "(none -- this is the first question)" if there isn't one.
+2. The text of the CURRENT/target question (whose answer should begin at the true boundary).
+3. A window of line-numbered text spanning some lines BEFORE the proposed boundary through some lines AFTER it.
+4. The PROPOSED boundary line (currently believed to be where the current question's answer starts).
+
+Decide the TRUE boundary line -- the exact first line of the CURRENT question's answer. Two kinds of mistakes are equally possible:
+- The proposed line is too LATE: a genuine opening line/sentence of the CURRENT answer was skipped -- the true boundary is EARLIER.
+- The proposed line is too EARLY: content still belonging to the PREVIOUS answer was wrongly included -- the true boundary is LATER.
+
+If the proposed line is already correct, confirm it as-is. Ignore OCR artifact-description lines (e.g. "there is a logo", "signature", "watermark", "red pen scribble") -- never treat one as the boundary.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{"corrected_start_line": 42}
+
+corrected_start_line MUST be one of the exact line numbers shown in the window -- if unsure, return the original proposed line."""
+
+
+def _build_combined_boundary_prompt(window_lines: list, prev_question, curr_question: str, proposed_line: int) -> str:
+    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
+    prev_block = prev_question if prev_question else "(none -- this is the first question)"
+    return (
+        f"PREVIOUS QUESTION: {prev_block}\n\n"
+        f"CURRENT QUESTION (target): {curr_question}\n\n"
+        f"PROPOSED BOUNDARY LINE: {proposed_line}\n\n"
+        f"TEXT WINDOW (line-numbered):\n{lines_block}"
+    )
+
+
+def _check_boundary_combined(client, numbered_lines: list, prev_question, curr_question: str,
+                               proposed_line: int, search_from_idx: int,
+                               budget: "_TokenBudgetTracker", log,
+                               back_radius: int = 40, forward_radius: int = 15) -> int:
+    lo = max(search_from_idx, proposed_line - back_radius)
+    hi = min(len(numbered_lines) - 1, proposed_line + forward_radius) if numbered_lines else proposed_line
+    window = [nl for nl in numbered_lines if lo <= nl[0] <= hi]
+    if not window:
+        return proposed_line
+
+    user_prompt = _build_combined_boundary_prompt(window, prev_question, curr_question, proposed_line)
+    try:
+        corrected = _call_groq_with_retries(
+            client, COMBINED_BOUNDARY_CHECK_SYSTEM_PROMPT, user_prompt,
+            _parse_boundary_confirm_response, budget, log, max_retries=1
+        )
+    except Exception as e:
+        log(f"  combined boundary check failed for line {proposed_line} (keeping original): {e}")
+        return proposed_line
+
+    valid_ids = {idx for idx, _ in window}
+    if corrected in valid_ids and corrected != proposed_line:
+        log(f"  combined boundary check adjusted start: {proposed_line} -> {corrected}")
+        return corrected
     return proposed_line
 
 
@@ -1683,11 +1588,6 @@ def _build_group_sibling_note(open_questions: list) -> str:
 
 
 def _estimate_expected_refs_in_window(window_lines: list, open_questions: list) -> set:
-    """Independent (non-LLM) estimate of which open questions look like
-    they genuinely start within this window, reusing the same
-    regex/word-overlap heuristic used elsewhere in this module. Used only
-    to detect when the model's response looks incomplete, to trigger a
-    targeted retry -- not used as ground truth itself."""
     q_texts = [q for _, q in open_questions]
     found_indices = set()
     current_idx = None
@@ -1700,18 +1600,6 @@ def _estimate_expected_refs_in_window(window_lines: list, open_questions: list) 
 
 
 def _detect_sibling_groups(questions: list) -> dict:
-    """
-    Scans the ORDERED questions list for contiguous runs that share the
-    same leading parent number and each carry their own sub-part label
-    (e.g. "1.(i)", "1.(ii)", "1.(iii)") -- these are the sibling groups
-    that need special, narrowly-bounded batch handling instead of being
-    searched for independently one at a time (which is what caused one
-    sibling's answer to swallow the others).
-
-    Returns {first_index_in_group: [list of indices in the group]} for
-    every group of size >= 2. Standalone questions (no siblings) are not
-    included and are handled by the normal single-target search.
-    """
     groups = {}
     i = 0
     n = len(questions)
@@ -1734,21 +1622,6 @@ def _detect_sibling_groups(questions: list) -> dict:
 def _resolve_sibling_group_batch(client, numbered_lines: list, group_questions: list,
                                    lower: int, upper: int, budget: "_TokenBudgetTracker",
                                    log) -> dict:
-    """
-    Given a group of sibling sub-parts and a TIGHT, already-confirmed
-    bound [lower, upper] that is known to contain (only) this group's
-    combined content, makes ONE call asking the model to find each LATER
-    sibling's internal start line (the first sibling is assumed to start
-    at `lower`, since that's how the bound was established). Only a
-    small handful of candidates are ever shown at once here -- never the
-    whole document's remaining questions -- which keeps the false-match
-    risk low. Any sibling the model isn't confident about is simply left
-    unreported (safe default: its content stays folded into whichever
-    sibling precedes it, rather than being wrongly split).
-
-    Returns {ref: start_line} for whichever siblings (beyond the first)
-    were confidently identified.
-    """
     window = [nl for nl in numbered_lines if lower <= nl[0] <= upper]
     if not window:
         return {}
@@ -1763,8 +1636,6 @@ def _resolve_sibling_group_batch(client, numbered_lines: list, group_questions: 
             client, WINDOWED_MULTI_TARGET_SYSTEM_PROMPT, user_prompt,
             _parse_windowed_multi_target_response, budget, log
         )
-    except GroqQuotaExhausted:
-        raise
     except Exception as e:
         log(f"WARNING: sibling-group batch resolution failed for lines {lower}-{upper}: {e}")
         return {}
@@ -1786,19 +1657,8 @@ def _resolve_sibling_group_batch(client, numbered_lines: list, group_questions: 
     return found
 
 
-def _remap_incomplete_answers(client, numbered_lines: list, questions: list, ranges: list,
-                                budget: "_TokenBudgetTracker", log, cache: dict = None, max_passes: int = 1) -> list:
-    """
-    A question can end up unmatched even though its content genuinely
-    exists in the document -- it just got silently absorbed into a
-    NEIGHBORING (usually the preceding) matched question's range,
-    since a range's end is only ever computed as "next CONFIRMED
-    start - 1". This does a narrowly BOUNDED re-search only inside the
-    range of whichever matched question currently spans across where
-    the missing one should be, and splits that range if found. Runs
-    multiple passes so a RUN of several consecutive unmatched questions
-    gets recovered one at a time, innermost-first.
-    """
+def _rescue_unmatched_questions(client, numbered_lines: list, questions: list, ranges: list,
+                                  budget: "_TokenBudgetTracker", log) -> list:
     ref_to_idx = {f"REF-{chr(65+i)}": i for i in range(len(questions))}
     idx_to_ref = {i: f"REF-{chr(65+i)}" for i in range(len(questions))}
 
@@ -1850,20 +1710,6 @@ def _ref_to_question_index(ref: str) -> int:
 
 def _reanalyze_and_repair_boundaries(client, numbered_lines: list, questions: list, ranges: list,
                                        budget: "_TokenBudgetTracker", log, max_passes: int = 1) -> list:
-    """
-    Final reanalysis/repair pass over the FULLY assembled mapping.
-
-    COST NOTE: checking EVERY adjacent boundary again here is mostly
-    redundant -- the main search walk already ran _confirm_boundary once
-    for almost every standalone question's boundary. Re-spending a full
-    Groq call on boundaries that already look completely normal wastes
-    tokens for no real benefit. This pass now only re-checks a boundary
-    when at least one of its two neighboring ranges is anomalously SHORT
-    compared to the rest of the document -- exactly the signature of a
-    truncated/swallowed answer, i.e. the case actually worth spending a
-    call to double-check. Boundaries between two normal-length ranges
-    are skipped entirely.
-    """
     if len(ranges) < 2:
         return ranges
 
@@ -1909,27 +1755,6 @@ def _reanalyze_and_repair_boundaries(client, numbered_lines: list, questions: li
 
 def _remap_incomplete_answers(client, numbered_lines: list, questions: list, ranges: list,
                                 budget: "_TokenBudgetTracker", log, max_passes: int = 1) -> list:
-    """
-    Runs AFTER _rescue_unmatched_questions and _reanalyze_and_repair_boundaries,
-    once the whole document's mapping has settled. Those two passes fix
-    boundary placement (start too early/late by a small amount) and
-    recover fully-missing questions, but neither one catches a question
-    whose range ended up suspiciously SHORT even though it IS "matched"
-    -- e.g. its true answer starts a page later than what got mapped, or
-    it got cut short and the rest silently ended up folded into a
-    neighbor. This is the concrete "answer half/skip hua" case.
-
-    For every such short range, this does a FULL re-search bounded
-    strictly between its immediate neighbors (so it can never swallow a
-    third question's content), and if a better start is found, updates
-    THIS range's start/end AND its neighbors' start/end in place.
-
-    CRITICAL: this never appends a new entry to `ranges` and never
-    changes which question a ref refers to -- it only mutates the
-    start_line/end_line of the SAME existing range dict for that ref.
-    The `questions` list itself is never touched, so this cannot ever
-    cause a question to be repeated/duplicated in the final output.
-    """
     if len(ranges) < 2:
         return ranges
 
@@ -1942,13 +1767,13 @@ def _remap_incomplete_answers(client, numbered_lines: list, questions: list, ran
             break
         median_len = sorted(lengths)[len(lengths) // 2]
         if median_len < 4:
-            break  # document itself is too short to judge "suspiciously short"
+            break
 
         changed = False
         for pos, r in enumerate(ordered):
             length = r["end_line"] - r["start_line"] + 1
             if length >= max(median_len * 0.25, 3):
-                continue  # not suspiciously short -- leave alone
+                continue
 
             q_idx = _ref_to_question_index(r["ref"])
             log(
@@ -2001,44 +1826,13 @@ def _remap_incomplete_answers(client, numbered_lines: list, questions: list, ran
     return ranges
 
 
-# =========================================================
-# PARALLEL GEMINI VERIFICATION (optional, runs alongside Groq)
-#
-# Purpose: an INDEPENDENT second opinion on every mapped answer, from a
-# different model/provider, running in BACKGROUND THREADS so it costs
-# no extra wall-clock time -- verification is dispatched for every
-# range the moment the initial sequential walk finishes, and those
-# background calls run WHILE Groq is still doing its own rescue /
-# reanalyze / remap passes in the main thread. Results are only
-# collected and applied at the very end, after Groq's own passes have
-# already run (Gemini acts as one more safety net layered on top, not
-# a replacement for the Groq-based checks).
-#
-# Entirely OPTIONAL: if GEMINI_API_KEY isn't set, none of this runs and
-# the pipeline behaves exactly as before -- get_api_key() already
-# returns None gracefully for a missing key/secret.
-#
-# SAFETY: _apply_gemini_corrections() only ever MUTATES the
-# start_line/end_line of an EXISTING range dict for a ref that's
-# already in `ranges` -- it never appends a new range and never touches
-# the `questions` list, so this can never cause a question to be
-# duplicated in the final output.
-# =========================================================
-
-GEMINI_MODEL = "gemini-2.0-flash"  # fast/cheap model, good fit for a lightweight verification pass; update the name here if this model is retired
+GEMINI_MODEL = "gemini-2.0-flash"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_VERIFY_MAX_WORKERS = 4
-GEMINI_VERIFY_CONTEXT_RADIUS = 8  # lines of context shown before/after the mapped range
+GEMINI_VERIFY_CONTEXT_RADIUS = 8
 
 
 def _call_gemini_json(api_key: str, prompt: str, log, max_retries: int = 2, timeout: float = 30.0):
-    """
-    Minimal Gemini REST call (generateContent) asking for a
-    structured-JSON response. Deliberately low-retry and fail-soft --
-    this is a verification NICE-TO-HAVE, so any failure here should
-    just skip that one item's verification rather than affect the main
-    Groq-based mapping pipeline in any way.
-    """
     url = f"{GEMINI_BASE_URL}/{GEMINI_MODEL}:generateContent?key={api_key}"
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -2157,15 +1951,6 @@ def _collect_gemini_results(futures: dict, log, timeout: float = 90.0) -> dict:
 
 
 def _apply_gemini_corrections(ranges: list, verdicts: dict, log) -> list:
-    """
-    Applies Gemini-flagged corrections IN PLACE. Only ever mutates an
-    EXISTING range dict's start_line/end_line (and, symmetrically, its
-    immediate neighbor's) -- never appends a new range, so this cannot
-    cause a question to be duplicated in the output. A suggested line
-    is only accepted if it stays strictly within this range's immediate
-    neighbors' bounds, so one range can never swallow a THIRD
-    question's content.
-    """
     if not verdicts:
         return ranges
 
@@ -2211,19 +1996,6 @@ def _apply_gemini_corrections(ranges: list, verdicts: dict, log) -> list:
 
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
-    """
-    RECOMMENDED default answer-mapping strategy. For each question in
-    order: search forward from wherever the previous question's answer
-    was confirmed to start, for a line where THIS question's answer
-    begins. Once found, the previous question's END is computed as
-    (this start - 1) -- never asked of the LLM. The very last question's
-    answer runs to the end of the document.
-
-    IMPORTANT: if a question's start can't be found, it is recorded as
-    unmatched and the search POINTER IS NOT ADVANCED -- see the long
-    comment above SEQUENTIAL_SEARCH_SYSTEM_PROMPT for why this matters.
-    Do not add pointer-skip-ahead "safety" logic here.
-    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -2245,129 +2017,173 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
 
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(numbered_lines)
-    search_cache = {}   # shared across every search call for this document
 
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
     sibling_groups = _detect_sibling_groups(questions)
     group_member_of = {idx: first_idx for first_idx, members in sibling_groups.items() for idx in members}
 
+    # TOKEN/TIME OPTIMIZATION: resolve every STANDALONE question that has
+    # an explicit answer label via a single zero-LLM-cost regex pre-pass,
+    # before spending a single Groq call. See _build_label_anchor_index
+    # for the full rationale. Sibling sub-part questions are excluded --
+    # they still go through the existing group-handling logic below.
+    label_anchors = _build_label_anchor_index(answer_lines, questions, set(group_member_of.keys()), log)
+
     found_starts = {}
+    for qi, line_idx in label_anchors.items():
+        found_starts[f"REF-{chr(65 + qi)}"] = line_idx
+
     pointer = 0
     i = 0
     n = len(questions)
 
-    try:
-        while i < n:
-            if i in sibling_groups:
-                group_indices = sibling_groups[i]
-                group_refs = [f"REF-{chr(65 + j)}" for j in group_indices]
-                group_questions = [(f"REF-{chr(65 + j)}", questions[j]) for j in group_indices]
-                log(f"Detected sibling sub-part group {group_refs} -- resolving as a bounded batch...")
+    while i < n:
+        if i in sibling_groups:
+            group_indices = sibling_groups[i]
+            group_refs = [f"REF-{chr(65 + j)}" for j in group_indices]
+            group_questions = [(f"REF-{chr(65 + j)}", questions[j]) for j in group_indices]
+            log(f"Detected sibling sub-part group {group_refs} -- resolving as a bounded batch...")
 
-                first_ref, first_q = group_questions[0]
-                group_start = _find_answer_start_sequential(client, numbered_lines, first_q, first_ref, pointer, budget, log)
+            first_ref, first_q = group_questions[0]
+            group_search_from = pointer
+            group_start = _find_answer_start_sequential(client, numbered_lines, first_q, first_ref, pointer, budget, log)
 
-                if group_start is None:
-                    log(f"WARNING: could not find the start of sibling group {group_refs} at all -- marking all as unmatched.")
-                    # pointer intentionally NOT advanced -- next question
-                    # still searched over this same remaining text.
-                    i = group_indices[-1] + 1
-                    continue
+            attempt = 1
+            while group_start is None and attempt <= 1:
+                reminder = (
+                    "REMINDER: a previous search pass did not find this answer. The same "
+                    "definition/explanation can legitimately repeat across the document -- "
+                    "that does not disqualify a genuine match. Also check for a short "
+                    "introductory line at the true start."
+                )
+                group_start = _find_answer_start_sequential(
+                    client, numbered_lines, first_q, first_ref, pointer, budget, log,
+                    extra_reminder=reminder
+                )
+                attempt += 1
 
-                if i > 0:
-                    group_start = _confirm_boundary(
-                         client, numbered_lines, questions[i - 1], first_q, group_start, budget, log
-                    )
-
-                found_starts[first_ref] = group_start
-                log(f"  found {first_ref} (group start) at line {group_start}")
-
-                next_index = group_indices[-1] + 1
-                group_end_bound = None
-                if next_index < n:
-                    next_ref = f"REF-{chr(65 + next_index)}"
-                    next_q = questions[next_index]
-                    group_end_bound = _find_answer_start_sequential(
-                        client, numbered_lines, next_q, next_ref, group_start + 1, budget, log
-                    )
-                    if group_end_bound is not None:
-                        group_end_bound = _confirm_boundary(
-                            client, numbered_lines, first_q, next_q, group_end_bound, budget, log
-                        )
-
-                upper = (group_end_bound - 1) if group_end_bound is not None else (total_lines - 1)
-
-                if len(group_questions) > 1:
-                    sibling_starts = _resolve_sibling_group_batch(
-                        client, numbered_lines, group_questions, group_start, upper, budget, log
-                    )
-                    for ref, sl in sibling_starts.items():
-                        found_starts[ref] = sl
-                        log(f"  found {ref} (sibling) at line {sl}")
-
-                unresolved = [ref for ref in group_refs[1:] if ref not in found_starts]
-                if unresolved:
-                    log(
-                        f"NOTE: sibling(s) {unresolved} were not confidently separated within "
-                        f"the group's bounded region (lines {group_start}-{upper}) -- their content "
-                        f"stays folded into the preceding sibling's answer rather than risking a "
-                        f"wrong split."
-                    )
-
-                if next_index < n and group_end_bound is not None:
-                    found_starts[f"REF-{chr(65 + next_index)}"] = group_end_bound
-                    log(f"  found REF-{chr(65 + next_index)} at line {group_end_bound}")
-                    pointer = group_end_bound + 1
-                    i = next_index + 1
-                else:
-                    pointer = total_lines
-                    i = next_index
-
+            if group_start is None:
+                log(f"WARNING: could not find the start of sibling group {group_refs} at all -- marking all as unmatched.")
+                i = group_indices[-1] + 1
                 continue
 
-            # ---- Standalone question: strict single-target search ----
-            ref = f"REF-{chr(65 + i)}"
-            q = questions[i]
-
-            if ref in found_starts:
-                pointer = found_starts[ref] + 1
-                i += 1
-                continue
-
-            log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
-            sub_part_hint = _build_sub_part_hint(questions, i)
-
-            start_line = _find_answer_start_sequential(
-                client, numbered_lines, q, ref, pointer, budget, log,
-                extra_reminder=sub_part_hint
+            group_start = _check_boundary_combined(
+                client, numbered_lines, questions[i - 1] if i > 0 else None, first_q,
+                group_start, group_search_from, budget, log
             )
 
-            if start_line is not None:
-            # NOTE: _verify_earliest_start call REMOVED -- _confirm_boundary
-            # (radius increased to 35 above) is bidirectional and now
-            # covers both "too early" and "too late" in a SINGLE call.
-            if i > 0:
-                start_line = _confirm_boundary(
-                    client, numbered_lines, questions[i - 1], q, start_line, budget, log
-                )
+            found_starts[first_ref] = group_start
+            log(f"  found {first_ref} (group start) at line {group_start}")
 
-            if start_line is not None:
-                found_starts[ref] = start_line
-                log(f"  found {ref} starting at line {start_line}")
-                pointer = start_line + 1
-            else:
+            next_index = group_indices[-1] + 1
+            group_end_bound = None
+            if next_index < n:
+                next_ref = f"REF-{chr(65 + next_index)}"
+                next_q = questions[next_index]
+                group_end_bound = _find_answer_start_sequential(
+                    client, numbered_lines, next_q, next_ref, group_start + 1, budget, log
+                )
+                if group_end_bound is not None:
+                    group_end_bound = _check_boundary_combined(
+                        client, numbered_lines, first_q, next_q,
+                        group_end_bound, group_start + 1, budget, log
+                    )
+
+            upper = (group_end_bound - 1) if group_end_bound is not None else (total_lines - 1)
+
+            if len(group_questions) > 1:
+                sibling_starts = _resolve_sibling_group_batch(
+                    client, numbered_lines, group_questions, group_start, upper, budget, log
+                )
+                for ref, sl in sibling_starts.items():
+                    found_starts[ref] = sl
+                    log(f"  found {ref} (sibling) at line {sl}")
+
+            unresolved = [ref for ref in group_refs[1:] if ref not in found_starts]
+            if unresolved:
                 log(
-                    f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
-                    f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
-                    f"The search pointer is NOT advanced, so the next question is still searched "
-                    f"for over this same remaining text."
+                    f"NOTE: sibling(s) {unresolved} were not confidently separated within "
+                    f"the group's bounded region (lines {group_start}-{upper}) -- their content "
+                    f"stays folded into the preceding sibling's answer rather than risking a "
+                    f"wrong split."
                 )
 
-            i += 1
+            if next_index < n and group_end_bound is not None:
+                found_starts[f"REF-{chr(65 + next_index)}"] = group_end_bound
+                log(f"  found REF-{chr(65 + next_index)} at line {group_end_bound}")
+                pointer = group_end_bound + 1
+                i = next_index + 1
+            else:
+                pointer = total_lines
+                i = next_index
 
-    except GroqQuotaExhausted as e:
-        log(f"STOPPING: {e}")
-        raise
+            continue
+
+        # ---- Standalone question: strict single-target search ----
+        ref = f"REF-{chr(65 + i)}"
+        q = questions[i]
+
+        if ref in found_starts:
+            pointer = found_starts[ref] + 1
+            i += 1
+            continue
+
+        log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
+        sub_part_hint = _build_sub_part_hint(questions, i)
+        search_from_idx = pointer
+
+        # TOKEN/TIME OPTIMIZATION: bound the search by the nearest
+        # already-known FUTURE anchor (from the label pre-pass or an
+        # earlier out-of-order resolution), if any -- keeps windows
+        # smaller and search calls fewer, and also prevents this search
+        # from ever overshooting into territory already claimed by a
+        # later question.
+        future_anchor_lines = [v for k, v in found_starts.items() if _ref_to_question_index(k) > i]
+        bound_end_idx = (min(future_anchor_lines) + 1) if future_anchor_lines else None
+
+        start_line = _find_answer_start_sequential(
+            client, numbered_lines, q, ref, pointer, budget, log,
+            extra_reminder=sub_part_hint, end_idx=bound_end_idx
+        )
+
+        attempt = 1
+        while start_line is None and attempt <= 1:
+            log(f"  pass {attempt} found nothing for {ref} -- retrying with a stronger reminder...")
+            reminder_parts = [
+                "REMINDER: a previous pass did not find this answer. The same "
+                "definition/explanation can legitimately repeat across the document -- "
+                "that does not disqualify a genuine match. Also check for a short "
+                "introductory line at the true start."
+            ]
+            if sub_part_hint:
+                reminder_parts.append(sub_part_hint)
+            start_line = _find_answer_start_sequential(
+                client, numbered_lines, q, ref, pointer, budget, log,
+                extra_reminder="\n\n".join(reminder_parts), end_idx=bound_end_idx
+            )
+            if start_line is not None:
+                log(f"  retry (pass {attempt + 1}) recovered {ref} starting at line {start_line}")
+            attempt += 1
+
+        if start_line is not None:
+            start_line = _check_boundary_combined(
+                client, numbered_lines, questions[i - 1] if i > 0 else None, q,
+                start_line, search_from_idx, budget, log
+            )
+
+        if start_line is not None:
+            found_starts[ref] = start_line
+            log(f"  found {ref} starting at line {start_line}")
+            pointer = start_line + 1
+        else:
+            log(
+                f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
+                f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
+                f"The search pointer is NOT advanced, so the next question is still searched "
+                f"for over this same remaining text."
+            )
+
+        i += 1
 
     ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
     ranges = []
@@ -2382,9 +2198,11 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         if gemini_executor else {}
     )
 
-    ranges = _rescue_unmatched_questions(client, numbered_lines, questions, ranges, budget, log, cache=search_cache)
+    ranges = _rescue_unmatched_questions(client, numbered_lines, questions, ranges, budget, log)
+
     ranges = _reanalyze_and_repair_boundaries(client, numbered_lines, questions, ranges, budget, log)
-    ranges = _remap_incomplete_answers(client, numbered_lines, questions, ranges, budget, log, cache=search_cache)
+
+    ranges = _remap_incomplete_answers(client, numbered_lines, questions, ranges, budget, log)
 
     if gemini_executor:
         gemini_verdicts = _collect_gemini_results(gemini_futures, log)
@@ -2697,18 +2515,6 @@ _TRAILING_LEADIN_RE = re.compile(
 
 
 def strip_trailing_leaked_next_question(answer_text: str, next_question_text: str) -> str:
-    """
-    OCR sometimes flattens multiple original lines into one text block,
-    so a range's LAST line can contain the genuine end of THIS answer
-    immediately followed by the verbatim text of the NEXT question (the
-    boundary search can only pick a line-level cut point, not a
-    mid-line one). Since we already know exactly what the next
-    question's text is, matching against it directly is far more
-    reliable than a generic label regex -- run this FIRST, then fall
-    back to strip_trailing_next_question_leadin() for generic label
-    fragments (Q5, Ans 6-, #3, Section B, etc.) that aren't a full
-    question echo.
-    """
     if not next_question_text:
         return answer_text
 
@@ -2733,12 +2539,6 @@ def strip_trailing_leaked_next_question(answer_text: str, next_question_text: st
 
 
 def strip_trailing_next_question_leadin(answer_text: str, max_passes: int = 3) -> str:
-    """
-    Repeatedly strips a trailing next-question label/scaffolding fragment
-    from the END of an already-sliced answer. Deliberately conservative:
-    only matches short, clearly label-shaped patterns anchored at the
-    very end of the string (via $), so it cannot eat genuine prose.
-    """
     text = answer_text.rstrip()
     for _ in range(max_passes):
         new_text = _TRAILING_LEADIN_RE.sub('', text).rstrip()
@@ -3191,7 +2991,7 @@ def process_pdf(file_input, status_callback=None):
 
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
 
-    pages = run_ocr_cached(file_bytes, file_name, status_callback)
+    pages = run_ocr(file_bytes, file_name, status_callback)
 
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
@@ -3264,17 +3064,10 @@ def process_pdf(file_input, status_callback=None):
         )
 
     log("Mapping each question to its answer (sequential single-target search)...")
-    try:
-        qa_pairs = map_answers_sequential(
-            answer_lines, official_questions, status_callback,
-            answer_line_pages=answer_line_pages
-        )
-    except GroqQuotaExhausted as e:
-        raise Exception(
-            f"Processing stopped: {e}\n\n"
-            f"Wait for the daily quota reset, then re-run -- OCR results are "
-            f"cached, so re-run resumes quickly."
-        ) from e
+    qa_pairs = map_answers_sequential(
+        answer_lines, official_questions, status_callback,
+        answer_line_pages=answer_line_pages
+    )
 
     matched_count = sum(1 for p in qa_pairs if p["matched"])
     log(f"Matched {matched_count} of {len(official_questions)} questions")
