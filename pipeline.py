@@ -493,6 +493,27 @@ _RATE_LIMIT_DETAIL_RE = re.compile(
 )
 
 
+class GroqQuotaExhaustedError(Exception):
+    """
+    Raised when EVERY configured Groq API key's daily quota (TPD) is
+    exhausted (i.e. the rotating client tried every key and all of
+    them are out). This is deliberately a DISTINCT exception type from
+    a generic Exception -- callers throughout this module specifically
+    re-raise it instead of swallowing it as a normal "this window
+    didn't match" or "this chunk failed" result. Swallowing it silently
+    was a confirmed, reproduced bug: once the quota ran out mid-
+    document, every remaining search call failed the same way, but was
+    being treated exactly like a genuine "not found" -- so questions
+    after the exhaustion point were marked unmatched, and their content
+    silently ended up folded into whichever earlier answer's range
+    still spanned that far (the "everything piles up under one answer"
+    symptom). Propagating this error instead makes the WHOLE pipeline
+    stop with one clear, actionable message the moment the quota is
+    truly gone, rather than quietly returning corrupted/merged output.
+    """
+    pass
+
+
 def _parse_rate_limit_detail(message: str):
     m = _RATE_LIMIT_DETAIL_RE.search(message)
     if not m:
@@ -763,13 +784,14 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             detail = _parse_rate_limit_detail(str(e))
 
             if detail and detail["limit_type"] == "TPD":
-                raise Exception(
-                    f"Groq daily token quota (TPD) exhausted: "
+                raise GroqQuotaExhaustedError(
+                    f"Groq daily token quota (TPD) exhausted on ALL configured key(s): "
                     f"{detail['used']}/{detail['limit']} tokens used today, "
                     f"{detail['requested']} more requested. This will reset "
                     f"in approximately {detail['wait_seconds']/60:.0f} minute(s). "
                     f"Retrying within this run will not help -- either wait "
-                    f"for the daily reset, or upgrade your Groq tier at "
+                    f"for the daily reset, add more backup keys (GROQ_API_KEY_2, "
+                    f"GROQ_API_KEY_3, ...), or upgrade your Groq tier at "
                     f"https://console.groq.com/settings/billing. "
                     f"(If you're processing the same document more than once "
                     f"per click/run, check for duplicate calls -- that doubles "
@@ -947,6 +969,8 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
             client, QUESTION_PAPER_ONLY_SYSTEM_PROMPT, user_prompt,
             _parse_canonical_questions_response, budget, log
         )
+    except GroqQuotaExhaustedError:
+        raise
     except Exception as e:
         log(f"WARNING: canonical question extraction failed: {e}")
         return []
@@ -982,6 +1006,8 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 
         try:
             qp_pages_1based, questions, admin_pages_1based = _call_groq_for_chunk(client, chunk, budget, log)
+        except GroqQuotaExhaustedError:
+            raise
         except Exception as e:
             log(f"WARNING: chunk {i+1}/{len(chunks)} question-identification failed, skipping: {e}")
             chunk_failures.append(str(e))
@@ -1349,6 +1375,14 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                 client, SEQUENTIAL_SEARCH_SYSTEM_PROMPT, user_prompt,
                 _parse_sequential_search_response, budget, log
             )
+        except GroqQuotaExhaustedError:
+            # CRITICAL: do NOT swallow this as "window didn't match" --
+            # every remaining window would fail identically, and
+            # treating it as a genuine non-match is exactly what caused
+            # unrelated questions' content to silently pile up into an
+            # earlier answer's range. Propagate so the whole pipeline
+            # stops with one clear error instead.
+            raise
         except Exception as e:
             log(f"WARNING: search call failed for {ref_label} (lines {window[0][0]}-{window[-1][0]}): {e}")
             found, start_line = False, None
@@ -1745,6 +1779,8 @@ def _resolve_sibling_group_batch(client, numbered_lines: list, group_questions: 
             client, WINDOWED_MULTI_TARGET_SYSTEM_PROMPT, user_prompt,
             _parse_windowed_multi_target_response, budget, log
         )
+    except GroqQuotaExhaustedError:
+        raise
     except Exception as e:
         log(f"WARNING: sibling-group batch resolution failed for lines {lower}-{upper}: {e}")
         return {}
@@ -2035,6 +2071,8 @@ def _groq_verify_answer(client, question_text: str, ref_label: str, numbered_lin
             client, GROQ_VERIFY_SYSTEM_PROMPT, prompt, _parse_groq_verify_response,
             budget, log, max_retries=1
         )
+    except GroqQuotaExhaustedError:
+        raise
     except Exception as e:
         log(f"  verify pass failed for {ref_label} (keeping range as-is): {e}")
         return None
@@ -2051,10 +2089,20 @@ def _run_groq_verification_pass(client, numbered_lines: list, questions: list, r
     flagged = 0
     for r in ranges:
         q_idx = _ref_to_question_index(r["ref"])
-        verdict = _groq_verify_answer(
-            client, questions[q_idx], r["ref"], numbered_lines,
-            r["start_line"], r["end_line"], budget, log
-        )
+        try:
+            verdict = _groq_verify_answer(
+                client, questions[q_idx], r["ref"], numbered_lines,
+                r["start_line"], r["end_line"], budget, log
+            )
+        except GroqQuotaExhaustedError as e:
+            # Verification is a nice-to-have final check running AFTER
+            # the actual mapping is already complete -- unlike the
+            # search stage, letting this abort the whole pipeline would
+            # throw away an otherwise-good, fully-mapped result just
+            # because there's no quota left for double-checking it.
+            # Stop verifying further answers and return what we have.
+            log(f"  Verification pass stopped early: {e}")
+            break
         if verdict:
             verdicts[r["ref"]] = verdict
             if verdict["status"] != "ok":
@@ -2790,6 +2838,8 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
                 client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
                 _parse_answer_map_llm_response, budget, log
             )
+        except GroqQuotaExhaustedError:
+            raise
         except Exception as e:
             log(f"WARNING: chunk {i+1}/{len(chunks_with_carry)} answer-mapping failed, skipping: {e}")
             chunk_failures.append(str(e))
@@ -3146,7 +3196,15 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    qp_page_indices, official_questions, admin_page_indices = identify_questions_with_llm(pages, status_callback)
+    try:
+        qp_page_indices, official_questions, admin_page_indices = identify_questions_with_llm(pages, status_callback)
+    except GroqQuotaExhaustedError as e:
+        raise Exception(
+            f"Stopped processing during question-paper identification: every configured "
+            f"Groq API key's daily quota is exhausted. {e}\n\n"
+            f"Add more backup keys (GROQ_API_KEY_2, GROQ_API_KEY_3, ...) in secrets, or "
+            f"wait for the daily reset, then reprocess this document."
+        ) from e
 
     log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
     log(f"Admin/cover pages detected: {[p+1 for p in admin_page_indices] if admin_page_indices else 'none'}")
@@ -3213,10 +3271,19 @@ def process_pdf(file_input, status_callback=None):
         )
 
     log("Mapping each question to its answer (sequential single-target search)...")
-    qa_pairs = map_answers_sequential(
-        answer_lines, official_questions, status_callback,
-        answer_line_pages=answer_line_pages
-    )
+    try:
+        qa_pairs = map_answers_sequential(
+            answer_lines, official_questions, status_callback,
+            answer_line_pages=answer_line_pages
+        )
+    except GroqQuotaExhaustedError as e:
+        raise Exception(
+            f"Stopped processing partway through answer-mapping: every configured Groq API "
+            f"key's daily quota is exhausted. {e}\n\n"
+            f"This document was NOT fully mapped, and no partial/corrupted results are "
+            f"returned -- add more backup keys (GROQ_API_KEY_2, GROQ_API_KEY_3, ...) in "
+            f"secrets, or wait for the daily reset, then reprocess this document."
+        ) from e
 
     matched_count = sum(1 for p in qa_pairs if p["matched"])
     log(f"Matched {matched_count} of {len(official_questions)} questions")
