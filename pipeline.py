@@ -493,25 +493,59 @@ _RATE_LIMIT_DETAIL_RE = re.compile(
 )
 
 
-class GroqQuotaExhaustedError(Exception):
-    """
-    Raised when EVERY configured Groq API key's daily quota (TPD) is
-    exhausted (i.e. the rotating client tried every key and all of
-    them are out). This is deliberately a DISTINCT exception type from
-    a generic Exception -- callers throughout this module specifically
-    re-raise it instead of swallowing it as a normal "this window
-    didn't match" or "this chunk failed" result. Swallowing it silently
-    was a confirmed, reproduced bug: once the quota ran out mid-
-    document, every remaining search call failed the same way, but was
-    being treated exactly like a genuine "not found" -- so questions
-    after the exhaustion point were marked unmatched, and their content
-    silently ended up folded into whichever earlier answer's range
-    still spanned that far (the "everything piles up under one answer"
-    symptom). Propagating this error instead makes the WHOLE pipeline
-    stop with one clear, actionable message the moment the quota is
-    truly gone, rather than quietly returning corrupted/merged output.
-    """
+class GroqQuotaExhausted(Exception):
+    """Raised when Groq's DAILY token quota (TPD) is exhausted on ALL
+    configured keys -- never caught by generic except blocks, always
+    propagates immediately."""
     pass
+
+
+class _GroqClientPool:
+    """
+    Manages GROQ_API_KEY plus any GROQ_API_KEY2, GROQ_API_KEY3, ... found
+    in secrets/environment, and transparently switches to the next
+    available key the INSTANT the current one's daily quota (TPD) is
+    exhausted -- mid-call, mid-document. All pipeline state (search
+    pointer, found_starts, ranges) lives outside the client, so swapping
+    clients and retrying the SAME request resumes exactly where
+    processing left off.
+    """
+    def __init__(self, log=print):
+        from groq import Groq
+        self.log = log
+        keys = []
+        primary = get_api_key("GROQ_API_KEY")
+        if primary:
+            keys.append(primary)
+        n = 2
+        while True:
+            k = get_api_key(f"GROQ_API_KEY{n}")
+            if not k:
+                break
+            keys.append(k)
+            n += 1
+        if not keys:
+            raise Exception("No GROQ_API_KEY (or GROQ_API_KEY2, GROQ_API_KEY3, ...) found in secrets or environment")
+        self._keys = keys
+        self._clients = [Groq(api_key=k) for k in keys]
+        self._current = 0
+        if len(keys) > 1:
+            self.log(f"Groq fallback enabled: {len(keys)} API key(s) configured.")
+
+    @property
+    def client(self):
+        return self._clients[self._current]
+
+    def advance(self) -> bool:
+        if self._current + 1 < len(self._clients):
+            self._current += 1
+            self.log(
+                f"Groq API key #{self._current} exhausted its daily quota -- "
+                f"switching to fallback key #{self._current + 1} and resuming "
+                f"from exactly where processing left off."
+            )
+            return True
+        return False
 
 
 def _parse_rate_limit_detail(message: str):
@@ -587,8 +621,16 @@ class _RotatingCompletions:
             except (groq.RateLimitError, groq.BadRequestError) as e:
                 detail = _parse_rate_limit_detail(str(e))
                 if detail and detail["limit_type"] == "TPD":
-                    if self._pool.rotate(reason="hit its daily token quota (TPD)"):
-                        continue
+                if client.advance():
+                    budget.reset_window()
+                    continue
+                raise GroqQuotaExhausted(
+                    f"Groq daily token quota (TPD) exhausted on ALL configured API "
+                    f"key(s): {detail['used']}/{detail['limit']} tokens used today "
+                    f"on the last key. This will reset in approximately "
+                    f"{detail['wait_seconds']/60:.0f} minute(s). Add GROQ_API_KEY2 "
+                    f"(and further) to secrets/environment for more fallback capacity."
+                ) from e
                 # TPM limits and everything else are left to
                 # _call_groq_with_retries's own pacing/backoff logic,
                 # exactly as before -- only a genuinely EXHAUSTED daily
@@ -741,7 +783,8 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 
     skip_next_proactive_check = False
 
-    for attempt in range(1, max_retries + 2):
+    attempt = 1
+    while attempt <= max_retries + 1:
         if skip_next_proactive_check:
             skip_next_proactive_check = False
         else:
@@ -749,7 +792,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 
         try:
             with _groq_call_lock:
-                response = client.chat.completions.create(
+                response = client.client.chat.completions.create(
                     model=GROQ_MODEL,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -818,11 +861,14 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                     f"Waiting {wait_s:.1f}s before retrying..."
                 )
                 time.sleep(wait_s)
+                attempt += 1
+                
 
         except Exception as e:
             last_error = e
             log(f"Chunk LLM call/parse attempt {attempt} failed: {e}")
             time.sleep(1)
+            attempt += 1
 
     raise Exception(
         f"Chunk LLM call failed after {max_retries + 1} attempts. Last error: {last_error}"
@@ -955,11 +1001,8 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
         return []
 
     groq_keys = _collect_groq_api_keys()
-    if not groq_keys:
-        raise Exception("GROQ_API_KEY not found in secrets or environment")
-
+    client = _GroqClientPool(log=log)
     budget = _TokenBudgetTracker()
-    client = _RotatingGroqClient(groq_keys, budget=budget, log=log)
 
     user_prompt = _build_canonical_questions_prompt(qp_pages)
     log(f"Extracting canonical question list from {len(qp_pages)} question-paper page(s) in a single pass...")
@@ -1809,7 +1852,7 @@ def _rescue_unmatched_questions(client, numbered_lines: list, questions: list, r
 
     changed = True
     passes = 0
-    while changed and passes < 2:
+    while changed and passes < 3:
         changed = False
         passes += 1
         matched_refs = {r["ref"] for r in ranges}
@@ -1838,6 +1881,18 @@ def _rescue_unmatched_questions(client, numbered_lines: list, questions: list, r
                 client, numbered_lines, q, ref, lower, budget, log,
                 end_idx=upper + 1
             )
+            if split_line is None:
+                split_line = _find_answer_start_sequential(
+                    client, numbered_lines, q, ref, lower, budget, log,
+                    end_idx=upper + 1,
+                    extra_reminder=(
+                        "REMINDER: this question's content may be hiding inside a "
+                        "neighboring answer's mapped range because the boundary was "
+                        "originally missed. Scan carefully -- similar wording to a "
+                        "nearby answer does NOT disqualify a genuine separate match "
+                        "for THIS specific question."
+                    )
+                )
 
             if split_line is not None and lower < split_line <= upper:
                 log(f"  RESCUE: recovered {ref} at line {split_line} (was absorbed into {candidate['ref']})")
@@ -2345,12 +2400,9 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         # smaller and search calls fewer, and also prevents this search
         # from ever overshooting into territory already claimed by a
         # later question.
-        future_anchor_lines = [v for k, v in found_starts.items() if _ref_to_question_index(k) > i]
-        bound_end_idx = (min(future_anchor_lines) + 1) if future_anchor_lines else None
-
         start_line = _find_answer_start_sequential(
             client, numbered_lines, q, ref, pointer, budget, log,
-            extra_reminder=sub_part_hint, end_idx=bound_end_idx
+            extra_reminder=sub_part_hint
         )
 
         attempt = 1
@@ -2366,7 +2418,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 reminder_parts.append(sub_part_hint)
             start_line = _find_answer_start_sequential(
                 client, numbered_lines, q, ref, pointer, budget, log,
-                extra_reminder="\n\n".join(reminder_parts), end_idx=bound_end_idx
+                extra_reminder="\n\n".join(reminder_parts)
             )
             if start_line is not None:
                 log(f"  retry (pass {attempt + 1}) recovered {ref} starting at line {start_line}")
@@ -3190,7 +3242,7 @@ def process_pdf(file_input, status_callback=None):
 
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
 
-    pages = run_ocr(file_bytes, file_name, status_callback)
+    pages = run_ocr_cached(file_bytes, file_name, status_callback)
 
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
