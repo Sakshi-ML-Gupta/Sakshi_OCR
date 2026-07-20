@@ -10,6 +10,17 @@ import fitz
 import httpx
 from pathlib import Path
 # =========================================================
+# SEMANTIC MATCHING FOR ANSWER CLEANING
+# =========================================================
+try:
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    SEMANTIC_AVAILABLE = True
+except ImportError:
+    SEMANTIC_AVAILABLE = False
+    print("Warning: sentence-transformers not installed. Install with: pip install sentence-transformers")
+
+# =========================================================
 # API KEYS
 # =========================================================
 def get_api_key(name):
@@ -263,7 +274,7 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 TPM_LIMIT = 30000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
-MAX_CHARS_PER_CHUNK = 9000  # increased from 6000 -- fewer chunks means fewer calls, each paying the ~500-token system-prompt overhead only once per (larger) chunk instead of once per (smaller) chunk
+MAX_CHARS_PER_CHUNK = 9000
 CHUNK_OVERLAP_PAGES = 1
 QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam/assignment answer booklet. This could be from ANY institution, ANY subject, and ANY language (or a mix of languages/scripts) -- do not assume a specific country, university, or language. The booklet mixes pages of different kinds, in no guaranteed order:
 1. ADMINISTRATIVE/COVER pages: roll number/enrolment number, programme/course code, student name, registration details, institution letterhead, blank cover sheets. These contain NO exam question text and NO student answer content -- just identifying/bureaucratic information.
@@ -414,7 +425,7 @@ def _parse_qp_llm_response(content: str) -> tuple:
         )
     qp_pages = data["question_paper_pages"]
     questions = data["questions"]
-    admin_pages = data.get("admin_pages", [])  # optional, backward-compatible
+    admin_pages = data.get("admin_pages", [])
     if not isinstance(qp_pages, list):
         raise ValueError(f"question_paper_pages must be a list, got: {type(qp_pages).__name__}")
     qp_pages = [int(x) for x in qp_pages]
@@ -702,9 +713,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
             return sorted(set(recovered))
         qp_pages_1based = _recover_pages(qp_pages_1based, "question-paper")
         admin_pages_1based = _recover_pages(admin_pages_1based, "admin")
-        # A page can't legitimately be both -- if the model contradicted
-        # itself, keep it as a question-paper page (the more consequential
-        # classification to get right) and drop it from admin.
         admin_pages_1based = [p for p in admin_pages_1based if p not in qp_pages_1based]
         log(
             f"Chunk {i+1}/{len(chunks)}: identified {len(qp_pages_1based)} question paper "
@@ -785,7 +793,7 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
             f"duplicate/extra questions."
         )
         for cluster in discarded_clusters:
-            reclassified_as_answer_pages.extend(p["page_number"] - 1 for p in cluster)  # back to 0-based
+            reclassified_as_answer_pages.extend(p["page_number"] - 1 for p in cluster)
         page_clusters = [chosen_cluster]
     questions = []
     for cluster in page_clusters:
@@ -800,7 +808,7 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
                 f"treating it as misclassified and moving these page(s) to the answer-page "
                 f"pool instead of discarding them."
             )
-            reclassified_as_answer_pages.extend(p["page_number"] - 1 for p in cluster)  # back to 0-based
+            reclassified_as_answer_pages.extend(p["page_number"] - 1 for p in cluster)
     if reclassified_as_answer_pages:
         qp_page_indices_0based = [i for i in qp_page_indices_0based if i not in reclassified_as_answer_pages]
         log(
@@ -821,6 +829,239 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         f"{len(admin_page_indices_0based)} admin/cover page(s)"
     )
     return qp_page_indices_0based, questions, admin_page_indices_0based
+# =========================================================
+# SEMANTIC MATCHING FOR ANSWER CLEANING
+# =========================================================
+class SemanticMatcher:
+    """Semantic matcher using sentence transformers to identify and remove question restatements from answers"""
+    
+    _instance = None
+    _model = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(SemanticMatcher, cls).__new__(cls)
+            cls._instance._initialize()
+        return cls._instance
+    
+    def _initialize(self):
+        self._model_loaded = False
+        self._model = None
+        self.similarity_threshold = 0.75  # Threshold for considering text semantically similar
+    
+    def load_model(self):
+        """Load the sentence transformer model if available"""
+        if not SEMANTIC_AVAILABLE:
+            print("Warning: sentence-transformers not available. Install with: pip install sentence-transformers")
+            return False
+        
+        if self._model is None:
+            try:
+                # Use a lightweight model for efficiency
+                self._model = SentenceTransformer('all-MiniLM-L6-v2')
+                self._model_loaded = True
+                print("Semantic matcher model loaded successfully")
+                return True
+            except Exception as e:
+                print(f"Error loading semantic model: {e}")
+                return False
+        return True
+    
+    def get_embedding(self, text: str):
+        """Get embedding for a text"""
+        if not self._model_loaded or self._model is None:
+            return None
+        
+        try:
+            # Clean text
+            text = text.strip()
+            if not text:
+                return None
+            
+            # Get embedding
+            embedding = self._model.encode([text], convert_to_numpy=True)
+            return embedding[0]
+        except Exception as e:
+            print(f"Error getting embedding: {e}")
+            return None
+    
+    def compute_similarity(self, text1: str, text2: str) -> float:
+        """Compute cosine similarity between two texts"""
+        if not text1 or not text2:
+            return 0.0
+        
+        emb1 = self.get_embedding(text1)
+        emb2 = self.get_embedding(text2)
+        
+        if emb1 is None or emb2 is None:
+            return 0.0
+        
+        # Compute cosine similarity
+        import numpy as np
+        similarity = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
+        return float(similarity)
+    
+    def is_semantically_similar(self, text1: str, text2: str, threshold: float = None) -> bool:
+        """Check if two texts are semantically similar"""
+        if threshold is None:
+            threshold = self.similarity_threshold
+        
+        similarity = self.compute_similarity(text1, text2)
+        return similarity >= threshold
+    
+    def split_into_sentences(self, text: str) -> list:
+        """Split text into sentences"""
+        # Simple sentence splitting
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        return [s.strip() for s in sentences if s.strip()]
+    
+    def clean_answer_semantically(self, answer_text: str, question_text: str, 
+                                   threshold: float = None) -> str:
+        """
+        Remove sentences from answer that are semantically similar to the question
+        
+        Args:
+            answer_text: The student's answer text
+            question_text: The question text
+            threshold: Similarity threshold (0-1), higher = stricter
+        
+        Returns:
+            Cleaned answer text with semantically similar sentences removed
+        """
+        if not answer_text or not question_text:
+            return answer_text
+        
+        if threshold is None:
+            threshold = self.similarity_threshold
+        
+        # If model not loaded, fallback to simple string matching
+        if not self._model_loaded:
+            return self._fallback_clean_answer(answer_text, question_text)
+        
+        # Split answer into sentences
+        sentences = self.split_into_sentences(answer_text)
+        if not sentences:
+            return answer_text
+        
+        # Get question embedding once
+        question_embedding = self.get_embedding(question_text)
+        if question_embedding is None:
+            return self._fallback_clean_answer(answer_text, question_text)
+        
+        # Filter sentences
+        cleaned_sentences = []
+        for sentence in sentences:
+            # Check if sentence is semantically similar to question
+            sentence_embedding = self.get_embedding(sentence)
+            if sentence_embedding is None:
+                cleaned_sentences.append(sentence)
+                continue
+            
+            # Compute similarity
+            import numpy as np
+            similarity = np.dot(sentence_embedding, question_embedding) / (
+                np.linalg.norm(sentence_embedding) * np.linalg.norm(question_embedding)
+            )
+            
+            # Keep sentence if not too similar to question
+            if similarity < threshold:
+                cleaned_sentences.append(sentence)
+        
+        # Join cleaned sentences
+        return " ".join(cleaned_sentences)
+    
+    def _fallback_clean_answer(self, answer_text: str, question_text: str) -> str:
+        """Fallback cleaning using simple string matching when semantic model not available"""
+        # Try simple overlap-based cleaning
+        question_words = set(self._normalize_text(question_text).split())
+        if not question_words:
+            return answer_text
+        
+        sentences = self.split_into_sentences(answer_text)
+        if not sentences:
+            return answer_text
+        
+        cleaned_sentences = []
+        for sentence in sentences:
+            sentence_words = set(self._normalize_text(sentence).split())
+            if not sentence_words:
+                cleaned_sentences.append(sentence)
+                continue
+            
+            # Calculate overlap
+            overlap = len(question_words & sentence_words) / len(question_words)
+            
+            # Keep sentence if less than 50% overlap with question
+            if overlap < 0.5:
+                cleaned_sentences.append(sentence)
+        
+        return " ".join(cleaned_sentences)
+    
+    def _normalize_text(self, text: str) -> str:
+        """Normalize text for comparison"""
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+    
+    def clean_qa_pairs(self, qa_pairs: list, status_callback=None) -> list:
+        """Clean all Q&A pairs using semantic matching"""
+        def log(msg):
+            print(msg)
+            if status_callback:
+                status_callback(msg)
+        
+        if not qa_pairs:
+            return qa_pairs
+        
+        # Try to load model
+        if not self._model_loaded:
+            log("Loading semantic matcher model for answer cleaning...")
+            self.load_model()
+        
+        cleaned_pairs = []
+        removed_count = 0
+        
+        for pair in qa_pairs:
+            if not pair.get("matched", False):
+                cleaned_pairs.append(pair)
+                continue
+            
+            question = pair.get("question", "")
+            answer = pair.get("answer", "")
+            
+            if answer:
+                # Clean the answer
+                cleaned_answer = self.clean_answer_semantically(answer, question)
+                
+                # If cleaning removed all content, keep original
+                if not cleaned_answer.strip() and answer.strip():
+                    cleaned_answer = answer
+                    log(f"Warning: Semantic cleaning removed all content for {pair.get('ref', '')} - keeping original")
+                else:
+                    removed_sentences = len(answer.split(".")) - len(cleaned_answer.split("."))
+                    if removed_sentences > 0:
+                        removed_count += removed_sentences
+                
+                pair["answer"] = cleaned_answer
+                pair["answer_cleaned_semantically"] = True
+            
+            cleaned_pairs.append(pair)
+        
+        if removed_count > 0:
+            log(f"Semantic cleaning removed {removed_count} sentence(s) that were semantically similar to their questions")
+        
+        return cleaned_pairs
+
+# Global instance
+_semantic_matcher = None
+
+def get_semantic_matcher():
+    global _semantic_matcher
+    if _semantic_matcher is None:
+        _semantic_matcher = SemanticMatcher()
+    return _semantic_matcher
+
 # =========================================================
 # FIXED: LLM-BASED ANSWER MAPPING (Groq) - CRITICAL FIXES
 # =========================================================
@@ -915,8 +1156,8 @@ def _parse_sequential_search_response(content: str) -> tuple:
     except (ValueError, TypeError):
         raise ValueError(f"'start_line' must be an integer, got {data['start_line']!r}")
     return True, start_line
-SEQUENTIAL_SEARCH_WINDOW_CHARS = 16000  # increased from 11000 -- larger windows mean fewer calls to scan the same document, cutting repeated system-prompt token overhead (the biggest fixed cost per call)
-SEQUENTIAL_SEARCH_MAX_WINDOWS = 200  # generous safety cap; a real document will exhaust far sooner
+SEQUENTIAL_SEARCH_WINDOW_CHARS = 16000
+SEQUENTIAL_SEARCH_MAX_WINDOWS = 200
 SEQUENTIAL_SEARCH_OVERLAP_LINES = 5
 _BARE_LABEL_RE = re.compile(
     r'^\s*(?:Q\.?\s*|प्र\.?\s*|प्रश्न\.?\s*)?'
@@ -1296,7 +1537,7 @@ def _resolve_sibling_group_batch(client, numbered_lines: list, group_questions: 
             log(f"WARNING: discarding out-of-range sibling start {sl} for {ref}")
             continue
         if sl <= lower:
-            continue  # can't start before/at the group's own confirmed start
+            continue
         found[ref] = min(found[ref], sl) if ref in found else sl
     return found
 def _rescue_unmatched_questions(client, numbered_lines: list, questions: list, ranges: list,
@@ -1354,7 +1595,7 @@ def _reanalyze_and_repair_boundaries(client, numbered_lines: list, questions: li
             prev_len = prev_r["end_line"] - prev_r["start_line"] + 1
             curr_len = curr_r["end_line"] - curr_r["start_line"] + 1
             if median_len >= 4 and prev_len >= median_len * 0.4 and curr_len >= median_len * 0.4:
-                continue  # both neighbors look like plausible, normal-length answers -- skip
+                continue
             prev_q_idx = _ref_to_question_index(prev_r["ref"])
             curr_q_idx = _ref_to_question_index(curr_r["ref"])
             proposed = curr_r["start_line"]
@@ -1593,7 +1834,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
     sibling_groups = _detect_sibling_groups(questions)
     group_member_of = {idx: first_idx for first_idx, members in sibling_groups.items() for idx in members}
-    # Label pre-pass for standalone questions
     label_anchors = _build_label_anchor_index(answer_lines, questions, set(group_member_of.keys()), log)
     found_starts = {}
     for qi, line_idx in label_anchors.items():
@@ -1671,7 +1911,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 pointer = total_lines
                 i = next_index
             continue
-        # ---- Standalone question: strict single-target search ----
         ref = f"REF-{chr(65 + i)}"
         q = questions[i]
         if ref in found_starts:
@@ -1681,7 +1920,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
         sub_part_hint = _build_sub_part_hint(questions, i)
         search_from_idx = pointer
-        # Bound the search by the nearest already-known FUTURE anchor
         future_anchor_lines = [v for k, v in found_starts.items() if _ref_to_question_index(k) > i]
         bound_end_idx = (min(future_anchor_lines) + 1) if future_anchor_lines else None
         start_line = _find_answer_start_sequential(
@@ -1740,7 +1978,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         gemini_verdicts = _collect_gemini_results(gemini_futures, log)
         ranges = _apply_gemini_corrections(ranges, gemini_verdicts, log)
         gemini_executor.shutdown(wait=False)
-    # FIXED: Ensure each question gets exactly one answer range, and ranges don't overlap
     ranges_by_ref = {r["ref"]: r for r in ranges}
     results = []
     for i, q in enumerate(questions):
@@ -1760,13 +1997,11 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             })
             continue
         s, e = r["start_line"], r["end_line"]
-        # Ensure we don't exceed array bounds
         if s >= len(answer_lines):
             s = len(answer_lines) - 1
         if e >= len(answer_lines):
             e = len(answer_lines) - 1
         if s > e:
-            # Swap if start > end
             s, e = e, s
         verbatim_lines = [
             answer_lines[j] for j in range(s, e + 1)
@@ -1988,11 +2223,11 @@ def strip_question_restatement(answer_text: str) -> str:
     return text
 _TRAILING_LEADIN_RE = re.compile(
     r'(?:'
-    r'\s*#{1,3}\s*\d*\s*$'                                   # trailing "#", "##3"
-    r'|\s*(?:Section|Sec\.?)\s*[-:]?\s*[A-Za-z0-9]+\s*$'      # "Section B", "Sec-2"
-    r'|\s*भाग\s*[-:]?\s*[०-९0-9]*\s*$'                        # "भाग-2"
-    r'|\s*(?:Q\.?|Ans(?:wer)?\.?|प्र\.?|प्रश्न\.?|उत्तर)\s*[-:.]?\s*\d+\s*[-:.)]?\s*$'  # "Q5", "Ans 6-", "प्र.7"
-    r'|\s*\(?[ivxlcdm]{1,5}\)?\s*[-:.)]?\s*$'                 # trailing bare roman-numeral label, e.g. "(iii)"
+    r'\s*#{1,3}\s*\d*\s*$'
+    r'|\s*(?:Section|Sec\.?)\s*[-:]?\s*[A-Za-z0-9]+\s*$'
+    r'|\s*भाग\s*[-:]?\s*[०-९0-9]*\s*$'
+    r'|\s*(?:Q\.?|Ans(?:wer)?\.?|प्र\.?|प्रश्न\.?|उत्तर)\s*[-:.]?\s*\d+\s*[-:.)]?\s*$'
+    r'|\s*\(?[ivxlcdm]{1,5}\)?\s*[-:.)]?\s*$'
     r')',
     re.IGNORECASE
 )
@@ -2076,7 +2311,7 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     chunks_with_carry = _chunk_lines_by_char_budget(numbered_lines, questions)
     log(f"Split {len(answer_lines)} answer line(s) into {len(chunks_with_carry)} LLM chunk(s) for answer mapping "
         f"(max {MAX_ANSWERS_PER_CHUNK} distinct answers per chunk)")
-    all_ranges = []  # list of {ref, start_line, end_line}
+    all_ranges = []
     chunk_failures = []
     chunk_zero_matches = 0
     for i, (chunk, carry_over_idx, expected_new_indices) in enumerate(chunks_with_carry):
@@ -2358,7 +2593,6 @@ def verify_no_llm_text_rewriting(qa_pairs: list, answer_lines: list, log=print) 
         if not p.get("matched"):
             continue
         s, e = p["start_line"], p["end_line"]
-        # Clamp indices to valid range
         if s < 0:
             s = 0
         if e >= len(answer_lines):
@@ -2385,7 +2619,7 @@ def verify_no_llm_text_rewriting(qa_pairs: list, answer_lines: list, log=print) 
         )
     return all_ok
 # =========================================================
-# COMPLETE PIPELINE
+# COMPLETE PIPELINE WITH SEMANTIC CLEANING
 # =========================================================
 @_diagnose_tuple_errors
 def process_pdf(file_input, status_callback=None):
@@ -2472,6 +2706,14 @@ def process_pdf(file_input, status_callback=None):
         )
     verify_no_llm_text_rewriting(qa_pairs, answer_lines, log)
     _flag_suspiciously_short_answers(qa_pairs, log)
+    
+    # =========================================================
+    # SEMANTIC CLEANING OF ANSWERS
+    # =========================================================
+    log("Applying semantic cleaning to remove question restatements from answers...")
+    matcher = get_semantic_matcher()
+    qa_pairs = matcher.clean_qa_pairs(qa_pairs, status_callback)
+    
     log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
     return ocr_json, qa_pairs
 def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
