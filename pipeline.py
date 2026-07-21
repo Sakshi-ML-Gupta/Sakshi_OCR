@@ -34,6 +34,26 @@ def get_api_key(name):
         return os.getenv(name)
 
 # =========================================================
+# CLEAN UNWANTED TEXT PATTERNS
+# =========================================================
+def clean_unwanted_text(text: str) -> str:
+    """Remove unwanted decorative/text patterns from OCR output"""
+    if not text:
+        return text
+    # Remove section headers like "### ★ भाग- 3 ★ ###"
+    text = re.sub(r'#+\s*★\s*[भागबग]\s*[-★\s\d]+\s*★\s*#+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'★\s*प्रश्नोत्तर\s*नं\.\s*[★\s\d]+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'★\s*प्रश्न\s*[★\s\d]+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'★\s*उत्तर\s*[★\s\d]+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'###\s*★\s*[भागबग]\s*[-★\s\d]+\s*★\s*###', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'★\s*[भागबग]\s*[-★\s\d]+\s*★', '', text, flags=re.IGNORECASE)
+    # Remove multiple newlines
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    # Remove extra spaces
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+# =========================================================
 # INPUT NORMALIZATION
 # =========================================================
 def _normalize_file_input(file_input, default_name="document.pdf"):
@@ -282,22 +302,6 @@ def process_reference(file_input, status_callback=None):
     return build_ocr_json(pages)
 
 # =========================================================
-# CLEAN UNWANTED TEXT PATTERNS
-# =========================================================
-def clean_unwanted_text(text: str) -> str:
-    """Remove unwanted decorative/text patterns from OCR output"""
-    # Remove section headers like "### ★ भाग- 3 ★ ###"
-    text = re.sub(r'#+\s*★\s*[भागबग]\s*[-★\s\d]+\s*★\s*#+', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'★\s*प्रश्नोत्तर\s*नं\.\s*[★\s\d]+', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'★\s*प्रश्न\s*[★\s\d]+', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'★\s*उत्तर\s*[★\s\d]+', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'###\s*★\s*[भागबग]\s*[-★\s\d]+\s*★\s*###', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'★\s*[भागबग]\s*[-★\s\d]+\s*★', '', text, flags=re.IGNORECASE)
-    # Remove multiple newlines
-    text = re.sub(r'\n\s*\n', '\n\n', text)
-    return text.strip()
-
-# =========================================================
 # LLM-BASED QUESTION PAPER / QUESTION DETECTION (Groq)
 # =========================================================
 GROQ_MODEL = "openai/gpt-oss-120b"
@@ -306,6 +310,9 @@ TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 MAX_CHARS_PER_CHUNK = 9000
 CHUNK_OVERLAP_PAGES = 1
+
+# Add a global flag to track if we're in a quota-exhausted state
+_QUOTA_EXHAUSTED = False
 
 QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam/assignment answer booklet. This could be from ANY institution, ANY subject, and ANY language (or a mix of languages/scripts) -- do not assume a specific country, university, or language. The booklet mixes pages of different kinds, in no guaranteed order:
 1. ADMINISTRATIVE/COVER pages: roll number/enrolment number, programme/course code, student name, registration details, institution letterhead, blank cover sheets. These contain NO exam question text and NO student answer content -- just identifying/bureaucratic information.
@@ -527,6 +534,12 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                               response_parser, budget: "_TokenBudgetTracker",
                               log, max_retries: int = 4):
     import groq
+    global _QUOTA_EXHAUSTED
+    
+    # If quota is already exhausted, don't even try
+    if _QUOTA_EXHAUSTED:
+        raise Exception("Groq daily token quota is exhausted. Please wait for reset or upgrade your tier.")
+    
     estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
     last_error = None
     skip_next_proactive_check = False
@@ -569,6 +582,8 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             last_error = e
             detail = _parse_rate_limit_detail(str(e))
             if detail and detail["limit_type"] == "TPD":
+                # Set the global flag to prevent further attempts
+                _QUOTA_EXHAUSTED = True
                 raise Exception(
                     f"Groq daily token quota (TPD) exhausted: "
                     f"{detail['used']}/{detail['limit']} tokens used today, "
@@ -751,8 +766,12 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         try:
             qp_pages_1based, questions, admin_pages_1based = _call_groq_for_chunk(client, chunk, budget, log)
         except Exception as e:
+            error_msg = str(e)
             log(f"WARNING: chunk {i+1}/{len(chunks)} question-identification failed, skipping: {e}")
-            chunk_failures.append(str(e))
+            chunk_failures.append(error_msg)
+            # If it's a quota exhaustion error, stop trying and propagate
+            if "quota" in error_msg.lower() or "TPD" in error_msg:
+                raise Exception(f"Groq quota exhausted: {error_msg}")
             continue
         def _recover_pages(pages_1based, label):
             recovered = []
@@ -2331,12 +2350,27 @@ def process_pdf(file_input, status_callback=None):
         print(msg)
         if status_callback:
             status_callback(msg)
+    
+    # Check if quota is already exhausted
+    global _QUOTA_EXHAUSTED
+    if _QUOTA_EXHAUSTED:
+        raise Exception("Groq daily token quota is exhausted. Please wait for the daily reset (about 7 minutes) or upgrade your Groq tier.")
+    
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
     pages = run_ocr(file_bytes, file_name, status_callback)
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
-    qp_page_indices, official_questions, admin_page_indices = identify_questions_with_llm(pages, status_callback)
+    
+    try:
+        qp_page_indices, official_questions, admin_page_indices = identify_questions_with_llm(pages, status_callback)
+    except Exception as e:
+        error_msg = str(e)
+        if "quota" in error_msg.lower() or "TPD" in error_msg:
+            _QUOTA_EXHAUSTED = True
+            raise Exception(f"Groq quota exhausted: {error_msg}")
+        raise
+    
     log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
     log(f"Admin/cover pages detected: {[p+1 for p in admin_page_indices] if admin_page_indices else 'none'}")
     log(f"Official questions extracted: {len(official_questions)}")
