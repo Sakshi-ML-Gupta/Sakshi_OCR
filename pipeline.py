@@ -1691,7 +1691,7 @@ def _rescue_unmatched_questions(client, numbered_lines: list, questions: list, r
 
     changed = True
     passes = 0
-    while changed and passes < 3:
+    while changed and passes < 4:
         changed = False
         passes += 1
         matched_refs = {r["ref"] for r in ranges}
@@ -1764,7 +1764,7 @@ def _reanalyze_and_repair_boundaries(client, numbered_lines: list, questions: li
 
             prev_len = prev_r["end_line"] - prev_r["start_line"] + 1
             curr_len = curr_r["end_line"] - curr_r["start_line"] + 1
-            if median_len >= 4 and prev_len >= median_len * 0.4 and curr_len >= median_len * 0.4:
+            if median_len >= 4 and prev_len >= median_len * 0.6 and curr_len >= median_len * 0.6:
                 continue
 
             prev_q_idx = _ref_to_question_index(prev_r["ref"])
@@ -1811,7 +1811,7 @@ def _remap_incomplete_answers(client, numbered_lines: list, questions: list, ran
         changed = False
         for pos, r in enumerate(ordered):
             length = r["end_line"] - r["start_line"] + 1
-            if length >= max(median_len * 0.25, 3):
+            if length >= max(median_len * 0.35, 3):
                 continue
 
             q_idx = _ref_to_question_index(r["ref"])
@@ -2698,6 +2698,37 @@ def _is_image_description_line(line: str) -> bool:
     return bool(_IMAGE_META_RE.match(stripped))
 
 
+_DECORATIVE_HEADING_CORE_RE = re.compile(
+    r'^(?:भाग|खण्ड|खंड|अनुभाग|प्रश्नोत्तर|section|part)\b'
+    r'(?:\s*(?:नं\.?|no\.?|number)?\s*[.:\-]?\s*[०-९0-9]*\s*'
+    r'(?:भाग|खण्ड|खंड|अनुभाग|प्रश्नोत्तर|section|part)?)*\s*$',
+    re.IGNORECASE
+)
+
+
+def _is_decorative_heading_line(line: str) -> bool:
+    """
+    Catches printed section/part-break headers that are wrapped in
+    markdown/decoration symbols -- e.g. "### ★ भाग- 3 ★ ### ★
+    प्रश्नोत्तर नं." These are never part of any student answer (they
+    are the OCR'd page's own printed section divider), but left in they
+    can (a) show up as junk inside the mapped answer text, and (b)
+    confuse boundary search between two adjacent answers, since the
+    line superficially "looks like" content sitting between them.
+    Deliberately anchored (^...$ after stripping decoration) so it only
+    matches lines that are PURELY heading/decoration -- never a genuine
+    sentence that happens to mention one of these words.
+    """
+    stripped = line.strip()
+    if not stripped or len(stripped) > 60:
+        return False
+    core = re.sub(r'[#★☆*\-_=~]+', ' ', stripped)
+    core = re.sub(r'\s+', ' ', core).strip()
+    if not core:
+        return True  # pure decoration, e.g. "### ***"
+    return bool(_DECORATIVE_HEADING_CORE_RE.match(core))
+
+
 def is_noise(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
@@ -2705,6 +2736,8 @@ def is_noise(line: str) -> bool:
     if re.match(r'^\s*\d{1,3}\s*$', stripped):
         return True
     if _is_image_description_line(stripped):
+        return True
+    if _is_decorative_heading_line(stripped):
         return True
     if len(stripped) > NOISE_LINE_MAX_CHARS:
         return False
