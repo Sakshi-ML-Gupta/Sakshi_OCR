@@ -276,29 +276,29 @@ TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 MAX_CHARS_PER_CHUNK = 9000
 CHUNK_OVERLAP_PAGES = 1
-QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam/assignment answer booklet. This could be from ANY institution, ANY subject, and ANY language (or a mix of languages/scripts) -- do not assume a specific country, university, or language. The booklet mixes pages of different kinds, in no guaranteed order:
-1. ADMINISTRATIVE/COVER pages: roll number/enrolment number, programme/course code, student name, registration details, institution letterhead, blank cover sheets. These contain NO exam question text and NO student answer content -- just identifying/bureaucratic information.
-2. QUESTION PAPER pages: the official printed list of numbered exam questions the student must answer. These read as instructions/prompts DIRECTED AT the student (e.g. "Discuss X", "Explain Y with examples", "Write notes on the following:", or the equivalent phrasing in whatever language this document uses). Mark allocations may appear (e.g. "10", "20").
-3. ANSWER pages: the student's own (handwritten, OCR'd) answers. These are typically long, restate or reference a question briefly then write an extended response, and may themselves contain numbered or bulleted sub-points as part of the student's OWN explanation. These numbered sub-points inside a long answer are NOT separate exam questions, even though superficially they look similar (number, period, text) -- they are part of the answer to ONE question.
-You are being shown only a PORTION of the document's pages at a time (a chunk), not the whole document. Some pages you see may be partial context carried over from a previous chunk -- still classify them normally based on their own content.
-Your task: read the pages shown and return ONLY valid JSON (no markdown fences, no commentary, no explanation) in EXACTLY this shape:
+QP_SYSTEM_PROMPT = """You are analyzing OCR text from a scanned student exam booklet (any institution/subject/language). Pages are of 3 types, in no guaranteed order:
+1. ADMIN/COVER: roll no., name, letterhead, blank sheets -- no question/answer content.
+2. QUESTION PAPER: official printed questions -- directive prompts ("Explain X", "Discuss Y") aimed AT the student, usually short and self-contained, sometimes with marks like (10).
+3. ANSWER: student's own long written response, which may itself contain numbered sub-points as part of ONE answer -- these are NOT separate exam questions.
+
+You see only a chunk of pages, possibly with carried-over context. Classify each page shown.
+
+Key distinctions:
+- A question paper item is a command/prompt ("explain", "discuss", question mark). A numbered point inside an answer is a STATEMENT/FACT, not a command.
+- If numbered items follow an "answer" label (Ans/उत्तर etc.) or long explanatory prose, it's an ANSWER page -- exclude from question_paper_pages.
+- TRAP: students often restate the question as their answer's FIRST sentence (e.g. "Examine X. Discuss Y. The theme is..."). This is the answer's OPENING page, not the question paper -- signals: much more text than a printed question needs, essay-like prose, or the same question already appears on a shorter/more concise page elsewhere. When unsure, prefer brevity as the deciding signal (real question papers are concise per question).
+- If unsure whether a page is a question-paper page, exclude it.
+- Cover/admin pages go in admin_pages (never counted as answer content either).
+- Preserve exact original text/numbering of real questions -- no paraphrasing, no renumbering, no translation.
+- Empty question_paper_pages/admin_pages is valid and expected for answer-only chunks.
+
+Return ONLY this JSON, no markdown fences, no commentary:
 {
   "question_paper_pages": [14, 16, 18],
   "admin_pages": [1, 2],
-  "questions": ["1. Example question text. (10)", "2. Another example question. (10)"]
+  "questions": ["1. Example question. (10)", "2. Another question. (10)"]
 }
-IMPORTANT formatting requirement: "question_paper_pages" and "admin_pages" must be JSON arrays where EACH page number is a SEPARATE element separated by commas, like [14, 16, 18] -- NEVER merge multiple page numbers into one number like [141618]. Each integer must be a single, individually valid page number from the pages shown. A page must never appear in both lists.
-Critical rules for telling question-paper pages apart from answer pages that happen to contain numbered content:
-- A genuine question paper question is a PROMPT directed at the student ("explain", "discuss", "describe", "write notes on", "compare", a question mark, etc., in whatever language is used) -- it asks the student to DO something.
-- A numbered point inside a long answer is typically a STATEMENT or FACT that is part of an explanation the student is giving -- it does not ask the reader to do anything; it's content, not an instruction.
-- If a page's numbered items closely follow a label meaning "answer" (in whatever language/script the document uses -- e.g. "Ans", "Ans-", or its equivalent), or come after a long paragraph of explanatory prose in the same block, that page is almost certainly an ANSWER page, not a question paper page -- exclude it from question_paper_pages even if it has multiple numbered lines.
-- A real question paper is usually self-contained and concise per question (a question, maybe a mark allocation) -- not a long flowing essay with numbered sub-points woven into running prose.
-- CRITICAL TRAP TO AVOID: students very commonly RESTATE the question itself as the FIRST SENTENCE of their answer, before writing their actual response (e.g. an answer's opening page reads "Examine the theme of concealment in X. Discuss with reference to Y. The theme of concealment is central to..." where everything after the first sentence is the student's OWN original explanation, not more instructions). Such a page can superficially look like a question-paper page because it contains prompt-style verbs ("Examine", "Discuss") -- but it is the FIRST page of a long, multi-page ANSWER, not a question paper page. Signals that this is really an answer's opening page, not a real question paper page: (a) the page has noticeably MORE text than a typical printed question would need, especially if it keeps going well past where a concise instruction would end; (b) the prose quality looks like a developing argument/explanation rather than a terse instruction; (c) the SAME or very similar question text already appears verbatim on a page you are more confident is the genuine, concise question paper (in which case this longer, messier page is almost certainly the student's restatement -- exclude it). When uncertain whether a page is the real question paper or a student's restatement-then-answer, treat brevity and conciseness as the deciding signal: genuine question papers are short per question; answer pages (including their opening restatement) run much longer.
-- When genuinely uncertain whether a page is a question paper page, prefer NOT including it as one, and prefer NOT extracting its numbered items as separate questions.
-- If a page is a cover/administrative page (roll number, letterhead, blank sheet with no question or answer content), put it in "admin_pages" so it is excluded from BOTH the question paper AND the student's answer text -- it should never be treated as answer content.
-- If NONE of the pages shown in this chunk are question paper pages, return an empty list for that field -- that is a valid and expected result for chunks that only contain answer/admin pages.
-- Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate.
-- Output ONLY the JSON object described above. No prose before or after it. No markdown code fences."""
+Each page number must be a separate array element (never concatenated like [141618]). A page never appears in both lists."""
 def _chunk_pages_by_char_budget(pages: list, max_chars: int = MAX_CHARS_PER_CHUNK,
                                   overlap_pages: int = CHUNK_OVERLAP_PAGES) -> list:
     if not pages:
@@ -613,18 +613,14 @@ def _merge_chunk_results(chunk_results: list) -> tuple:
         all_questions.extend(questions)
     deduped_questions = _dedup_questions(all_questions)
     return sorted(all_qp_pages), deduped_questions, sorted(all_admin_pages)
-QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are reading the OFFICIAL question paper pages of a student exam assignment booklet (the printed list of questions, NOT the student's answers). You are given the complete, exact text of these pages, in order.
-Your task: extract the COMPLETE, clean list of every distinct question/sub-part, exactly as printed, and return them in printed order.
-Critical rules for multi-part questions:
-- If a single numbered question contains multiple LABELED sub-parts -- e.g. "1. Identify and explain the following: (i) ... (ii) ... (iii) ... (iv) ..." -- output EACH labeled sub-part as its OWN SEPARATE entry, not merged into one block. Each sub-part entry should include enough of the parent question's context to be self-contained (e.g. carry forward the parent instruction like "Identify and explain the following:" into each sub-part's text, or at minimum keep the original numbering label, e.g. "1.(i)", "1.(ii)", "1.(iii)", "1.(iv)") so each entry is independently understandable without needing to look at a different entry for context.
-- This applies to ANY labeled sub-structure: (i)/(ii)/(iii)/(iv), (a)/(b)/(c), (क)/(ख)/(ग), 1./2./3. used as sub-parts within a larger numbered question, etc. -- always split these into separate entries.
-- Decide this ONCE, consistently, for the whole document -- you are seeing the COMPLETE question paper text in this single call, so there is no need to guess or produce different splits for different parts of the same question.
-- Preserve the EXACT original text of each part -- do not paraphrase, do not translate. You MAY prepend the parent question's numbering/label to each split-out sub-part for self-contained context, as described above.
-- Output entries in the SAME ORDER they appear on the question paper (monotonic, matching the printed sequence) -- sub-parts of the same parent question must stay together and in their own (i)/(ii)/(iii)/(iv) order; never reorder anything.
-Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
-{
-  "questions": ["<exact text of question/sub-part 1>", "<exact text of question/sub-part 2>", ...]
-}"""
+QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are given the COMPLETE, exact text of a student exam's question paper pages, in order. Extract the full, clean list of every distinct question/sub-part, in printed order.
+
+Multi-part rule: if a numbered question has labeled sub-parts -- e.g. "1. Identify and explain: (i)... (ii)... (iii)..." -- split EACH sub-part into its OWN entry (never merge). Applies to any labeling: (i)/(ii), (a)/(b), (क)/(ख), etc. Carry the parent instruction/number into each sub-part (e.g. "1.(i) Identify and explain: ...") so each entry is self-contained. Decide this split ONCE, consistently, since you see the whole question paper at once.
+
+Preserve exact original text -- no paraphrasing, no translation (you may prepend parent numbering for context). Keep sub-parts together and in original order; never reorder.
+
+Return ONLY this JSON, no markdown fences, no commentary:
+{"questions": ["<exact text 1>", "<exact text 2>", ...]}"""
 def _build_canonical_questions_prompt(qp_pages: list) -> str:
     blocks = []
     for p in qp_pages:
@@ -1072,32 +1068,25 @@ def get_semantic_matcher():
 # =========================================================
 # FIXED: LLM-BASED ANSWER MAPPING (Groq) - CRITICAL FIXES
 # =========================================================
-ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
-1. A numbered list of the OFFICIAL exam questions, each tagged with a reference label like [REF-A], [REF-B], etc.
-2. The student's answer text, with each line prefixed by its line number in [brackets].
-Your task: for EACH official question, find WHERE in the answer text the student's response to that specific question starts and ends, and return the LINE NUMBER RANGE (inclusive) for each, identified by its REF label.
+ANSWER_MAP_SYSTEM_PROMPT = """You are mapping a student's OCR'd handwritten exam answers to official questions. Given:
+1. Numbered official questions, each tagged [REF-A], [REF-B], etc.
+2. The answer text, each line prefixed with its line number in [brackets].
 
-CRITICAL: Each question's answer MUST be mapped to EXACTLY ONE range. Under NO circumstances should two different questions share the same range, nor should one range contain content from two different answers.
+For EACH question, find the inclusive LINE RANGE of the student's response, by REF label. Each REF gets EXACTLY ONE range; ranges must never overlap or mix two questions' content.
 
-Important guidance for finding boundaries correctly:
-- A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
-- An answer's content ends at the LAST line that is still part of that answer's reasoning/explanation, RIGHT BEFORE the next answer begins (whether or not the next answer is in your list of official questions).
-- If a question's answer is genuinely not present anywhere in the text shown, do NOT invent a range -- omit that REF entirely from your output. It may appear in a different chunk of the document.
-- Each REF's range must NOT overlap with another REF's range. If you are unsure exactly where one answer ends and the next begins, prefer ending the EARLIER answer sooner rather than letting it swallow content that belongs to a later answer -- a short correct answer is far more useful than a long answer that incorrectly absorbed unrelated content.
-- IGNORE OCR ARTIFACT-DESCRIPTION LINES when deciding boundaries -- e.g. a line that just describes a non-text element ("there is a logo", "red pen scribble", "signature", "watermark", "stamp here"). These are never part of the student's actual written answer; never let one of these lines count as the start or end of a range, and never let it cause two real answers to be merged into one range.
-- NEVER merge two DIFFERENT questions' content into a single REF's range, even if their answers are similar or adjacent in the text. Each REF's range must contain ONLY that one question's own response.
-- Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
-- Use the EXACT REF label (e.g. "REF-A") to identify each question. Do NOT retype or paraphrase the question text itself -- the REF label is all that's needed.
-- If a note at the top of this prompt tells you this chunk CONTINUES an answer from a previous chunk, treat that instruction as authoritative: the opening lines of this chunk likely belong to that same REF even though you cannot see the earlier part of the answer.
-- CRITICAL: this chunk is deliberately kept SHORT and normally contains only a small number of distinct answers (often 1-3). You MUST scan the ENTIRE text shown, all the way to the last line, before responding -- do not stop after finding the first one or two answers. If you can identify 3 separate answer-start points in this text, your output must contain 3 entries, not fewer. Missing a clearly-present answer is a serious error.
-Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
-{
-  "answers": [
-    {"ref": "REF-A", "start_line": 12, "end_line": 18},
-    {"ref": "REF-B", "start_line": 19, "end_line": 25}
-  ]
-}
-If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any of these answers."""
+Rules:
+- A new answer usually starts where the student labels/restates a question ("Ans 5-", "उत्तर 6-", "प्र. 8", a matching number) or a clear topic shift to the next question.
+- An answer ends at its last real content line, right before the next answer begins.
+- If a question's answer isn't in this text, omit its REF entirely -- don't invent a range (it may be in another chunk).
+- If a boundary is unclear, end the earlier answer sooner rather than let it swallow later content -- a short correct answer beats a long wrong one.
+- Ignore OCR artifact-description lines ("there is a logo", "red pen scribble", "signature", "watermark") -- never let these be a boundary or merge two answers.
+- Use line numbers exactly as given; use REF labels only, don't retype question text.
+- If told this chunk continues a previous chunk's answer, treat the opening lines as belonging to that REF unless content clearly shifts topic.
+- This chunk is short and usually has only 1-3 answers -- scan to the LAST line before responding; don't stop early.
+
+Return ONLY this JSON, no markdown fences, no commentary:
+{"answers": [{"ref": "REF-A", "start_line": 12, "end_line": 18}, {"ref": "REF-B", "start_line": 19, "end_line": 25}]}
+If none of the questions' answers appear here, return {"answers": []}."""
 # =========================================================
 # SEQUENTIAL SINGLE-TARGET ANSWER MAPPING (recommended, default)
 # =========================================================
@@ -1271,18 +1260,15 @@ def _build_sub_part_hint(questions: list, i: int) -> str:
         f"not match content that is actually the student's response to a DIFFERENT sibling "
         f"sub-part just because it discusses a closely related aspect of the same topic."
     )
-BOUNDARY_CONFIRM_SYSTEM_PROMPT = """You are double-checking a proposed boundary line between two consecutive answers in a student's exam booklet.
-You are given:
-1. The text of the PREVIOUS question (whose answer should end right before the proposed boundary).
-2. The text of the CURRENT/target question (whose answer should begin at the proposed boundary).
-3. A short window of text (line-numbered) centered on the proposed boundary line.
-Decide: does the proposed boundary line genuinely mark the FIRST line of the CURRENT question's answer -- i.e., is everything from the boundary line onward truly about the CURRENT question, and everything before it truly still about the PREVIOUS question (or noise/labels)?
-Two kinds of mistakes are possible, and both are equally serious:
-- TOO EARLY: the proposed line is still part of the PREVIOUS answer's content (e.g. a coincidental keyword overlap, a sub-point within the previous explanation) -- the CURRENT answer actually starts LATER. This mistake silently truncates the PREVIOUS answer and steals its final content into the CURRENT one.
-- TOO LATE: the CURRENT answer actually starts EARLIER than proposed (e.g. an introductory line, or an entire page, was missed).
-If the proposed line is correct, confirm it. If not, report the corrected line number (which MUST be one of the line numbers shown in the window). If you cannot confidently identify a better line within this window, keep the original proposed line -- do not guess.
-Ignore OCR artifact-description lines (e.g. "there is a logo", "red pen scribble", "signature", "watermark") entirely -- never propose one of these as the boundary; treat them as if they were not there and look at the real text around them.
-Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+BOUNDARY_CONFIRM_SYSTEM_PROMPT = """Double-check a proposed boundary between two consecutive answers. Given: previous question text, current/target question text, and a line-numbered window centered on the proposed boundary.
+
+Check: does the boundary correctly mark the FIRST line of the CURRENT answer? Two possible mistakes, equally bad:
+- TOO EARLY: line still belongs to the PREVIOUS answer (truncates it, steals its ending into CURRENT).
+- TOO LATE: CURRENT answer actually starts earlier (an opening line/page was missed).
+
+If correct, confirm it. If not, report the corrected line (must be shown in the window). If unsure, keep the original -- don't guess. Ignore OCR artifact-description lines (logo/scribble/signature/watermark) as if absent.
+
+Return ONLY this JSON, no markdown fences, no commentary:
 {"corrected_start_line": 42}"""
 def _build_boundary_confirm_prompt(window_lines: list, prev_question: str, curr_question: str, proposed_line: int) -> str:
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
@@ -1365,23 +1351,13 @@ def _build_label_anchor_index(answer_lines: list, questions: list, exclude_indic
 # =========================================================
 # FIXED: Combined boundary check with better verification
 # =========================================================
-COMBINED_BOUNDARY_CHECK_SYSTEM_PROMPT = """You are checking the boundary at the start of one answer in a student's exam booklet, in ONE pass that covers both possible mistakes at once.
-You are given:
-1. The text of the PREVIOUS question (whose answer should end right before the true boundary), or "(none -- this is the first question)" if there isn't one.
-2. The text of the CURRENT/target question (whose answer should begin at the true boundary).
-3. A window of line-numbered text spanning some lines BEFORE the proposed boundary through some lines AFTER it.
-4. The PROPOSED boundary line (currently believed to be where the current question's answer starts).
+COMBINED_BOUNDARY_CHECK_SYSTEM_PROMPT = """Check the boundary at the start of one answer, covering both possible mistakes in one pass. Given: previous question text (or "none" if first), current/target question text, a line-numbered window before+after the proposed boundary, and the PROPOSED boundary line.
 
-CRITICAL: You must ensure that the boundary does NOT merge two different answers. If the proposed boundary is too early (includes content from previous answer) or too late (skips content from current answer), correct it.
+Find the TRUE first line of the CURRENT answer. Either mistake is possible: proposed is too LATE (a genuine opening line was skipped -- true boundary earlier) or too EARLY (still includes PREVIOUS answer's content -- true boundary later). Confirm as-is if already correct. Ignore OCR artifact-description lines (logo/signature/watermark/scribble) -- never treat as boundary.
 
-Decide the TRUE boundary line -- the exact first line of the CURRENT question's answer. Two kinds of mistakes are equally possible:
-- The proposed line is too LATE: a genuine opening line/sentence of the CURRENT answer was skipped -- the true boundary is EARLIER.
-- The proposed line is too EARLY: content still belonging to the PREVIOUS answer was wrongly included -- the true boundary is LATER.
-
-If the proposed line is already correct, confirm it as-is. Ignore OCR artifact-description lines (e.g. "there is a logo", "signature", "watermark", "red pen scribble") -- never treat one as the boundary.
-Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+Return ONLY this JSON, no markdown fences, no commentary:
 {"corrected_start_line": 42}
-corrected_start_line MUST be one of the exact line numbers shown in the window -- if unsure, return the original proposed line."""
+Must be an exact line number in the window; if unsure, return the original proposed line."""
 def _build_combined_boundary_prompt(window_lines: list, prev_question, curr_question: str, proposed_line: int) -> str:
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
     prev_block = prev_question if prev_question else "(none -- this is the first question)"
@@ -1414,20 +1390,15 @@ def _check_boundary_combined(client, numbered_lines: list, prev_question, curr_q
         log(f"  combined boundary check adjusted start: {proposed_line} -> {corrected}")
         return corrected
     return proposed_line
-WINDOWED_MULTI_TARGET_SYSTEM_PROMPT = """You are resolving the internal boundaries WITHIN a small, already-confirmed block of text that belongs to a multi-part question's sibling sub-parts.
-You are given:
-1. A short list of candidate sub-parts (2-5 typically), each tagged with a REF label (REF-B, REF-C, ...). These are CONFIRMED to be sibling sub-parts of the SAME parent question -- the text window shown definitely contains some or all of their answers, back to back, in order.
-2. The exact text window (line-numbered) that this whole group's answers fall within.
-Your task: for each sibling sub-part, find the line where ITS OWN portion begins (i.e. where the student moves on from the previous sibling's content to start addressing this one specifically).
-Guidance:
-- The siblings appear in order in this window. Look for the transition points: a new label (e.g. (ii), (iii)), a sub-part identifier, or a clear shift in exactly what specific aspect is now being addressed -- even though all siblings share the same overall topic (they're part of one parent question).
-- The FIRST sibling in the list normally starts at or very near the beginning of this window (it may already be confirmed separately -- focus your effort on finding where the LATER siblings begin).
-- PRECISION MATTERS MOST: only report a sibling's start_line if you can identify a genuine, specific transition point for it. If you cannot clearly tell where one sibling's content ends and the next begins, it is much better to leave that boundary unreported than to guess -- an incorrect split would mix one sibling's answer into another's. A sibling with no reported start will simply be treated as folded into the content of whichever sibling came before it, which is a safer default than a wrong guess.
-- Content, definitions, or explanations CAN legitimately repeat across siblings -- do not reject a genuine transition just because similar wording appeared for an earlier sibling.
-- Always report the EARLIEST line at which each identified sibling's own content begins.
-Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+WINDOWED_MULTI_TARGET_SYSTEM_PROMPT = """Resolve internal boundaries within a confirmed block of text belonging to sibling sub-parts of one multi-part question. Given: 2-5 candidate sub-parts tagged [REF-B], [REF-C] etc. (confirmed siblings whose answers fall in this window, back to back, in order), and the line-numbered text window.
+
+For each sibling, find where its OWN portion begins (a new label like (ii)/(iii), or a clear shift to that specific aspect -- even though all siblings share the parent topic). The first sibling usually starts near the window's start -- focus on finding later siblings' starts.
+
+Only report a start_line if you can identify a genuine, specific transition -- if unclear, omit it (an unreported sibling safely folds into the preceding one; a wrong guess would wrongly split content). Content can legitimately repeat across siblings -- don't reject a real transition for that reason. Always report the earliest line of each identified transition.
+
+Return ONLY this JSON, no markdown fences, no commentary:
 {"starts": [{"ref": "REF-B", "start_line": 42}, {"ref": "REF-C", "start_line": 58}]}
-Only include sibling(s) whose start you can confidently identify -- omitting an uncertain one is expected and safe. Every start_line MUST be an exact line number shown in [brackets] in this window."""
+Only include siblings you're confident about. Every start_line must be an exact line number shown."""
 def _build_windowed_multi_target_prompt(window_lines: list, open_questions: list,
                                           sibling_note: str = None) -> str:
     questions_block = "\n".join(f"[{ref}] {q}" for ref, q in open_questions)
@@ -1723,18 +1694,17 @@ def _call_gemini_json(api_key: str, prompt: str, log, max_retries: int = 2, time
             time.sleep(0.5)
     log(f"  Gemini verify call failed after {max_retries} attempt(s), skipping verification for this item: {last_error}")
     return None
-GEMINI_VERIFY_INSTRUCTIONS = """You are an independent, second-opinion QA checker verifying whether a mapped answer range correctly and completely captures a student's response to ONE exam question, in a line-numbered OCR transcript.
-You are given:
-1. The exact target question text.
-2. A window of line-numbered text that includes a few lines of CONTEXT BEFORE and AFTER the currently-mapped answer, with the mapped range itself marked using >>> at its first line and <<< at its last line.
-Check for exactly these problems:
-- "missing_start": the mapped answer is missing its true opening line(s) -- the real start is earlier, among the CONTEXT BEFORE lines shown.
-- "contains_other": the mapped range includes content that actually belongs to a DIFFERENT question (two answers got merged) -- report the line where THIS question's own content should instead end.
-- "too_short": the mapped range is implausibly short for a real answer to this question, and the CONTEXT AFTER lines look like they genuinely continue this same answer's topic.
-- "ok": none of the above -- the mapped range looks correct and complete as shown.
-Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+GEMINI_VERIFY_INSTRUCTIONS = """You are an independent QA check on a mapped answer range for ONE exam question, in line-numbered OCR text. Given: the target question, and a window with context before/after the mapped range (marked >>> at its first line, <<< at its last line).
+
+Check for:
+- "missing_start": true opening is earlier, among the CONTEXT BEFORE lines.
+- "contains_other": range includes a DIFFERENT question's content -- report where THIS question's content should end instead.
+- "too_short": range is implausibly short and CONTEXT AFTER genuinely continues this same answer.
+- "ok": none of the above.
+
+Return ONLY this JSON, no markdown fences, no commentary:
 {"status": "ok", "suggested_start_line": null, "suggested_end_line": null}
-Only set suggested_start_line/suggested_end_line (to an exact line number shown in the window) when status is not "ok". If you cannot confidently identify a better line within this window, return status "ok" rather than guessing -- a missed problem can still be caught by another check, but a wrong guess here could corrupt a correct answer."""
+Only set suggested lines (exact line numbers in the window) when status isn't "ok". If unsure, return "ok" rather than guessing -- a missed problem may be caught elsewhere; a wrong guess could corrupt a correct answer."""
 def _build_gemini_verify_prompt(question_text: str, ref_label: str, numbered_lines: list,
                                   start_line: int, end_line: int,
                                   context_radius: int = GEMINI_VERIFY_CONTEXT_RADIUS) -> str:
