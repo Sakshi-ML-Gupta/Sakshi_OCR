@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import base64
 import tempfile
 from pathlib import Path
+import httpx
 
 # Configuration constants
 GEMINI_VERIFY_MAX_WORKERS = 2
