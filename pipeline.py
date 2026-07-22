@@ -1,17 +1,18 @@
 import os
-import io
-import re
+import sys
 import json
 import time
-import difflib
 import threading
-import fitz
-import httpx
-from pathlib import Path
-# Add these imports at the very top of pipeline.py
-import threading
+import re
 from concurrent.futures import ThreadPoolExecutor
-import time
+from typing import List, Dict, Any, Optional, Tuple
+import base64
+import tempfile
+from pathlib import Path
+
+# Configuration constants
+GEMINI_VERIFY_MAX_WORKERS = 2
+GROQ_MODEL = "mixtral-8x7b-32768"
 # =========================================================
 # API KEYS
 # =========================================================
@@ -1867,6 +1868,9 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     from concurrent.futures import ThreadPoolExecutor
     import time
     from groq import Groq
+    
+    # Define GEMINI_VERIFY_MAX_WORKERS if not already defined
+    GEMINI_VERIFY_MAX_WORKERS = 2  # Default value
     
     api_key = get_api_key("GROQ_API_KEY")
     if not api_key:
