@@ -2061,7 +2061,7 @@ if unresolved:
             "answer": answer_clean,
             "answer_raw": answer_raw,
         })
-    return results
+        return results
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
                                     carry_over_ref: str = None) -> str:
     questions_block = "\n".join(
