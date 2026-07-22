@@ -1918,150 +1918,150 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                     found_starts[ref] = sl
                     log(f"  found {ref} (sibling) at line {sl}")
             unresolved = [ref for ref in group_refs[1:] if ref not in found_starts]
-if unresolved:
-    log(f"NOTE: sibling(s) {unresolved} not resolved via batch call -- retrying individually...")
-    for ref in unresolved:
-        prev_ref = None
-        for r2 in reversed(group_refs):
-            if r2 in found_starts and r2 != ref:
-                prev_ref = r2
-                break
-        lower_bound = (found_starts[prev_ref] + 1) if prev_ref else group_start
-        idx = _ref_to_question_index(ref)
-        individual_start = _find_answer_start_sequential(
-            client, numbered_lines, questions[idx], ref, lower_bound, budget, log,
-            end_idx=upper + 1
-        )
-        if individual_start is not None and lower_bound <= individual_start <= upper:
-            found_starts[ref] = individual_start
-            log(f"  RESOLVED {ref} individually at line {individual_start}")
-        else:
-            log(f"  {ref} still unresolved -- will attempt in the rescue pass instead of silently folding.")
-            if next_index < n and group_end_bound is not None:
-                found_starts[f"REF-{chr(65 + next_index)}"] = group_end_bound
-                log(f"  found REF-{chr(65 + next_index)} at line {group_end_bound}")
-                pointer = group_end_bound + 1
-                i = next_index + 1
-            else:
-                pointer = total_lines
-                i = next_index
-            continue
-        ref = f"REF-{chr(65 + i)}"
-        q = questions[i]
-        if ref in found_starts:
-            pointer = found_starts[ref] + 1
-            i += 1
-            continue
-        log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
-        sub_part_hint = _build_sub_part_hint(questions, i)
-        search_from_idx = pointer
-        future_anchor_lines = [v for k, v in found_starts.items() if _ref_to_question_index(k) > i]
-        bound_end_idx = (min(future_anchor_lines) + 1) if future_anchor_lines else None
-        start_line = _find_answer_start_sequential(
-            client, numbered_lines, q, ref, pointer, budget, log,
-            extra_reminder=sub_part_hint, end_idx=bound_end_idx
-        )
-        attempt = 1
-        while start_line is None and attempt <= 1:
-            log(f"  pass {attempt} found nothing for {ref} -- retrying with a stronger reminder...")
-            reminder_parts = [
-                "REMINDER: a previous pass did not find this answer. The same "
-                "definition/explanation can legitimately repeat across the document -- "
-                "that does not disqualify a genuine match. Also check for a short "
-                "introductory line at the true start."
-            ]
-            if sub_part_hint:
-                reminder_parts.append(sub_part_hint)
+            if unresolved:
+                log(f"NOTE: sibling(s) {unresolved} not resolved via batch call -- retrying individually...")
+                for ref in unresolved:
+                    prev_ref = None
+                    for r2 in reversed(group_refs):
+                        if r2 in found_starts and r2 != ref:
+                            prev_ref = r2
+                            break
+                    lower_bound = (found_starts[prev_ref] + 1) if prev_ref else group_start
+                    idx = _ref_to_question_index(ref)
+                    individual_start = _find_answer_start_sequential(
+                        client, numbered_lines, questions[idx], ref, lower_bound, budget, log,
+                        end_idx=upper + 1
+                    )
+                    if individual_start is not None and lower_bound <= individual_start <= upper:
+                        found_starts[ref] = individual_start
+                        log(f"  RESOLVED {ref} individually at line {individual_start}")
+                    else:
+                        log(f"  {ref} still unresolved -- will attempt in the rescue pass instead of silently folding.")
+                        if next_index < n and group_end_bound is not None:
+                            found_starts[f"REF-{chr(65 + next_index)}"] = group_end_bound
+                            log(f"  found REF-{chr(65 + next_index)} at line {group_end_bound}")
+                            pointer = group_end_bound + 1
+                            i = next_index + 1
+                        else:
+                            pointer = total_lines
+                            i = next_index
+                        continue
+            ref = f"REF-{chr(65 + i)}"
+            q = questions[i]
+            if ref in found_starts:
+                pointer = found_starts[ref] + 1
+                i += 1
+                continue
+            log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
+            sub_part_hint = _build_sub_part_hint(questions, i)
+            search_from_idx = pointer
+            future_anchor_lines = [v for k, v in found_starts.items() if _ref_to_question_index(k) > i]
+            bound_end_idx = (min(future_anchor_lines) + 1) if future_anchor_lines else None
             start_line = _find_answer_start_sequential(
                 client, numbered_lines, q, ref, pointer, budget, log,
-                extra_reminder="\n\n".join(reminder_parts), end_idx=bound_end_idx
+                extra_reminder=sub_part_hint, end_idx=bound_end_idx
             )
+            attempt = 1
+            while start_line is None and attempt <= 1:
+                log(f"  pass {attempt} found nothing for {ref} -- retrying with a stronger reminder...")
+                reminder_parts = [
+                    "REMINDER: a previous pass did not find this answer. The same "
+                    "definition/explanation can legitimately repeat across the document -- "
+                    "that does not disqualify a genuine match. Also check for a short "
+                    "introductory line at the true start."
+                ]
+                if sub_part_hint:
+                    reminder_parts.append(sub_part_hint)
+                start_line = _find_answer_start_sequential(
+                    client, numbered_lines, q, ref, pointer, budget, log,
+                    extra_reminder="\n\n".join(reminder_parts), end_idx=bound_end_idx
+                )
+                if start_line is not None:
+                    log(f"  retry (pass {attempt + 1}) recovered {ref} starting at line {start_line}")
+                attempt += 1
             if start_line is not None:
-                log(f"  retry (pass {attempt + 1}) recovered {ref} starting at line {start_line}")
-            attempt += 1
-        if start_line is not None:
-            start_line = _check_boundary_combined(
-                client, numbered_lines, questions[i - 1] if i > 0 else None, q,
-                start_line, search_from_idx, budget, log
-            )
-        if start_line is not None:
-            found_starts[ref] = start_line
-            log(f"  found {ref} starting at line {start_line}")
-            pointer = start_line + 1
-        else:
-            log(
-                f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
-                f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
-                f"The search pointer is NOT advanced, so the next question is still searched "
-                f"for over this same remaining text."
-            )
-        i += 1
-    ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
-    ranges = []
-    for idx, (ref, start) in enumerate(ordered):
-        end = ordered[idx + 1][1] - 1 if idx + 1 < len(ordered) else total_lines - 1
-        ranges.append({"ref": ref, "start_line": start, "end_line": end})
-    log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
-    gemini_futures = (
-        _dispatch_gemini_verifications(gemini_executor, gemini_api_key, numbered_lines, questions, ranges, log)
-        if gemini_executor else {}
-    )
-    ranges = _rescue_unmatched_questions(client, numbered_lines, questions, ranges, budget, log)
-    ranges = _reanalyze_and_repair_boundaries(client, numbered_lines, questions, ranges, budget, log)
-    ranges = _remap_incomplete_answers(client, numbered_lines, questions, ranges, budget, log)
-    if gemini_executor:
-        gemini_verdicts = _collect_gemini_results(gemini_futures, log)
-        ranges = _apply_gemini_corrections(ranges, gemini_verdicts, log)
-        gemini_executor.shutdown(wait=False)
-    ranges_by_ref = {r["ref"]: r for r in ranges}
-    results = []
-    for i, q in enumerate(questions):
-        ref = f"REF-{chr(65 + i)}"
-        r = ranges_by_ref.get(ref)
-        if r is None:
+                start_line = _check_boundary_combined(
+                    client, numbered_lines, questions[i - 1] if i > 0 else None, q,
+                    start_line, search_from_idx, budget, log
+                )
+            if start_line is not None:
+                found_starts[ref] = start_line
+                log(f"  found {ref} starting at line {start_line}")
+                pointer = start_line + 1
+            else:
+                log(
+                    f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
+                    f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
+                    f"The search pointer is NOT advanced, so the next question is still searched "
+                    f"for over this same remaining text."
+                )
+            i += 1
+        ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
+        ranges = []
+        for idx, (ref, start) in enumerate(ordered):
+            end = ordered[idx + 1][1] - 1 if idx + 1 < len(ordered) else total_lines - 1
+            ranges.append({"ref": ref, "start_line": start, "end_line": end})
+        log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
+        gemini_futures = (
+            _dispatch_gemini_verifications(gemini_executor, gemini_api_key, numbered_lines, questions, ranges, log)
+            if gemini_executor else {}
+        )
+        ranges = _rescue_unmatched_questions(client, numbered_lines, questions, ranges, budget, log)
+        ranges = _reanalyze_and_repair_boundaries(client, numbered_lines, questions, ranges, budget, log)
+        ranges = _remap_incomplete_answers(client, numbered_lines, questions, ranges, budget, log)
+        if gemini_executor:
+            gemini_verdicts = _collect_gemini_results(gemini_futures, log)
+            ranges = _apply_gemini_corrections(ranges, gemini_verdicts, log)
+            gemini_executor.shutdown(wait=False)
+        ranges_by_ref = {r["ref"]: r for r in ranges}
+        results = []
+        for i, q in enumerate(questions):
+            ref = f"REF-{chr(65 + i)}"
+            r = ranges_by_ref.get(ref)
+            if r is None:
+                results.append({
+                    "ref": ref,
+                    "question": q,
+                    "matched": False,
+                    "start_line": None,
+                    "end_line": None,
+                    "start_page": None,
+                    "end_page": None,
+                    "answer": "",
+                    "answer_raw": "",
+                })
+                continue
+            s, e = r["start_line"], r["end_line"]
+            if s >= len(answer_lines):
+                s = len(answer_lines) - 1
+            if e >= len(answer_lines):
+                e = len(answer_lines) - 1
+            if s > e:
+                s, e = e, s
+            verbatim_lines = [
+                answer_lines[j] for j in range(s, e + 1)
+                if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
+            ]
+            answer_raw = " ".join(verbatim_lines).strip()
+            answer_clean = strip_question_restatement(answer_raw)
+            answer_clean = strip_full_question_echo(answer_clean, q)
+            next_q_text = questions[i + 1] if i + 1 < len(questions) else None
+            answer_clean = strip_trailing_leaked_next_question(answer_clean, next_q_text)
+            answer_clean = strip_trailing_next_question_leadin(answer_clean)
+            start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
+            end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
             results.append({
                 "ref": ref,
                 "question": q,
-                "matched": False,
-                "start_line": None,
-                "end_line": None,
-                "start_page": None,
-                "end_page": None,
-                "answer": "",
-                "answer_raw": "",
+                "matched": True,
+                "start_line": s,
+                "end_line": e,
+                "start_page": start_page,
+                "end_page": end_page,
+                "answer": answer_clean,
+                "answer_raw": answer_raw,
             })
-            continue
-        s, e = r["start_line"], r["end_line"]
-        if s >= len(answer_lines):
-            s = len(answer_lines) - 1
-        if e >= len(answer_lines):
-            e = len(answer_lines) - 1
-        if s > e:
-            s, e = e, s
-        verbatim_lines = [
-            answer_lines[j] for j in range(s, e + 1)
-            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ]
-        answer_raw = " ".join(verbatim_lines).strip()
-        answer_clean = strip_question_restatement(answer_raw)
-        answer_clean = strip_full_question_echo(answer_clean, q)
-        next_q_text = questions[i + 1] if i + 1 < len(questions) else None
-        answer_clean = strip_trailing_leaked_next_question(answer_clean, next_q_text)
-        answer_clean = strip_trailing_next_question_leadin(answer_clean)
-        start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
-        end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
-        results.append({
-            "ref": ref,
-            "question": q,
-            "matched": True,
-            "start_line": s,
-            "end_line": e,
-            "start_page": start_page,
-            "end_page": end_page,
-            "answer": answer_clean,
-            "answer_raw": answer_raw,
-        })
-return results
+        return results
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
                                     carry_over_ref: str = None) -> str:
     questions_block = "\n".join(
