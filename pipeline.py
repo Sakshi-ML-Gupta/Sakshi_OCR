@@ -1893,7 +1893,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             group_search_from = pointer
             group_start = _find_answer_start_sequential(client, numbered_lines, first_q, first_ref, pointer, budget, log)
             attempt = 1
-            while group_start is None and attempt <= 2:  # Increased retries
+            while group_start is None and attempt <= 2:
                 reminder = (
                     "REMINDER: a previous search pass did not find this answer. The same "
                     "definition/explanation can legitimately repeat across the document -- "
@@ -1907,7 +1907,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 attempt += 1
             if group_start is None:
                 log(f"WARNING: could not find the start of sibling group {group_refs} at all -- marking all as unmatched.")
-                # Mark all group questions as missing
                 for ref in group_refs:
                     missing_questions.append(ref)
                 i = group_indices[-1] + 1
@@ -1981,7 +1980,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         future_anchor_lines = [v for k, v in found_starts.items() if _ref_to_question_index(k) > i]
         bound_end_idx = (min(future_anchor_lines) + 1) if future_anchor_lines else None
         
-        # TRY MULTIPLE STRATEGIES TO FIND START
         start_line = None
         
         # Strategy 1: Normal search
@@ -2033,12 +2031,9 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         else:
             log(
                 f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
-                f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
-                f"The search pointer is NOT advanced, so the next question is still searched "
-                f"for over this same remaining text."
+                f"to the end of the document ({total_lines} lines) -- marking as unmatched."
             )
             missing_questions.append(ref)
-            # Don't advance pointer, try next question
         i += 1
     
     # RESCUE PASS FOR MISSING QUESTIONS
@@ -2047,7 +2042,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         for ref in missing_questions:
             idx = _ref_to_question_index(ref)
             q = questions[idx]
-            # Try to find from the beginning with special instructions
             log(f"Attempting rescue for {ref}...")
             rescue_start = _find_answer_start_sequential(
                 client, numbered_lines, q, ref, 0, budget, log,
@@ -2067,21 +2061,36 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         ranges.append({"ref": ref, "start_line": start, "end_line": end})
     log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
     
-    # Additional rescue for any remaining questions
+    # FINAL RESCUE: Force include all questions
     found_refs = {r["ref"] for r in ranges}
     for i, q in enumerate(questions):
         ref = f"REF-{chr(65 + i)}"
         if ref not in found_refs:
-            log(f"Final attempt for {ref}...")
-            # Search entire document
+            log(f"⚠️ FINAL ATTEMPT for {ref} - Forcing detection...")
+            # Search entire document without any restrictions
             final_start = _find_answer_start_sequential(
                 client, numbered_lines, q, ref, 0, budget, log,
                 extra_reminder="FINAL ATTEMPT: Find the start of this answer anywhere in the document. Look for question markers, numbers, or contextual clues.",
                 end_idx=total_lines
             )
             if final_start is not None:
-                ranges.append({"ref": ref, "start_line": final_start, "end_line": total_lines - 1})
-                log(f"  FINAL SUCCESS: found {ref} at line {final_start}")
+                # Find appropriate end
+                next_refs = [r for r in ranges if r["start_line"] > final_start]
+                if next_refs:
+                    end_line = min(next_refs, key=lambda x: x["start_line"])["start_line"] - 1
+                else:
+                    end_line = total_lines - 1
+                ranges.append({"ref": ref, "start_line": final_start, "end_line": end_line})
+                log(f"  ✅ FINAL SUCCESS: found {ref} at line {final_start}")
+            else:
+                # If still not found, use a default range
+                log(f"  ❌ FINAL FAILED: Could not find {ref}, using default range")
+                # Find appropriate position
+                if ranges:
+                    last_range = ranges[-1]
+                    ranges.append({"ref": ref, "start_line": last_range["end_line"] + 1, "end_line": total_lines - 1})
+                else:
+                    ranges.append({"ref": ref, "start_line": 0, "end_line": total_lines - 1})
     
     # Re-sort ranges after final rescue
     ranges = sorted(ranges, key=lambda x: x["start_line"])
@@ -2145,6 +2154,14 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             "answer": answer_clean,
             "answer_raw": answer_raw,
         })
+    
+    # LOG SUMMARY
+    matched_count = sum(1 for r in results if r["matched"])
+    log(f"\n📊 FINAL SUMMARY: {matched_count} of {len(questions)} questions matched")
+    if matched_count < len(questions):
+        missing = [r["ref"] for r in results if not r["matched"]]
+        log(f"⚠️ Missing questions: {missing}")
+    
     return results
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
                                     carry_over_ref: str = None) -> str:
@@ -2812,9 +2829,27 @@ def process_pdf(file_input, status_callback=None):
         )
     log("Mapping each question to its answer (sequential single-target search)...")
     try:
+        # WHEREVER YOU CALL map_answers_sequential, ADD THIS:
+
+# Before calling
+print(f"Total questions before mapping: {len(questions)}")
+for i, q in enumerate(questions):
+    print(f"Q{i+1}: {q[:100]}...")
+
+# Call the function
+results = map_answers_sequential(answer_lines, questions, status_callback, answer_line_pages)
+
+# After calling
+matched = sum(1 for r in results if r["matched"])
+print(f"Total questions: {len(questions)}, Matched: {matched}")
+if matched < len(questions):
+    for r in results:
+        if not r["matched"]:
+            print(f"❌ MISSING: {r['ref']} - {r['question'][:100]}...")
         qa_pairs = map_answers_sequential(
             answer_lines, official_questions, status_callback,
             answer_line_pages=answer_line_pages
+        
         )
     except GroqQuotaExhaustedError as e:
         raise Exception(
