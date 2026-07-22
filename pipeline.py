@@ -487,8 +487,6 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             budget.wait_if_needed(estimated_tokens, log=log)
         try:
             with _groq_call_lock:
-                _GROQ_MAX_CONCURRENT = 4   # tune based on your Groq tier's concurrent request limit
-                _groq_call_lock = threading.Semaphore(_GROQ_MAX_CONCURRENT)
                 response = client.chat.completions.create(
                     model=GROQ_MODEL,
                     messages=[
