@@ -8,6 +8,10 @@ import threading
 import fitz
 import httpx
 from pathlib import Path
+# Add these imports at the very top of pipeline.py
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import time
 # =========================================================
 # API KEYS
 # =========================================================
@@ -1857,7 +1861,13 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         print(msg)
         if status_callback:
             status_callback(msg)
+    
+    # IMPORTANT: Import required modules inside function
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import time
     from groq import Groq
+    
     api_key = get_api_key("GROQ_API_KEY")
     if not api_key:
         raise Exception("GROQ_API_KEY not found in secrets or environment")
@@ -2067,14 +2077,12 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         ref = f"REF-{chr(65 + i)}"
         if ref not in found_refs:
             log(f"⚠️ FINAL ATTEMPT for {ref} - Forcing detection...")
-            # Search entire document without any restrictions
             final_start = _find_answer_start_sequential(
                 client, numbered_lines, q, ref, 0, budget, log,
                 extra_reminder="FINAL ATTEMPT: Find the start of this answer anywhere in the document. Look for question markers, numbers, or contextual clues.",
                 end_idx=total_lines
             )
             if final_start is not None:
-                # Find appropriate end
                 next_refs = [r for r in ranges if r["start_line"] > final_start]
                 if next_refs:
                     end_line = min(next_refs, key=lambda x: x["start_line"])["start_line"] - 1
@@ -2083,9 +2091,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 ranges.append({"ref": ref, "start_line": final_start, "end_line": end_line})
                 log(f"  ✅ FINAL SUCCESS: found {ref} at line {final_start}")
             else:
-                # If still not found, use a default range
                 log(f"  ❌ FINAL FAILED: Could not find {ref}, using default range")
-                # Find appropriate position
                 if ranges:
                     last_range = ranges[-1]
                     ranges.append({"ref": ref, "start_line": last_range["end_line"] + 1, "end_line": total_lines - 1})
