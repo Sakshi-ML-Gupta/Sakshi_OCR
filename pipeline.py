@@ -583,20 +583,27 @@ def _is_near_duplicate_question(q1: str, q2: str) -> bool:
     if k1 == k2:
         return True
     ratio = difflib.SequenceMatcher(None, k1, k2).ratio()
-    if ratio < 0.90:
+    if ratio < 0.95:                     # was 0.90 -- stricter, fewer false-positive dedups
         return False
     words1 = sorted(set(re.findall(r'[a-z]{3,}', k1)))
     words2 = sorted(set(re.findall(r'[a-z]{3,}', k2)))
     if not words1 or not words2:
-        return ratio >= 0.92
+        return ratio >= 0.97             # was 0.92
     matched = sum(1 for w1 in words1 if any(_words_nearly_match(w1, w2) for w2 in words2))
     overlap = matched / max(len(words1), len(words2))
-    return ratio >= 0.90 and overlap >= 0.92
+    return ratio >= 0.95 and overlap >= 0.97   # was 0.90 / 0.92
 def _dedup_questions(questions: list) -> list:
     unique = []
     for q in questions:
-        if not any(_is_near_duplicate_question(q, existing) for existing in unique):
+        dup_of = None
+        for existing in unique:
+            if _is_near_duplicate_question(q, existing):
+                dup_of = existing
+                break
+        if dup_of is None:
             unique.append(q)
+        else:
+            print(f"DEDUP: dropping question as near-duplicate:\n  DROPPED: {q!r}\n  KEPT:    {dup_of!r}")
     return unique
 def _merge_chunk_results(chunk_results: list) -> tuple:
     all_qp_pages = set()
@@ -745,8 +752,8 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         lengths_only = [length for _, length in qp_page_lengths]
         median_length = sorted(lengths_only)[len(lengths_only) // 2]
         outliers = [
-            page_idx for page_idx, length in qp_page_lengths
-            if length > max(median_length * 3, 1500)
+             page_idx for page_idx, length in qp_page_lengths
+             if length > max(median_length * 5, 2500)     # was: median_length * 3, 1500
         ]
         if outliers and len(outliers) <= len(qp_page_indices_0based) // 2:
             for page_idx in outliers:
@@ -1539,13 +1546,12 @@ def _rescue_unmatched_questions(client, numbered_lines: list, questions: list, r
     idx_to_ref = {i: f"REF-{chr(65+i)}" for i in range(len(questions))}
     changed = True
     passes = 0
-    while changed and passes < 2:
+    while changed and passes < 3:                       # was: < 2
         changed = False
         passes += 1
-        matched_refs = {r["ref"] for r in ranges}
         for i, q in enumerate(questions):
             ref = idx_to_ref[i]
-            if ref in matched_refs:
+            if any(r["ref"] == ref for r in ranges):
                 continue
             candidate = None
             for r in ranges:
@@ -1559,17 +1565,41 @@ def _rescue_unmatched_questions(client, numbered_lines: list, questions: list, r
             upper = candidate["end_line"]
             if upper <= lower:
                 continue
-            log(f"  RESCUE: {ref} is unmatched -- searching for it inside {candidate['ref']}'s range (lines {lower}-{upper})...")
+            log(f"  RESCUE (pass {passes}): {ref} is unmatched -- searching inside {candidate['ref']}'s range (lines {lower}-{upper})...")
+
             split_line = _find_answer_start_sequential(
-                client, numbered_lines, q, ref, lower, budget, log,
-                end_idx=upper + 1
+                client, numbered_lines, q, ref, lower, budget, log, end_idx=upper + 1
             )
+            # retry once more with a stronger reminder before giving up on the LLM search
+            if split_line is None:
+                split_line = _find_answer_start_sequential(
+                    client, numbered_lines, q, ref, lower, budget, log, end_idx=upper + 1,
+                    extra_reminder=(
+                        "REMINDER: this question's answer was NOT found in a previous pass. "
+                        "It is CONFIRMED to be somewhere inside this exact window (it was "
+                        "absorbed into a neighboring question's range by mistake). Look "
+                        "carefully at every line -- a bare label like 'Q5', '(iii)', or a "
+                        "topic shift matching this question is enough to count as a match."
+                    )
+                )
+            # zero-cost regex/label fallback if the LLM still can't find it
+            if split_line is None:
+                for idx in range(lower, upper + 1):
+                    line_text = numbered_lines[idx][1]
+                    matched_idx = _line_starts_new_answer_for_question(line_text, [q])
+                    if matched_idx == 0:
+                        split_line = idx
+                        log(f"  RESCUE: recovered {ref} via regex/label fallback at line {idx}")
+                        break
+
             if split_line is not None and lower < split_line <= upper:
                 log(f"  RESCUE: recovered {ref} at line {split_line} (was absorbed into {candidate['ref']})")
                 new_end = candidate["end_line"]
                 candidate["end_line"] = split_line - 1
                 ranges.append({"ref": ref, "start_line": split_line, "end_line": new_end})
                 changed = True
+            else:
+                log(f"  RESCUE: {ref} still not found inside {candidate['ref']}'s range after retry + fallback.")
     return ranges
 def _ref_to_question_index(ref: str) -> int:
     return int(ord(ref.split("-")[-1]) - ord("A"))
