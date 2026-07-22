@@ -1857,24 +1857,16 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         print(msg)
         if status_callback:
             status_callback(msg)
-    groq_keys = _collect_groq_api_keys()
-    if not groq_keys:
+    from groq import Groq
+    api_key = get_api_key("GROQ_API_KEY")
+    if not api_key:
         raise Exception("GROQ_API_KEY not found in secrets or environment")
+    client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
-    client = _RotatingGroqClient(groq_keys, budget=budget, log=log)
-    # Optional SEPARATE key pool for the verification pass, so it
-    # doesn't compete with the main mapping calls' rate limit. Supports
-    # its own fallback chain too: GROQ_API_KEY_VERIFY, then
-    # GROQ_API_KEY_VERIFY_2, GROQ_API_KEY_VERIFY_3, ... Falls back to
-    # reusing the main client/budget if none of these are set.
-    verify_keys = _collect_groq_api_keys(env_prefix="GROQ_API_KEY_VERIFY")
-    if verify_keys:
-        verify_budget = _TokenBudgetTracker()
-        verify_client = _RotatingGroqClient(verify_keys, budget=verify_budget, log=log)
-        log(f"Verification pass will use {len(verify_keys)} SEPARATE Groq API key(s) (GROQ_API_KEY_VERIFY*) with its own rate-limit pool.")
-    else:
-        verify_client = client
-        verify_budget = budget
+    gemini_api_key = get_api_key("GEMINI_API_KEY")
+    gemini_executor = ThreadPoolExecutor(max_workers=GEMINI_VERIFY_MAX_WORKERS) if gemini_api_key else None
+    if gemini_api_key:
+        log("Gemini verification enabled -- will run in the background alongside Groq's own checks.")
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(numbered_lines)
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
@@ -1887,6 +1879,10 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     pointer = 0
     i = 0
     n = len(questions)
+    
+    # TRACK MISSING QUESTIONS
+    missing_questions = []
+    
     while i < n:
         if i in sibling_groups:
             group_indices = sibling_groups[i]
@@ -1897,7 +1893,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             group_search_from = pointer
             group_start = _find_answer_start_sequential(client, numbered_lines, first_q, first_ref, pointer, budget, log)
             attempt = 1
-            while group_start is None and attempt <= 1:
+            while group_start is None and attempt <= 2:  # Increased retries
                 reminder = (
                     "REMINDER: a previous search pass did not find this answer. The same "
                     "definition/explanation can legitimately repeat across the document -- "
@@ -1911,6 +1907,9 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 attempt += 1
             if group_start is None:
                 log(f"WARNING: could not find the start of sibling group {group_refs} at all -- marking all as unmatched.")
+                # Mark all group questions as missing
+                for ref in group_refs:
+                    missing_questions.append(ref)
                 i = group_indices[-1] + 1
                 continue
             group_start = _check_boundary_combined(
@@ -1940,61 +1939,36 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 for ref, sl in sibling_starts.items():
                     found_starts[ref] = sl
                     log(f"  found {ref} (sibling) at line {sl}")
-                # FIX: sub-question merge bug -- previously, if the batch
-                # call above didn't confidently separate a LATER sibling,
-                # its content silently stayed folded into whichever
-                # sibling precedes it (the visible symptom: a sub-
-                # question's answer appears merged into the answer
-                # above it). Recover any still-unresolved sibling with a
-                # dedicated, well-tested single-target search (the same
-                # search used for every standalone question) instead of
-                # accepting the batch call's silence as final. Bounded
-                # strictly within [previous confirmed sibling's start,
-                # upper] so it can never reach into a DIFFERENT
-                # question's territory outside this group.
-                search_floor = group_start
-                for gi in group_indices[1:]:
-                    gref = f"REF-{chr(65 + gi)}"
-                    if gref in found_starts:
-                        search_floor = found_starts[gref]
-                        continue
-                    if search_floor >= upper:
-                        continue
-                    gq = questions[gi]
-                    log(
-                        f"  sibling {gref} not separated by the batch call -- retrying with a "
-                        f"dedicated targeted search (lines {search_floor + 1}-{upper})..."
-                    )
-                    recovered = _find_answer_start_sequential(
-                        client, numbered_lines, gq, gref, search_floor + 1, budget, log,
-                        end_idx=upper + 1,
-                        extra_reminder=_build_sub_part_hint(questions, gi)
-                    )
-                    if recovered is not None and search_floor < recovered <= upper:
-                        found_starts[gref] = recovered
-                        search_floor = recovered
-                        log(
-                            f"  RECOVERED sibling {gref} at line {recovered} -- it would otherwise "
-                            f"have been silently merged into the sibling above it"
-                        )
             unresolved = [ref for ref in group_refs[1:] if ref not in found_starts]
             if unresolved:
-                log(
-                    f"NOTE: sibling(s) {unresolved} were not confidently separated within "
-                    f"the group's bounded region (lines {group_start}-{upper}) even after a "
-                    f"dedicated retry -- their content stays folded into the preceding "
-                    f"sibling's answer rather than risking a wrong split."
-                )
-            if next_index < n and group_end_bound is not None:
-                found_starts[f"REF-{chr(65 + next_index)}"] = group_end_bound
-                log(f"  found REF-{chr(65 + next_index)} at line {group_end_bound}")
-                pointer = group_end_bound + 1
-                i = next_index + 1
-            else:
-                pointer = total_lines
-                i = next_index
-            continue
-        # ---- Standalone question: strict single-target search ----
+                log(f"NOTE: sibling(s) {unresolved} not resolved via batch call -- retrying individually...")
+                for ref in unresolved:
+                    prev_ref = None
+                    for r2 in reversed(group_refs):
+                        if r2 in found_starts and r2 != ref:
+                            prev_ref = r2
+                            break
+                    lower_bound = (found_starts[prev_ref] + 1) if prev_ref else group_start
+                    idx = _ref_to_question_index(ref)
+                    individual_start = _find_answer_start_sequential(
+                        client, numbered_lines, questions[idx], ref, lower_bound, budget, log,
+                        end_idx=upper + 1
+                    )
+                    if individual_start is not None and lower_bound <= individual_start <= upper:
+                        found_starts[ref] = individual_start
+                        log(f"  RESOLVED {ref} individually at line {individual_start}")
+                    else:
+                        log(f"  {ref} still unresolved -- will attempt in the rescue pass instead of silently folding.")
+                        missing_questions.append(ref)
+                        if next_index < n and group_end_bound is not None:
+                            found_starts[f"REF-{chr(65 + next_index)}"] = group_end_bound
+                            log(f"  found REF-{chr(65 + next_index)} at line {group_end_bound}")
+                            pointer = group_end_bound + 1
+                            i = next_index + 1
+                        else:
+                            pointer = total_lines
+                            i = next_index
+                        continue
         ref = f"REF-{chr(65 + i)}"
         q = questions[i]
         if ref in found_starts:
@@ -2006,12 +1980,19 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         search_from_idx = pointer
         future_anchor_lines = [v for k, v in found_starts.items() if _ref_to_question_index(k) > i]
         bound_end_idx = (min(future_anchor_lines) + 1) if future_anchor_lines else None
+        
+        # TRY MULTIPLE STRATEGIES TO FIND START
+        start_line = None
+        
+        # Strategy 1: Normal search
         start_line = _find_answer_start_sequential(
             client, numbered_lines, q, ref, pointer, budget, log,
             extra_reminder=sub_part_hint, end_idx=bound_end_idx
         )
+        
+        # Strategy 2: Retry with stronger reminder
         attempt = 1
-        while start_line is None and attempt <= 1:
+        while start_line is None and attempt <= 2:
             log(f"  pass {attempt} found nothing for {ref} -- retrying with a stronger reminder...")
             reminder_parts = [
                 "REMINDER: a previous pass did not find this answer. The same "
@@ -2028,6 +2009,18 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             if start_line is not None:
                 log(f"  retry (pass {attempt + 1}) recovered {ref} starting at line {start_line}")
             attempt += 1
+        
+        # Strategy 3: Search from beginning if still not found
+        if start_line is None and pointer > 0:
+            log(f"  Trying to find {ref} from the beginning of document (fallback)...")
+            start_line = _find_answer_start_sequential(
+                client, numbered_lines, q, ref, 0, budget, log,
+                extra_reminder="SEARCH FROM THE VERY BEGINNING. The answer might appear earlier than expected.", 
+                end_idx=bound_end_idx
+            )
+            if start_line is not None:
+                log(f"  FALLBACK: found {ref} starting at line {start_line}")
+        
         if start_line is not None:
             start_line = _check_boundary_combined(
                 client, numbered_lines, questions[i - 1] if i > 0 else None, q,
@@ -2044,18 +2037,66 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 f"The search pointer is NOT advanced, so the next question is still searched "
                 f"for over this same remaining text."
             )
+            missing_questions.append(ref)
+            # Don't advance pointer, try next question
         i += 1
+    
+    # RESCUE PASS FOR MISSING QUESTIONS
+    if missing_questions:
+        log(f"\n=== RESCUE PASS for {len(missing_questions)} missing questions ===")
+        for ref in missing_questions:
+            idx = _ref_to_question_index(ref)
+            q = questions[idx]
+            # Try to find from the beginning with special instructions
+            log(f"Attempting rescue for {ref}...")
+            rescue_start = _find_answer_start_sequential(
+                client, numbered_lines, q, ref, 0, budget, log,
+                extra_reminder="CRITICAL: This question was previously missed. Search the ENTIRE document carefully. The answer MUST exist somewhere. Look for question numbers, bold text, section headers, or any indicator of where this answer begins.",
+                end_idx=total_lines
+            )
+            if rescue_start is not None:
+                found_starts[ref] = rescue_start
+                log(f"  RESCUE SUCCESS: found {ref} at line {rescue_start}")
+            else:
+                log(f"  RESCUE FAILED: could not find {ref}")
+    
     ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
     ranges = []
     for idx, (ref, start) in enumerate(ordered):
         end = ordered[idx + 1][1] - 1 if idx + 1 < len(ordered) else total_lines - 1
         ranges.append({"ref": ref, "start_line": start, "end_line": end})
     log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s)")
+    
+    # Additional rescue for any remaining questions
+    found_refs = {r["ref"] for r in ranges}
+    for i, q in enumerate(questions):
+        ref = f"REF-{chr(65 + i)}"
+        if ref not in found_refs:
+            log(f"Final attempt for {ref}...")
+            # Search entire document
+            final_start = _find_answer_start_sequential(
+                client, numbered_lines, q, ref, 0, budget, log,
+                extra_reminder="FINAL ATTEMPT: Find the start of this answer anywhere in the document. Look for question markers, numbers, or contextual clues.",
+                end_idx=total_lines
+            )
+            if final_start is not None:
+                ranges.append({"ref": ref, "start_line": final_start, "end_line": total_lines - 1})
+                log(f"  FINAL SUCCESS: found {ref} at line {final_start}")
+    
+    # Re-sort ranges after final rescue
+    ranges = sorted(ranges, key=lambda x: x["start_line"])
+    
+    gemini_futures = (
+        _dispatch_gemini_verifications(gemini_executor, gemini_api_key, numbered_lines, questions, ranges, log)
+        if gemini_executor else {}
+    )
     ranges = _rescue_unmatched_questions(client, numbered_lines, questions, ranges, budget, log)
     ranges = _reanalyze_and_repair_boundaries(client, numbered_lines, questions, ranges, budget, log)
     ranges = _remap_incomplete_answers(client, numbered_lines, questions, ranges, budget, log)
-    ranges = _run_groq_verification_pass(verify_client, numbered_lines, questions, ranges, verify_budget, log)
-    ranges = _guarantee_full_mapping(client, numbered_lines, questions, ranges, budget, log)
+    if gemini_executor:
+        gemini_verdicts = _collect_gemini_results(gemini_futures, log)
+        ranges = _apply_gemini_corrections(ranges, gemini_verdicts, log)
+        gemini_executor.shutdown(wait=False)
     ranges_by_ref = {r["ref"]: r for r in ranges}
     results = []
     for i, q in enumerate(questions):
@@ -2072,10 +2113,15 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 "end_page": None,
                 "answer": "",
                 "answer_raw": "",
-                "low_confidence": False,
             })
             continue
         s, e = r["start_line"], r["end_line"]
+        if s >= len(answer_lines):
+            s = len(answer_lines) - 1
+        if e >= len(answer_lines):
+            e = len(answer_lines) - 1
+        if s > e:
+            s, e = e, s
         verbatim_lines = [
             answer_lines[j] for j in range(s, e + 1)
             if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
@@ -2098,7 +2144,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             "end_page": end_page,
             "answer": answer_clean,
             "answer_raw": answer_raw,
-            "low_confidence": bool(r.get("low_confidence", False)),
         })
     return results
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list,
