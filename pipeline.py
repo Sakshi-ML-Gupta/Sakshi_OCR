@@ -736,6 +736,50 @@ def _parse_canonical_questions_response(content: str) -> list:
     if not isinstance(questions, list):
         raise ValueError(f"'questions' must be a list, got: {type(questions).__name__}")
     return [str(q).strip() for q in questions if str(q).strip()]
+# =========================================================
+# QUESTION-EXTRACTION SANITY CHECK
+#
+# FIX (this round): a confirmed bug -- extract_canonical_questions can
+# occasionally miss ONE question/sub-part out of the full list (e.g.
+# extracting 11 of 12), even though the question paper's own numbering
+# clearly shows it should be there. Since map_answers_sequential only
+# ever creates a REF for questions that actually made it into this
+# list, a missed question has NO slot at all downstream -- its answer
+# content silently gets absorbed into whichever neighboring question's
+# range happens to span that text (visible as "one question's answer
+# is merged into the answer above it", except the missing question
+# never even shows up as "unmatched" -- it's simply not in the list).
+#
+# This deterministic (non-LLM) regex scan finds every top-level
+# question number that appears at the start of a line in the RAW
+# question-paper OCR text (e.g. "12." starting a line), and compares
+# that against the top-level numbers actually present in the extracted
+# question list. Any number found in the raw text but missing from the
+# extraction triggers ONE targeted retry with an explicit reminder
+# naming the exact missing number(s) -- far more effective than a
+# generic "did you get everything?" retry, since it tells the model
+# precisely what to look for.
+# =========================================================
+_TOP_LEVEL_QNUM_RE = re.compile(r'(?:^|\n)\s*(\d{1,2})[.)]\s')
+def _detect_top_level_question_numbers(qp_pages: list) -> set:
+    numbers = set()
+    for p in qp_pages:
+        for m in _TOP_LEVEL_QNUM_RE.finditer(p["raw_text"]):
+            try:
+                numbers.add(int(m.group(1)))
+            except ValueError:
+                pass
+    return numbers
+def _extracted_top_level_numbers(questions: list) -> set:
+    nums = set()
+    for q in questions:
+        n = _extract_leading_number(q)
+        if n is not None:
+            try:
+                nums.add(int(n))
+            except ValueError:
+                pass
+    return nums
 def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
     def log(msg):
         print(msg)
@@ -761,6 +805,47 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
         log(f"WARNING: canonical question extraction failed: {e}")
         return []
     log(f"Canonical question list: {len(questions)} question(s), single consistent pass")
+    detected = _detect_top_level_question_numbers(qp_pages)
+    extracted = _extracted_top_level_numbers(questions)
+    missing = sorted(detected - extracted)
+    if missing:
+        log(
+            f"WARNING: question-paper sanity check found number(s) {missing} in the raw OCR "
+            f"text that are NOT present in the extracted list -- retrying once with an "
+            f"explicit reminder naming them specifically..."
+        )
+        reminder = (
+            f"\n\nIMPORTANT: a sanity check of the raw page text found question number(s) "
+            f"{missing} that do NOT appear anywhere in your list above. Look again very "
+            f"carefully at the FULL text and make sure question(s) {missing} (and all of "
+            f"their own labeled sub-parts, if any) are included in your output -- do not "
+            f"skip any numbered question, even one that's easy to overlook among the others."
+        )
+        try:
+            retried_questions = _call_groq_with_retries(
+                client, QUESTION_PAPER_ONLY_SYSTEM_PROMPT, user_prompt + reminder,
+                _parse_canonical_questions_response, budget, log, max_retries=2
+            )
+            retried_extracted = _extracted_top_level_numbers(retried_questions)
+            if len(retried_extracted) > len(extracted):
+                log(f"  retry recovered previously-missing question(s) -- using the retry's result ({len(retried_questions)} question(s) total)")
+                questions = retried_questions
+                extracted = retried_extracted
+                missing = sorted(detected - extracted)
+            else:
+                log(f"  retry did not recover more questions than before -- keeping the original result")
+        except GroqQuotaExhaustedError:
+            raise
+        except Exception as e:
+            log(f"  retry attempt failed: {e}")
+        if missing:
+            log(
+                f"WARNING: after retry, question number(s) {missing} STILL appear to be "
+                f"missing from the extracted list. Downstream answer-mapping will have NO "
+                f"slot for these -- their content may get silently absorbed into a "
+                f"neighboring question's answer. Please double-check the question paper "
+                f"pages manually for question(s): {missing}"
+            )
     return questions
 def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     def log(msg):
