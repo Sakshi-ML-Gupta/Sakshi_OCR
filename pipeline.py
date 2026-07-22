@@ -2758,11 +2758,13 @@ def process_pdf(file_input, status_callback=None):
         print(msg)
         if status_callback:
             status_callback(msg)
+    
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
     pages = run_ocr(file_bytes, file_name, status_callback)
     log("Building OCR JSON...")
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
+    
     try:
         qp_page_indices, official_questions, admin_page_indices = identify_questions_with_llm(pages, status_callback)
     except GroqQuotaExhaustedError as e:
@@ -2772,14 +2774,17 @@ def process_pdf(file_input, status_callback=None):
             f"Add more backup keys (GROQ_API_KEY_2, GROQ_API_KEY_3, ...) in secrets, or "
             f"wait for the daily reset, then reprocess this document."
         ) from e
+    
     log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
     log(f"Admin/cover pages detected: {[p+1 for p in admin_page_indices] if admin_page_indices else 'none'}")
     log(f"Official questions extracted: {len(official_questions)}")
+    
     if not qp_page_indices:
         raise Exception(
             "The LLM could not identify any question paper pages in this document.\n"
             f"Page 1 preview:\n{pages[0]['raw_text'][:500]}"
         )
+    
     if not official_questions:
         raise Exception(
             "Question paper pages were identified, but no questions were extracted from any "
@@ -2791,10 +2796,12 @@ def process_pdf(file_input, status_callback=None):
             "page classification itself is likely unreliable for this document -- check the "
             "OCR text of those specific pages directly."
         )
+    
     excluded_indices = set(qp_page_indices) | set(admin_page_indices)
     answer_page_indices = [i for i in range(len(pages)) if i not in excluded_indices]
     answer_pages = [pages[i] for i in answer_page_indices]
     log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
+    
     answer_lines = []
     answer_line_pages = []
     for page in answer_pages:
@@ -2802,11 +2809,13 @@ def process_pdf(file_input, status_callback=None):
             if not is_noise(line):
                 answer_lines.append(line)
                 answer_line_pages.append(page["page_number"])
+    
     all_page_numbers = {p["page_number"] for p in pages}
     answer_page_numbers = {pages[i]["page_number"] for i in answer_page_indices}
     qp_page_numbers = {pages[i]["page_number"] for i in qp_page_indices}
     admin_page_numbers = {pages[i]["page_number"] for i in admin_page_indices}
     last_page_num = max(all_page_numbers)
+    
     if last_page_num not in answer_page_numbers:
         log(
             f"WARNING: the LAST page of the document (page {last_page_num}) was NOT "
@@ -2814,8 +2823,10 @@ def process_pdf(file_input, status_callback=None):
             f"{'question-paper' if last_page_num in qp_page_numbers else 'admin'} pages "
             f"instead. If this page actually contains the tail of the last answer, "
             f"that content has been silently dropped. Please spot-check page {last_page_num}."
-       )
+        )
+    
     log(f"Flattened {len(answer_lines)} answer lines")
+    
     pages_look_plausible = _sanity_check_answer_pages(answer_lines, len(official_questions), log)
     if not pages_look_plausible:
         raise Exception(
@@ -2827,29 +2838,21 @@ def process_pdf(file_input, status_callback=None):
             "document structure. No answer-mapping LLM calls were made, since they "
             "would be guaranteed to fail."
         )
+    
     log("Mapping each question to its answer (sequential single-target search)...")
+    
+    # DEBUG: Print all questions before mapping
+    log(f"\n📝 TOTAL QUESTIONS BEFORE MAPPING: {len(official_questions)}")
+    for i, q in enumerate(official_questions):
+        log(f"  Q{i+1}: {q[:100]}...")
+    
     try:
-        # WHEREVER YOU CALL map_answers_sequential, ADD THIS:
-
-# Before calling
-print(f"Total questions before mapping: {len(questions)}")
-for i, q in enumerate(questions):
-    print(f"Q{i+1}: {q[:100]}...")
-
-# Call the function
-results = map_answers_sequential(answer_lines, questions, status_callback, answer_line_pages)
-
-# After calling
-matched = sum(1 for r in results if r["matched"])
-print(f"Total questions: {len(questions)}, Matched: {matched}")
-if matched < len(questions):
-    for r in results:
-        if not r["matched"]:
-            print(f"❌ MISSING: {r['ref']} - {r['question'][:100]}...")
+        # Call the mapping function
         qa_pairs = map_answers_sequential(
-            answer_lines, official_questions, status_callback,
+            answer_lines, 
+            official_questions, 
+            status_callback,
             answer_line_pages=answer_line_pages
-        
         )
     except GroqQuotaExhaustedError as e:
         raise Exception(
@@ -2859,22 +2862,36 @@ if matched < len(questions):
             f"returned -- add more backup keys (GROQ_API_KEY_2, GROQ_API_KEY_3, ...) in "
             f"secrets, or wait for the daily reset, then reprocess this document."
         ) from e
+    
+    # DEBUG: Check results after mapping
     matched_count = sum(1 for p in qa_pairs if p["matched"])
+    log(f"\n📊 MAPPING RESULTS: {matched_count} of {len(official_questions)} questions matched")
+    
+    if matched_count < len(official_questions):
+        log("⚠️ MISSING QUESTIONS:")
+        for p in qa_pairs:
+            if not p["matched"]:
+                log(f"  ❌ {p['ref']}: {p['question'][:100]}...")
+    
     low_conf_count = sum(1 for p in qa_pairs if p.get("low_confidence"))
     log(f"Matched {matched_count} of {len(official_questions)} questions"
         + (f" ({low_conf_count} low-confidence best-effort match(es) -- worth spot-checking)" if low_conf_count else ""))
+    
     for p in qa_pairs:
         if not p["matched"]:
             log(f"WARNING: No match found for: {p['question'][:60]}")
+    
     if matched_count == 0:
         raise Exception(
             "Could not match any questions to answers.\n"
             f"Official questions: {official_questions}\n"
             f"First 10 answer lines: {answer_lines[:10]}"
         )
+    
     verify_no_llm_text_rewriting(qa_pairs, answer_lines, log)
     _flag_suspiciously_short_answers(qa_pairs, log)
     log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
+    
     return ocr_json, qa_pairs
 def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".",
                   base_name: str = "document") -> tuple:
