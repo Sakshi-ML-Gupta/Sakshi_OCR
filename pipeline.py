@@ -2750,6 +2750,183 @@ def verify_no_llm_text_rewriting(qa_pairs: list, answer_lines: list, log=print) 
             "never for text content, so it could not have silently corrected grammar or spelling."
         )
     return all_ok
+
+
+"""
+ADDON for pipeline.py -- paste these functions into pipeline.py (near is_noise /
+strip_full_question_echo), then wire them in at the 2 marked call-sites below.
+Only needs `re`, which pipeline.py already imports.
+"""
+import re
+
+# =========================================================
+# DECORATIVE / BANNER LINE REMOVAL
+# Chandra (Datalab) OCR sometimes emits decorative section banners that are NOT
+# part of the student's actual answer -- e.g.:
+#   भाग - 1
+#   ### ★ प्रश्नोत्तर नं: 3 ★
+#   ============
+#   ---- Q&A No. 4 ----
+# These should never survive into the final answer text or print anywhere.
+# =========================================================
+_DECORATIVE_SYMBOLS = "★☆✦✧✩✪❋❃❖◆●○▪▫➤➔→»«‣·•■□❀❁✵✶✷✸✹✺"
+_DECORATIVE_CHARCLASS = r'\s#=＝\-_~' + re.escape(_DECORATIVE_SYMBOLS)
+
+# A whole line that, once decorative symbols/hashes/dashes are stripped away,
+# is ONLY a section/part/Q&A-number label (with or without a number).
+# NOTE: deliberately no \b word-boundary here -- \b is unreliable right after
+# Devanagari text in Python's `re` module and silently fails to match.
+_DECORATIVE_BANNER_RE = re.compile(
+    r'^[' + _DECORATIVE_CHARCLASS + r']*'
+    r'(?:'
+    r'भाग|part|section|sec\.?'
+    r'|प्रश्नोत्तर\s*(?:नं\.?|number|no\.?)?'
+    r'|q\s*(?:&|and)?\s*a\s*(?:no\.?|number)?'
+    r'|question\s*(?:&|and)?\s*answer\s*(?:no\.?|number)?'
+    r')'
+    r'[' + _DECORATIVE_CHARCLASS + r':.\-–०-९0-9]*$',
+    re.IGNORECASE | re.UNICODE
+)
+# A line that is PURELY decorative -- just symbols/hashes/dashes, nothing else.
+_PURE_DECORATIVE_RE = re.compile(r'^[' + _DECORATIVE_CHARCLASS + r']+$')
+
+
+def _is_decorative_banner_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if _PURE_DECORATIVE_RE.match(s):
+        return True
+    return bool(_DECORATIVE_BANNER_RE.match(s))
+
+
+# For cleanup INSIDE an already-joined answer string (OCR sometimes glues a
+# banner onto the same line as real text with no newline separating them).
+_DECORATIVE_INLINE_RE = re.compile(
+    r'(?:^|\s)[' + _DECORATIVE_CHARCLASS + r']*'
+    r'(?:भाग\s*[-–:]?\s*\d*'
+    r'|प्रश्नोत्तर\s*(?:नं\.?|number|no\.?)?\s*[:\-–]?\s*\d*'
+    r'|q\s*(?:&|and)?\s*a\s*(?:no\.?|number)?\s*[:\-–]?\s*\d*'
+    r')'
+    r'[' + _DECORATIVE_CHARCLASS + r']*(?=\s|$)',
+    re.IGNORECASE | re.UNICODE
+)
+_PURE_SYMBOL_RUN_RE = re.compile(r'[' + re.escape(_DECORATIVE_SYMBOLS) + r']+')
+_HASH_BANNER_RE = re.compile(r'#{2,}[^\n]{0,40}#{2,}|#{3,}')
+
+
+def strip_decorative_markers(text: str) -> str:
+    """Remove decorative section banners / star symbols / stray markdown hashes
+    from ANYWHERE inside a string -- safe to call on any answer/question text."""
+    if not text:
+        return text
+    text = _DECORATIVE_INLINE_RE.sub(' ', text)
+    text = _HASH_BANNER_RE.sub(' ', text)
+    text = _PURE_SYMBOL_RUN_RE.sub(' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+# =========================================================
+# STRIP ANY OTHER QUESTION'S TEXT LEAKING INTO THE TRAILING END OF AN ANSWER
+# Broader safety net than only checking the immediate "next" question (which
+# strip_trailing_leaked_next_question already does) -- this checks the tail of
+# the answer against the opening words of EVERY OTHER question in the paper,
+# since a boundary slip can leak in any question, not only the adjacent one.
+# =========================================================
+def _normalize_words(text: str) -> list:
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', ' ', text, flags=re.UNICODE)
+    return text.split()
+
+
+def strip_any_question_leak(answer_text: str, all_questions: list, own_index: int,
+                             tail_window_words: int = 25, min_match_words: int = 4) -> str:
+    if not answer_text or not all_questions:
+        return answer_text
+    words = answer_text.split()
+    if len(words) < min_match_words:
+        return answer_text
+    best_cut = None
+    for qi, q in enumerate(all_questions):
+        if qi == own_index:
+            continue
+        q_core = re.sub(r'^\s*\d+[\.\)]\s*(?:\([ivxlcdma-z]+\)\s*)?', '', q, flags=re.IGNORECASE).strip()
+        q_words = _normalize_words(q_core)[:8]
+        if len(q_words) < min_match_words:
+            continue
+        tail_start = max(0, len(words) - tail_window_words - len(q_words))
+        tail_words_norm = _normalize_words(" ".join(words[tail_start:]))
+        joined_q = " ".join(q_words)
+        joined_tail = " ".join(tail_words_norm)
+        idx = joined_tail.find(joined_q)
+        if idx == -1:
+            shorter = " ".join(q_words[:5])
+            idx = joined_tail.find(shorter)
+        if idx != -1:
+            words_before_match = joined_tail[:idx].split()
+            cut_word_pos = tail_start + len(words_before_match)
+            if best_cut is None or cut_word_pos < best_cut:
+                best_cut = cut_word_pos
+    if best_cut is not None and best_cut < len(words):
+        result = " ".join(words[:best_cut]).strip()
+        # a bare trailing number/label (e.g. "...actions. 4.") can be left over
+        # once the leaked question text after it was cut away -- trim that too.
+        result = re.sub(r'[\s,;:\-–]*\(?\d{1,2}\)?\.?\s*$', '', result).strip()
+        return result
+    return answer_text
+
+
+# =========================================================
+# MASTER FINAL-PASS CLEANER -- call this ONCE, at the very end of process_pdf,
+# over the fully-built qa_pairs list (see call-site instructions below).
+# =========================================================
+def finalize_qa_pairs(qa_pairs: list, all_questions: list) -> list:
+    for i, pair in enumerate(qa_pairs):
+        answer = pair.get("answer", "")
+        if not answer:
+            continue
+        answer = strip_decorative_markers(answer)
+        answer = strip_any_question_leak(answer, all_questions, i)
+        answer = strip_decorative_markers(answer)  # 2nd pass in case the leak-cut exposed a banner at the new tail
+        pair["answer"] = answer
+    return qa_pairs
+
+
+# =========================================================
+# MULTI-PDF WRAPPER
+# process_pdf() is intentionally single-document (one PDF = one question paper +
+# one student's answers = one independent unit of work). If your app needs to
+# handle several uploaded PDFs in one go, loop it with this wrapper instead of
+# modifying process_pdf itself -- keeps single-file behavior/tests unaffected,
+# and one bad file can't abort the rest of the batch.
+# =========================================================
+def process_multiple_pdfs(file_inputs: list, status_callback=None):
+    """
+    file_inputs: list of anything process_pdf() already accepts (path, bytes,
+    file-like object, or (filename, bytes) tuple).
+    Returns: list of dicts, one per input, in the same order:
+      {"file_name": ..., "ocr_json": ..., "qa_pairs": ..., "error": None or str}
+    A failure on one file is caught and recorded -- it does NOT stop the batch.
+    """
+    from pipeline import process_pdf, _normalize_file_input  # adjust import if needed
+
+    results = []
+    for idx, file_input in enumerate(file_inputs):
+        try:
+            _, file_name = _normalize_file_input(file_input)
+        except Exception:
+            file_name = f"file_{idx + 1}"
+        def _cb(msg, _name=file_name):
+            if status_callback:
+                status_callback(f"[{_name}] {msg}")
+        try:
+            ocr_json, qa_pairs = process_pdf(file_input, status_callback=_cb)
+            results.append({"file_name": file_name, "ocr_json": ocr_json, "qa_pairs": qa_pairs, "error": None})
+        except Exception as e:
+            _cb(f"FAILED: {e}")
+            results.append({"file_name": file_name, "ocr_json": None, "qa_pairs": None, "error": str(e)})
+    return results
 # =========================================================
 # COMPLETE PIPELINE
 # =========================================================
