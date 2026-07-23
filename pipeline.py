@@ -21,6 +21,26 @@ except ImportError:
     print("Warning: sentence-transformers not installed. Install with: pip install sentence-transformers")
 
 # =========================================================
+# SAFE LOGGING (never let a broken status_callback crash the pipeline)
+# =========================================================
+def _make_safe_logger(status_callback=None):
+    """
+    Returns a log(msg) function that always prints, and only best-effort calls
+    status_callback. Streamlit's status_callback breaks with NoSessionContext when
+    called from a background thread (e.g. our batch ThreadPoolExecutor workers) --
+    previously that exception propagated straight out of a warning-log call and took
+    down the entire pipeline. Now it's swallowed here so a UI-logging hiccup can never
+    abort real work.
+    """
+    def log(msg):
+        print(msg)
+        if status_callback:
+            try:
+                status_callback(msg)
+            except Exception:
+                pass
+    return log
+# =========================================================
 # API KEYS
 # =========================================================
 def get_api_key(name):
@@ -95,7 +115,7 @@ def _diagnose_tuple_errors(func):
 # threads, so parallel dispatch bought nothing. A semaphore lets a few requests be
 # in flight over the network at once (still respects the token-budget pacing below),
 # which is what actually cuts wall-clock time when we batch multiple chunks.
-GROQ_MAX_CONCURRENT_CALLS = 4
+GROQ_MAX_CONCURRENT_CALLS = int(os.getenv("GROQ_MAX_CONCURRENT_CALLS", "2"))
 _groq_call_semaphore = threading.Semaphore(GROQ_MAX_CONCURRENT_CALLS)
 _budget_lock = threading.Lock()
 # =========================================================
@@ -158,10 +178,7 @@ def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=pr
     )
     return [markdown.strip()]
 def run_ocr(file_content: bytes, file_name: str, status_callback=None):
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
+    log = _make_safe_logger(status_callback)
     file_name = _coerce_name(file_name, default_name="document.pdf")
     if not isinstance(file_content, (bytes, bytearray)):
         raise TypeError(
@@ -265,10 +282,7 @@ def build_ocr_json(pages: list) -> dict:
 # =========================================================
 @_diagnose_tuple_errors
 def process_reference(file_input, status_callback=None):
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
+    log = _make_safe_logger(status_callback)
     file_bytes, file_name = _normalize_file_input(file_input, default_name="reference.pdf")
     pages = run_ocr_cached(file_bytes, file_name, status_callback)
     log(f"Reference OCR complete -- {len(pages)} page(s)")
@@ -277,7 +291,7 @@ def process_reference(file_input, status_callback=None):
 # LLM-BASED QUESTION PAPER / QUESTION DETECTION (Groq)
 # =========================================================
 GROQ_MODEL = "openai/gpt-oss-120b"
-TPM_LIMIT = 30000
+TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "8000"))
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
 MAX_CHARS_PER_CHUNK = 13000
@@ -337,27 +351,31 @@ class _TokenBudgetTracker:
         self._prune(now)
         return sum(tok for _, tok in self.events)
     def wait_if_needed(self, upcoming_tokens: int, log=print):
-        with _budget_lock:
-            now = time.monotonic()
-            used = self.used_in_window(now)
-            projected = used + upcoming_tokens
-            if projected <= self.safe_limit:
-                return
-            needed_to_free = projected - self.safe_limit
-            freed = 0
-            wait_s = 0.0
-            for ts, tok in self.events:
-                freed += tok
-                wait_s = max(wait_s, 60 - (now - ts))
-                if freed >= needed_to_free:
-                    break
-        wait_s = max(0.0, wait_s) + 0.5
-        log(
-            f"Proactively pacing requests: {used:.0f} tokens used in the last 60s, "
-            f"+{upcoming_tokens} upcoming would exceed safe budget "
-            f"({self.safe_limit:.0f}). Waiting {wait_s:.1f}s before sending next chunk..."
-        )
-        time.sleep(wait_s)
+        while True:
+            with _budget_lock:
+                now = time.monotonic()
+                used = self.used_in_window(now)
+                projected = used + upcoming_tokens
+                if projected <= self.safe_limit:
+                    # Reserve immediately, inside the same lock, so a concurrent
+                    # thread checking a microsecond later already sees this usage.
+                    self.events.append((now, upcoming_tokens))
+                    return
+                needed_to_free = projected - self.safe_limit
+                freed = 0
+                wait_s = 0.0
+                for ts, tok in self.events:
+                    freed += tok
+                    wait_s = max(wait_s, 60 - (now - ts))
+                    if freed >= needed_to_free:
+                        break
+            wait_s = max(0.0, wait_s) + 0.5
+            log(
+                f"Proactively pacing requests: {used:.0f} tokens used in the last 60s, "
+                f"+{upcoming_tokens} upcoming would exceed safe budget "
+                f"({self.safe_limit:.0f}). Waiting {wait_s:.1f}s before sending next chunk..."
+            )
+            time.sleep(wait_s)
     def record_usage(self, tokens: int):
         with _budget_lock:
             self.events.append((time.monotonic(), tokens))
@@ -482,8 +500,10 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
     for attempt in range(1, max_retries + 2):
         if skip_next_proactive_check:
             skip_next_proactive_check = False
+            reserved_via_wait = False
         else:
             budget.wait_if_needed(estimated_tokens, log=log)
+            reserved_via_wait = True
         try:
             with _groq_call_semaphore:
                 response = client.chat.completions.create(
@@ -495,7 +515,8 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                     response_format={"type": "json_object"},
                     temperature=0.0,
                 )
-            budget.record_usage(estimated_tokens)
+            if not reserved_via_wait:
+                budget.record_usage(estimated_tokens)
             content = response.choices[0].message.content
             return response_parser(content)
         except groq.AuthenticationError as e:
@@ -634,10 +655,7 @@ def _parse_canonical_questions_response(content: str) -> list:
         raise ValueError(f"'questions' must be a list, got: {type(questions).__name__}")
     return [str(q).strip() for q in questions if str(q).strip()]
 def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
+    log = _make_safe_logger(status_callback)
     if not qp_pages:
         return []
     from groq import Groq
@@ -659,10 +677,7 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
     log(f"Canonical question list: {len(questions)} question(s), single consistent pass")
     return questions
 def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
+    log = _make_safe_logger(status_callback)
     from groq import Groq
     api_key = get_api_key("GROQ_API_KEY")
     if not api_key:
@@ -1254,9 +1269,9 @@ Rules:
 Return ONLY valid JSON (no markdown fences, no commentary):
 {"starts": [{"ref": "REF-C", "start_line": 88}, {"ref": "REF-D", "start_line": 140}]}
 Omit any question whose answer isn't in this chunk. If none match, return {"starts": []}."""
-BATCH_CHUNK_CHARS = 14000
+BATCH_CHUNK_CHARS = int(os.getenv("GROQ_BATCH_CHUNK_CHARS", "7000"))
 BATCH_CHUNK_OVERLAP_LINES = 3
-BATCH_MAX_CONCURRENCY = 4
+BATCH_MAX_CONCURRENCY = GROQ_MAX_CONCURRENT_CALLS
 def _chunk_numbered_lines_by_chars(numbered_lines: list, chunk_chars: int = BATCH_CHUNK_CHARS,
                                      overlap_lines: int = BATCH_CHUNK_OVERLAP_LINES) -> list:
     chunks = []
@@ -1327,10 +1342,7 @@ def _batch_find_all_starts(client, numbered_lines: list, questions: list, alread
 # =========================================================
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
+    log = _make_safe_logger(status_callback)
     from groq import Groq
     api_key = get_api_key("GROQ_API_KEY")
     if not api_key:
@@ -1656,10 +1668,7 @@ def verify_no_llm_text_rewriting(qa_pairs: list, answer_lines: list, log=print) 
 # =========================================================
 @_diagnose_tuple_errors
 def process_pdf(file_input, status_callback=None):
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
+    log = _make_safe_logger(status_callback)
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
     pages = run_ocr(file_bytes, file_name, status_callback)
     log("Building OCR JSON...")
