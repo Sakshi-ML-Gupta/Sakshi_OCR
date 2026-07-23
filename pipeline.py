@@ -5,6 +5,7 @@ import json
 import time
 import difflib
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import fitz
 import httpx
 from pathlib import Path
@@ -90,7 +91,13 @@ def _diagnose_tuple_errors(func):
                 ) from e
             raise
     return wrapper
-_groq_call_lock = threading.Lock()
+# Was a single Lock() before -- that fully serialized every Groq call even across
+# threads, so parallel dispatch bought nothing. A semaphore lets a few requests be
+# in flight over the network at once (still respects the token-budget pacing below),
+# which is what actually cuts wall-clock time when we batch multiple chunks.
+GROQ_MAX_CONCURRENT_CALLS = 4
+_groq_call_semaphore = threading.Semaphore(GROQ_MAX_CONCURRENT_CALLS)
+_budget_lock = threading.Lock()
 # =========================================================
 # PREPROCESS PDF
 # =========================================================
@@ -273,31 +280,22 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 TPM_LIMIT = 30000
 TPM_SAFETY_FRACTION = 0.85
 CHARS_PER_TOKEN_ESTIMATE = 2.0
-MAX_CHARS_PER_CHUNK = 9000
+MAX_CHARS_PER_CHUNK = 13000
 CHUNK_OVERLAP_PAGES = 1
-QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam/assignment answer booklet. This could be from ANY institution, ANY subject, and ANY language (or a mix of languages/scripts) -- do not assume a specific country, university, or language. The booklet mixes pages of different kinds, in no guaranteed order:
-1. ADMINISTRATIVE/COVER pages: roll number/enrolment number, programme/course code, student name, registration details, institution letterhead, blank cover sheets. These contain NO exam question text and NO student answer content -- just identifying/bureaucratic information.
-2. QUESTION PAPER pages: the official printed list of numbered exam questions the student must answer. These read as instructions/prompts DIRECTED AT the student (e.g. "Discuss X", "Explain Y with examples", "Write notes on the following:", or the equivalent phrasing in whatever language this document uses). Mark allocations may appear (e.g. "10", "20").
-3. ANSWER pages: the student's own (handwritten, OCR'd) answers. These are typically long, restate or reference a question briefly then write an extended response, and may themselves contain numbered or bulleted sub-points as part of the student's OWN explanation. These numbered sub-points inside a long answer are NOT separate exam questions, even though superficially they look similar (number, period, text) -- they are part of the answer to ONE question.
-You are being shown only a PORTION of the document's pages at a time (a chunk), not the whole document. Some pages you see may be partial context carried over from a previous chunk -- still classify them normally based on their own content.
-Your task: read the pages shown and return ONLY valid JSON (no markdown fences, no commentary, no explanation) in EXACTLY this shape:
-{
-  "question_paper_pages": [14, 16, 18],
-  "admin_pages": [1, 2],
-  "questions": ["1. Example question text. (10)", "2. Another example question. (10)"]
-}
-IMPORTANT formatting requirement: "question_paper_pages" and "admin_pages" must be JSON arrays where EACH page number is a SEPARATE element separated by commas, like [14, 16, 18] -- NEVER merge multiple page numbers into one number like [141618]. Each integer must be a single, individually valid page number from the pages shown. A page must never appear in both lists.
-Critical rules for telling question-paper pages apart from answer pages that happen to contain numbered content:
-- A genuine question paper question is a PROMPT directed at the student ("explain", "discuss", "describe", "write notes on", "compare", a question mark, etc., in whatever language is used) -- it asks the student to DO something.
-- A numbered point inside a long answer is typically a STATEMENT or FACT that is part of an explanation the student is giving -- it does not ask the reader to do anything; it's content, not an instruction.
-- If a page's numbered items closely follow a label meaning "answer" (in whatever language/script the document uses -- e.g. "Ans", "Ans-", or its equivalent), or come after a long paragraph of explanatory prose in the same block, that page is almost certainly an ANSWER page, not a question paper page -- exclude it from question_paper_pages even if it has multiple numbered lines.
-- A real question paper is usually self-contained and concise per question (a question, maybe a mark allocation) -- not a long flowing essay with numbered sub-points woven into running prose.
-- CRITICAL TRAP TO AVOID: students very commonly RESTATE the question itself as the FIRST SENTENCE of their answer, before writing their actual response (e.g. an answer's opening page reads "Examine the theme of concealment in X. Discuss with reference to Y. The theme of concealment is central to..." where everything after the first sentence is the student's OWN original explanation, not more instructions). Such a page can superficially look like a question-paper page because it contains prompt-style verbs ("Examine", "Discuss") -- but it is the FIRST page of a long, multi-page ANSWER, not a question paper page. Signals that this is really an answer's opening page, not a real question paper page: (a) the page has noticeably MORE text than a typical printed question would need, especially if it keeps going well past where a concise instruction would end; (b) the prose quality looks like a developing argument/explanation rather than a terse instruction; (c) the SAME or very similar question text already appears verbatim on a page you are more confident is the genuine, concise question paper (in which case this longer, messier page is almost certainly the student's restatement -- exclude it). When uncertain whether a page is the real question paper or a student's restatement-then-answer, treat brevity and conciseness as the deciding signal: genuine question papers are short per question; answer pages (including their opening restatement) run much longer.
-- When genuinely uncertain whether a page is a question paper page, prefer NOT including it as one, and prefer NOT extracting its numbered items as separate questions.
-- If a page is a cover/administrative page (roll number, letterhead, blank sheet with no question or answer content), put it in "admin_pages" so it is excluded from BOTH the question paper AND the student's answer text -- it should never be treated as answer content.
-- If NONE of the pages shown in this chunk are question paper pages, return an empty list for that field -- that is a valid and expected result for chunks that only contain answer/admin pages.
-- Preserve the EXACT original text and numbering of real questions -- do not paraphrase, do not renumber, do not translate.
-- Output ONLY the JSON object described above. No prose before or after it. No markdown code fences."""
+QP_SYSTEM_PROMPT = """OCR text from a scanned exam/assignment booklet (any institution/subject/language). Pages are one of:
+1. ADMIN/COVER: roll no., course code, name, letterhead, blank sheets -- no question or answer content.
+2. QUESTION PAPER: the official printed numbered questions -- prompts DIRECTED at the student ("discuss", "explain", "write notes on", a "?", etc., in whatever language). May show mark allocations ("10","20").
+3. ANSWER pages: the student's own long OCR'd response, often restating/labeling a question briefly then writing an extended answer. Numbered sub-points INSIDE that answer are the student's own content, not separate questions.
+You see only a chunk of pages (order not guaranteed; some may be carried-over context). Classify each page shown.
+KEY TRAP: students often restate the question as their answer's opening sentence (e.g. "Discuss X. The concept of X is..."). That page is the START OF AN ANSWER, not the question paper, even though it uses prompt verbs. Tells: it runs much longer than a real printed question would; prose reads like a developing argument, not a terse instruction; or the same/similar question already appears on a page you're more confident is the real, concise question paper. When unsure, brevity = real question paper, length = answer restatement -- exclude the long one.
+Other rules:
+- Numbered items following an "answer" label (Ans/उत्तर/etc., any script) or long explanatory prose = answer page, not question paper, even with multiple numbered lines.
+- When genuinely unsure a page is a question-paper page, leave it out of question_paper_pages (and don't extract its items as questions).
+- Admin/cover pages go in admin_pages (excluded from both question and answer text).
+- Preserve exact original text/numbering of real questions -- no paraphrasing, renumbering, translating.
+Return ONLY this JSON (no fences, no commentary):
+{"question_paper_pages": [14, 16, 18], "admin_pages": [1, 2], "questions": ["1. Example question. (10)", "2. Another. (10)"]}
+Page-number arrays must be individual comma-separated ints (e.g. [14,16,18], never merged like [141618]); a page never appears in both lists; empty question_paper_pages is valid if this chunk has none."""
 def _chunk_pages_by_char_budget(pages: list, max_chars: int = MAX_CHARS_PER_CHUNK,
                                   overlap_pages: int = CHUNK_OVERLAP_PAGES) -> list:
     if not pages:
@@ -339,19 +337,20 @@ class _TokenBudgetTracker:
         self._prune(now)
         return sum(tok for _, tok in self.events)
     def wait_if_needed(self, upcoming_tokens: int, log=print):
-        now = time.monotonic()
-        used = self.used_in_window(now)
-        projected = used + upcoming_tokens
-        if projected <= self.safe_limit:
-            return
-        needed_to_free = projected - self.safe_limit
-        freed = 0
-        wait_s = 0.0
-        for ts, tok in self.events:
-            freed += tok
-            wait_s = max(wait_s, 60 - (now - ts))
-            if freed >= needed_to_free:
-                break
+        with _budget_lock:
+            now = time.monotonic()
+            used = self.used_in_window(now)
+            projected = used + upcoming_tokens
+            if projected <= self.safe_limit:
+                return
+            needed_to_free = projected - self.safe_limit
+            freed = 0
+            wait_s = 0.0
+            for ts, tok in self.events:
+                freed += tok
+                wait_s = max(wait_s, 60 - (now - ts))
+                if freed >= needed_to_free:
+                    break
         wait_s = max(0.0, wait_s) + 0.5
         log(
             f"Proactively pacing requests: {used:.0f} tokens used in the last 60s, "
@@ -360,7 +359,8 @@ class _TokenBudgetTracker:
         )
         time.sleep(wait_s)
     def record_usage(self, tokens: int):
-        self.events.append((time.monotonic(), tokens))
+        with _budget_lock:
+            self.events.append((time.monotonic(), tokens))
     def record_actual_from_error(self, used: int, limit: int):
         now = time.monotonic()
         current = self.used_in_window(now)
@@ -485,7 +485,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
         else:
             budget.wait_if_needed(estimated_tokens, log=log)
         try:
-            with _groq_call_lock:
+            with _groq_call_semaphore:
                 response = client.chat.completions.create(
                     model=GROQ_MODEL,
                     messages=[
@@ -605,18 +605,10 @@ def _merge_chunk_results(chunk_results: list) -> tuple:
         all_questions.extend(questions)
     deduped_questions = _dedup_questions(all_questions)
     return sorted(all_qp_pages), deduped_questions, sorted(all_admin_pages)
-QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are reading the OFFICIAL question paper pages of a student exam assignment booklet (the printed list of questions, NOT the student's answers). You are given the complete, exact text of these pages, in order.
-Your task: extract the COMPLETE, clean list of every distinct question/sub-part, exactly as printed, and return them in printed order.
-Critical rules for multi-part questions:
-- If a single numbered question contains multiple LABELED sub-parts -- e.g. "1. Identify and explain the following: (i) ... (ii) ... (iii) ... (iv) ..." -- output EACH labeled sub-part as its OWN SEPARATE entry, not merged into one block. Each sub-part entry should include enough of the parent question's context to be self-contained (e.g. carry forward the parent instruction like "Identify and explain the following:" into each sub-part's text, or at minimum keep the original numbering label, e.g. "1.(i)", "1.(ii)", "1.(iii)", "1.(iv)") so each entry is independently understandable without needing to look at a different entry for context.
-- This applies to ANY labeled sub-structure: (i)/(ii)/(iii)/(iv), (a)/(b)/(c), (क)/(ख)/(ग), 1./2./3. used as sub-parts within a larger numbered question, etc. -- always split these into separate entries.
-- Decide this ONCE, consistently, for the whole document -- you are seeing the COMPLETE question paper text in this single call, so there is no need to guess or produce different splits for different parts of the same question.
-- Preserve the EXACT original text of each part -- do not paraphrase, do not translate. You MAY prepend the parent question's numbering/label to each split-out sub-part for self-contained context, as described above.
-- Output entries in the SAME ORDER they appear on the question paper (monotonic, matching the printed sequence) -- sub-parts of the same parent question must stay together and in their own (i)/(ii)/(iii)/(iv) order; never reorder anything.
-Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
-{
-  "questions": ["<exact text of question/sub-part 1>", "<exact text of question/sub-part 2>", ...]
-}"""
+QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """Complete, exact text of the OFFICIAL question paper pages (not the student's answers), in order. Extract the full clean list of every distinct question/sub-part exactly as printed, in printed order.
+Multi-part rule: if a numbered question has labeled sub-parts -- (i)/(ii)/(iii), (a)/(b)/(c), (क)/(ख), or 1./2./3. used as sub-parts -- split EACH into its own entry, not merged. Keep each entry self-contained: carry the parent instruction forward or at least keep the label (e.g. "1.(i)", "1.(ii)"). Decide this once, consistently, for the whole set. Preserve exact original text (no paraphrase/translation); output in the same printed order, sub-parts grouped and ordered under their parent.
+Return ONLY this JSON (no fences, no commentary):
+{"questions": ["<exact text 1>", "<exact text 2>", ...]}"""
 def _build_canonical_questions_prompt(qp_pages: list) -> str:
     blocks = []
     for p in qp_pages:
@@ -1246,6 +1238,85 @@ def _build_label_anchor_index(answer_lines: list, questions: list, exclude_indic
         )
     return anchors
 # =========================================================
+# BATCHED MULTI-QUESTION START FINDER (primary strategy -- replaces one-LLM-call-per-
+# question-per-window. Instead of scanning the document up to N_questions x N_windows
+# times, we scan it ONCE, chunk by chunk, asking for ALL still-unfound questions at
+# once per chunk. Chunks are independent so they run concurrently too. This is both
+# the main token-cost cut and the main time-complexity cut in this pipeline.)
+# =========================================================
+BATCH_START_FINDER_SYSTEM_PROMPT = """Scan this chunk of a line-numbered OCR transcript (a student exam answer booklet) for where EACH listed target question's answer begins. Most questions will NOT start in this chunk -- that's expected, only report the ones that genuinely do.
+Rules:
+- A bare label matching a question's own number (e.g. "Q3", "3)", "(ii)") followed by relevant content is enough on its own -- no restated question text needed.
+- Report the EARLIEST line of each match, including a short intro sentence before the topic becomes explicit.
+- Similar content can legitimately repeat across different questions on the same broad topic -- don't reject a real match just because similar wording appeared elsewhere.
+- Ignore OCR artifact-description lines ("there is a logo", "signature", "watermark", "red pen scribble") -- never report one as a start.
+- If a plausible start exists for a question in this chunk, report it rather than omitting it out of caution.
+Return ONLY valid JSON (no markdown fences, no commentary):
+{"starts": [{"ref": "REF-C", "start_line": 88}, {"ref": "REF-D", "start_line": 140}]}
+Omit any question whose answer isn't in this chunk. If none match, return {"starts": []}."""
+BATCH_CHUNK_CHARS = 14000
+BATCH_CHUNK_OVERLAP_LINES = 3
+BATCH_MAX_CONCURRENCY = 4
+def _chunk_numbered_lines_by_chars(numbered_lines: list, chunk_chars: int = BATCH_CHUNK_CHARS,
+                                     overlap_lines: int = BATCH_CHUNK_OVERLAP_LINES) -> list:
+    chunks = []
+    i = 0
+    n = len(numbered_lines)
+    while i < n:
+        chars = 0
+        j = i
+        while j < n and (j == i or chars + len(numbered_lines[j][1]) <= chunk_chars):
+            chars += len(numbered_lines[j][1])
+            j += 1
+        chunks.append(numbered_lines[i:j])
+        if j >= n:
+            break
+        i = max(i + 1, j - overlap_lines)
+    return chunks
+def _batch_find_all_starts(client, numbered_lines: list, questions: list, already_found: set,
+                             budget: "_TokenBudgetTracker", log,
+                             max_workers: int = BATCH_MAX_CONCURRENCY) -> dict:
+    open_questions = [
+        (f"REF-{chr(65+i)}", q) for i, q in enumerate(questions)
+        if f"REF-{chr(65+i)}" not in already_found
+    ]
+    if not open_questions:
+        return {}
+    chunks = _chunk_numbered_lines_by_chars(numbered_lines)
+    log(
+        f"Batch pass: scanning {len(chunks)} chunk(s) once for all {len(open_questions)} "
+        f"remaining question(s) (up to {max_workers} chunk(s) in flight at once) -- "
+        f"replaces what used to be up to {len(open_questions) * 20}+ separate window calls."
+    )
+    sibling_note = _build_group_sibling_note(open_questions)
+    def _run_chunk(chunk):
+        user_prompt = _build_windowed_multi_target_prompt(chunk, open_questions, sibling_note)
+        try:
+            return _call_groq_with_retries(
+                client, BATCH_START_FINDER_SYSTEM_PROMPT, user_prompt,
+                _parse_windowed_multi_target_response, budget, log
+            )
+        except Exception as e:
+            log(f"WARNING: batch chunk (lines {chunk[0][0]}-{chunk[-1][0]}) failed, skipping: {e}")
+            return []
+    results_per_chunk = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_run_chunk, c) for c in chunks]
+        for c, fut in zip(chunks, futures):
+            results_per_chunk.append((c, fut.result()))
+    valid_refs = {ref for ref, _ in open_questions}
+    hits = {}
+    for chunk, starts in results_per_chunk:
+        valid_ids = {idx for idx, _ in chunk}
+        for item in starts:
+            ref, sl = item["ref"], item["start_line"]
+            if ref not in valid_refs or sl not in valid_ids:
+                continue
+            hits.setdefault(ref, []).append(sl)
+    found = {ref: min(lines) for ref, lines in hits.items()}
+    log(f"Batch pass matched {len(found)}/{len(open_questions)} remaining question(s) in {len(chunks)} chunk call(s).")
+    return found
+# =========================================================
 # MAIN ANSWER MAPPING FUNCTION
 # (Gemini verification and the extra Groq re-analysis/remap passes have been removed --
 #  they added latency/cost without reliably improving accuracy, and in practice the strict
@@ -1268,116 +1339,68 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     budget = _TokenBudgetTracker()
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(numbered_lines)
+    n = len(questions)
     sibling_groups = _detect_sibling_groups(questions)
     group_member_of = {idx: first_idx for first_idx, members in sibling_groups.items() for idx in members}
+
+    # STAGE 1 -- free, zero-LLM-cost label pre-pass (regex based).
     label_anchors = _build_label_anchor_index(answer_lines, questions, set(group_member_of.keys()), log)
-    found_starts = {}
-    for qi, line_idx in label_anchors.items():
-        found_starts[f"REF-{chr(65 + qi)}"] = line_idx
-    pointer = 0
-    i = 0
-    n = len(questions)
-    while i < n:
-        if i in sibling_groups:
-            group_indices = sibling_groups[i]
-            group_refs = [f"REF-{chr(65 + j)}" for j in group_indices]
-            group_questions = [(f"REF-{chr(65 + j)}", questions[j]) for j in group_indices]
-            log(f"Detected sibling sub-part group {group_refs} -- resolving as a bounded batch...")
-            first_ref, first_q = group_questions[0]
-            group_start = _find_answer_start_sequential(client, numbered_lines, first_q, first_ref, pointer, budget, log)
-            if group_start is None:
-                group_start = _find_answer_start_sequential(
-                    client, numbered_lines, first_q, first_ref, pointer, budget, log,
-                    extra_reminder=(
-                        "REMINDER: a previous search pass did not find this answer. The same "
-                        "definition/explanation can legitimately repeat across the document -- "
-                        "that does not disqualify a genuine match. Also check for a short "
-                        "introductory line at the true start."
-                    )
-                )
-            if group_start is None:
-                log(f"NOTE: could not find the start of sibling group {group_refs} in this pass -- will be recovered by rescue/force-fill.")
-                i = group_indices[-1] + 1
-                continue
-            found_starts[first_ref] = group_start
-            log(f"  found {first_ref} (group start) at line {group_start}")
-            next_index = group_indices[-1] + 1
-            group_end_bound = None
-            if next_index < n:
-                next_ref = f"REF-{chr(65 + next_index)}"
-                next_q = questions[next_index]
-                group_end_bound = _find_answer_start_sequential(
-                    client, numbered_lines, next_q, next_ref, group_start + 1, budget, log
-                )
-            upper = (group_end_bound - 1) if group_end_bound is not None else (total_lines - 1)
-            if len(group_questions) > 1:
-                sibling_starts = _resolve_sibling_group_batch(
-                    client, numbered_lines, group_questions, group_start, upper, budget, log
-                )
-                for ref, sl in sibling_starts.items():
-                    found_starts[ref] = sl
-                    log(f"  found {ref} (sibling) at line {sl}")
-            if next_index < n and group_end_bound is not None:
-                found_starts[f"REF-{chr(65 + next_index)}"] = group_end_bound
-                log(f"  found REF-{chr(65 + next_index)} at line {group_end_bound}")
-                pointer = group_end_bound + 1
-                i = next_index + 1
-            else:
-                pointer = total_lines
-                i = next_index
+    found_starts = {f"REF-{chr(65 + qi)}": line_idx for qi, line_idx in label_anchors.items()}
+
+    # STAGE 2 -- ONE batched pass over the whole document for every question the
+    # label pre-pass missed, instead of a separate windowed search per question.
+    # This is the main token/time saver: O(chunks) calls instead of O(questions x windows).
+    batch_starts = _batch_find_all_starts(client, numbered_lines, questions, set(found_starts.keys()), budget, log)
+    found_starts.update(batch_starts)
+
+    # STAGE 3 -- sibling sub-part groups: if a group's members collapsed onto the same
+    # (or missing) start from the batch pass, resolve their internal split with one
+    # bounded call per group (cheap -- only runs for actual multi-part questions).
+    for first_idx, group_indices in sibling_groups.items():
+        group_refs = [f"REF-{chr(65 + j)}" for j in group_indices]
+        if all(r in found_starts for r in group_refs):
             continue
-        ref = f"REF-{chr(65 + i)}"
-        q = questions[i]
-        if ref in found_starts:
-            pointer = found_starts[ref] + 1
-            i += 1
-            continue
-        log(f"Searching for the start of {ref} ({q[:60]}...) from line {pointer} onward...")
-        sub_part_hint = _build_sub_part_hint(questions, i)
-        future_anchor_lines = [v for k, v in found_starts.items() if _ref_to_question_index(k) > i]
-        bound_end_idx = (min(future_anchor_lines) + 1) if future_anchor_lines else None
-        start_line = _find_answer_start_sequential(
-            client, numbered_lines, q, ref, pointer, budget, log,
-            extra_reminder=sub_part_hint, end_idx=bound_end_idx
+        group_questions = [(f"REF-{chr(65 + j)}", questions[j]) for j in group_indices]
+        first_ref, first_q = group_questions[0]
+        anchor_before = max(
+            (v for k, v in found_starts.items() if _ref_to_question_index(k) < first_idx),
+            default=-1,
         )
-        if start_line is None:
-            log(f"  first pass found nothing for {ref} -- retrying once with a stronger reminder...")
-            reminder_parts = [
-                "REMINDER: a previous pass did not find this answer. The same "
-                "definition/explanation can legitimately repeat across the document -- "
-                "that does not disqualify a genuine match. Also check for a short "
-                "introductory line at the true start. If any plausible candidate exists "
-                "in this window, report it rather than returning found=false."
-            ]
-            if sub_part_hint:
-                reminder_parts.append(sub_part_hint)
-            start_line = _find_answer_start_sequential(
-                client, numbered_lines, q, ref, pointer, budget, log,
-                extra_reminder="\n\n".join(reminder_parts), end_idx=bound_end_idx
+        anchor_after = min(
+            (v for k, v in found_starts.items() if _ref_to_question_index(k) > group_indices[-1]),
+            default=total_lines,
+        )
+        group_start = found_starts.get(first_ref)
+        if group_start is None:
+            group_start = _find_answer_start_sequential(
+                client, numbered_lines, first_q, first_ref, anchor_before + 1, budget, log,
+                end_idx=anchor_after
             )
-            if start_line is not None:
-                log(f"  retry recovered {ref} starting at line {start_line}")
-        if start_line is not None:
-            found_starts[ref] = start_line
-            log(f"  found {ref} starting at line {start_line}")
-            pointer = start_line + 1
-        else:
-            log(
-                f"NOTE: could not find the start of {ref} anywhere from line {pointer} to "
-                f"the end of the document ({total_lines} lines) in this pass -- it will be "
-                f"picked up by the rescue pass / guaranteed force-fill below, so it will "
-                f"still appear in the final output."
+        if group_start is None:
+            log(f"NOTE: sibling group {group_refs} not found in this pass -- will be recovered by rescue/force-fill.")
+            continue
+        found_starts[first_ref] = group_start
+        upper = anchor_after - 1 if anchor_after < total_lines else total_lines - 1
+        if len(group_questions) > 1:
+            sibling_starts = _resolve_sibling_group_batch(
+                client, numbered_lines, group_questions, group_start, upper, budget, log
             )
-        i += 1
+            for ref, sl in sibling_starts.items():
+                found_starts[ref] = sl
+                log(f"  found {ref} (sibling) at line {sl}")
+
     ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
     ranges = []
     for idx, (ref, start) in enumerate(ordered):
         end = ordered[idx + 1][1] - 1 if idx + 1 < len(ordered) else total_lines - 1
         ranges.append({"ref": ref, "start_line": start, "end_line": end})
-    log(f"Sequential mapping found {len(ranges)} of {len(questions)} question(s) before rescue/force-fill")
+    log(f"Label + batch pass found {len(ranges)} of {n} question(s) before rescue/force-fill")
+
+    # STAGE 4 -- targeted rescue only for the (usually very few) stragglers.
     ranges = _rescue_unmatched_questions(client, numbered_lines, questions, ranges, budget, log)
+    # STAGE 5 -- guarantee: whatever's still missing gets a fallback range, never dropped.
     ranges = _force_fill_missing_refs(questions, ranges, total_lines, log)
-    log(f"Final: {len(ranges)} of {len(questions)} question(s) present in output (force-fill guarantees all {len(questions)} appear)")
+    log(f"Final: {len(ranges)} of {n} question(s) present in output (force-fill guarantees all {n} appear)")
     ranges_by_ref = {r["ref"]: r for r in ranges}
     results = []
     for i, q in enumerate(questions):
