@@ -351,6 +351,7 @@ class _TokenBudgetTracker:
         self._prune(now)
         return sum(tok for _, tok in self.events)
     def wait_if_needed(self, upcoming_tokens: int, log=print):
+        already_warned_oversized = False
         while True:
             with _budget_lock:
                 now = time.monotonic()
@@ -359,6 +360,23 @@ class _TokenBudgetTracker:
                 if projected <= self.safe_limit:
                     # Reserve immediately, inside the same lock, so a concurrent
                     # thread checking a microsecond later already sees this usage.
+                    self.events.append((now, upcoming_tokens))
+                    return
+                # CRITICAL: if this single request's own size already exceeds the
+                # entire safe budget, no amount of waiting will ever fix it -- there
+                # is nothing to "free up" (used can be 0 and it still won't fit).
+                # Waiting forever here was an infinite-loop bug. Proceed anyway and
+                # let Groq's own 429 (with its actual retry-after) handle it if needed.
+                if upcoming_tokens >= self.safe_limit:
+                    if not already_warned_oversized:
+                        log(
+                            f"NOTE: this request alone (~{upcoming_tokens} tokens) is at or "
+                            f"above the tracked safe budget ({self.safe_limit:.0f}) -- proactive "
+                            f"pacing can't help here, sending it directly. If Groq rejects it "
+                            f"with a 429, the retry logic will back off using Groq's own "
+                            f"reported wait time."
+                        )
+                        already_warned_oversized = True
                     self.events.append((now, upcoming_tokens))
                     return
                 needed_to_free = projected - self.safe_limit
@@ -1269,9 +1287,27 @@ Rules:
 Return ONLY valid JSON (no markdown fences, no commentary):
 {"starts": [{"ref": "REF-C", "start_line": 88}, {"ref": "REF-D", "start_line": 140}]}
 Omit any question whose answer isn't in this chunk. If none match, return {"starts": []}."""
-BATCH_CHUNK_CHARS = int(os.getenv("GROQ_BATCH_CHUNK_CHARS", "7000"))
+BATCH_CHUNK_CHARS = int(os.getenv("GROQ_BATCH_CHUNK_CHARS", "7000"))  # ceiling; actual size is adaptive, see below
 BATCH_CHUNK_OVERLAP_LINES = 3
 BATCH_MAX_CONCURRENCY = GROQ_MAX_CONCURRENT_CALLS
+BATCH_CHUNK_TARGET_FRACTION = 0.5  # aim to use at most half the safe budget per single call
+def _compute_safe_chunk_chars(budget: "_TokenBudgetTracker", overhead_chars: int,
+                                ceiling_chars: int = BATCH_CHUNK_CHARS,
+                                target_fraction: float = BATCH_CHUNK_TARGET_FRACTION,
+                                min_chunk_chars: int = 1200) -> int:
+    """
+    The question list (+ sibling note) gets re-sent as overhead on EVERY chunk call,
+    so with many questions that overhead alone can already eat most of a tight TPM
+    budget -- a fixed chunk-char size doesn't account for that and can produce a
+    single request bigger than the whole safe budget (the "8289 > 6800, forever"
+    situation). Size the chunk dynamically instead: budget the tokens, subtract
+    the overhead, spend the rest on transcript text.
+    """
+    target_tokens = budget.safe_limit * target_fraction
+    overhead_tokens = _estimate_tokens(" " * overhead_chars) + 800
+    remaining_tokens = max(300, target_tokens - overhead_tokens)
+    chunk_chars = int(remaining_tokens * CHARS_PER_TOKEN_ESTIMATE)
+    return max(min_chunk_chars, min(ceiling_chars, chunk_chars))
 def _chunk_numbered_lines_by_chars(numbered_lines: list, chunk_chars: int = BATCH_CHUNK_CHARS,
                                      overlap_lines: int = BATCH_CHUNK_OVERLAP_LINES) -> list:
     chunks = []
@@ -1297,13 +1333,17 @@ def _batch_find_all_starts(client, numbered_lines: list, questions: list, alread
     ]
     if not open_questions:
         return {}
-    chunks = _chunk_numbered_lines_by_chars(numbered_lines)
-    log(
-        f"Batch pass: scanning {len(chunks)} chunk(s) once for all {len(open_questions)} "
-        f"remaining question(s) (up to {max_workers} chunk(s) in flight at once) -- "
-        f"replaces what used to be up to {len(open_questions) * 20}+ separate window calls."
-    )
     sibling_note = _build_group_sibling_note(open_questions)
+    questions_block_chars = sum(len(ref) + len(q) + 4 for ref, q in open_questions)
+    overhead_chars = questions_block_chars + len(sibling_note or "") + len(BATCH_START_FINDER_SYSTEM_PROMPT)
+    chunk_chars = _compute_safe_chunk_chars(budget, overhead_chars)
+    chunks = _chunk_numbered_lines_by_chars(numbered_lines, chunk_chars=chunk_chars)
+    log(
+        f"Batch pass: scanning {len(chunks)} chunk(s) (~{chunk_chars} chars each, sized to fit "
+        f"this account's token budget) for all {len(open_questions)} remaining question(s) "
+        f"(up to {max_workers} chunk(s) in flight at once) -- replaces what used to be up to "
+        f"{len(open_questions) * 20}+ separate window calls."
+    )
     def _run_chunk(chunk):
         user_prompt = _build_windowed_multi_target_prompt(chunk, open_questions, sibling_note)
         try:
