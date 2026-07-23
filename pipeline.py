@@ -682,19 +682,24 @@ def _words_nearly_match(w1: str, w2: str) -> bool:
         return False
     return difflib.SequenceMatcher(None, w1, w2).ratio() >= 0.8
 def _is_near_duplicate_question(q1: str, q2: str) -> bool:
-    k1, k2 = _normalize_question_key(q1), _normalize_question_key(q2)
-    if k1 == k2:
-        return True
-    ratio = difflib.SequenceMatcher(None, k1, k2).ratio()
-    if ratio < 0.90:
-        return False
-    words1 = sorted(set(re.findall(r'[a-z]{3,}', k1)))
-    words2 = sorted(set(re.findall(r'[a-z]{3,}', k2)))
-    if not words1 or not words2:
-        return ratio >= 0.92
-    matched = sum(1 for w1 in words1 if any(_words_nearly_match(w1, w2) for w2 in words2))
-    overlap = matched / max(len(words1), len(words2))
-    return ratio >= 0.90 and overlap >= 0.92
+    """
+    FIX: previously used fuzzy similarity (>=90% text-similarity ratio
+    plus >=92% word overlap) to catch "near duplicate" questions. This
+    was a confirmed, reproduced cause of a REAL question silently
+    disappearing from the final list (e.g. "12 questions on the paper,
+    only 11 extracted"): sibling sub-parts of a multi-part question
+    deliberately carry the SAME parent instruction text forward into
+    each sub-part for self-containment (per the extraction prompt's own
+    rules) -- e.g. "1.(i) Identify and explain: theme of light." and
+    "1.(ii) Identify and explain: theme of darkness." share almost all
+    their wording and easily cross a 90% fuzzy-similarity threshold
+    despite being two completely separate, genuine questions. Only an
+    EXACT match (after normalizing case/whitespace/leading numbering)
+    now counts as a duplicate -- fuzzy similarity is no longer used at
+    all for this check, so two questions must be identical in wording,
+    not merely similar, to be treated as the same question.
+    """
+    return _normalize_question_key(q1) == _normalize_question_key(q2)
 def _dedup_questions(questions: list) -> list:
     unique = []
     for q in questions:
