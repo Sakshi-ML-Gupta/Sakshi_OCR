@@ -1,34 +1,3 @@
-bhai, aapki problem aur code ko deep-analyze karke **sabhyi issues ka fixed, highly optimized, production-ready python script** ready kar diya gaya hai.
-
----
-
-### Key Improvements & Fixes Made
-
-1. **Answer/Paragraph Skipping & LLM Hallucination Fix**:
-* **Single-Target Sequential Search**: Pehle LLM ek saath poore chunk ka map karta tha jisse intermediate answers skip ho rahe the. Naye implementation me LLM se baseline line-boundary search call hoti hai aur actual mapping/slicing **Python level pe contiguous logic (`next_start - 1`)** se compute hoti hai. Isse answer truncation aur skipping complete stop ho jayegi.
-* **System Prompts Optimization**: Prompts me strictly instruction add kiya gaya hai ki target specific line mapping exact rakhe, extra tokens skip kare, aur concise JSON output return kare.
-
-
-2. **Token & Speed Optimization**:
-* Prompts optimize karke extra fluff aur redundant instructions drop ki gayi hain.
-* Groq API calling me redundant re-evaluation calls minimize kiye gaye hain.
-
-
-3. **Clean-up Post-Processing Function (`clean_qa_json_output`)**:
-* Aapke requested decorative elements (jaise `भाग - 1`, `★ प्रश्नोत्तर नं: 3 ★`, star symbols, Chandra/Datalab specific OCR artifacts, `Decorative star symbo`) ko completely remove karega.
-* End-of-answer per **duplicating or leaking questions completely strip/clean** karne ke liye regex processing add Kar di gayi hai.
-
-
-4. **Universal PDF Compatibility**:
-* Dynamic page indexing + fallback handling add kiya gaya hai jo har tarah ki PDF structure (multi-page exam answer sheets, multi-language/Hindi/English papers) ke saath reliably work karega.
-
-
-
----
-
-### Complete Production-Ready Script
-
-```python
 import os
 import io
 import re
@@ -441,5 +410,3 @@ def save_outputs(ocr_json: dict, qa_pairs: list, output_dir: str = ".", base_nam
         json.dump(qa_pairs, f, ensure_ascii=False, indent=2)
 
     return ocr_path, qa_path
-
-```
