@@ -301,6 +301,11 @@ def identify_questions(pages: List[Dict], status_callback=None) -> Tuple[List[in
     if not pages:
         return [], [], []
 
+    # Initialize with defaults
+    qp_indices = []
+    admin_indices = []
+    questions = []
+
     # Quick heuristic check for question pages first
     candidate_qp_pages = []
     for i, page in enumerate(pages):
@@ -316,57 +321,86 @@ def identify_questions(pages: List[Dict], status_callback=None) -> Tuple[List[in
     if candidate_qp_pages:
         log(f"Found {len(candidate_qp_pages)} candidate question pages via heuristics")
         qp_indices = candidate_qp_pages
+        admin_indices = []
     else:
         # Fallback to LLM
-        from groq import Groq
-        
-        api_key = get_api_key("GROQ_API_KEY")
-        if not api_key:
-            raise Exception("GROQ_API_KEY not found")
-        
-        client = Groq(api_key=api_key)
-        
-        # Process in chunks
-        all_qp = []
-        all_admin = []
-        
-        for i in range(0, len(pages), 5):
-            chunk = pages[i:i+5]
-            chunk_text = "\n\n".join([f"PAGE {p['page_number']}:\n{p['raw_text'][:3000]}" for p in chunk])
+        try:
+            from groq import Groq
             
-            user_prompt = f"Pages shown:\n{chunk_text}\n\nWhich pages are question paper pages? Admin pages?"
+            api_key = get_api_key("GROQ_API_KEY")
+            if not api_key:
+                log("GROQ_API_KEY not found, using regex fallback")
+                # Try to find questions using regex on all pages
+                all_text = "\n".join([p["raw_text"] for p in pages])
+                matches = re.findall(r'(?m)^\s*(\d+[\.\)]\s*[^\n]{10,})', all_text)
+                if matches:
+                    questions = [m.strip() for m in matches[:20]]
+                    # Assume pages with numbers are question pages
+                    qp_indices = [i for i, p in enumerate(pages) if re.search(r'(?m)^\s*\d+[\.\)]\s', p["raw_text"])]
+                    admin_indices = []
+                    log(f"Regex fallback: found {len(questions)} questions on {len(qp_indices)} pages")
+                    return qp_indices, questions, admin_indices
+                else:
+                    log("No questions found in document")
+                    return [], [], []
             
-            try:
-                response = client.chat.completions.create(
-                    model="openai/gpt-oss-120b",
-                    messages=[
-                        {"role": "system", "content": QP_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.0,
-                )
-                data = json.loads(response.choices[0].message.content)
-                qp_pages = data.get("qp_pages", [])
-                admin_pages = data.get("admin_pages", [])
+            client = Groq(api_key=api_key)
+            all_qp = []
+            all_admin = []
+            
+            # Process in chunks
+            for i in range(0, len(pages), 5):
+                chunk = pages[i:i+5]
+                chunk_text = "\n\n".join([f"PAGE {p['page_number']}:\n{p['raw_text'][:3000]}" for p in chunk])
                 
-                # Convert 1-based to 0-based
-                for p in qp_pages:
-                    if 1 <= p <= len(pages):
-                        all_qp.append(p - 1)
-                for p in admin_pages:
-                    if 1 <= p <= len(pages):
-                        all_admin.append(p - 1)
-                        
-            except Exception as e:
-                log(f"LLM call failed for chunk {i//5 + 1}: {e}")
-                continue
-        
-        qp_indices = sorted(set(all_qp))
-        admin_indices = sorted(set(all_admin))
-        
-        # Remove admin from qp
-        qp_indices = [i for i in qp_indices if i not in admin_indices]
+                user_prompt = f"Pages shown:\n{chunk_text}\n\nWhich pages are question paper pages? Admin pages?"
+                
+                try:
+                    response = client.chat.completions.create(
+                        model="openai/gpt-oss-120b",
+                        messages=[
+                            {"role": "system", "content": QP_SYSTEM_PROMPT},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        response_format={"type": "json_object"},
+                        temperature=0.0,
+                    )
+                    data = json.loads(response.choices[0].message.content)
+                    qp_pages = data.get("qp_pages", [])
+                    admin_pages = data.get("admin_pages", [])
+                    
+                    # Convert 1-based to 0-based
+                    for p in qp_pages:
+                        if 1 <= p <= len(pages):
+                            all_qp.append(p - 1)
+                    for p in admin_pages:
+                        if 1 <= p <= len(pages):
+                            all_admin.append(p - 1)
+                            
+                except Exception as e:
+                    log(f"LLM call failed for chunk {i//5 + 1}: {e}")
+                    continue
+            
+            qp_indices = sorted(set(all_qp))
+            admin_indices = sorted(set(all_admin))
+            
+            # Remove admin from qp
+            qp_indices = [i for i in qp_indices if i not in admin_indices]
+            
+        except Exception as e:
+            log(f"LLM fallback failed: {e}")
+            # Last resort: use regex on all pages
+            all_text = "\n".join([p["raw_text"] for p in pages])
+            matches = re.findall(r'(?m)^\s*(\d+[\.\)]\s*[^\n]{10,})', all_text)
+            if matches:
+                questions = [m.strip() for m in matches[:20]]
+                qp_indices = [i for i, p in enumerate(pages) if re.search(r'(?m)^\s*\d+[\.\)]\s', p["raw_text"])]
+                admin_indices = []
+                log(f"Emergency fallback: found {len(questions)} questions")
+                return qp_indices, questions, admin_indices
+            else:
+                log("No questions could be identified")
+                return [], [], []
     
     # Extract questions from QP pages
     questions = []
@@ -392,11 +426,11 @@ def identify_questions(pages: List[Dict], status_callback=None) -> Tuple[List[in
         
         # If regex failed, use LLM
         if not questions:
-            from groq import Groq
-            api_key = get_api_key("GROQ_API_KEY")
-            if api_key:
-                client = Groq(api_key=api_key)
-                try:
+            try:
+                from groq import Groq
+                api_key = get_api_key("GROQ_API_KEY")
+                if api_key:
+                    client = Groq(api_key=api_key)
                     response = client.chat.completions.create(
                         model="openai/gpt-oss-120b",
                         messages=[
@@ -408,8 +442,8 @@ def identify_questions(pages: List[Dict], status_callback=None) -> Tuple[List[in
                     )
                     data = json.loads(response.choices[0].message.content)
                     questions = data.get("questions", [])
-                except Exception as e:
-                    log(f"Question extraction failed: {e}")
+            except Exception as e:
+                log(f"Question extraction failed: {e}")
     
     # Remove duplicate questions
     seen = set()
@@ -420,7 +454,18 @@ def identify_questions(pages: List[Dict], status_callback=None) -> Tuple[List[in
             seen.add(q_clean)
             unique_questions.append(q)
     
-    log(f"Identified {len(qp_indices)} QP pages, {len(unique_questions)} questions")
+    # If still no questions, try one more regex pass on all pages
+    if not unique_questions:
+        all_text = "\n".join([p["raw_text"] for p in pages])
+        matches = re.findall(r'(?m)^\s*(\d+[\.\)]\s*[^\n]{10,})', all_text)
+        if matches:
+            unique_questions = [m.strip() for m in matches[:20]]
+            # Update qp_indices to include all pages with numbers
+            qp_indices = [i for i, p in enumerate(pages) if re.search(r'(?m)^\s*\d+[\.\)]\s', p["raw_text"])]
+            admin_indices = [i for i in range(len(pages)) if i not in qp_indices]
+            log(f"Final fallback: found {len(unique_questions)} questions")
+    
+    log(f"Identified {len(qp_indices)} QP pages, {len(unique_questions)} questions, {len(admin_indices)} admin pages")
     return qp_indices, unique_questions, admin_indices
 
 
