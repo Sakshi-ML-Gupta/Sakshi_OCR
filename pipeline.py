@@ -156,27 +156,19 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None) -> List[D
 
 
 # =========================================================
-# SIMPLE QUESTION EXTRACTION - REGEX FIRST, LLM ONLY IF NEEDED
+# EXTRACT QUESTIONS - SIMPLE REGEX
 # =========================================================
 
-def extract_questions(pages: List[Dict], status_callback=None) -> Tuple[List[int], List[str]]:
-    """Extract questions using regex first, LLM fallback."""
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
-
-    if not pages:
-        return [], []
-
-    # STEP 1: Try to find question pages using simple heuristics
+def extract_questions(pages: List[Dict]) -> Tuple[List[int], List[str]]:
+    """Extract questions from pages using regex."""
+    
     question_pages = []
     all_text = ""
     
     for i, page in enumerate(pages):
         text = page["raw_text"]
         # Check if page has numbered questions
-        if re.search(r'(?m)^\s*\d+[\.\)]\s+[A-Za-z]', text):
+        if re.search(r'(?m)^\s*\d+[\.\)]\s+', text):
             question_pages.append(i)
             all_text += text + "\n\n"
     
@@ -187,7 +179,7 @@ def extract_questions(pages: List[Dict], status_callback=None) -> Tuple[List[int
                 question_pages.append(i)
                 all_text += page["raw_text"] + "\n\n"
     
-    # STEP 2: Extract questions using regex
+    # Extract questions
     questions = []
     if all_text:
         # Pattern to match numbered questions
@@ -195,99 +187,95 @@ def extract_questions(pages: List[Dict], status_callback=None) -> Tuple[List[int
         matches = re.findall(pattern, all_text)
         if matches:
             questions = [m.strip() for m in matches]
-            log(f"Regex extracted {len(questions)} questions")
     
-    # STEP 3: If regex fails, use LLM
-    if not questions and question_pages:
-        try:
-            from groq import Groq
-            api_key = get_api_key("GROQ_API_KEY")
-            if api_key:
-                client = Groq(api_key=api_key)
-                
-                # Take first 3 question pages or first 5000 chars
-                qp_text = all_text[:8000]
-                
-                response = client.chat.completions.create(
-                    model="openai/gpt-oss-120b",
-                    messages=[
-                        {"role": "system", "content": "Extract all numbered questions from the text. Return JSON: {\"questions\": [\"1. Question text\", \"2. Question text\"]}"},
-                        {"role": "user", "content": f"Questions text:\n{qp_text}"}
-                    ],
-                    temperature=0.0,
-                )
-                
-                content = response.choices[0].message.content
-                # Try to parse JSON
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    data = json.loads(json_match.group())
-                    questions = data.get("questions", [])
-                    log(f"LLM extracted {len(questions)} questions")
-        except Exception as e:
-            log(f"LLM fallback failed: {e}")
+    # If still no questions, try simpler pattern
+    if not questions:
+        pattern = r'(?m)^\s*(\d+)\s*[\.\)]\s*([^\n]+)'
+        matches = re.findall(pattern, all_text)
+        if matches:
+            questions = [f"{m[0]}. {m[1]}" for m in matches]
     
-    # Clean up questions
-    cleaned = []
-    seen = set()
-    for q in questions:
-        # Remove duplicate question numbers
-        q_clean = re.sub(r'^\d+[\.\)]\s*', '', q).strip()
-        if q_clean and q_clean not in seen:
-            seen.add(q_clean)
-            cleaned.append(q)
-    
-    log(f"Final: {len(question_pages)} question pages, {len(cleaned)} questions")
-    return question_pages, cleaned
+    print(f"Found {len(questions)} questions on {len(question_pages)} pages")
+    return question_pages, questions
 
 
 # =========================================================
-# SIMPLE ANSWER MAPPING - WITHOUT LLM
+# ANSWER MAPPING - DIRECT TEXT MATCHING (NO LLM)
 # =========================================================
 
-def map_answers_simple(answer_lines: List[str], questions: List[str]) -> List[Dict]:
-    """Simple answer mapping using text matching."""
+def map_answers_direct(answer_lines: List[str], questions: List[str]) -> List[Dict]:
+    """Directly map answers by matching question numbers."""
     
     results = []
     
     for q_idx, question in enumerate(questions):
-        # Extract question number (e.g., "1.", "2.")
+        # Extract question number
         q_num_match = re.match(r'^\s*(\d+)', question)
         q_num = q_num_match.group(1) if q_num_match else str(q_idx + 1)
         
+        print(f"Looking for answer to question {q_num}: {question[:50]}...")
+        
         # Find where this answer starts
         start_idx = None
+        
+        # Pattern 1: "Ans 1.", "Answer 1:", "उत्तर 1"
+        patterns = [
+            rf'(?i)(?:Ans|Answer|उत्तर|प्र)\s*{q_num}[\.\s:-]',
+            rf'(?i)question\s*{q_num}',
+            rf'\b{q_num}[\.\)]\s+[A-Z]',
+        ]
+        
         for i, line in enumerate(answer_lines):
-            # Look for answer marker like "Ans 1", "Answer 1", "1.", "Q1."
-            if re.search(rf'(?:Ans|Answer|उत्तर|प्र)\s*{q_num}[\.\s:-]', line, re.IGNORECASE):
-                start_idx = i
+            for pattern in patterns:
+                if re.search(pattern, line):
+                    start_idx = i
+                    print(f"  Found start at line {i}: {line[:50]}...")
+                    break
+            if start_idx is not None:
                 break
-            # Or if line contains the question number and looks like an answer
-            if re.search(rf'\b{q_num}[\.\)]\s+[A-Za-z]', line):
-                start_idx = i
-                break
+        
+        # If not found, try to find any line containing the question number
+        if start_idx is None:
+            for i, line in enumerate(answer_lines):
+                if re.search(rf'\b{q_num}\b', line) and len(line) > 20:
+                    start_idx = i
+                    print(f"  Found by number at line {i}: {line[:50]}...")
+                    break
         
         if start_idx is not None:
             # Find where next answer starts
-            next_q_num = str(q_idx + 2)
+            next_q_num = str(int(q_num) + 1)
             end_idx = len(answer_lines)
+            
             for i in range(start_idx + 1, len(answer_lines)):
-                if re.search(rf'(?:Ans|Answer|उत्तर|प्र)\s*{next_q_num}[\.\s:-]', answer_lines[i], re.IGNORECASE):
+                if re.search(rf'(?i)(?:Ans|Answer|उत्तर|प्र)\s*{next_q_num}[\.\s:-]', answer_lines[i]):
                     end_idx = i
                     break
-                if re.search(rf'\b{next_q_num}[\.\)]\s+[A-Za-z]', answer_lines[i]):
+                if re.search(rf'\b{next_q_num}[\.\)]\s+[A-Z]', answer_lines[i]):
                     end_idx = i
                     break
+                # If we see a new question number
+                if re.search(rf'\b\d+[\.\)]\s+[A-Z]', answer_lines[i]):
+                    # Check if it's a different question
+                    num_match = re.search(r'\b(\d+)[\.\)]', answer_lines[i])
+                    if num_match and num_match.group(1) != q_num:
+                        end_idx = i
+                        break
             
             # Extract answer text
-            answer_text = " ".join(answer_lines[start_idx:end_idx]).strip()
+            answer_text = "\n".join(answer_lines[start_idx:end_idx]).strip()
+            
+            # Remove the "Ans" prefix if present
+            answer_text = re.sub(r'(?i)^(?:Ans|Answer|उत्तर|प्र)\s*\d+[\.\s:-]*', '', answer_text).strip()
             
             results.append({
                 "question": question,
                 "answer": answer_text,
                 "matched": True
             })
+            print(f"  Matched: {len(answer_text)} chars")
         else:
+            print(f"  No match found for question {q_num}")
             results.append({
                 "question": question,
                 "answer": "",
@@ -298,82 +286,61 @@ def map_answers_simple(answer_lines: List[str], questions: List[str]) -> List[Di
 
 
 # =========================================================
-# HYBRID ANSWER MAPPING - LLM ONLY FOR TOUGH CASES
+# FALLBACK - SPLIT BY PAGE IF NO ANSWERS FOUND
 # =========================================================
 
-def map_answers_hybrid(answer_lines: List[str], questions: List[str], 
-                       status_callback=None) -> List[Dict]:
-    """Map answers using regex first, LLM for tough cases."""
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
+def map_answers_fallback(pages: List[Dict], question_pages: List[int]) -> List[Dict]:
+    """Fallback: treat each page after question pages as an answer."""
     
-    # First try simple matching
-    results = map_answers_simple(answer_lines, questions)
-    matched_count = sum(1 for r in results if r["matched"])
+    results = []
     
-    # If less than 50% matched, use LLM for the rest
-    if matched_count < len(questions) * 0.5:
-        log(f"Simple matching found only {matched_count}/{len(questions)}, using LLM...")
+    # Get all non-question pages as answers
+    answer_page_indices = [i for i in range(len(pages)) if i not in question_pages]
+    
+    if not answer_page_indices:
+        return []
+    
+    # Combine all answer text
+    all_answer_text = ""
+    for idx in answer_page_indices:
+        all_answer_text += pages[idx]["raw_text"] + "\n\n"
+    
+    # Try to split by question numbers
+    answer_lines = all_answer_text.split("\n")
+    answer_lines = [l.strip() for l in answer_lines if l.strip()]
+    
+    # Try to find question numbers in the answer text
+    # If we can't find answers, just return the whole text as one answer
+    if answer_lines:
+        # Group by question numbers found in text
+        q_pattern = r'(?m)^\s*(\d+)[\.\)]\s+'
+        matches = list(re.finditer(q_pattern, all_answer_text))
         
-        try:
-            from groq import Groq
-            api_key = get_api_key("GROQ_API_KEY")
-            if api_key:
-                client = Groq(api_key=api_key)
+        if matches:
+            # Split by each question number found
+            for i, match in enumerate(matches):
+                q_num = match.group(1)
+                start = match.start()
+                end = matches[i+1].start() if i+1 < len(matches) else len(all_answer_text)
+                answer_text = all_answer_text[start:end].strip()
                 
-                # Get unmatched questions
-                unmatched = [r for r in results if not r["matched"]]
-                if unmatched:
-                    # Build numbered lines for LLM
-                    numbered_lines = [f"[{i}] {line}" for i, line in enumerate(answer_lines)]
-                    text = "\n".join(numbered_lines[:2000])  # Limit context
-                    
-                    for r in unmatched:
-                        q = r["question"]
-                        q_num = re.match(r'^\s*(\d+)', q)
-                        q_num = q_num.group(1) if q_num else "unknown"
-                        
-                        user_prompt = f"""Question: {q}
-
-Answer text (line numbers in [brackets]):
-{text}
-
-Find which line number the answer to this question starts at.
-Return only the line number (just the number, e.g., 42).
-If not found, return -1.
-
-Line number:"""
-
-                        response = client.chat.completions.create(
-                            model="openai/gpt-oss-120b",
-                            messages=[
-                                {"role": "system", "content": "Return only a number."},
-                                {"role": "user", "content": user_prompt}
-                            ],
-                            temperature=0.0,
-                            max_tokens=10,
-                        )
-                        
-                        content = response.choices[0].message.content.strip()
-                        num_match = re.search(r'(\d+)', content)
-                        if num_match:
-                            start_idx = int(num_match.group(1))
-                            if 0 <= start_idx < len(answer_lines):
-                                # Find end
-                                end_idx = len(answer_lines)
-                                next_q = str(int(q_num) + 1)
-                                for i in range(start_idx + 1, len(answer_lines)):
-                                    if re.search(rf'\b{next_q}[\.\)]', answer_lines[i]):
-                                        end_idx = i
-                                        break
-                                
-                                r["answer"] = " ".join(answer_lines[start_idx:end_idx]).strip()
-                                r["matched"] = True
-                                log(f"LLM found answer for question {q_num}")
-        except Exception as e:
-            log(f"LLM fallback failed: {e}")
+                # Find matching question
+                for q in questions:
+                    if q.startswith(q_num):
+                        results.append({
+                            "question": q,
+                            "answer": answer_text,
+                            "matched": True
+                        })
+                        break
+        else:
+            # If no question numbers found, treat entire text as one answer
+            if questions:
+                results.append({
+                    "question": questions[0],
+                    "answer": all_answer_text.strip(),
+                    "matched": True
+                })
     
     return results
 
@@ -401,31 +368,48 @@ def process_pdf(file_input, status_callback=None) -> Tuple[Dict, List[Dict]]:
 
     # Step 2: Extract questions
     log("Extracting questions...")
-    question_pages, questions = extract_questions(pages, status_callback)
+    question_pages, questions = extract_questions(pages)
     
     if not questions:
         raise Exception("No questions found in the document")
     
     log(f"Found {len(questions)} questions")
 
-    # Step 3: Extract answer text (skip question pages)
+    # Step 3: Extract answer text
     answer_lines = []
     answer_page_indices = [i for i in range(len(pages)) if i not in question_pages]
     
-    for page_idx in answer_page_indices:
-        page = pages[page_idx]
-        for line in page["raw_text"].split("\n"):
-            if line.strip():
-                answer_lines.append(line)
+    if answer_page_indices:
+        log(f"Found {len(answer_page_indices)} answer pages")
+        for page_idx in answer_page_indices:
+            page = pages[page_idx]
+            for line in page["raw_text"].split("\n"):
+                if line.strip() and len(line.strip()) > 10:  # Skip very short lines
+                    answer_lines.append(line.strip())
+    else:
+        log("No separate answer pages found, using all non-question text")
+        # Use all text except question pages
+        for page in pages:
+            if page not in question_pages:
+                for line in page["raw_text"].split("\n"):
+                    if line.strip() and len(line.strip()) > 10:
+                        answer_lines.append(line.strip())
     
     log(f"Extracted {len(answer_lines)} answer lines")
 
     # Step 4: Map answers
-    log("Mapping answers...")
-    qa_pairs = map_answers_hybrid(answer_lines, questions, status_callback)
+    log("Mapping answers directly...")
+    qa_pairs = map_answers_direct(answer_lines, questions)
     
     matched = sum(1 for p in qa_pairs if p["matched"])
-    log(f"Matched {matched}/{len(questions)} questions")
+    log(f"Matched {matched}/{len(questions)} questions directly")
+    
+    # If no answers matched, try fallback
+    if matched == 0:
+        log("No answers matched directly, trying fallback...")
+        qa_pairs = map_answers_fallback(pages, question_pages)
+        matched = sum(1 for p in qa_pairs if p["matched"])
+        log(f"Fallback matched {matched}/{len(questions)} questions")
 
     return ocr_json, qa_pairs
 
