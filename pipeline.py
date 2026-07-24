@@ -268,25 +268,6 @@ Rules:
 - Preserve numbering
 - JSON ONLY. No markdown."""
 
-ANSWER_MAP_SYSTEM = """Map each question to its answer. Given:
-1. Questions with REF-X labels
-2. Student answers with line numbers [0], [1], etc.
-
-Return JSON:
-{
-  "matches": [
-    {"ref": "REF-A", "start": 12, "end": 25}
-  ]
-}
-
-Rules:
-- Each answer starts where student restates/references the question
-- Include ALL lines of the answer
-- If answer not found, omit it
-- Use ONLY line numbers shown
-- JSON ONLY. No markdown."""
-
-
 # =========================================================
 # QUESTION DETECTION (OPTIMIZED)
 # =========================================================
@@ -470,12 +451,12 @@ def identify_questions(pages: List[Dict], status_callback=None) -> Tuple[List[in
 
 
 # =========================================================
-# ANSWER MAPPING (OPTIMIZED - Sequential)
+# ANSWER MAPPING - USING SIMPLE TEXT RESPONSE (NO JSON)
 # =========================================================
 
 def map_answers(answer_lines: List[str], questions: List[str], 
                 status_callback=None) -> List[Dict]:
-    """Map questions to answers using sequential search."""
+    """Map questions to answers using sequential search with simple text responses."""
     def log(msg):
         print(msg)
         if status_callback:
@@ -506,43 +487,56 @@ def map_answers(answer_lines: List[str], questions: List[str],
         
         # Search forward from pointer
         found_start = None
-        chunk_size = 200  # lines per chunk
-        max_chunks = 50
+        chunk_size = 300  # lines per chunk
         
         for chunk_start in range(pointer, total_lines, chunk_size):
             chunk_end = min(chunk_start + chunk_size, total_lines)
             chunk = numbered[chunk_start:chunk_end]
             
-            # Build prompt
+            if not chunk:
+                break
+                
+            # Build prompt - SIMPLE, NO JSON
             chunk_text = "\n".join([f"[{idx}] {text}" for idx, text in chunk])
-            user_prompt = f"""Question ({ref}): {question}
+            
+            user_prompt = f"""Question: {question}
 
-Student answer lines (numbered):
+Answer lines (line numbers in [brackets]):
 {chunk_text}
 
-Find where the answer to this question STARTS. Return JSON:
-{{"found": true, "line": 12}} or {{"found": false}}"""
-            
+Find the line number where the answer to this question STARTS.
+- Look for the student restating the question or starting their response
+- Return ONLY the line number (e.g., 42)
+- If not found in this chunk, return -1
+
+Line number:"""
+
             try:
                 response = client.chat.completions.create(
                     model="openai/gpt-oss-120b",
                     messages=[
-                        {"role": "system", "content": "Find answer start. Return JSON."},
+                        {"role": "system", "content": "Return ONLY a single number - the line number where the answer starts, or -1 if not found."},
                         {"role": "user", "content": user_prompt}
                     ],
-                    response_format={"type": "json_object"},
                     temperature=0.0,
-                    max_tokens=100,  # Very short response
+                    max_tokens=10,  # Just need a number
                 )
-                data = json.loads(response.choices[0].message.content)
                 
-                if data.get("found") and "line" in data:
-                    line = int(data["line"])
-                    # Verify line is in this chunk
-                    if chunk_start <= line < chunk_end:
-                        found_start = line
-                        log(f"  Found start at line {line}")
+                # Parse the response
+                content = response.choices[0].message.content.strip()
+                
+                # Extract number from response
+                number_match = re.search(r'(-?\d+)', content)
+                if number_match:
+                    line_num = int(number_match.group(1))
+                    
+                    if 0 <= line_num < total_lines:
+                        found_start = line_num
+                        log(f"  Found start at line {line_num}")
                         break
+                    elif line_num == -1:
+                        # Not found in this chunk
+                        continue
                 
             except Exception as e:
                 log(f"  Search error in chunk {chunk_start}: {e}")
@@ -578,6 +572,7 @@ Find where the answer to this question STARTS. Return JSON:
     for result in results:
         if not result["matched"]:
             result["answer"] = ""
+            result["answer_raw"] = ""
             continue
         
         start, end = result["start"], result["end"]
@@ -651,7 +646,7 @@ def process_pdf(file_input, status_callback=None) -> Tuple[Dict, List[Dict]]:
         log("WARNING: No questions found, using heuristics...")
         # Emergency fallback: treat all pages as answer pages and try to find numbered items
         all_text = "\n".join([p["raw_text"] for p in pages])
-        matches = re.findall(r'(?m)^\s*(\d+[\.\)]\s*[^\n]+)', all_text)
+        matches = re.findall(r'(?m)^\s*(\d+[\.\)]\s*[^\n]{10,})', all_text)
         questions = [m.strip() for m in matches[:20]]  # Limit to 20 questions
         qp_indices = list(range(len(pages)))
         admin_indices = []
