@@ -123,7 +123,6 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None) -> List[D
     # Parse pages
     pages = []
     
-    # Try page markers
     markers = [
         r'\n\s*\{(\d+)\}\s*-{3,}\s*\n',
         r'\n\s*-{2,}\{(\d+)\}\s*-{2,}\s*\n',
@@ -146,7 +145,6 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None) -> List[D
                     pages.append({"page_number": idx + 1, "raw_text": text})
                 break
     
-    # Fallback: single page
     if not pages:
         pages = [{"page_number": 1, "raw_text": markdown.strip()}]
         log("WARNING: Could not detect page boundaries, treating as single page")
@@ -156,190 +154,207 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None) -> List[D
 
 
 # =========================================================
-# EXTRACT QUESTIONS - SIMPLE REGEX
+# SMART QUESTION EXTRACTION
 # =========================================================
 
-def extract_questions(pages: List[Dict]) -> Tuple[List[int], List[str]]:
-    """Extract questions from pages using regex."""
+def extract_questions_smart(pages: List[Dict]) -> Tuple[List[int], List[Dict]]:
+    """Extract questions with their context."""
     
     question_pages = []
-    all_text = ""
+    questions_with_context = []
     
     for i, page in enumerate(pages):
         text = page["raw_text"]
-        # Check if page has numbered questions
-        if re.search(r'(?m)^\s*\d+[\.\)]\s+', text):
+        
+        # Check for question patterns
+        # Pattern 1: Numbered questions with context
+        pattern = r'(?m)^\s*(\d+[\.\)])\s*([^\n]+(?:\n\s+[^\n\d]+)*)'
+        matches = re.findall(pattern, text)
+        
+        if matches:
             question_pages.append(i)
-            all_text += text + "\n\n"
+            for num, q_text in matches:
+                # Clean up the question text
+                q_text = q_text.strip()
+                if len(q_text) > 10:  # Avoid very short matches
+                    questions_with_context.append({
+                        "page": i,
+                        "number": num.strip(),
+                        "text": f"{num} {q_text}",
+                        "raw": q_text
+                    })
     
+    # If no clear question pages, try more patterns
     if not question_pages:
-        # If no clear question pages, check all pages
         for i, page in enumerate(pages):
-            if len(page["raw_text"]) < 2000 and re.search(r'\d+[\.\)]', page["raw_text"]):
-                question_pages.append(i)
-                all_text += page["raw_text"] + "\n\n"
+            text = page["raw_text"]
+            # Look for "Question" or "Answer" patterns
+            if re.search(r'(?i)(?:question|answer|write|explain|discuss)', text):
+                # Extract numbered items
+                matches = re.findall(r'(?m)^\s*(\d+[\.\)])\s*([^\n]{20,})', text)
+                if matches:
+                    question_pages.append(i)
+                    for num, q_text in matches:
+                        if len(q_text) > 20:
+                            questions_with_context.append({
+                                "page": i,
+                                "number": num.strip(),
+                                "text": f"{num} {q_text}",
+                                "raw": q_text
+                            })
     
-    # Extract questions
-    questions = []
-    if all_text:
-        # Pattern to match numbered questions
-        pattern = r'(?m)^\s*(\d+[\.\)]\s*[^\n]+(?:\n\s+[^\n\d]+)*)'
-        matches = re.findall(pattern, all_text)
-        if matches:
-            questions = [m.strip() for m in matches]
+    # Group questions by their number - handle multiple sections
+    grouped = {}
+    for q in questions_with_context:
+        num = q["number"]
+        if num not in grouped:
+            grouped[num] = []
+        grouped[num].append(q)
     
-    # If still no questions, try simpler pattern
-    if not questions:
-        pattern = r'(?m)^\s*(\d+)\s*[\.\)]\s*([^\n]+)'
-        matches = re.findall(pattern, all_text)
-        if matches:
-            questions = [f"{m[0]}. {m[1]}" for m in matches]
+    # For each number, keep the most detailed question
+    final_questions = []
+    for num, q_list in grouped.items():
+        # Sort by length (longer is usually more complete)
+        q_list.sort(key=lambda x: len(x["text"]), reverse=True)
+        final_questions.append(q_list[0])
     
-    print(f"Found {len(questions)} questions on {len(question_pages)} pages")
-    return question_pages, questions
+    # Sort by page order
+    final_questions.sort(key=lambda x: (x["page"], x["number"]))
+    
+    print(f"Found {len(question_pages)} question pages, {len(final_questions)} unique questions")
+    return question_pages, final_questions
 
 
 # =========================================================
-# ANSWER MAPPING - DIRECT TEXT MATCHING (NO LLM)
+# CONTEXT-AWARE ANSWER MAPPING
 # =========================================================
 
-def map_answers_direct(answer_lines: List[str], questions: List[str]) -> List[Dict]:
-    """Directly map answers by matching question numbers."""
+def map_answers_contextual(answer_lines: List[str], questions: List[Dict], 
+                           question_pages: List[int]) -> List[Dict]:
+    """Map answers using context and section boundaries."""
     
     results = []
     
-    for q_idx, question in enumerate(questions):
-        # Extract question number
-        q_num_match = re.match(r'^\s*(\d+)', question)
-        q_num = q_num_match.group(1) if q_num_match else str(q_idx + 1)
+    # Build full answer text with line numbers
+    full_text = "\n".join([f"[{i}] {line}" for i, line in enumerate(answer_lines)])
+    
+    # Find section boundaries in the answer text
+    # Look for patterns like "1." "2." "3." that indicate new sections
+    section_boundaries = []
+    for i, line in enumerate(answer_lines):
+        if re.match(r'^\s*\d+[\.\)]\s+[A-Z]', line):
+            section_boundaries.append(i)
+    
+    # If we have section boundaries, use them to split answers
+    if section_boundaries:
+        print(f"Found {len(section_boundaries)} section boundaries in answer text")
         
-        print(f"Looking for answer to question {q_num}: {question[:50]}...")
-        
-        # Find where this answer starts
-        start_idx = None
-        
-        # Pattern 1: "Ans 1.", "Answer 1:", "उत्तर 1"
-        patterns = [
-            rf'(?i)(?:Ans|Answer|उत्तर|प्र)\s*{q_num}[\.\s:-]',
-            rf'(?i)question\s*{q_num}',
-            rf'\b{q_num}[\.\)]\s+[A-Z]',
-        ]
-        
-        for i, line in enumerate(answer_lines):
-            for pattern in patterns:
-                if re.search(pattern, line):
-                    start_idx = i
-                    print(f"  Found start at line {i}: {line[:50]}...")
-                    break
-            if start_idx is not None:
-                break
-        
-        # If not found, try to find any line containing the question number
-        if start_idx is None:
-            for i, line in enumerate(answer_lines):
-                if re.search(rf'\b{q_num}\b', line) and len(line) > 20:
-                    start_idx = i
-                    print(f"  Found by number at line {i}: {line[:50]}...")
-                    break
-        
-        if start_idx is not None:
-            # Find where next answer starts
-            next_q_num = str(int(q_num) + 1)
-            end_idx = len(answer_lines)
+        for q in questions:
+            q_num = q["number"].replace('.', '').replace(')', '').strip()
+            q_text = q["text"]
             
-            for i in range(start_idx + 1, len(answer_lines)):
-                if re.search(rf'(?i)(?:Ans|Answer|उत्तर|प्र)\s*{next_q_num}[\.\s:-]', answer_lines[i]):
-                    end_idx = i
+            # Find where this answer starts - look for section with this number
+            start_idx = None
+            for i, line in enumerate(answer_lines):
+                # Check if line starts with this question number
+                if re.match(rf'^\s*{q_num}[\.\)]\s+', line):
+                    start_idx = i
                     break
-                if re.search(rf'\b{next_q_num}[\.\)]\s+[A-Z]', answer_lines[i]):
-                    end_idx = i
+                # Check for "Ans X" or "Answer X"
+                if re.search(rf'(?i)(?:ans|answer|उत्तर)\s*{q_num}[\.\s:-]', line):
+                    start_idx = i
                     break
-                # If we see a new question number
-                if re.search(rf'\b\d+[\.\)]\s+[A-Z]', answer_lines[i]):
-                    # Check if it's a different question
-                    num_match = re.search(r'\b(\d+)[\.\)]', answer_lines[i])
-                    if num_match and num_match.group(1) != q_num:
+            
+            if start_idx is not None:
+                # Find end - next section or next question number
+                end_idx = len(answer_lines)
+                next_num = str(int(q_num) + 1)
+                for i in range(start_idx + 1, len(answer_lines)):
+                    if re.match(rf'^\s*{next_num}[\.\)]\s+', answer_lines[i]):
                         end_idx = i
                         break
-            
-            # Extract answer text
-            answer_text = "\n".join(answer_lines[start_idx:end_idx]).strip()
-            
-            # Remove the "Ans" prefix if present
-            answer_text = re.sub(r'(?i)^(?:Ans|Answer|उत्तर|प्र)\s*\d+[\.\s:-]*', '', answer_text).strip()
-            
-            results.append({
-                "question": question,
-                "answer": answer_text,
-                "matched": True
-            })
-            print(f"  Matched: {len(answer_text)} chars")
-        else:
-            print(f"  No match found for question {q_num}")
-            results.append({
-                "question": question,
-                "answer": "",
-                "matched": False
-            })
-    
-    return results
-
-
-# =========================================================
-# FALLBACK - SPLIT BY PAGE IF NO ANSWERS FOUND
-# =========================================================
-
-def map_answers_fallback(pages: List[Dict], question_pages: List[int]) -> List[Dict]:
-    """Fallback: treat each page after question pages as an answer."""
-    
-    results = []
-    
-    # Get all non-question pages as answers
-    answer_page_indices = [i for i in range(len(pages)) if i not in question_pages]
-    
-    if not answer_page_indices:
-        return []
-    
-    # Combine all answer text
-    all_answer_text = ""
-    for idx in answer_page_indices:
-        all_answer_text += pages[idx]["raw_text"] + "\n\n"
-    
-    # Try to split by question numbers
-    answer_lines = all_answer_text.split("\n")
-    answer_lines = [l.strip() for l in answer_lines if l.strip()]
-    
-    # Try to find question numbers in the answer text
-    # If we can't find answers, just return the whole text as one answer
-    if answer_lines:
-        # Group by question numbers found in text
-        q_pattern = r'(?m)^\s*(\d+)[\.\)]\s+'
-        matches = list(re.finditer(q_pattern, all_answer_text))
-        
-        if matches:
-            # Split by each question number found
-            for i, match in enumerate(matches):
-                q_num = match.group(1)
-                start = match.start()
-                end = matches[i+1].start() if i+1 < len(matches) else len(all_answer_text)
-                answer_text = all_answer_text[start:end].strip()
-                
-                # Find matching question
-                for q in questions:
-                    if q.startswith(q_num):
-                        results.append({
-                            "question": q,
-                            "answer": answer_text,
-                            "matched": True
-                        })
+                    if re.search(rf'(?i)(?:ans|answer|उत्तर)\s*{next_num}[\.\s:-]', answer_lines[i]):
+                        end_idx = i
                         break
-        else:
-            # If no question numbers found, treat entire text as one answer
-            if questions:
+                
+                # Extract answer
+                answer_text = "\n".join(answer_lines[start_idx:end_idx]).strip()
+                
+                # Remove the question number prefix from answer
+                answer_text = re.sub(rf'^\s*{q_num}[\.\)]\s+', '', answer_text)
+                answer_text = re.sub(rf'(?i)^(?:ans|answer|उत्तर)\s*{q_num}[\.\s:-]*', '', answer_text)
+                answer_text = answer_text.strip()
+                
                 results.append({
-                    "question": questions[0],
-                    "answer": all_answer_text.strip(),
+                    "question": q_text,
+                    "answer": answer_text,
                     "matched": True
+                })
+                print(f"Matched question {q_num}: {len(answer_text)} chars")
+            else:
+                print(f"No match for question {q_num}")
+                results.append({
+                    "question": q_text,
+                    "answer": "",
+                    "matched": False
+                })
+    
+    # Fallback: If no section boundaries, try to match by keywords
+    else:
+        print("No clear section boundaries, using keyword matching...")
+        
+        for q in questions:
+            q_num = q["number"].replace('.', '').replace(')', '').strip()
+            q_keywords = re.findall(r'[A-Za-z]{4,}', q["text"])[:5]  # Extract keywords
+            
+            # Find best matching answer
+            best_match = None
+            best_score = 0
+            
+            for i, line in enumerate(answer_lines):
+                # Check for number match first
+                if re.search(rf'\b{q_num}\b', line):
+                    # Check if this is likely an answer start
+                    if re.search(r'(?i)(?:ans|answer|उत्तर|प्र)', line) or len(line) > 30:
+                        score = 100 + len(line)
+                        if score > best_score:
+                            best_score = score
+                            best_match = i
+            
+            # If no number match, try keyword matching
+            if best_match is None and q_keywords:
+                for i, line in enumerate(answer_lines):
+                    if len(line) > 50:  # Likely an answer line
+                        keyword_score = sum(1 for kw in q_keywords if kw.lower() in line.lower())
+                        if keyword_score > 0:
+                            score = keyword_score * 10 + len(line)
+                            if score > best_score:
+                                best_score = score
+                                best_match = i
+            
+            if best_match is not None:
+                # Find end - next question or end
+                end_idx = len(answer_lines)
+                next_num = str(int(q_num) + 1)
+                for i in range(best_match + 1, len(answer_lines)):
+                    if re.search(rf'\b{next_num}\b', answer_lines[i]) and len(answer_lines[i]) < 50:
+                        end_idx = i
+                        break
+                    if i - best_match > 100:  # Limit answer length
+                        end_idx = i
+                        break
+                
+                answer_text = "\n".join(answer_lines[best_match:end_idx]).strip()
+                results.append({
+                    "question": q_text,
+                    "answer": answer_text,
+                    "matched": True
+                })
+            else:
+                results.append({
+                    "question": q_text,
+                    "answer": "",
+                    "matched": False
                 })
     
     return results
@@ -366,9 +381,9 @@ def process_pdf(file_input, status_callback=None) -> Tuple[Dict, List[Dict]]:
     }
     log(f"OCR complete: {len(pages)} pages")
 
-    # Step 2: Extract questions
+    # Step 2: Extract questions with context
     log("Extracting questions...")
-    question_pages, questions = extract_questions(pages)
+    question_pages, questions = extract_questions_smart(pages)
     
     if not questions:
         raise Exception("No questions found in the document")
@@ -384,32 +399,26 @@ def process_pdf(file_input, status_callback=None) -> Tuple[Dict, List[Dict]]:
         for page_idx in answer_page_indices:
             page = pages[page_idx]
             for line in page["raw_text"].split("\n"):
-                if line.strip() and len(line.strip()) > 10:  # Skip very short lines
-                    answer_lines.append(line.strip())
+                line = line.strip()
+                if line and len(line) > 10:  # Skip very short lines
+                    answer_lines.append(line)
     else:
         log("No separate answer pages found, using all non-question text")
-        # Use all text except question pages
         for page in pages:
             if page not in question_pages:
                 for line in page["raw_text"].split("\n"):
-                    if line.strip() and len(line.strip()) > 10:
-                        answer_lines.append(line.strip())
+                    line = line.strip()
+                    if line and len(line) > 10:
+                        answer_lines.append(line)
     
     log(f"Extracted {len(answer_lines)} answer lines")
 
-    # Step 4: Map answers
-    log("Mapping answers directly...")
-    qa_pairs = map_answers_direct(answer_lines, questions)
+    # Step 4: Map answers with context
+    log("Mapping answers contextually...")
+    qa_pairs = map_answers_contextual(answer_lines, questions, question_pages)
     
     matched = sum(1 for p in qa_pairs if p["matched"])
-    log(f"Matched {matched}/{len(questions)} questions directly")
-    
-    # If no answers matched, try fallback
-    if matched == 0:
-        log("No answers matched directly, trying fallback...")
-        qa_pairs = map_answers_fallback(pages, question_pages)
-        matched = sum(1 for p in qa_pairs if p["matched"])
-        log(f"Fallback matched {matched}/{len(questions)} questions")
+    log(f"Matched {matched}/{len(questions)} questions")
 
     return ocr_json, qa_pairs
 
