@@ -372,57 +372,34 @@ def _estimate_tokens(text: str) -> int:
 
 class _TokenBudgetTracker:
     def __init__(self, tpm_limit=TPM_LIMIT, safety_fraction=TPM_SAFETY_FRACTION):
-        import collections
         self.tpm_limit = tpm_limit
         self.safe_limit = tpm_limit * safety_fraction
-        self.events = collections.deque()
+        self.events = []
 
-    def _prune(self, now=None):
-        now = now if now is not None else time.monotonic()
-        while self.events and now - self.events[0][0] >= 60:
-            self.events.popleft()
+    def _prune(self):
+        now = time.monotonic()
+        # Clean events older than 60 seconds
+        self.events = [(ts, tok) for ts, tok in self.events if now - ts < 60]
 
-    def used_in_window(self, now=None) -> int:
-        now = now if now is not None else time.monotonic()
-        self._prune(now)
+    def used_in_window(self) -> int:
+        self._prune()
         return sum(tok for _, tok in self.events)
 
     def wait_if_needed(self, upcoming_tokens: int, log=print):
-        now = time.monotonic()
-        used = self.used_in_window(now)
-        projected = used + upcoming_tokens
-
-        if projected <= self.safe_limit:
-            return
-
-        needed_to_free = projected - self.safe_limit
-        freed = 0
-        wait_s = 0.0
-        for ts, tok in self.events:
-            freed += tok
-            wait_s = max(wait_s, 60 - (now - ts))
-            if freed >= needed_to_free:
-                break
-
-        wait_s = max(0.0, wait_s) + 0.5
-        log(f"Rate protection: Waiting {wait_s:.1f}s to respect token window...")
-        time.sleep(wait_s)
+        self._prune()
+        used = sum(tok for _, tok in self.events)
+        
+        # If adding new tokens exceeds budget, force hard pause
+        if (used + upcoming_tokens) > self.safe_limit:
+            log(f"Rate protection: Token budget near limit ({used}/{self.safe_limit:.0f}). Waiting 30s to clear window...")
+            time.sleep(30)
+            self._prune()
 
     def record_usage(self, tokens: int):
         self.events.append((time.monotonic(), tokens))
 
-    def record_actual_from_error(self, used: int, limit: int):
-        now = time.monotonic()
-        current = self.used_in_window(now)
-        if used > current:
-            self.events.append((now, used - current))
-        if limit:
-            self.tpm_limit = limit
-            self.safe_limit = limit * TPM_SAFETY_FRACTION
-
     def reset_window(self):
         self.events.clear()
-
 
 _RATE_LIMIT_DETAIL_RE = re.compile(
     r'on\s+tokens\s+per\s+(minute|day)\s*\((TPM\vert{}TPD)\).*?'
@@ -465,13 +442,10 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
     import groq
 
     estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
-    skip_next_proactive_check = False
 
     for attempt in range(1, max_retries + 2):
-        if skip_next_proactive_check:
-            skip_next_proactive_check = False
-        else:
-            budget.wait_if_needed(estimated_tokens, log=log)
+        # Check token budget before request
+        budget.wait_if_needed(estimated_tokens, log=log)
 
         try:
             with _groq_call_lock:
@@ -488,28 +462,21 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             content = response.choices[0].message.content
             return response_parser(content)
 
-        except groq.AuthenticationError as e:
-            raise Exception("Invalid Groq API Key.") from e
-
         except (groq.RateLimitError, groq.BadRequestError) as e:
-            detail = _parse_rate_limit_detail(str(e))
-            if detail and detail["limit_type"] == "TPD":
-                raise Exception(f"Groq daily quota exhausted. Resets in {detail['wait_seconds']/60:.0f} mins.") from e
-
-            if detail:
-                budget.record_actual_from_error(detail["used"], detail["limit"])
-                log(f"Rate limit hit. Waiting {detail['wait_seconds'] + 0.5:.1f}s...")
-                time.sleep(detail["wait_seconds"] + 0.5)
-                budget.reset_window()
-                skip_next_proactive_check = True
-            else:
-                time.sleep(5.0 * attempt)
+            err_msg = str(e)
+            log(f"Rate Limit / API Error on attempt {attempt}: {err_msg[:100]}...")
+            
+            # Reset local budget and wait a strict fixed duration
+            budget.reset_window()
+            wait_time = 30.0 * attempt
+            log(f"Waiting {wait_time}s for Groq quota cooldown...")
+            time.sleep(wait_time)
 
         except Exception as e:
-            time.sleep(1)
+            log(f"Unexpected Error: {e}")
+            time.sleep(5.0)
 
-    raise Exception("Groq API call max retries exceeded.")
-
+    raise Exception("Groq API call failed after multiple retries due to rate limits.")
 
 QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are reading official question paper pages. Extract every question/sub-part in printed order.
 Split sub-parts (e.g., (i), (ii)) into separate distinct self-contained questions.
