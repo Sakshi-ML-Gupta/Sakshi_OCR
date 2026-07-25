@@ -3,3 +3,4 @@ pymupdf
 python-dotenv
 groq
 openai
+google-genai
