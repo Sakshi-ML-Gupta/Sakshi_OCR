@@ -3,11 +3,17 @@ import io
 import re
 import json
 import time
-import difflib
 import threading
 import fitz
 import httpx
 from pathlib import Path
+
+# Optional LangChain splitter with pure-python fallback
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    HAS_LANGCHAIN = True
+except ImportError:
+    HAS_LANGCHAIN = False
 
 # =========================================================
 # API KEYS
@@ -24,20 +30,16 @@ def get_api_key(name):
 
 
 # =========================================================
-# INPUT NORMALIZATION
+# INPUT NORMALIZATION & DIAGNOSTICS
 # =========================================================
 
 def _normalize_file_input(file_input, default_name="document.pdf"):
     if isinstance(file_input, tuple):
         if len(file_input) < 2:
-            raise ValueError(
-                f"Tuple file_input must have at least (filename, bytes), got {len(file_input)} items"
-            )
+            raise ValueError(f"Tuple file_input must have at least 2 items, got {len(file_input)}")
         name, data = file_input[0], file_input[1]
         if not isinstance(data, (bytes, bytearray)):
-            raise TypeError(
-                f"Expected bytes as second tuple element, got {type(data).__name__}"
-            )
+            raise TypeError(f"Expected bytes as second tuple element, got {type(data).__name__}")
         return bytes(data), _coerce_name(name, default_name)
 
     if isinstance(file_input, (bytes, bytearray)):
@@ -50,18 +52,11 @@ def _normalize_file_input(file_input, default_name="document.pdf"):
     if hasattr(file_input, "read"):
         data = file_input.read()
         if not isinstance(data, (bytes, bytearray)):
-            raise TypeError(
-                f"file_input.read() returned {type(data).__name__}, expected bytes. "
-                f"Open the file in binary mode ('rb')."
-            )
+            raise TypeError(f"file_input.read() returned {type(data).__name__}, expected bytes.")
         name = getattr(file_input, "name", default_name)
         return bytes(data), _coerce_name(name, default_name)
 
-    raise TypeError(
-        f"Unsupported file_input type: {type(file_input).__name__}. "
-        f"Expected str, Path, bytes, a file-like object with .read(), "
-        f"or a (filename, bytes) tuple."
-    )
+    raise TypeError(f"Unsupported file_input type: {type(file_input).__name__}")
 
 
 def _coerce_name(name, default_name="document.pdf"):
@@ -75,40 +70,24 @@ def _coerce_name(name, default_name="document.pdf"):
         return default_name
 
 
-# =========================================================
-# DIAGNOSTIC GUARD
-# =========================================================
-
 def _diagnose_tuple_errors(func):
     import functools
-
     @functools.wraps(func)
     def wrapper(file_input, *args, **kwargs):
         try:
             return func(file_input, *args, **kwargs)
         except TypeError as e:
             if "os.PathLike object, not tuple" in str(e):
-                raise TypeError(
-                    f"[DIAGNOSTIC] Caught the 'os.PathLike, not tuple' error INSIDE "
-                    f"{func.__name__}(), not before it -- this means the bug genuinely "
-                    f"is somewhere in this module's call chain. "
-                    f"file_input received: type={type(file_input).__name__}, "
-                    f"repr={file_input!r}. Original error: {e}"
-                ) from e
+                raise TypeError(f"[DIAGNOSTIC] Error in {func.__name__}(): {e}") from e
             raise
-
     return wrapper
 
-
-# =========================================================
-# CONCURRENCY GUARD
-# =========================================================
 
 _groq_call_lock = threading.Lock()
 
 
 # =========================================================
-# PREPROCESS PDF
+# PREPROCESS & OCR
 # =========================================================
 
 def preprocess_pdf(file_bytes, dpi=250):
@@ -126,10 +105,6 @@ def preprocess_pdf(file_bytes, dpi=250):
     return buf.read()
 
 
-# =========================================================
-# OCR -- Datalab (Chandra model) via /convert endpoint
-# =========================================================
-
 DATALAB_BASE_URL = "https://www.datalab.to"
 
 PAGE_BREAK_PATTERNS = [
@@ -143,12 +118,10 @@ PAGE_BREAK_PATTERNS = [
 
 def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=print) -> list:
     best_parts = None
-
     for pattern in PAGE_BREAK_PATTERNS:
         matches = list(pattern.finditer(markdown))
         if not matches:
             continue
-
         parts = []
         start = 0
         for m in matches:
@@ -159,10 +132,8 @@ def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=pr
 
         if len(parts) <= 1:
             continue
-
         if page_count_hint and len(parts) == page_count_hint:
             return parts
-
         if best_parts is None or len(parts) > len(best_parts):
             best_parts = parts
 
@@ -174,11 +145,7 @@ def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=pr
         if len(parts) > 1:
             return parts
 
-    log(
-        f"WARNING: No page-break marker recognized in Datalab output "
-        f"(length={len(markdown)} chars, page_count_hint={page_count_hint}). "
-        f"Treating entire document as a single page."
-    )
+    log("WARNING: Page breaks not found cleanly. Using full document as single page.")
     return [markdown.strip()]
 
 
@@ -189,185 +156,63 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
             status_callback(msg)
 
     file_name = _coerce_name(file_name, default_name="document.pdf")
-
-    if not isinstance(file_content, (bytes, bytearray)):
-        raise TypeError(
-            f"run_ocr() expected file_content as bytes, got {type(file_content).__name__}"
-        )
-
     api_key = get_api_key("DATALAB_API_KEY")
     if not api_key:
-        raise Exception("DATALAB_API_KEY not found in secrets or environment")
-
-    size_mb = len(file_content) / (1024 * 1024)
-    MAX_MB  = 45
-    if size_mb > MAX_MB:
-        raise Exception(
-            f"File is {size_mb:.1f}MB, which exceeds the {MAX_MB}MB upload limit."
-        )
+        raise Exception("DATALAB_API_KEY not found in secrets")
 
     headers = {"X-API-Key": api_key}
-
-    log(f"Submitting document to Datalab (Chandra OCR)... ({size_mb:.1f}MB)")
+    log(f"Submitting document to Datalab OCR... ({len(file_content)/(1024*1024):.1f}MB)")
 
     resp = httpx.post(
         f"{DATALAB_BASE_URL}/api/v1/convert",
         headers=headers,
         files={"file": (file_name, file_content, "application/pdf")},
-        data={
-            "output_format": "markdown",
-            "mode": "accurate",
-            "paginate": "true"
-        },
+        data={"output_format": "markdown", "mode": "accurate", "paginate": "true"},
         timeout=120
     )
 
     if resp.status_code != 200:
-        raise Exception(f"Datalab submit error {resp.status_code}: {resp.text}")
+        raise Exception(f"Datalab error {resp.status_code}: {resp.text}")
 
     data = resp.json()
-
-    if not data.get("success", True):
-        raise Exception(f"Datalab submit failed: {data.get('error')}")
-
     check_url = data["request_check_url"]
-    log("Document submitted -- polling for OCR result...")
+    log("Document submitted -- polling OCR...")
 
-    max_polls = 150
-    poll_interval = 2
-
-    result = None
-    for attempt in range(max_polls):
+    for attempt in range(150):
         poll_resp = httpx.get(check_url, headers=headers, timeout=60)
-
-        if poll_resp.status_code != 200:
-            raise Exception(f"Datalab poll error {poll_resp.status_code}: {poll_resp.text}")
-
         result = poll_resp.json()
-        status = result.get("status")
-
-        if status == "complete":
-            log("OCR complete -- parsing pages...")
+        if result.get("status") == "complete":
+            log("OCR complete.")
             break
-
-        if status == "failed" or result.get("error"):
-            raise Exception(f"Datalab conversion failed: {result.get('error')}")
-
-        if attempt % 5 == 0:
-            log(f"Still processing... ({attempt * poll_interval}s elapsed)")
-
-        time.sleep(poll_interval)
+        if result.get("status") == "failed":
+            raise Exception(f"OCR failed: {result.get('error')}")
+        time.sleep(2)
     else:
-        raise Exception("Datalab conversion timed out after 5 minutes")
-
-    if not result.get("success", True):
-        raise Exception(f"Datalab conversion error: {result.get('error')}")
+        raise Exception("OCR timed out")
 
     markdown = result.get("markdown") or ""
+    page_texts = _split_paginated_markdown(markdown, result.get("page_count"), log=log)
 
-    if not markdown.strip():
-        raise Exception("Datalab returned empty markdown output")
-
-    page_count_hint = result.get("page_count")
-    page_texts = _split_paginated_markdown(markdown, page_count_hint, log=log)
-
-    pages = []
-    for idx, text in enumerate(page_texts):
-        pages.append({
-            "page_number": idx + 1,
-            "raw_text":    text
-        })
-
-    log(f"OCR done -- {len(pages)} page(s) extracted")
-    return pages
+    return [{"page_number": idx + 1, "raw_text": text} for idx, text in enumerate(page_texts)]
 
 
 def build_ocr_json(pages: list) -> dict:
     return {
         "total_pages": len(pages),
-        "pages": [
-            {"page_number": p["page_number"], "text": p["raw_text"]}
-            for p in pages
-        ]
+        "pages": [{"page_number": p["page_number"], "text": p["raw_text"]} for p in pages]
     }
 
 
-@_diagnose_tuple_errors
-def process_reference(file_input, status_callback=None):
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
-
-    file_bytes, file_name = _normalize_file_input(file_input, default_name="reference.pdf")
-    pages = run_ocr(file_bytes, file_name, status_callback)
-    log(f"Reference OCR complete -- {len(pages)} page(s)")
-    return build_ocr_json(pages)
-
-
 # =========================================================
-# LLM-BASED QUESTION PAPER / QUESTION DETECTION (Groq)
+# TOKEN BUDGET TRACKER (FIXED LOOP ISSUE)
 # =========================================================
 
 GROQ_MODEL = "openai/gpt-oss-120b"
 TPM_LIMIT = 8000
-TPM_SAFETY_FRACTION = 0.85
-CHARS_PER_TOKEN_ESTIMATE = 2.0
-MAX_CHARS_PER_CHUNK = 6000
-CHUNK_OVERLAP_PAGES = 1
-
-QP_SYSTEM_PROMPT = """You are analyzing OCR text extracted from a scanned student exam assignment booklet (e.g. IGNOU-style, India). The booklet mixes pages of different kinds, in no guaranteed order:
-
-1. ADMINISTRATIVE/COVER pages: enrolment number, programme code, learner name, registration details.
-2. QUESTION PAPER pages: the official printed list of numbered exam questions the student must answer.
-3. ANSWER pages: the student's own answers (handwritten, OCR'd).
-
-Your task: read the pages shown and return ONLY valid JSON (no markdown fences, no commentary) in EXACTLY this shape:
-
-{
-  "question_paper_pages": [14, 16, 18],
-  "questions": ["1. Example question text. (10)", "2. Another example question. (10)"]
-}
-
-Rules:
-- "question_paper_pages" must be a JSON array of individual page numbers.
-- Output ONLY the JSON object. No prose or markdown tags."""
-
-
-def _chunk_pages_by_char_budget(pages: list, max_chars: int = MAX_CHARS_PER_CHUNK,
-                                  overlap_pages: int = CHUNK_OVERLAP_PAGES) -> list:
-    if not pages:
-        return []
-
-    chunks = []
-    current_chunk = []
-    current_chars = 0
-
-    for page in pages:
-        page_chars = len(page["raw_text"])
-
-        if current_chunk and current_chars + page_chars > max_chars:
-            chunks.append(current_chunk)
-            overlap = current_chunk[-overlap_pages:] if overlap_pages > 0 else []
-            current_chunk = list(overlap)
-            current_chars = sum(len(p["raw_text"]) for p in current_chunk)
-
-        current_chunk.append(page)
-        current_chars += page_chars
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
-
-
-def _build_qp_user_prompt(pages: list) -> str:
-    blocks = [f"--- PAGE {p['page_number']} ---\n{p['raw_text']}" for p in pages]
-    return "Here are the OCR'd pages shown in this chunk:\n\n" + "\n\n".join(blocks)
-
+TPM_SAFETY_FRACTION = 0.80
 
 def _estimate_tokens(text: str) -> int:
-    return int(len(text) / CHARS_PER_TOKEN_ESTIMATE) + 1
+    return int(len(text) / 2.5) + 1
 
 
 class _TokenBudgetTracker:
@@ -378,21 +223,15 @@ class _TokenBudgetTracker:
 
     def _prune(self):
         now = time.monotonic()
-        # Clean events older than 60 seconds
         self.events = [(ts, tok) for ts, tok in self.events if now - ts < 60]
-
-    def used_in_window(self) -> int:
-        self._prune()
-        return sum(tok for _, tok in self.events)
 
     def wait_if_needed(self, upcoming_tokens: int, log=print):
         self._prune()
         used = sum(tok for _, tok in self.events)
         
-        # If adding new tokens exceeds budget, force hard pause
         if (used + upcoming_tokens) > self.safe_limit:
-            log(f"Rate protection: Token budget near limit ({used}/{self.safe_limit:.0f}). Waiting 30s to clear window...")
-            time.sleep(30)
+            log("Token limit buffer reached. Waiting 12s for cooling...")
+            time.sleep(12)
             self._prune()
 
     def record_usage(self, tokens: int):
@@ -401,50 +240,15 @@ class _TokenBudgetTracker:
     def reset_window(self):
         self.events.clear()
 
-_RATE_LIMIT_DETAIL_RE = re.compile(
-    r'on\s+tokens\s+per\s+(minute|day)\s*\((TPM\vert{}TPD)\).*?'
-    r'Limit\s+(\d+),\s*Used\s+(\d+),\s*Requested\s+(\d+).*?'
-    r'try again in\s+(?:(\d+)m)?([\d.]+)s',
-    re.IGNORECASE | re.DOTALL
-)
-
-
-def _parse_rate_limit_detail(message: str):
-    m = _RATE_LIMIT_DETAIL_RE.search(message)
-    if not m:
-        return None
-    period, limit_type, limit, used, requested, minutes, seconds = m.groups()
-    wait_seconds = (int(minutes) * 60 if minutes else 0) + float(seconds)
-    return {
-        "limit_type": limit_type.upper(),
-        "limit": int(limit),
-        "used": int(used),
-        "requested": int(requested),
-        "wait_seconds": wait_seconds,
-    }
-
-
-def _parse_qp_llm_response(content: str) -> tuple:
-    content = content.strip()
-    if content.startswith("```"):
-        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
-        content = re.sub(r'\n?```\s*$', '', content).strip()
-
-    data = json.loads(content)
-    qp_pages = [int(x) for x in data.get("question_paper_pages", [])]
-    questions = [str(x).strip() for x in data.get("questions", []) if str(x).strip()]
-    return qp_pages, questions
-
 
 def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                               response_parser, budget: "_TokenBudgetTracker",
                               log, max_retries: int = 4):
     import groq
 
-    estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
+    estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 500
 
     for attempt in range(1, max_retries + 2):
-        # Check token budget before request
         budget.wait_if_needed(estimated_tokens, log=log)
 
         try:
@@ -459,61 +263,31 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                     temperature=0.0,
                 )
             budget.record_usage(estimated_tokens)
-            content = response.choices[0].message.content
-            return response_parser(content)
+            return response_parser(response.choices[0].message.content)
 
         except (groq.RateLimitError, groq.BadRequestError) as e:
-            err_msg = str(e)
-            log(f"Rate Limit / API Error on attempt {attempt}: {err_msg[:100]}...")
-            
-            # Reset local budget and wait a strict fixed duration
             budget.reset_window()
-            wait_time = 30.0 * attempt
-            log(f"Waiting {wait_time}s for Groq quota cooldown...")
+            wait_time = 15.0 * attempt
+            log(f"Rate limit hit. Sleeping {wait_time}s before retry...")
             time.sleep(wait_time)
 
         except Exception as e:
-            log(f"Unexpected Error: {e}")
-            time.sleep(5.0)
+            log(f"Groq exception: {e}")
+            time.sleep(3.0)
 
-    raise Exception("Groq API call failed after multiple retries due to rate limits.")
+    raise Exception("Groq API call failed after retries.")
 
-QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are reading official question paper pages. Extract every question/sub-part in printed order.
-Split sub-parts (e.g., (i), (ii)) into separate distinct self-contained questions.
 
-Return JSON in this shape:
+# =========================================================
+# QUESTION PAPER IDENTIFICATION
+# =========================================================
+
+QP_SYSTEM_PROMPT = """Analyze student exam assignment booklet pages.
+Return ONLY JSON:
 {
+  "question_paper_pages": [1, 2],
   "questions": ["1.(i) Question text...", "1.(ii) Question text..."]
 }"""
-
-
-def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
-    def log(msg):
-        print(msg)
-        if status_callback:
-            status_callback(msg)
-
-    if not qp_pages:
-        return []
-
-    from groq import Groq
-    api_key = get_api_key("GROQ_API_KEY")
-    client = Groq(api_key=api_key)
-    budget = _TokenBudgetTracker()
-
-    blocks = [f"--- PAGE {p['page_number']} ---\n{p['raw_text']}" for p in qp_pages]
-    user_prompt = "Question Paper Content:\n\n" + "\n\n".join(blocks)
-
-    log(f"Extracting canonical question list pass...")
-
-    def parse_fn(content):
-        c = re.sub(r'^```(?:json)?\s*\n?|\n?```\s*$', '', content.strip())
-        return [str(q).strip() for q in json.loads(c).get("questions", [])]
-
-    return _call_groq_with_retries(
-        client, QUESTION_PAPER_ONLY_SYSTEM_PROMPT, user_prompt,
-        parse_fn, budget, log
-    )
 
 
 def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
@@ -527,116 +301,109 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
-    chunks = _chunk_pages_by_char_budget(pages)
-    valid_page_numbers = {p["page_number"] for p in pages}
     qp_pages_found = set()
-
-    for i, chunk in enumerate(chunks):
-        user_prompt = _build_qp_user_prompt(chunk)
-        try:
-            qp_pages, _ = _call_groq_with_retries(
-                client, QP_SYSTEM_PROMPT, user_prompt,
-                _parse_qp_llm_response, budget, log
-            )
-            for p in qp_pages:
-                if p in valid_page_numbers:
-                    qp_pages_found.add(p)
-        except Exception as e:
-            log(f"Chunk error: {e}")
-
-    qp_page_indices_0based = sorted(p - 1 for p in qp_pages_found)
-    qp_pages_full = [pages[i] for i in qp_page_indices_0based]
-
-    canonical_questions = extract_canonical_questions(qp_pages_full, status_callback)
-    return qp_page_indices_0based, canonical_questions
-
-
-# =========================================================
-# LLM-BASED ANSWER MAPPING
-# =========================================================
-
-ANSWER_MAP_SYSTEM_PROMPT = """You are an expert evaluator mapping student answer paragraphs to official question references.
-Read the paragraphs provided (labelled [P0], [P1], etc.) and map EACH paragraph to the correct question REF (e.g., REF-A, REF-B).
-
-Rules:
-1. If a paragraph is part of the answer for REF-A, map it to REF-A.
-2. If an answer spans multiple paragraphs, map ALL those paragraphs to the same REF.
-3. If a paragraph is random noise, teacher signatures, or irrelevant, set "ref": null.
-4. EVERY paragraph ID provided in the input MUST be in your output.
-
-Return ONLY valid JSON in this exact shape:
-{
-  "mapping": [
-    {"p_id": "P0", "ref": "REF-A"},
-    {"p_id": "P1", "ref": "REF-A"},
-    {"p_id": "P2", "ref": null},
-    {"p_id": "P3", "ref": "REF-B"}
-  ]
-}"""""
-
-
-def _build_answer_map_user_prompt(paragraphs: list, questions: list) -> str:
-    questions_block = "\n".join(
-        f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
-    )
     
-    # Create [P0] Text... [P1] Text... layout
-    lines_block = "\n\n".join(f"[{pid}] {text}" for pid, text in paragraphs)
-    
-    return f"OFFICIAL QUESTIONS:\n{questions_block}\n\nSTUDENT ANSWER PARAGRAPHS:\n{lines_block}"
-
-
-def _parse_answer_map_llm_response(content: str) -> dict:
-    c = re.sub(r'^```(?:json)?\s*\n?|\n?```\s*$', '', content.strip())
-    try:
-        data = json.loads(c)
-        mapping = {}
-        for item in data.get("mapping", []):
-            pid = item.get("p_id")
-            ref = item.get("ref")
-            if pid and ref:
-                mapping[pid] = str(ref).strip().upper()
-        return mapping
-    except (ValueError, TypeError, KeyError):
-        return {}
-
-
-def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
-    sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
-    resolved = []
-    for i, r in enumerate(sorted_ranges):
-        r = dict(r)
-        if i + 1 < len(sorted_ranges):
-            next_start = sorted_ranges[i + 1]["start_line"]
-            if r["end_line"] >= next_start:
-                r["end_line"] = next_start - 1
-        if r["end_line"] >= r["start_line"]:
-            resolved.append(r)
-    return resolved
-
-def group_into_paragraphs(answer_lines: list) -> list:
-    """Combines continuous lines into paragraphs to reduce LLM workload and keep context intact."""
-    paragraphs = []
-    current_para = []
-    
-    for line in answer_lines:
-        cleaned = line.strip()
-        if not cleaned:
-            continue
-            
-        # If line looks like a new list item or heading, force a new paragraph
-        if re.match(r'^(\d+[\.\)]|[a-zA-Z][\.\)]|[-•*])\s', cleaned) and current_para:
-            paragraphs.append(" ".join(current_para))
-            current_para = [cleaned]
-        else:
-            current_para.append(cleaned)
-            
-    if current_para:
-        paragraphs.append(" ".join(current_para))
+    # Process 2 pages at a time for QP detection
+    for i in range(0, len(pages), 2):
+        chunk_pages = pages[i:i+2]
+        user_prompt = "\n\n".join([f"--- PAGE {p['page_number']} ---\n{p['raw_text']}" for p in chunk_pages])
         
-    return paragraphs
+        def parse_qp(content):
+            c = re.sub(r'^```(?:json)?\s*\n?|\n?```\s*$', '', content.strip())
+            d = json.loads(c)
+            return d.get("question_paper_pages", []), d.get("questions", [])
 
-def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
+        try:
+            qp_p, _ = _call_groq_with_retries(client, QP_SYSTEM_PROMPT, user_prompt, parse_qp, budget, log)
+            for p in qp_p:
+                if 1 <= p <= len(pages):
+                    qp_pages_found.add(p - 1)
+        except Exception as e:
+            log(f"QP detection error on pages {i+1}-{i+2}: {e}")
+
+    qp_indices = sorted(list(qp_pages_found))
+    qp_pages = [pages[idx] for idx in qp_indices]
+
+    if not qp_pages:
+        return [], []
+
+    # Canonical Question Extraction Pass
+    qp_prompt = "\n\n".join([f"--- PAGE {p['page_number']} ---\n{p['raw_text']}" for p in qp_pages])
+    
+    def parse_canonical(content):
+        c = re.sub(r'^```(?:json)?\s*\n?|\n?```\s*$', '', content.strip())
+        return json.loads(c).get("questions", [])
+
+    canonical_questions = _call_groq_with_retries(
+        client, 
+        "Extract all individual official questions from the Question Paper pages. Return JSON: {\"questions\": [\"1. ...\", \"2. ...\"]}", 
+        qp_prompt, 
+        parse_canonical, 
+        budget, 
+        log
+    )
+
+    return qp_indices, canonical_questions
+
+
+# =========================================================
+# CHUNK-BASED ANSWER MAPPING (LANGCHAIN / RECURSIVE CHUNKING)
+# =========================================================
+
+NOISE_RE = re.compile(r'(?:Teacher\'?s?\s*Signature|PAGE\s*NO|^\s*DATE\b|^\s*\d{1,3}\s*$)', re.IGNORECASE)
+
+def is_noise(line: str) -> bool:
+    return bool(NOISE_RE.search(line))
+
+
+ANSWER_CHUNK_SYSTEM_PROMPT = """You are mapping chunks of student answers to official questions.
+Find which official question REF (e.g. REF-A, REF-B) this text belongs to.
+
+Return ONLY JSON:
+{
+  "mapped_answers": [
+    {
+      "ref": "REF-A",
+      "verbatim_text": "Exact text segment corresponding to this question from the chunk"
+    }
+  ]
+}"""
+
+
+def _split_text_with_overlap(text: str, chunk_size=3500, chunk_overlap=250) -> list:
+    """Uses LangChain RecursiveCharacterTextSplitter if installed, else python fallback."""
+    if HAS_LANGCHAIN:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        return splitter.split_text(text)
+    
+    # Fallback Recursive Splitter Logic
+    chunks = []
+    start = 0
+    text_len = len(text)
+    while start < text_len:
+        end = start + chunk_size
+        if end >= text_len:
+            chunks.append(text[start:].strip())
+            break
+        
+        # Try to break at paragraph or line break
+        break_pos = text.rfind("\n\n", start, end)
+        if break_pos == -1:
+            break_pos = text.rfind("\n", start, end)
+        if break_pos == -1 or break_pos < start + (chunk_size // 2):
+            break_pos = end
+
+        chunks.append(text[start:break_pos].strip())
+        start = max(start + 1, break_pos - chunk_overlap)
+        
+    return [c for c in chunks if c]
+
+
+def map_answers_with_llm(answer_text: str, questions: list, status_callback=None) -> dict:
     def log(msg):
         print(msg)
         if status_callback:
@@ -647,50 +414,51 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
-    # Step 1: Create dictionary of Ref -> Actual Question
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
-    
-    # Step 2: Group messy lines into solid paragraphs and assign IDs
-    clean_paragraphs = group_into_paragraphs(answer_lines)
-    numbered_paragraphs = [(f"P{i}", text) for i, text in enumerate(clean_paragraphs)]
-    
-    if not numbered_paragraphs:
-        return {}
+    questions_block = "\n".join(f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions))
 
-    # Step 3: Call LLM to map P-IDs to REFs
-    user_prompt = _build_answer_map_user_prompt(numbered_paragraphs, questions)
-    
-    log("Mapping paragraphs to questions exactly...")
-    pid_to_ref = _call_groq_with_retries(
-        client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
-        _parse_answer_map_llm_response, budget, log
-    )
+    # Split long answer text into manageable overlapping chunks (~1500 tokens / 3500 chars)
+    chunks = _split_text_with_overlap(answer_text, chunk_size=3500, chunk_overlap=250)
+    log(f"Answer text divided into {len(chunks)} chunk(s) with 250-char overlap.")
 
-    # Step 4: Reconstruct exact answers based on mapped P-IDs
-    qa_map = {q: [] for q in ref_to_question.values()}
-    
-    for pid, text in numbered_paragraphs:
-        assigned_ref = pid_to_ref.get(pid)
-        if assigned_ref and assigned_ref in ref_to_question:
-            actual_q = ref_to_question[assigned_ref]
-            qa_map[actual_q].append(text)
+    qa_map = {q: [] for q in questions}
 
-    # Step 5: Join paragraphs back together
+    for idx, chunk in enumerate(chunks):
+        log(f"Processing Answer Chunk {idx+1}/{len(chunks)}...")
+        user_prompt = f"OFFICIAL QUESTIONS:\n{questions_block}\n\nSTUDENT ANSWER CHUNK:\n{chunk}"
+
+        def parse_chunk_res(content):
+            c = re.sub(r'^```(?:json)?\s*\n?|\n?```\s*$', '', content.strip())
+            data = json.loads(c)
+            return data.get("mapped_answers", [])
+
+        try:
+            mapped_segments = _call_groq_with_retries(
+                client, ANSWER_CHUNK_SYSTEM_PROMPT, user_prompt,
+                parse_chunk_res, budget, log
+            )
+            for item in mapped_segments:
+                ref = str(item.get("ref", "")).strip().upper()
+                verbatim = str(item.get("verbatim_text", "")).strip()
+                
+                if ref in ref_to_question and verbatim:
+                    q_title = ref_to_question[ref]
+                    # Avoid duplicate overlapping text insertions
+                    if not any(verbatim in existing for existing in qa_map[q_title]):
+                        qa_map[q_title].append(verbatim)
+
+        except Exception as e:
+            log(f"Error mapping chunk {idx+1}: {e}")
+
+    # Format final outputs
     final_qa_map = {}
-    for q, paras in qa_map.items():
-        if paras:
-            final_qa_map[q] = "\n\n".join(paras).strip()
+    for q, text_list in qa_map.items():
+        if text_list:
+            final_qa_map[q] = "\n\n".join(text_list).strip()
+        else:
+            final_qa_map[q] = ""
 
     return final_qa_map
-
-NOISE_RE = re.compile(
-    r'(?:Teacher\'?s?\s*Signature|PAGE\s*NO|^\s*DATE\b|^\s*\d{1,3}\s*$)',
-    re.IGNORECASE
-)
-
-
-def is_noise(line: str) -> bool:
-    return bool(NOISE_RE.search(line))
 
 
 # =========================================================
@@ -706,15 +474,18 @@ def process_pdf(file_input, status_callback=None):
 
     file_bytes, file_name = _normalize_file_input(file_input, default_name="document.pdf")
     pages = run_ocr(file_bytes, file_name, status_callback)
-
     ocr_json = build_ocr_json(pages)
-    qp_page_indices, official_questions = identify_questions_with_llm(pages, status_callback)
 
-    if not qp_page_indices or not official_questions:
-        raise Exception("Could not successfully parse Question Paper structure.")
+    log("Identifying Question Paper pages and extracting canonical questions...")
+    qp_indices, official_questions = identify_questions_with_llm(pages, status_callback)
 
-    answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
-    answer_pages = [pages[i] for i in answer_page_indices]
+    if not official_questions:
+        raise Exception("Could not detect official questions from Question Paper.")
+
+    log(f"Found {len(official_questions)} question(s). Extracting answers...")
+
+    # Filter out QP pages to isolate Student Answers
+    answer_pages = [pages[i] for i in range(len(pages)) if i not in qp_indices]
 
     answer_lines = []
     for page in answer_pages:
@@ -722,15 +493,19 @@ def process_pdf(file_input, status_callback=None):
             if not is_noise(line):
                 answer_lines.append(line)
 
-    qa_map = map_answers_with_llm(answer_lines, official_questions, status_callback)
+    full_answer_text = "\n".join(answer_lines)
 
-    qa_pairs = []
-    for q in official_questions:
-        qa_pairs.append({
+    log("Mapping student answers chunk-by-chunk...")
+    qa_map = map_answers_with_llm(full_answer_text, official_questions, status_callback)
+
+    qa_pairs = [
+        {
             "question": q,
             "answer": qa_map.get(q, ""),
-            "matched": q in qa_map,
-        })
+            "matched": bool(qa_map.get(q, "").strip())
+        }
+        for q in official_questions
+    ]
 
     return ocr_json, qa_pairs
 
