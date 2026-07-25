@@ -228,37 +228,48 @@ def process_reference(file_input, status_callback=None):
 # LLM PROVIDER ABSTRACTION
 # Default provider is Anthropic Claude (claude-sonnet-5, the current Sonnet
 # model as of this writing -- Claude Sonnet 4.6 was superseded by Sonnet 5 on
-# 2026-06-30). Groq remains available as a fallback/cheaper option via
-# LLM_PROVIDER=groq. Every call-site in this file goes through ONE function,
-# _call_groq_with_retries (name kept for backward compatibility with the rest
-# of this module), so switching providers never requires touching any of the
-# question-identification / answer-mapping logic below.
+# 2026-06-30). Gemini (free tier) and Groq remain available as alternatives via
+# LLM_PROVIDER=gemini / LLM_PROVIDER=groq. Every call-site in this file goes
+# through ONE function, _call_groq_with_retries (name kept for backward
+# compatibility with the rest of this module), so switching providers never
+# requires touching any of the question-identification / answer-mapping logic.
 # =========================================================
 def _detect_llm_provider() -> str:
     """
     Respects an explicit LLM_PROVIDER env var if set. Otherwise auto-detects
-    based on whichever API key is actually configured -- prefers Anthropic if
-    both are present, falls back to Groq if only GROQ_API_KEY exists. This
-    avoids a hard crash like "No ANTHROPIC API key found" just because someone
-    only ever set up GROQ_API_KEY and never explicitly chose a provider.
+    based on whichever API key is actually configured -- prefers Gemini (free
+    tier, the current default choice) if GEMINI_API_KEY is set, then
+    Anthropic, then Groq. This avoids a hard crash like "No X API key found"
+    just because someone only set up one key and never explicitly chose.
     """
     explicit = os.getenv("LLM_PROVIDER")
     if explicit:
         return explicit.strip().lower()
+    if get_api_key("GEMINI_API_KEY"):
+        return "gemini"
     if get_api_key("ANTHROPIC_API_KEY"):
         return "anthropic"
     if get_api_key("GROQ_API_KEY"):
         return "groq"
-    return "anthropic"  # neither configured -- keep this as the named default so the resulting error is specific and actionable
+    return "gemini"  # neither configured -- keep this as the named default so the resulting error is specific and actionable
 LLM_PROVIDER = _detect_llm_provider()
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # free tier; use gemini-2.5-flash-lite via env for higher RPM/RPD if this gets too tight
 CHARS_PER_TOKEN_ESTIMATE = 2.0
-# Conservative defaults; override with LLM_TPM_LIMIT if your account/tier is higher.
-_DEFAULT_TPM = {"anthropic": 30000, "groq": 8000}
+# Conservative token-per-minute defaults; override with LLM_TPM_LIMIT if your account/tier is higher.
+_DEFAULT_TPM = {"anthropic": 30000, "groq": 8000, "gemini": 200000}
 TPM_LIMIT = int(os.getenv("LLM_TPM_LIMIT", str(_DEFAULT_TPM.get(LLM_PROVIDER, 20000))))
 TPM_SAFETY_FRACTION = 0.85
-GROQ_MAX_CONCURRENT_CALLS = int(os.getenv("LLM_MAX_CONCURRENT_CALLS", "3"))
+# Requests-per-minute defaults -- this is the REAL bottleneck on Gemini's free tier
+# (as low as 10 RPM), much more binding than the token budget above. 0 = no RPM cap.
+_DEFAULT_RPM = {"gemini": 10, "anthropic": 0, "groq": 0}
+RPM_LIMIT = int(os.getenv("LLM_RPM_LIMIT", str(_DEFAULT_RPM.get(LLM_PROVIDER, 0))))
+# Provider-specific safe concurrency -- Gemini's low RPM means firing several
+# requests at once just makes them all queue up behind the RPM limiter anyway,
+# so keep concurrency low there; Groq/Anthropic can sustain more in flight.
+_DEFAULT_CONCURRENCY = {"gemini": 2, "anthropic": 3, "groq": 3}
+GROQ_MAX_CONCURRENT_CALLS = int(os.getenv("LLM_MAX_CONCURRENT_CALLS", str(_DEFAULT_CONCURRENCY.get(LLM_PROVIDER, 3))))
 _groq_call_semaphore = threading.Semaphore(GROQ_MAX_CONCURRENT_CALLS)
 _budget_lock = threading.Lock()
 def _estimate_tokens(text: str) -> int:
@@ -328,6 +339,36 @@ class _TokenBudgetTracker:
             self.safe_limit = limit * TPM_SAFETY_FRACTION
     def reset_window(self):
         self.events.clear()
+class _RateLimiter:
+    """
+    Drop-in replacement for _TokenBudgetTracker that ALSO paces on requests-per-
+    minute, not just tokens-per-minute. Groq/Anthropic are token-bound in
+    practice, but Gemini's free tier is request-bound (as low as 10 RPM) --
+    without this, the pipeline would hammer Gemini with far more requests per
+    minute than it allows and 429 constantly regardless of how well tokens are
+    paced. Reuses _TokenBudgetTracker for both (an "RPM tracker" is just a
+    token tracker where every request costs exactly 1 "token").
+    """
+    def __init__(self, tpm_limit=TPM_LIMIT, rpm_limit=RPM_LIMIT, safety_fraction=TPM_SAFETY_FRACTION):
+        self._tpm = _TokenBudgetTracker(tpm_limit, safety_fraction)
+        self._rpm = _TokenBudgetTracker(rpm_limit, safety_fraction) if rpm_limit else None
+    def wait_if_needed(self, upcoming_tokens: int, log=print):
+        self._tpm.wait_if_needed(upcoming_tokens, log=log)
+        if self._rpm is not None:
+            self._rpm.wait_if_needed(1, log=log)
+    def record_usage(self, tokens: int):
+        self._tpm.record_usage(tokens)
+        if self._rpm is not None:
+            self._rpm.record_usage(1)
+    def record_actual_from_error(self, used: int, limit: int):
+        self._tpm.record_actual_from_error(used, limit)
+    def reset_window(self):
+        self._tpm.reset_window()
+        if self._rpm is not None:
+            self._rpm.reset_window()
+    @property
+    def safe_limit(self):
+        return self._tpm.safe_limit
 _RATE_LIMIT_DETAIL_RE = re.compile(
     r'on\s+tokens\s+per\s+(minute|day)\s*\((TPM|TPD)\).*?'
     r'Limit\s+(\d+),\s*Used\s+(\d+),\s*Requested\s+(\d+).*?'
@@ -354,8 +395,9 @@ class LLMQuotaExhaustedError(Exception):
     answer's range."""
     pass
 _MAX_API_KEYS = 10
+_PROVIDER_KEY_PREFIX = {"anthropic": "ANTHROPIC_API_KEY", "groq": "GROQ_API_KEY", "gemini": "GEMINI_API_KEY"}
 def _collect_api_keys() -> list:
-    prefix = "ANTHROPIC_API_KEY" if LLM_PROVIDER == "anthropic" else "GROQ_API_KEY"
+    prefix = _PROVIDER_KEY_PREFIX.get(LLM_PROVIDER, "GEMINI_API_KEY")
     keys = []
     primary = get_api_key(prefix)
     if primary:
@@ -367,19 +409,20 @@ def _collect_api_keys() -> list:
     return keys
 # Kept for any external code that imported the old Groq-specific name.
 _collect_groq_api_keys = _collect_api_keys
+_gemini_configure_lock = threading.Lock()
 class _RotatingLLMClient:
     """Provider-agnostic client. `.create(system_prompt, user_prompt, max_tokens)`
     returns (text, actual_tokens_used_or_None). Transparently rotates to the
     next configured API key on auth failure or (Groq-only) daily-quota
     exhaustion, retrying the SAME request from where it left off."""
-    def __init__(self, api_keys: list, budget: "_TokenBudgetTracker" = None, log=print):
+    def __init__(self, api_keys: list, budget: "_RateLimiter" = None, log=print):
         if not api_keys:
             raise Exception(
-            f"No {LLM_PROVIDER.upper()} API key found. Add "
-            f"{'ANTHROPIC_API_KEY' if LLM_PROVIDER == 'anthropic' else 'GROQ_API_KEY'} "
-            f"to st.secrets or your environment (or set LLM_PROVIDER=groq / LLM_PROVIDER=anthropic "
-            f"explicitly to pick which one this should use)."
-        )
+                f"No {LLM_PROVIDER.upper()} API key found. Add "
+                f"{_PROVIDER_KEY_PREFIX.get(LLM_PROVIDER, 'GEMINI_API_KEY')} to st.secrets or your "
+                f"environment (or set LLM_PROVIDER=gemini / LLM_PROVIDER=anthropic / LLM_PROVIDER=groq "
+                f"explicitly to pick which one this should use)."
+            )
         self._keys = api_keys
         self._index = 0
         self._budget = budget
@@ -391,6 +434,14 @@ class _RotatingLLMClient:
         if LLM_PROVIDER == "anthropic":
             import anthropic
             self._client = anthropic.Anthropic(api_key=self._keys[self._index])
+        elif LLM_PROVIDER == "gemini":
+            import google.generativeai as genai
+            # google.generativeai's API key is process-global (genai.configure), not
+            # per-instance -- configuring it here just records which key THIS client
+            # should use; the actual configure() call happens inside create(), under
+            # a lock, immediately before the request, so concurrent threads/clients
+            # using different keys can't race and silently use the wrong one.
+            self._client = genai
         else:
             from groq import Groq
             self._client = Groq(api_key=self._keys[self._index])
@@ -420,6 +471,21 @@ class _RotatingLLMClient:
             usage = getattr(resp, "usage", None)
             total_tokens = (usage.input_tokens + usage.output_tokens) if usage else None
             return text, total_tokens
+        elif LLM_PROVIDER == "gemini":
+            import google.generativeai as genai
+            with _gemini_configure_lock:
+                genai.configure(api_key=self._keys[self._index])
+                model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=system_prompt)
+                resp = model.generate_content(
+                    user_prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.0, max_output_tokens=max_tokens, response_mime_type="application/json",
+                    ),
+                )
+            text = getattr(resp, "text", None)
+            usage = getattr(resp, "usage_metadata", None)
+            total_tokens = (usage.prompt_token_count + usage.candidates_token_count) if usage else None
+            return text, total_tokens
         else:
             resp = self._client.chat.completions.create(
                 model=GROQ_MODEL,
@@ -436,6 +502,9 @@ def _get_provider_sdk():
     if LLM_PROVIDER == "anthropic":
         import anthropic
         return anthropic, anthropic.AuthenticationError, anthropic.RateLimitError
+    elif LLM_PROVIDER == "gemini":
+        import google.api_core.exceptions as gexc
+        return gexc, gexc.PermissionDenied, gexc.ResourceExhausted
     else:
         import groq
         return groq, groq.AuthenticationError, groq.RateLimitError
@@ -466,8 +535,8 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str, respon
             return response_parser(content)
         except AuthErr as e:
             raise Exception(
-                f"{LLM_PROVIDER.upper()} API rejected the API key (401). This will NOT be fixed by "
-                f"retrying -- check that {'ANTHROPIC_API_KEY' if LLM_PROVIDER == 'anthropic' else 'GROQ_API_KEY'} "
+                f"{LLM_PROVIDER.upper()} API rejected the API key (401/403). This will NOT be fixed by "
+                f"retrying -- check that {_PROVIDER_KEY_PREFIX.get(LLM_PROVIDER, 'GEMINI_API_KEY')} "
                 f"is set correctly (no extra whitespace/quotes) and hasn't been revoked. Original error: {e}"
             ) from e
         except RateErr as e:
@@ -793,11 +862,11 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
     if not api_keys:
         raise Exception(
             f"No {LLM_PROVIDER.upper()} API key found. Add "
-            f"{'ANTHROPIC_API_KEY' if LLM_PROVIDER == 'anthropic' else 'GROQ_API_KEY'} "
-            f"to st.secrets or your environment (or set LLM_PROVIDER=groq / LLM_PROVIDER=anthropic "
-            f"explicitly to pick which one this should use)."
+            f"{_PROVIDER_KEY_PREFIX.get(LLM_PROVIDER, 'GEMINI_API_KEY')} "
+            f"to st.secrets or your environment (or set LLM_PROVIDER=gemini / LLM_PROVIDER=anthropic / "
+            f"LLM_PROVIDER=groq explicitly to pick which one this should use)."
         )
-    budget = _TokenBudgetTracker()
+    budget = _RateLimiter()
     client = _RotatingLLMClient(api_keys, budget=budget, log=log)
     user_prompt = _build_canonical_questions_prompt(qp_pages)
     log(f"Extracting canonical question list from {len(qp_pages)} question-paper page(s) in a single pass...")
@@ -888,11 +957,11 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     if not api_keys:
         raise Exception(
             f"No {LLM_PROVIDER.upper()} API key found. Add "
-            f"{'ANTHROPIC_API_KEY' if LLM_PROVIDER == 'anthropic' else 'GROQ_API_KEY'} "
-            f"to st.secrets or your environment (or set LLM_PROVIDER=groq / LLM_PROVIDER=anthropic "
-            f"explicitly to pick which one this should use)."
+            f"{_PROVIDER_KEY_PREFIX.get(LLM_PROVIDER, 'GEMINI_API_KEY')} "
+            f"to st.secrets or your environment (or set LLM_PROVIDER=gemini / LLM_PROVIDER=anthropic / "
+            f"LLM_PROVIDER=groq explicitly to pick which one this should use)."
         )
-    budget = _TokenBudgetTracker()
+    budget = _RateLimiter()
     client = _RotatingLLMClient(api_keys, budget=budget, log=log)
     chunks = _chunk_pages_by_char_budget(pages)
     log(f"Split {len(pages)} page(s) into {len(chunks)} LLM chunk(s) to respect token limits")
@@ -1577,11 +1646,11 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     if not api_keys:
         raise Exception(
             f"No {LLM_PROVIDER.upper()} API key found. Add "
-            f"{'ANTHROPIC_API_KEY' if LLM_PROVIDER == 'anthropic' else 'GROQ_API_KEY'} "
-            f"to st.secrets or your environment (or set LLM_PROVIDER=groq / LLM_PROVIDER=anthropic "
-            f"explicitly to pick which one this should use)."
+            f"{_PROVIDER_KEY_PREFIX.get(LLM_PROVIDER, 'GEMINI_API_KEY')} "
+            f"to st.secrets or your environment (or set LLM_PROVIDER=gemini / LLM_PROVIDER=anthropic / "
+            f"LLM_PROVIDER=groq explicitly to pick which one this should use)."
         )
-    budget = _TokenBudgetTracker()
+    budget = _RateLimiter()
     client = _RotatingLLMClient(api_keys, budget=budget, log=log)
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(numbered_lines)
