@@ -409,7 +409,6 @@ def _collect_api_keys() -> list:
     return keys
 # Kept for any external code that imported the old Groq-specific name.
 _collect_groq_api_keys = _collect_api_keys
-_gemini_configure_lock = threading.Lock()
 class _RotatingLLMClient:
     """Provider-agnostic client. `.create(system_prompt, user_prompt, max_tokens)`
     returns (text, actual_tokens_used_or_None). Transparently rotates to the
@@ -432,18 +431,25 @@ class _RotatingLLMClient:
             log(f"{LLM_PROVIDER} key rotation enabled: {len(api_keys)} key(s) configured -- will fall back key-to-key if needed.")
     def _make_client(self):
         if LLM_PROVIDER == "anthropic":
-            import anthropic
+            try:
+                import anthropic
+            except ImportError as e:
+                raise ImportError("LLM_PROVIDER=anthropic requires the 'anthropic' package -- run: pip install anthropic") from e
             self._client = anthropic.Anthropic(api_key=self._keys[self._index])
         elif LLM_PROVIDER == "gemini":
-            import google.generativeai as genai
-            # google.generativeai's API key is process-global (genai.configure), not
-            # per-instance -- configuring it here just records which key THIS client
-            # should use; the actual configure() call happens inside create(), under
-            # a lock, immediately before the request, so concurrent threads/clients
-            # using different keys can't race and silently use the wrong one.
-            self._client = genai
+            try:
+                from google import genai
+            except ImportError as e:
+                raise ImportError(
+                    "LLM_PROVIDER=gemini requires the 'google-genai' package -- run: pip install google-genai "
+                    "(NOT the old, deprecated 'google-generativeai' package)."
+                ) from e
+            self._client = genai.Client(api_key=self._keys[self._index])
         else:
-            from groq import Groq
+            try:
+                from groq import Groq
+            except ImportError as e:
+                raise ImportError("LLM_PROVIDER=groq requires the 'groq' package -- run: pip install groq") from e
             self._client = Groq(api_key=self._keys[self._index])
     @property
     def key_count(self) -> int:
@@ -472,16 +478,15 @@ class _RotatingLLMClient:
             total_tokens = (usage.input_tokens + usage.output_tokens) if usage else None
             return text, total_tokens
         elif LLM_PROVIDER == "gemini":
-            import google.generativeai as genai
-            with _gemini_configure_lock:
-                genai.configure(api_key=self._keys[self._index])
-                model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=system_prompt)
-                resp = model.generate_content(
-                    user_prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        temperature=0.0, max_output_tokens=max_tokens, response_mime_type="application/json",
-                    ),
-                )
+            from google.genai import types as gtypes
+            resp = self._client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=user_prompt,
+                config=gtypes.GenerateContentConfig(
+                    system_instruction=system_prompt, temperature=0.0,
+                    max_output_tokens=max_tokens, response_mime_type="application/json",
+                ),
+            )
             text = getattr(resp, "text", None)
             usage = getattr(resp, "usage_metadata", None)
             total_tokens = (usage.prompt_token_count + usage.candidates_token_count) if usage else None
@@ -498,20 +503,47 @@ class _RotatingLLMClient:
             usage = getattr(resp, "usage", None)
             total_tokens = getattr(usage, "total_tokens", None) if usage else None
             return text, total_tokens
-def _get_provider_sdk():
+def _get_catchable_exception_types():
+    """Returns a tuple of exception types worth specially classifying (auth vs
+    rate-limit) for the active provider -- everything else falls through to the
+    generic retry handler."""
     if LLM_PROVIDER == "anthropic":
         import anthropic
-        return anthropic, anthropic.AuthenticationError, anthropic.RateLimitError
+        return (anthropic.AuthenticationError, anthropic.RateLimitError)
     elif LLM_PROVIDER == "gemini":
-        import google.api_core.exceptions as gexc
-        return gexc, gexc.PermissionDenied, gexc.ResourceExhausted
+        from google.genai import errors as gerrors
+        return (gerrors.APIError,)  # covers both auth (401/403) and rate-limit (429); split by .code below
     else:
         import groq
-        return groq, groq.AuthenticationError, groq.RateLimitError
+        return (groq.AuthenticationError, groq.RateLimitError)
+def _classify_llm_error(e: Exception) -> str:
+    """Returns 'auth', 'rate_limit', or 'other', regardless of which provider's
+    exception shape raised it."""
+    if LLM_PROVIDER == "anthropic":
+        import anthropic
+        if isinstance(e, anthropic.AuthenticationError):
+            return "auth"
+        if isinstance(e, anthropic.RateLimitError):
+            return "rate_limit"
+        return "other"
+    elif LLM_PROVIDER == "gemini":
+        code = getattr(e, "code", None)
+        if code in (401, 403):
+            return "auth"
+        if code == 429:
+            return "rate_limit"
+        return "other"
+    else:
+        import groq
+        if isinstance(e, groq.AuthenticationError):
+            return "auth"
+        if isinstance(e, groq.RateLimitError):
+            return "rate_limit"
+        return "other"
 def _call_groq_with_retries(client, system_prompt: str, user_prompt: str, response_parser,
                               budget: "_TokenBudgetTracker", log, max_retries: int = 4,
                               max_tokens: int = None):
-    _sdk, AuthErr, RateErr = _get_provider_sdk()
+    catchable = _get_catchable_exception_types()
     estimated_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt) + 800
     last_error = None
     skip_next_proactive_check = False
@@ -533,37 +565,45 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str, respon
                     "before completing valid JSON (max_tokens too low for a long output). Will retry."
                 )
             return response_parser(content)
-        except AuthErr as e:
-            raise Exception(
-                f"{LLM_PROVIDER.upper()} API rejected the API key (401/403). This will NOT be fixed by "
-                f"retrying -- check that {_PROVIDER_KEY_PREFIX.get(LLM_PROVIDER, 'GEMINI_API_KEY')} "
-                f"is set correctly (no extra whitespace/quotes) and hasn't been revoked. Original error: {e}"
-            ) from e
-        except RateErr as e:
-            last_error = e
-            detail = _parse_rate_limit_detail(str(e)) if LLM_PROVIDER == "groq" else None
-            if detail and detail["limit_type"] == "TPD":
-                if hasattr(client, "rotate") and client.rotate(reason="hit its daily token quota (TPD)"):
-                    skip_next_proactive_check = True
-                    continue
-                raise LLMQuotaExhaustedError(
-                    f"Groq daily token quota (TPD) exhausted on ALL configured key(s): "
-                    f"{detail['used']}/{detail['limit']} tokens used today. Wait for the daily reset, "
-                    f"add more backup keys (GROQ_API_KEY_2, ...), or switch LLM_PROVIDER=anthropic."
+        except catchable as e:
+            kind = _classify_llm_error(e)
+            if kind == "auth":
+                raise Exception(
+                    f"{LLM_PROVIDER.upper()} API rejected the API key (401/403). This will NOT be fixed by "
+                    f"retrying -- check that {_PROVIDER_KEY_PREFIX.get(LLM_PROVIDER, 'GEMINI_API_KEY')} "
+                    f"is set correctly (no extra whitespace/quotes) and hasn't been revoked. Original error: {e}"
                 ) from e
-            if detail:
-                budget.record_actual_from_error(detail["used"], detail["limit"])
-                wait_s = detail["wait_seconds"] + 0.5
-            else:
-                retry_after = None
-                resp_obj = getattr(e, "response", None)
-                if resp_obj is not None and hasattr(resp_obj, "headers"):
-                    retry_after = resp_obj.headers.get("retry-after")
-                wait_s = (float(retry_after) + 0.5) if retry_after else 5.0 * attempt
-            log(f"Rate limit hit (attempt {attempt}): {e}. Waiting {wait_s:.1f}s before retrying...")
-            time.sleep(wait_s)
-            budget.reset_window()
-            skip_next_proactive_check = True
+            if kind == "rate_limit":
+                last_error = e
+                detail = _parse_rate_limit_detail(str(e)) if LLM_PROVIDER == "groq" else None
+                if detail and detail["limit_type"] == "TPD":
+                    if hasattr(client, "rotate") and client.rotate(reason="hit its daily token quota (TPD)"):
+                        skip_next_proactive_check = True
+                        continue
+                    raise LLMQuotaExhaustedError(
+                        f"Groq daily token quota (TPD) exhausted on ALL configured key(s): "
+                        f"{detail['used']}/{detail['limit']} tokens used today. Wait for the daily reset, "
+                        f"add more backup keys (GROQ_API_KEY_2, ...), or switch LLM_PROVIDER."
+                    ) from e
+                if detail:
+                    budget.record_actual_from_error(detail["used"], detail["limit"])
+                    wait_s = detail["wait_seconds"] + 0.5
+                else:
+                    retry_after = None
+                    resp_obj = getattr(e, "response", None)
+                    if resp_obj is not None and hasattr(resp_obj, "headers"):
+                        retry_after = resp_obj.headers.get("retry-after")
+                    wait_s = (float(retry_after) + 0.5) if retry_after else 5.0 * attempt
+                log(f"Rate limit hit (attempt {attempt}): {e}. Waiting {wait_s:.1f}s before retrying...")
+                time.sleep(wait_s)
+                budget.reset_window()
+                skip_next_proactive_check = True
+                continue
+            # kind == "other" -- an APIError/SDK error we don't specially classify;
+            # fall through to the generic retry-with-backoff handling below.
+            last_error = e
+            log(f"LLM call/parse attempt {attempt} failed: {e}")
+            time.sleep(1)
         except Exception as e:
             last_error = e
             log(f"LLM call/parse attempt {attempt} failed: {e}")
