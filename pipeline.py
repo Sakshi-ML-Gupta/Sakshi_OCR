@@ -1,8 +1,10 @@
 import os
 import re
+import io
 import json
 import time
 import tempfile
+import httpx
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 import fitz  # PyMuPDF
@@ -12,7 +14,7 @@ from groq import Groq
 # 1. API KEY SETUP
 # =========================================================
 
-def get_api_key(name: str = "GROQ_API_KEY") -> str:
+def get_api_key(name: str) -> str:
     try:
         import streamlit as st
         if name in st.secrets:
@@ -26,7 +28,7 @@ def get_api_key(name: str = "GROQ_API_KEY") -> str:
 
 
 # =========================================================
-# 2. PYDANTIC SCHEMAS FOR STRICT SINGLE-TARGET SEARCH
+# 2. SCHEMAS FOR SEQUENTIAL SINGLE-TARGET SEARCH
 # =========================================================
 
 class QuestionExtractionSchema(BaseModel):
@@ -45,13 +47,57 @@ class TargetLineSchema(BaseModel):
 
 
 # =========================================================
-# 3. OCR & LINE PREPARATION
+# 3. OCR FALLBACK FOR SCANNED / HANDWRITTEN PDFS
 # =========================================================
 
-def extract_numbered_lines_from_pdf(pdf_path: str) -> List[str]:
+DATALAB_BASE_URL = "https://www.datalab.to"
+
+def run_datalab_ocr(pdf_path: str, log=print) -> str:
+    """Fallback OCR engine using Datalab API for scanned/handwritten PDFs."""
+    api_key = get_api_key("DATALAB_API_KEY")
+    if not api_key:
+        raise Exception("DATALAB_API_KEY missing! Required for scanned PDF text extraction.")
+
+    log("Scanned PDF detected. Submitting to Datalab OCR...")
+    
+    with open(pdf_path, "rb") as f:
+        file_bytes = f.read()
+
+    headers = {"X-API-Key": api_key}
+    file_name = os.path.basename(pdf_path)
+
+    resp = httpx.post(
+        f"{DATALAB_BASE_URL}/api/v1/convert",
+        headers=headers,
+        files={"file": (file_name, file_bytes, "application/pdf")},
+        data={"output_format": "markdown", "mode": "accurate"},
+        timeout=120
+    )
+
+    if resp.status_code != 200:
+        raise Exception(f"Datalab submit error {resp.status_code}: {resp.text}")
+
+    data = resp.json()
+    check_url = data["request_check_url"]
+
+    log("Polling OCR engine for results...")
+    for _ in range(150):
+        poll_resp = httpx.get(check_url, headers=headers, timeout=60)
+        if poll_resp.status_code == 200:
+            result = poll_resp.json()
+            if result.get("status") == "complete":
+                return result.get("markdown") or ""
+            if result.get("status") == "failed":
+                raise Exception(f"Datalab conversion failed: {result.get('error')}")
+        time.sleep(2)
+
+    raise Exception("Datalab OCR conversion timed out.")
+
+
+def extract_numbered_lines_from_pdf(pdf_path: str, log=print) -> List[str]:
     """
-    Extracts text from PDF page by page, cleans up noise, and returns 
-    a flat list of indexed lines representing the student's answer sheet.
+    Tries PyMuPDF text extraction first. If empty (Scanned PDF),
+    falls back to Datalab OCR automatically.
     """
     doc = fitz.open(pdf_path)
     lines = []
@@ -61,6 +107,7 @@ def extract_numbered_lines_from_pdf(pdf_path: str) -> List[str]:
         re.IGNORECASE
     )
 
+    # 1. Primary Direct Text Extraction
     for page in doc:
         text = page.get_text("text")
         for line in text.split("\n"):
@@ -69,27 +116,34 @@ def extract_numbered_lines_from_pdf(pdf_path: str) -> List[str]:
                 lines.append(line_str)
                 
     doc.close()
+
+    # 2. OCR Fallback if direct text extraction is empty
+    if not lines:
+        log("No selectable text found in PDF. Triggering OCR engine...")
+        ocr_text = run_datalab_ocr(pdf_path, log=log)
+        for line in ocr_text.split("\n"):
+            line_str = line.strip()
+            if line_str and not noise_re.search(line_str):
+                lines.append(line_str)
+
     return lines
 
 
 # =========================================================
-# 4. SEQUENTIAL SINGLE-TARGET SEARCH ENGINE
+# 4. SEQUENTIAL SEARCH EXTRACTOR
 # =========================================================
 
 class SequentialSearchExtractor:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or get_api_key("GROQ_API_KEY")
         if not self.api_key:
-            raise ValueError("GROQ_API_KEY is missing! Set it in Streamlit Secrets or .env file.")
+            raise ValueError("GROQ_API_KEY is missing!")
         self.client = Groq(api_key=self.api_key)
         self.model = "llama-3.3-70b-versatile"
 
     def extract_all_questions(self, full_text: str) -> List[str]:
-        """
-        Extracts all questions and sub-questions from the document in strict sequence.
-        """
-        system_prompt = """You are an exam document analyzer.
-Extract EVERY question and sub-question (e.g., 1(a), 1(b), Q2, Q3.i) in strict order as printed.
+        system_prompt = """You are an exam paper structure analyzer.
+Extract EVERY question and sub-question (e.g., 1(a), 1(b), Q2, Q3.i) in exact order as printed.
 Return strictly JSON adhering to the provided schema."""
 
         user_prompt = f"Extract all questions from this text:\n\n{full_text[:8000]}"
@@ -118,18 +172,9 @@ Return strictly JSON adhering to the provided schema."""
         chunk_size: int = 150, 
         overlap: int = 20
     ) -> int:
-        """
-        Performs a forward-only single-target search for ONE question at a time.
-        Returns the absolute line index where the answer starts.
-        """
         system_prompt = """You are a line-matching assistant.
-You are given a TARGET QUESTION and a line-numbered block of student answer text.
-Find the EXACT line index where the student BEGINS answering this TARGET QUESTION (e.g., "Ans 1", "Q1.", or topic heading).
-
-STRICT RULES:
-- ONLY locate the START line for the requested TARGET QUESTION.
-- Do NOT worry about where the answer ends.
-- Return `found: false` if this line block does not contain the beginning of the target question."""
+Find the EXACT line index where the student BEGINS answering the TARGET QUESTION.
+Return `found: false` if this chunk does not contain the beginning of the target answer."""
 
         total_lines = len(lines)
         curr = search_start_idx
@@ -137,11 +182,9 @@ STRICT RULES:
         while curr < total_lines:
             end_chunk = min(curr + chunk_size, total_lines)
             chunk_lines = lines[curr:end_chunk]
-            
-            # Format chunk with absolute index numbers
             formatted_block = "\n".join([f"[{curr + i}] {text}" for i, text in enumerate(chunk_lines)])
             
-            user_prompt = f"TARGET QUESTION TO FIND:\n{target_question}\n\nANSWER SHEET LINES:\n{formatted_block}"
+            user_prompt = f"TARGET QUESTION:\n{target_question}\n\nANSWER LINES:\n{formatted_block}"
 
             try:
                 completion = self.client.chat.completions.create(
@@ -160,19 +203,18 @@ STRICT RULES:
                 result = TargetLineSchema.model_validate_json(completion.choices[0].message.content)
 
                 if result.found and result.start_line_index is not None:
-                    # Sanity check: Ensure returned index is valid and monotonic
                     if search_start_idx <= result.start_line_index < total_lines:
                         return result.start_line_index
 
             except Exception as e:
-                print(f"Error during line search for target '{target_question[:20]}...': {e}")
+                print(f"Error searching '{target_question[:20]}...': {e}")
 
             if end_chunk >= total_lines:
                 break
                 
             curr += (chunk_size - overlap)
 
-        return -1  # Not found
+        return -1
 
     def process(self, pdf_path: str, status_callback=None) -> List[Dict[str, Any]]:
         def log(msg):
@@ -180,10 +222,11 @@ STRICT RULES:
             if status_callback:
                 status_callback(msg)
 
-        log("1. Extracting line-by-line text from PDF...")
-        lines = extract_numbered_lines_from_pdf(pdf_path)
+        log("1. Extracting text lines (PyMuPDF + OCR Fallback)...")
+        lines = extract_numbered_lines_from_pdf(pdf_path, log=log)
+        
         if not lines:
-            raise Exception("No text lines extracted from PDF.")
+            raise Exception("No text lines could be extracted even after running OCR.")
 
         full_doc_text = "\n".join(lines)
 
@@ -196,18 +239,17 @@ STRICT RULES:
         search_cursor = 0
 
         for idx, q in enumerate(questions):
-            log(f"Searching start line for Q{idx+1}: '{q[:40]}...' (Search Cursor: Line {search_cursor})")
-            
+            log(f"Searching Q{idx+1}: '{q[:35]}...' (Cursor: Line {search_cursor})")
             start_idx = self.find_start_line_for_target(q, lines, search_cursor)
             
             if start_idx != -1:
                 question_starts.append({"question": q, "start_line": start_idx})
-                search_cursor = start_idx + 1  # Forward search guarantee: Never look backwards!
+                search_cursor = start_idx + 1
             else:
                 log(f"⚠️ Start line not found for Q{idx+1}. Skipping target.")
                 question_starts.append({"question": q, "start_line": None})
 
-        log("4. Computing Math Boundaries (End = Next Start - 1) & Verbatim Slicing...")
+        log("4. Math Boundary Computation (End = Next Start - 1) & Slicing...")
         final_qa_pairs = []
         num_found = len(question_starts)
 
@@ -224,8 +266,6 @@ STRICT RULES:
                 })
                 continue
 
-            # MATH COMPUTATION FOR END LINE (100% Deterministic - No LLM Hallucination)
-            # Find the start line of the NEXT valid question
             end = len(lines) - 1
             for j in range(i + 1, num_found):
                 if question_starts[j]["start_line"] is not None:
@@ -234,7 +274,6 @@ STRICT RULES:
 
             if start <= end:
                 answer_text = " ".join(lines[start:end + 1]).strip()
-                # Clean up leading question labels like "Ans 1.", "उत्तर 1", etc.
                 answer_text = re.sub(r'^\s*(?:Ans(?:wer)?\s*\d*\s*[.:\-]?|उत्तर\s*\d*|Q\.?\s*\d+)\s*', '', answer_text, flags=re.IGNORECASE).strip()
             else:
                 answer_text = lines[start].strip()
@@ -249,14 +288,10 @@ STRICT RULES:
 
 
 # =========================================================
-# 5. WRAPPER FOR STREAMLIT APP (`app.py`) INTEGRATION
+# 5. STREAMLIT APP COMPATIBILITY WRAPPER
 # =========================================================
 
 def process_pdf(file_input, status_callback=None):
-    """
-    Direct drop-in replacement function for Streamlit (`from pipeline import process_pdf`).
-    Handles file paths, bytes, or Streamlit UploadedFile objects automatically.
-    """
     file_bytes = None
     
     if hasattr(file_input, "read"):
@@ -276,9 +311,7 @@ def process_pdf(file_input, status_callback=None):
     try:
         extractor = SequentialSearchExtractor()
         qa_pairs = extractor.process(tmp_path, status_callback=status_callback)
-        
-        # Structure compatibility return for app.py
-        ocr_json = {"total_pages": 1, "status": "Sequential Search Complete"}
+        ocr_json = {"total_pages": 1, "status": "Processed with OCR Fallback"}
         return ocr_json, qa_pairs
     finally:
         if file_bytes and os.path.exists(tmp_path):
