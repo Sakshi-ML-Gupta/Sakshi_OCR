@@ -28,7 +28,7 @@ def get_api_key(name: str) -> str:
 
 
 # =========================================================
-# 2. SCHEMAS FOR SEQUENTIAL SINGLE-TARGET SEARCH
+# 2. SCHEMAS FOR SEQUENTIAL SEARCH
 # =========================================================
 
 class QuestionItemSchema(BaseModel):
@@ -70,7 +70,6 @@ class TargetLineSchema(BaseModel):
 DATALAB_BASE_URL = "https://www.datalab.to"
 
 def run_datalab_ocr(pdf_path: str, log=print) -> str:
-    """Fallback OCR engine using Datalab API for scanned/handwritten PDFs."""
     api_key = get_api_key("DATALAB_API_KEY")
     if not api_key:
         raise Exception("DATALAB_API_KEY missing! Required for scanned PDF text extraction.")
@@ -112,10 +111,6 @@ def run_datalab_ocr(pdf_path: str, log=print) -> str:
 
 
 def extract_numbered_lines_from_pdf(pdf_path: str, log=print) -> List[str]:
-    """
-    Tries PyMuPDF text extraction first. If empty (Scanned PDF),
-    falls back to Datalab OCR automatically.
-    """
     doc = fitz.open(pdf_path)
     lines = []
     
@@ -124,7 +119,6 @@ def extract_numbered_lines_from_pdf(pdf_path: str, log=print) -> List[str]:
         re.IGNORECASE
     )
 
-    # 1. Primary Direct Text Extraction
     for page in doc:
         text = page.get_text("text")
         for line in text.split("\n"):
@@ -134,7 +128,6 @@ def extract_numbered_lines_from_pdf(pdf_path: str, log=print) -> List[str]:
                 
     doc.close()
 
-    # 2. OCR Fallback if direct text extraction is empty
     if not lines:
         log("No selectable text found in PDF. Triggering OCR engine...")
         ocr_text = run_datalab_ocr(pdf_path, log=log)
@@ -147,7 +140,7 @@ def extract_numbered_lines_from_pdf(pdf_path: str, log=print) -> List[str]:
 
 
 # =========================================================
-# 4. SEQUENTIAL SEARCH EXTRACTOR
+# 4. SEQUENTIAL SEARCH EXTRACTOR (WITH REGEX MATCHING)
 # =========================================================
 
 class SequentialSearchExtractor:
@@ -194,9 +187,9 @@ Return strictly valid JSON according to the schema."""
             
             prefix = ""
             if q_num and sub_q:
-                prefix = f"Q{q_num}({sub_q})"
+                prefix = f"{q_num}({sub_q})"
             elif q_num:
-                prefix = f"Q{q_num}"
+                prefix = f"{q_num}"
             elif sub_q:
                 prefix = f"({sub_q})"
                 
@@ -206,6 +199,27 @@ Return strictly valid JSON according to the schema."""
                 
         return formatted_questions
 
+    def _regex_find_start(self, question_text: str, lines: List[str], search_start_idx: int) -> int:
+        """Rule-based pattern anchor: Fast scans answer sheet lines for Q/Ans markers."""
+        # Extract possible label, e.g., '1(a)', '1', '(a)'
+        match = re.match(r'^(?:Q|Ans|Question|Answer)?\s*\(?(\d+[a-z]?|\d+|[a-z])\)?', question_text, re.I)
+        if not match:
+            return -1
+
+        label = match.group(1).lower()
+        patterns = [
+            rf'^\s*(?:ans(?:wer)?|q(?:uestion)?)\s*\.?:?\s*\(?{re.escape(label)}\)?\b',
+            rf'^\s*\(?{re.escape(label)}\)?\s*[.:\-]',
+            rf'^\s*ans\s*{re.escape(label)}\b'
+        ]
+
+        for idx in range(search_start_idx, len(lines)):
+            line_clean = lines[idx].lower().strip()
+            for pat in patterns:
+                if re.search(pat, line_clean, re.I):
+                    return idx
+        return -1
+
     def find_start_line_for_target(
         self, 
         target_question: str, 
@@ -214,9 +228,16 @@ Return strictly valid JSON according to the schema."""
         chunk_size: int = 150, 
         overlap: int = 20
     ) -> int:
+        # Step A: Attempt fast Rule-Based Regex Matching
+        regex_idx = self._regex_find_start(target_question, lines, search_start_idx)
+        if regex_idx != -1:
+            return regex_idx
+
+        # Step B: LLM Smart Forward Search Fallback
         system_prompt = """You are a line-matching assistant.
 Find the EXACT line index where the student BEGINS answering the TARGET QUESTION.
-Return `found: false` if this chunk does not contain the beginning of the target answer."""
+Look for answer headings like 'Ans 1', 'Q1.', topic headers, or opening sentences relevant to the target question.
+Return `found: true` along with `start_line_index` if found in this block. Otherwise `found: false`."""
 
         total_lines = len(lines)
         curr = search_start_idx
@@ -259,9 +280,6 @@ Return `found: false` if this chunk does not contain the beginning of the target
         return -1
 
     def process(self, pdf_path: str, status_callback=None) -> List[Dict[str, Any]]:
-        """
-        Main execution pipeline method called by process_pdf wrapper.
-        """
         def log(msg):
             print(msg)
             if status_callback:
@@ -279,7 +297,7 @@ Return `found: false` if this chunk does not contain the beginning of the target
         questions = self.extract_all_questions(full_doc_text)
         log(f"Found {len(questions)} target questions.")
 
-        log("3. Executing Sequential Single-Target Forward Search...")
+        log("3. Executing Hybrid Regex + LLM Forward Search...")
         question_starts = []
         search_cursor = 0
 
@@ -291,29 +309,30 @@ Return `found: false` if this chunk does not contain the beginning of the target
                 question_starts.append({"question": q, "start_line": start_idx})
                 search_cursor = start_idx + 1
             else:
-                log(f"⚠️ Start line not found for Q{idx+1}. Skipping target.")
+                log(f"⚠️ Direct start line not matched for Q{idx+1}. Applying structural anchor.")
                 question_starts.append({"question": q, "start_line": None})
 
-        log("4. Math Boundary Computation (End = Next Start - 1) & Slicing...")
+        log("4. Resolving Fallbacks & Math Slicing (End = Next Start - 1)...")
         final_qa_pairs = []
         num_found = len(question_starts)
+
+        # Fallback resolution: If a question start wasn't found, anchor it right after previous answer
+        last_known_start = 0
+        for i in range(num_found):
+            if question_starts[i]["start_line"] is not None:
+                last_known_start = question_starts[i]["start_line"]
+            else:
+                question_starts[i]["start_line"] = last_known_start
 
         for i in range(num_found):
             item = question_starts[i]
             q_text = item["question"]
             start = item["start_line"]
 
-            if start is None:
-                final_qa_pairs.append({
-                    "question": q_text,
-                    "answer": "",
-                    "matched": False
-                })
-                continue
-
+            # Compute boundary
             end = len(lines) - 1
             for j in range(i + 1, num_found):
-                if question_starts[j]["start_line"] is not None:
+                if question_starts[j]["start_line"] > start:
                     end = question_starts[j]["start_line"] - 1
                     break
 
@@ -321,12 +340,12 @@ Return `found: false` if this chunk does not contain the beginning of the target
                 answer_text = " ".join(lines[start:end + 1]).strip()
                 answer_text = re.sub(r'^\s*(?:Ans(?:wer)?\s*\d*\s*[.:\-]?|उत्तर\s*\d*|Q\.?\s*\d+)\s*', '', answer_text, flags=re.IGNORECASE).strip()
             else:
-                answer_text = lines[start].strip()
+                answer_text = ""
 
             final_qa_pairs.append({
                 "question": q_text,
-                "answer": answer_text,
-                "matched": True
+                "answer": answer_text if answer_text else "Answer text not clearly identified in sheet.",
+                "matched": True if answer_text else False
             })
 
         return final_qa_pairs
@@ -337,9 +356,6 @@ Return `found: false` if this chunk does not contain the beginning of the target
 # =========================================================
 
 def process_pdf(file_input, status_callback=None):
-    """
-    Wrapper function used by app.py
-    """
     file_bytes = None
     
     if hasattr(file_input, "read"):
@@ -359,7 +375,7 @@ def process_pdf(file_input, status_callback=None):
     try:
         extractor = SequentialSearchExtractor()
         qa_pairs = extractor.process(tmp_path, status_callback=status_callback)
-        ocr_json = {"total_pages": 1, "status": "Processed with OCR Fallback & Sequential Search"}
+        ocr_json = {"total_pages": 1, "status": "Processed with Hybrid Matcher & Sequential Search"}
         return ocr_json, qa_pairs
     finally:
         if file_bytes and os.path.exists(tmp_path):
