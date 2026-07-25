@@ -588,38 +588,50 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 # LLM-BASED ANSWER MAPPING
 # =========================================================
 
-ANSWER_MAP_SYSTEM_PROMPT = """Find line ranges (start_line, end_line inclusive) in student answer text corresponding to each official question REF label.
+ANSWER_MAP_SYSTEM_PROMPT = """You are an expert evaluator mapping student answer paragraphs to official question references.
+Read the paragraphs provided (labelled [P0], [P1], etc.) and map EACH paragraph to the correct question REF (e.g., REF-A, REF-B).
 
-Return ONLY valid JSON:
+Rules:
+1. If a paragraph is part of the answer for REF-A, map it to REF-A.
+2. If an answer spans multiple paragraphs, map ALL those paragraphs to the same REF.
+3. If a paragraph is random noise, teacher signatures, or irrelevant, set "ref": null.
+4. EVERY paragraph ID provided in the input MUST be in your output.
+
+Return ONLY valid JSON in this exact shape:
 {
-  "answers": [
-    {"ref": "REF-A", "start_line": 12, "end_line": 18}
+  "mapping": [
+    {"p_id": "P0", "ref": "REF-A"},
+    {"p_id": "P1", "ref": "REF-A"},
+    {"p_id": "P2", "ref": null},
+    {"p_id": "P3", "ref": "REF-B"}
   ]
-}"""
+}""""""
 
 
-def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
+def _build_answer_map_user_prompt(paragraphs: list, questions: list) -> str:
     questions_block = "\n".join(
         f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
     )
-    lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
-    return f"OFFICIAL QUESTIONS:\n{questions_block}\n\nSTUDENT ANSWERS:\n{lines_block}"
+    
+    # Create [P0] Text... [P1] Text... layout
+    lines_block = "\n\n".join(f"[{pid}] {text}" for pid, text in paragraphs)
+    
+    return f"OFFICIAL QUESTIONS:\n{questions_block}\n\nSTUDENT ANSWER PARAGRAPHS:\n{lines_block}"
 
 
-def _parse_answer_map_llm_response(content: str) -> list:
+def _parse_answer_map_llm_response(content: str) -> dict:
     c = re.sub(r'^```(?:json)?\s*\n?|\n?```\s*$', '', content.strip())
-    data = json.loads(c)
-    res = []
-    for item in data.get("answers", []):
-        try:
-            res.append({
-                "ref": str(item["ref"]).strip().upper(),
-                "start_line": int(item["start_line"]),
-                "end_line": int(item["end_line"])
-            })
-        except (ValueError, TypeError, KeyError):
-            continue
-    return res
+    try:
+        data = json.loads(c)
+        mapping = {}
+        for item in data.get("mapping", []):
+            pid = item.get("p_id")
+            ref = item.get("ref")
+            if pid and ref:
+                mapping[pid] = str(ref).strip().upper()
+        return mapping
+    except (ValueError, TypeError, KeyError):
+        return {}
 
 
 def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
@@ -635,6 +647,27 @@ def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
             resolved.append(r)
     return resolved
 
+def group_into_paragraphs(answer_lines: list) -> list:
+    """Combines continuous lines into paragraphs to reduce LLM workload and keep context intact."""
+    paragraphs = []
+    current_para = []
+    
+    for line in answer_lines:
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+            
+        # If line looks like a new list item or heading, force a new paragraph
+        if re.match(r'^(\d+[\.\)]|[a-zA-Z][\.\)]|[-•*])\s', cleaned) and current_para:
+            paragraphs.append(" ".join(current_para))
+            current_para = [cleaned]
+        else:
+            current_para.append(cleaned)
+            
+    if current_para:
+        paragraphs.append(" ".join(current_para))
+        
+    return paragraphs
 
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
     def log(msg):
@@ -647,31 +680,41 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
+    # Step 1: Create dictionary of Ref -> Actual Question
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
-    numbered_lines = list(enumerate(answer_lines))
     
-    # Process answer mapping pass
-    user_prompt = _build_answer_map_user_prompt(numbered_lines, questions)
-    mapped_ranges = _call_groq_with_retries(
+    # Step 2: Group messy lines into solid paragraphs and assign IDs
+    clean_paragraphs = group_into_paragraphs(answer_lines)
+    numbered_paragraphs = [(f"P{i}", text) for i, text in enumerate(clean_paragraphs)]
+    
+    if not numbered_paragraphs:
+        return {}
+
+    # Step 3: Call LLM to map P-IDs to REFs
+    user_prompt = _build_answer_map_user_prompt(numbered_paragraphs, questions)
+    
+    log("Mapping paragraphs to questions exactly...")
+    pid_to_ref = _call_groq_with_retries(
         client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
         _parse_answer_map_llm_response, budget, log
     )
 
-    resolved_ranges = _resolve_overlapping_answer_ranges(mapped_ranges)
+    # Step 4: Reconstruct exact answers based on mapped P-IDs
+    qa_map = {q: [] for q in ref_to_question.values()}
+    
+    for pid, text in numbered_paragraphs:
+        assigned_ref = pid_to_ref.get(pid)
+        if assigned_ref and assigned_ref in ref_to_question:
+            actual_q = ref_to_question[assigned_ref]
+            qa_map[actual_q].append(text)
 
-    qa_map = {}
-    for r in resolved_ranges:
-        start, end = r["start_line"], r["end_line"]
-        verbatim_lines = [
-            answer_lines[j] for j in range(start, end + 1)
-            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
-        ]
-        q_text = ref_to_question.get(r["ref"])
-        if q_text:
-            qa_map[q_text] = " ".join(verbatim_lines).strip()
+    # Step 5: Join paragraphs back together
+    final_qa_map = {}
+    for q, paras in qa_map.items():
+        if paras:
+            final_qa_map[q] = "\n\n".join(paras).strip()
 
-    return qa_map
-
+    return final_qa_map
 
 NOISE_RE = re.compile(
     r'(?:Teacher\'?s?\s*Signature|PAGE\s*NO|^\s*DATE\b|^\s*\d{1,3}\s*$)',
