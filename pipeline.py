@@ -2,251 +2,287 @@ import os
 import re
 import json
 import time
-from pathlib import Path
+import tempfile
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 import fitz  # PyMuPDF
 from groq import Groq
 
 # =========================================================
-# 1. PYDANTIC SCHEMAS FOR STRUCTURED OUTPUT
+# 1. API KEY SETUP
 # =========================================================
 
-class QAPair(BaseModel):
-    question_number: Optional[str] = Field(
-        default=None, 
-        description="Question or Sub-question number if present (e.g., 'Q1', '1(a)', '2.i')"
-    )
-    question: str = Field(
-        description="The exact full question text extracted verbatim from the chunk."
-    )
-    answer: str = Field(
-        description="The complete, exact answer text corresponding to the question. Do not summarize or truncate."
-    )
-
-class ExtractedQAList(BaseModel):
-    items: List[QAPair] = Field(
-        default_factory=list,
-        description="List of all question-answer pairs found in the given text chunk."
-    )
+def get_api_key(name: str = "GROQ_API_KEY") -> str:
+    try:
+        import streamlit as st
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    
+    from dotenv import load_dotenv
+    load_dotenv()
+    return os.getenv(name, "")
 
 
 # =========================================================
-# 2. TEXT CHUNKING WITH OVERLAP
+# 2. PYDANTIC SCHEMAS FOR STRICT SINGLE-TARGET SEARCH
 # =========================================================
 
-def chunk_text_with_overlap(
-    text: str, 
-    chunk_size: int = 3500, 
-    overlap: int = 200
-) -> List[str]:
+class QuestionExtractionSchema(BaseModel):
+    questions: List[str] = Field(
+        description="List of all individual questions and sub-questions extracted in exact order from the paper."
+    )
+
+class TargetLineSchema(BaseModel):
+    found: bool = Field(
+        description="True if the student's answer start line for the specified question was found in the chunk."
+    )
+    start_line_index: Optional[int] = Field(
+        default=None,
+        description="The EXACT global integer line index where the student BEGINS answering this question."
+    )
+
+
+# =========================================================
+# 3. OCR & LINE PREPARATION
+# =========================================================
+
+def extract_numbered_lines_from_pdf(pdf_path: str) -> List[str]:
     """
-    Splits text into chunks of `chunk_size` characters with `overlap` characters.
-    Tries to split at sentence/newline boundaries to avoid breaking sentences midway.
+    Extracts text from PDF page by page, cleans up noise, and returns 
+    a flat list of indexed lines representing the student's answer sheet.
     """
-    if len(text) <= chunk_size:
-        return [text]
+    doc = fitz.open(pdf_path)
+    lines = []
+    
+    noise_re = re.compile(
+        r'(?:Teacher\'?s?\s*Signature|PAGE\s*NO|DATE\b|Neel?\s*Kamal|TAKMA\s*SINAN|^\s*\d{1,3}\s*$)',
+        re.IGNORECASE
+    )
 
-    chunks = []
-    start = 0
-    text_length = len(text)
-
-    while start < text_length:
-        end = start + chunk_size
-
-        if end >= text_length:
-            chunks.append(text[start:].strip())
-            break
-
-        # Try to break at a newline or period boundary within the last 200 chars of chunk
-        boundary = text.rfind('\n', start + chunk_size - 200, end)
-        if boundary == -1:
-            boundary = text.rfind('. ', start + chunk_size - 200, end)
-
-        if boundary != -1 and boundary > start:
-            actual_end = boundary + 1
-        else:
-            actual_end = end
-
-        chunk = text[start:actual_end].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        # Move start forward, backing off by overlap amount
-        start = actual_end - overlap
-        if start < 0:
-            start = 0
-
-    return chunks
+    for page in doc:
+        text = page.get_text("text")
+        for line in text.split("\n"):
+            line_str = line.strip()
+            if line_str and not noise_re.search(line_str):
+                lines.append(line_str)
+                
+    doc.close()
+    return lines
 
 
 # =========================================================
-# 3. STRICT SYSTEM PROMPT
+# 4. SEQUENTIAL SINGLE-TARGET SEARCH ENGINE
 # =========================================================
 
-STRICT_QA_SYSTEM_PROMPT = """You are a high-precision document extraction system.
-Your sole job is to extract Question and Answer pairs from the provided text chunk with 100% accuracy.
-
-CRITICAL MANDATORY RULES:
-1. VERBATIM EXTRACTION ONLY:
-   - Extract questions and answers EXACTLY as they appear in the source text.
-   - DO NOT rephrase, summarize, condense, clean up grammar, or alter a single word.
-2. NO SKIPPING / NO TRUNCATION:
-   - Extract the COMPLETE answer from start to end.
-   - Do NOT drop introductory sentences, concluding lines, or sub-points.
-3. NO MERGING:
-   - Every question/sub-question (e.g., 1(a), 1(b)) MUST be extracted as an individual object in the list.
-   - NEVER combine two separate answers into one object.
-4. HANDLE OVERLAPS & PARTIAL TEXT:
-   - If a sentence or answer started in a previous chunk or ends midway due to chunk boundary, extract whatever complete or partial text is available in THIS chunk without inventing text.
-5. IF NO QA PAIRS EXIST:
-   - Return an empty list `{"items": []}` if no questions or answers are found.
-"""
-
-
-# =========================================================
-# 4. CHUNK-BY-LOOP EXTRACTION ENGINE
-# =========================================================
-
-class PDFQAExtractor:
+class SequentialSearchExtractor:
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("GROQ_API_KEY")
+        self.api_key = api_key or get_api_key("GROQ_API_KEY")
         if not self.api_key:
-            raise ValueError("GROQ_API_KEY environment variable or argument is required.")
+            raise ValueError("GROQ_API_KEY is missing! Set it in Streamlit Secrets or .env file.")
         self.client = Groq(api_key=self.api_key)
         self.model = "llama-3.3-70b-versatile"
 
-    def extract_from_pdf(
-        self, 
-        pdf_path: str, 
-        chunk_size: int = 3500, 
-        overlap: int = 200,
-        status_callback=None
-    ) -> List[Dict[str, Any]]:
+    def extract_all_questions(self, full_text: str) -> List[str]:
+        """
+        Extracts all questions and sub-questions from the document in strict sequence.
+        """
+        system_prompt = """You are an exam document analyzer.
+Extract EVERY question and sub-question (e.g., 1(a), 1(b), Q2, Q3.i) in strict order as printed.
+Return strictly JSON adhering to the provided schema."""
+
+        user_prompt = f"Extract all questions from this text:\n\n{full_text[:8000]}"
+
+        completion = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            response_format={
+                "type": "json_object",
+                "schema": QuestionExtractionSchema.model_json_schema()
+            },
+            temperature=0.0
+        )
         
+        parsed = QuestionExtractionSchema.model_validate_json(completion.choices[0].message.content)
+        return [q.strip() for q in parsed.questions if q.strip()]
+
+    def find_start_line_for_target(
+        self, 
+        target_question: str, 
+        lines: List[str], 
+        search_start_idx: int, 
+        chunk_size: int = 150, 
+        overlap: int = 20
+    ) -> int:
+        """
+        Performs a forward-only single-target search for ONE question at a time.
+        Returns the absolute line index where the answer starts.
+        """
+        system_prompt = """You are a line-matching assistant.
+You are given a TARGET QUESTION and a line-numbered block of student answer text.
+Find the EXACT line index where the student BEGINS answering this TARGET QUESTION (e.g., "Ans 1", "Q1.", or topic heading).
+
+STRICT RULES:
+- ONLY locate the START line for the requested TARGET QUESTION.
+- Do NOT worry about where the answer ends.
+- Return `found: false` if this line block does not contain the beginning of the target question."""
+
+        total_lines = len(lines)
+        curr = search_start_idx
+
+        while curr < total_lines:
+            end_chunk = min(curr + chunk_size, total_lines)
+            chunk_lines = lines[curr:end_chunk]
+            
+            # Format chunk with absolute index numbers
+            formatted_block = "\n".join([f"[{curr + i}] {text}" for i, text in enumerate(chunk_lines)])
+            
+            user_prompt = f"TARGET QUESTION TO FIND:\n{target_question}\n\nANSWER SHEET LINES:\n{formatted_block}"
+
+            try:
+                completion = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    response_format={
+                        "type": "json_object",
+                        "schema": TargetLineSchema.model_json_schema()
+                    },
+                    temperature=0.0
+                )
+
+                result = TargetLineSchema.model_validate_json(completion.choices[0].message.content)
+
+                if result.found and result.start_line_index is not None:
+                    # Sanity check: Ensure returned index is valid and monotonic
+                    if search_start_idx <= result.start_line_index < total_lines:
+                        return result.start_line_index
+
+            except Exception as e:
+                print(f"Error during line search for target '{target_question[:20]}...': {e}")
+
+            if end_chunk >= total_lines:
+                break
+                
+            curr += (chunk_size - overlap)
+
+        return -1  # Not found
+
+    def process(self, pdf_path: str, status_callback=None) -> List[Dict[str, Any]]:
         def log(msg):
             print(msg)
             if status_callback:
                 status_callback(msg)
 
-        log(f"Reading PDF: {pdf_path}")
-        doc = fitz.open(pdf_path)
-        full_text_pages = []
-        for page_num in range(len(doc)):
-            page_text = doc[page_num].get_text("text")
-            if page_text.strip():
-                full_text_pages.append(page_text)
-        doc.close()
+        log("1. Extracting line-by-line text from PDF...")
+        lines = extract_numbered_lines_from_pdf(pdf_path)
+        if not lines:
+            raise Exception("No text lines extracted from PDF.")
 
-        full_text = "\n\n".join(full_text_pages)
-        if not full_text.strip():
-            log("No text extracted from PDF. (Might be an image-only PDF needing OCR)")
-            return []
+        full_doc_text = "\n".join(lines)
 
-        # Step 1: Chunking with Overlap
-        log(f"Total Text Length: {len(full_text)} characters.")
-        chunks = chunk_text_with_overlap(full_text, chunk_size=chunk_size, overlap=overlap)
-        log(f"Split into {len(chunks)} chunks with size ~{chunk_size} and overlap {overlap}.")
+        log("2. Extracting Target Questions sequence...")
+        questions = self.extract_all_questions(full_doc_text)
+        log(f"Found {len(questions)} target questions.")
 
-        # Step 2: Loop Processing
-        all_extracted_items: List[QAPair] = []
+        log("3. Executing Sequential Single-Target Forward Search...")
+        question_starts = []
+        search_cursor = 0
 
-        for idx, chunk in enumerate(chunks):
-            log(f"Processing Chunk {idx + 1}/{len(chunks)} ({len(chunk)} chars)...")
+        for idx, q in enumerate(questions):
+            log(f"Searching start line for Q{idx+1}: '{q[:40]}...' (Search Cursor: Line {search_cursor})")
             
-            user_prompt = f"Extract all Question and Answer pairs from this text chunk:\n\n---\n{chunk}\n---"
+            start_idx = self.find_start_line_for_target(q, lines, search_cursor)
+            
+            if start_idx != -1:
+                question_starts.append({"question": q, "start_line": start_idx})
+                search_cursor = start_idx + 1  # Forward search guarantee: Never look backwards!
+            else:
+                log(f"⚠️ Start line not found for Q{idx+1}. Skipping target.")
+                question_starts.append({"question": q, "start_line": None})
 
-            try:
-                # Utilizing Structured Output with Pydantic JSON Schema
-                completion = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": STRICT_QA_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    response_format={
-                        "type": "json_object",
-                        "schema": ExtractedQAList.model_json_schema()
-                    },
-                    temperature=0.0
-                )
+        log("4. Computing Math Boundaries (End = Next Start - 1) & Verbatim Slicing...")
+        final_qa_pairs = []
+        num_found = len(question_starts)
 
-                response_content = completion.choices[0].message.content
-                parsed_response = ExtractedQAList.model_validate_json(response_content)
-                
-                log(f"Chunk {idx + 1}: Found {len(parsed_response.items)} QA pairs.")
-                all_extracted_items.extend(parsed_response.items)
+        for i in range(num_found):
+            item = question_starts[i]
+            q_text = item["question"]
+            start = item["start_line"]
 
-            except Exception as e:
-                log(f"Error processing Chunk {idx + 1}: {e}")
-                time.sleep(1)  # Brief pause on error
-
-        # Step 3: Deduplication & Clean Up
-        log("Deduplicating cross-chunk overlapping QA pairs...")
-        final_qa_list = self._deduplicate_qa_pairs(all_extracted_items)
-        log(f"Final Count after Deduplication: {len(final_qa_list)} QA pairs.")
-
-        return [item.model_dump() for item in final_qa_list]
-
-    def _deduplicate_qa_pairs(self, items: List[QAPair]) -> List[QAPair]:
-        """
-        Merges duplicate or partial QA pairs that were extracted twice across overlapping chunks.
-        """
-        if not items:
-            return []
-
-        unique_items: List[QAPair] = []
-
-        for current in items:
-            if not current.question.strip():
+            if start is None:
+                final_qa_pairs.append({
+                    "question": q_text,
+                    "answer": "",
+                    "matched": False
+                })
                 continue
 
-            matched = False
-            for idx, existing in enumerate(unique_items):
-                # Clean up string comparisons
-                q1 = re.sub(r'\s+', ' ', current.question.strip().lower())
-                q2 = re.sub(r'\s+', ' ', existing.question.strip().lower())
-
-                # If question texts are substantially similar/identical
-                if q1 in q2 or q2 in q1 or self._similarity(q1, q2) > 0.85:
-                    matched = True
-                    # Take the longer answer (covers overlap boundary truncation)
-                    if len(current.answer.strip()) > len(existing.answer.strip()):
-                        unique_items[idx] = current
+            # MATH COMPUTATION FOR END LINE (100% Deterministic - No LLM Hallucination)
+            # Find the start line of the NEXT valid question
+            end = len(lines) - 1
+            for j in range(i + 1, num_found):
+                if question_starts[j]["start_line"] is not None:
+                    end = question_starts[j]["start_line"] - 1
                     break
 
-            if not matched:
-                unique_items.append(current)
+            if start <= end:
+                answer_text = " ".join(lines[start:end + 1]).strip()
+                # Clean up leading question labels like "Ans 1.", "उत्तर 1", etc.
+                answer_text = re.sub(r'^\s*(?:Ans(?:wer)?\s*\d*\s*[.:\-]?|उत्तर\s*\d*|Q\.?\s*\d+)\s*', '', answer_text, flags=re.IGNORECASE).strip()
+            else:
+                answer_text = lines[start].strip()
 
-        return unique_items
+            final_qa_pairs.append({
+                "question": q_text,
+                "answer": answer_text,
+                "matched": True
+            })
 
-    @staticmethod
-    def _similarity(s1: str, s2: str) -> float:
-        from difflib import SequenceMatcher
-        return SequenceMatcher(None, s1, s2).ratio()
+        return final_qa_pairs
 
 
 # =========================================================
-# 5. EXECUTION & UTILITY
+# 5. WRAPPER FOR STREAMLIT APP (`app.py`) INTEGRATION
 # =========================================================
 
-if __name__ == "__main__":
-    # Specify PDF Path
-    PDF_FILE_PATH = "sample_test.pdf"
+def process_pdf(file_input, status_callback=None):
+    """
+    Direct drop-in replacement function for Streamlit (`from pipeline import process_pdf`).
+    Handles file paths, bytes, or Streamlit UploadedFile objects automatically.
+    """
+    file_bytes = None
+    
+    if hasattr(file_input, "read"):
+        file_bytes = file_input.read()
+    elif isinstance(file_input, (bytes, bytearray)):
+        file_bytes = bytes(file_input)
+    elif isinstance(file_input, tuple):
+        file_bytes = file_input[0] if isinstance(file_input[0], (bytes, bytearray)) else file_input[1]
 
-    if os.path.exists(PDF_FILE_PATH):
-        extractor = PDFQAExtractor()
-        results = extractor.extract_from_pdf(
-            pdf_path=PDF_FILE_PATH,
-            chunk_size=3500,
-            overlap=200
-        )
-
-        # Save Output to JSON
-        output_file = "extracted_qa_pairs.json"
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-
-        print(f"\nExtraction Completed! Results saved to '{output_file}'")
+    if file_bytes:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
     else:
-        print(f"File '{PDF_FILE_PATH}' not found. Please update path.")
+        tmp_path = str(file_input)
+
+    try:
+        extractor = SequentialSearchExtractor()
+        qa_pairs = extractor.process(tmp_path, status_callback=status_callback)
+        
+        # Structure compatibility return for app.py
+        ocr_json = {"total_pages": 1, "status": "Sequential Search Complete"}
+        return ocr_json, qa_pairs
+    finally:
+        if file_bytes and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
