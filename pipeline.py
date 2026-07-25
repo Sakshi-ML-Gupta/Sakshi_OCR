@@ -31,8 +31,25 @@ def get_api_key(name: str) -> str:
 # 2. SCHEMAS FOR SEQUENTIAL SINGLE-TARGET SEARCH
 # =========================================================
 
+class QuestionItemSchema(BaseModel):
+    question_number: Optional[str] = Field(
+        default="", 
+        alias="question",
+        description="Question number e.g., '1' or 'Q1'"
+    )
+    sub_question: Optional[str] = Field(
+        default="", 
+        description="Sub-question identifier e.g., 'a', 'i', or '(a)'"
+    )
+    text: str = Field(
+        description="The actual question text string"
+    )
+
+    class Config:
+        populate_by_name = True
+
 class QuestionExtractionSchema(BaseModel):
-    questions: List[str] = Field(
+    questions: List[QuestionItemSchema] = Field(
         description="List of all individual questions and sub-questions extracted in exact order from the paper."
     )
 
@@ -141,46 +158,6 @@ class SequentialSearchExtractor:
         self.client = Groq(api_key=self.api_key)
         self.model = "llama-3.3-70b-versatile"
 
-  # =========================================================
-# 2. SCHEMAS FOR SEQUENTIAL SINGLE-TARGET SEARCH (FIXED)
-# =========================================================
-
-class QuestionItemSchema(BaseModel):
-    question_number: Optional[str] = Field(
-        default="", 
-        alias="question",
-        description="Question number e.g., '1' or 'Q1'"
-    )
-    sub_question: Optional[str] = Field(
-        default="", 
-        description="Sub-question identifier e.g., 'a', 'i', or '(a)'"
-    )
-    text: str = Field(
-        description="The actual question text string"
-    )
-
-    class Config:
-        populate_by_name = True
-
-class QuestionExtractionSchema(BaseModel):
-    questions: List[QuestionItemSchema] = Field(
-        description="List of all individual questions and sub-questions extracted in exact order from the paper."
-    )
-
-class TargetLineSchema(BaseModel):
-    found: bool = Field(
-        description="True if the student's answer start line for the specified question was found in the chunk."
-    )
-    start_line_index: Optional[int] = Field(
-        default=None,
-        description="The EXACT global integer line index where the student BEGINS answering this question."
-    )
-
-
-# =========================================================
-# UPDATED EXTRACT FUNCTION
-# =========================================================
-
     def extract_all_questions(self, full_text: str) -> List[str]:
         system_prompt = """You are an exam paper structure analyzer.
 Extract EVERY question and sub-question (e.g., 1(a), 1(b), Q2, Q3.i) in exact order as printed.
@@ -209,7 +186,6 @@ Return strictly valid JSON according to the schema."""
         
         parsed = QuestionExtractionSchema.model_validate_json(completion.choices[0].message.content)
         
-        # Merge question/sub_question + text into clean flat strings for forward search
         formatted_questions = []
         for q in parsed.questions:
             q_num = (q.question_number or "").strip()
@@ -283,6 +259,9 @@ Return `found: false` if this chunk does not contain the beginning of the target
         return -1
 
     def process(self, pdf_path: str, status_callback=None) -> List[Dict[str, Any]]:
+        """
+        Main execution pipeline method called by process_pdf wrapper.
+        """
         def log(msg):
             print(msg)
             if status_callback:
@@ -358,6 +337,9 @@ Return `found: false` if this chunk does not contain the beginning of the target
 # =========================================================
 
 def process_pdf(file_input, status_callback=None):
+    """
+    Wrapper function used by app.py
+    """
     file_bytes = None
     
     if hasattr(file_input, "read"):
@@ -377,7 +359,7 @@ def process_pdf(file_input, status_callback=None):
     try:
         extractor = SequentialSearchExtractor()
         qa_pairs = extractor.process(tmp_path, status_callback=status_callback)
-        ocr_json = {"total_pages": 1, "status": "Processed with OCR Fallback"}
+        ocr_json = {"total_pages": 1, "status": "Processed with OCR Fallback & Sequential Search"}
         return ocr_json, qa_pairs
     finally:
         if file_bytes and os.path.exists(tmp_path):
