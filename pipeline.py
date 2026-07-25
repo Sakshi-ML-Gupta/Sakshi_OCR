@@ -605,7 +605,7 @@ Return ONLY valid JSON in this exact shape:
     {"p_id": "P2", "ref": null},
     {"p_id": "P3", "ref": "REF-B"}
   ]
-}""""""
+}"""""
 
 
 def _build_answer_map_user_prompt(paragraphs: list, questions: list) -> str:
