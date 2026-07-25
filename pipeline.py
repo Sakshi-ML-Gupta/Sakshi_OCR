@@ -130,6 +130,13 @@ PAGE_BREAK_PATTERNS = [
 def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=print) -> list:
     best_parts = None
 
+    # Step 1: Check Form Feed character (\f) explicitly emitted by OCR engines
+    if '\f' in markdown:
+        parts = [p.strip() for p in markdown.split('\f') if p.strip()]
+        if len(parts) > 1:
+            return parts
+
+    # Step 2: Custom Regex page break markers
     for pattern in PAGE_BREAK_PATTERNS:
         matches = list(pattern.finditer(markdown))
         if not matches:
@@ -155,18 +162,14 @@ def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=pr
     if best_parts:
         return best_parts
 
-    if '\f' in markdown:
-        parts = [p.strip() for p in markdown.split('\f') if p.strip()]
-        if len(parts) > 1:
-            return parts
+    # Fallback Fix: If initial pages skipped due to bad markers, split by double line breaks
+    log("WARNING: Page break markers missing. Recovering pages via structural split...")
+    chunks = [c.strip() for c in markdown.split("\n\n\n") if c.strip()]
+    if len(chunks) > 1:
+        return chunks
 
-    log(
-        f"WARNING: No page-break marker recognized in Datalab output. "
-        f"Treating entire document as single page."
-    )
     return [markdown.strip()]
-
-
+    
 def run_ocr(file_content: bytes, file_name: str, status_callback=None):
     def log(msg):
         print(msg)
@@ -419,16 +422,25 @@ def _parse_qp_llm_response(content: str) -> tuple:
 
 
 QUESTION_PAPER_ONLY_SYSTEM_PROMPT = """You are reading official printed Question Paper pages.
-Extract EVERY question/sub-part exactly as written.
+Extract EVERY question AND ALL SUB-QUESTIONS as distinct items.
+
+STRICT MANDATE FOR SUB-QUESTIONS:
+- If a question has sub-parts like (i), (ii), (iii), or (a), (b), (c), or 1.1, 1.2:
+  YOU MUST TREAT EACH SUB-PART AS A SEPARATE QUESTION IN THE ARRAY.
+- Example input: "Q1. Read the passage and answer: (a) What is X? (b) What is Y?"
+- Example output array: ["Q1.(a) What is X?", "Q1.(b) What is Y?"]
 
 Rules:
-- Split sub-parts like (i), (ii), (a), (b) into distinct canonical entries if they require separate answers.
-- Do NOT paraphrase, summarize, or alter the question text.
-- Maintain original sequence.
+- Do NOT combine sub-questions into a single line.
+- Do NOT paraphrase, summarize, or skip sub-parts.
+- Keep the exact textual order.
 
-Return valid JSON:
+Return strictly JSON:
 {
-  "questions": ["1.(i) Question text...", "1.(ii) Next subpart..."]
+  "questions": [
+    "Q1.(a) Question text...",
+    "Q1.(b) Next subpart..."
+  ]
 }"""
 
 
@@ -611,9 +623,9 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
     numbered_lines = list(enumerate(answer_lines))
 
-    # Chunk lines with generous overlap to preserve continuous context
-    chunk_size = 150
-    overlap = 20
+    # Extended Chunk Size & 30-line Overlap to prevent initial page skips
+    chunk_size = 200
+    overlap = 35
     chunks = []
     i = 0
     while i < len(numbered_lines):
@@ -626,7 +638,7 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     for c_idx, chunk in enumerate(chunks):
         q_block = "\n".join([f"[{ref}] {q}" for ref, q in ref_to_question.items()])
         l_block = "\n".join([f"[{idx}] {text}" for idx, text in chunk])
-        user_prompt = f"QUESTIONS:\n{q_block}\n\nSTUDENT ANSWER LINES:\n{l_block}"
+        user_prompt = f"QUESTIONS (INCLUDING SUB-QUESTIONS):\n{q_block}\n\nSTUDENT ANSWER LINES:\n{l_block}"
 
         try:
             chunk_res = _call_groq_with_retries(
@@ -637,7 +649,6 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         except Exception as e:
             log(f"Answer map chunk {c_idx+1} error: {e}")
 
-    # Deduplicate ranges across chunks (keep longest range for each REF)
     ref_best = {}
     for r in raw_ranges:
         ref = r["ref"]
@@ -645,10 +656,8 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         if ref not in ref_best or span > (ref_best[ref]["end_line"] - ref_best[ref]["start_line"]):
             ref_best[ref] = r
 
-    # Post-process: Enforce non-hallucinated sequential monotonicity
     resolved_ranges = _enforce_monotonic_boundaries(list(ref_best.values()))
 
-    # Verbatim line slicing
     qa_map = {}
     for r in resolved_ranges:
         q_text = ref_to_question.get(r["ref"])
