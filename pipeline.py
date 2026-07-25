@@ -141,10 +141,56 @@ class SequentialSearchExtractor:
         self.client = Groq(api_key=self.api_key)
         self.model = "llama-3.3-70b-versatile"
 
+  # =========================================================
+# 2. SCHEMAS FOR SEQUENTIAL SINGLE-TARGET SEARCH (FIXED)
+# =========================================================
+
+class QuestionItemSchema(BaseModel):
+    question_number: Optional[str] = Field(
+        default="", 
+        alias="question",
+        description="Question number e.g., '1' or 'Q1'"
+    )
+    sub_question: Optional[str] = Field(
+        default="", 
+        description="Sub-question identifier e.g., 'a', 'i', or '(a)'"
+    )
+    text: str = Field(
+        description="The actual question text string"
+    )
+
+    class Config:
+        populate_by_name = True
+
+class QuestionExtractionSchema(BaseModel):
+    questions: List[QuestionItemSchema] = Field(
+        description="List of all individual questions and sub-questions extracted in exact order from the paper."
+    )
+
+class TargetLineSchema(BaseModel):
+    found: bool = Field(
+        description="True if the student's answer start line for the specified question was found in the chunk."
+    )
+    start_line_index: Optional[int] = Field(
+        default=None,
+        description="The EXACT global integer line index where the student BEGINS answering this question."
+    )
+
+
+# =========================================================
+# UPDATED EXTRACT FUNCTION
+# =========================================================
+
     def extract_all_questions(self, full_text: str) -> List[str]:
         system_prompt = """You are an exam paper structure analyzer.
 Extract EVERY question and sub-question (e.g., 1(a), 1(b), Q2, Q3.i) in exact order as printed.
-Return strictly JSON adhering to the provided schema."""
+
+For each item, populate:
+- 'question': Main question number (e.g. '1')
+- 'sub_question': Sub question label if present (e.g. 'a')
+- 'text': The full wording of the question
+
+Return strictly valid JSON according to the schema."""
 
         user_prompt = f"Extract all questions from this text:\n\n{full_text[:8000]}"
 
@@ -162,7 +208,27 @@ Return strictly JSON adhering to the provided schema."""
         )
         
         parsed = QuestionExtractionSchema.model_validate_json(completion.choices[0].message.content)
-        return [q.strip() for q in parsed.questions if q.strip()]
+        
+        # Merge question/sub_question + text into clean flat strings for forward search
+        formatted_questions = []
+        for q in parsed.questions:
+            q_num = (q.question_number or "").strip()
+            sub_q = (q.sub_question or "").strip()
+            q_text = (q.text or "").strip()
+            
+            prefix = ""
+            if q_num and sub_q:
+                prefix = f"Q{q_num}({sub_q})"
+            elif q_num:
+                prefix = f"Q{q_num}"
+            elif sub_q:
+                prefix = f"({sub_q})"
+                
+            full_str = f"{prefix} {q_text}".strip()
+            if full_str:
+                formatted_questions.append(full_str)
+                
+        return formatted_questions
 
     def find_start_line_for_target(
         self, 
