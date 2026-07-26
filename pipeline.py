@@ -1203,6 +1203,23 @@ _PARENT_INSTRUCTION_PREFIX_RE = re.compile(
 )
 
 
+# FIX: a hard safety cap on how much of an answer echo-stripping is
+# ever allowed to remove. Confirmed real-world failure mode: on some
+# documents the echo-similarity check (SequenceMatcher ratio over
+# normalized text) found a "good enough" match against a LARGE portion
+# of the answer purely because the question and answer share a lot of
+# common/topical vocabulary -- not because the answer actually
+# restates the question. Without a ceiling, this could strip away
+# roughly HALF of a genuine answer's own original content, which
+# matches the "answers coming back half" symptom seen in testing. A
+# real question-restatement echo is always a SHORT opening sentence
+# relative to a multi-paragraph answer -- if the computed strip would
+# remove more than this fraction of the answer, it is far more likely
+# a false-positive topical-overlap match than a genuine restatement,
+# so it is skipped entirely (answer kept whole) instead.
+MAX_ECHO_STRIP_FRACTION = 0.35
+
+
 def strip_full_question_echo(answer_text: str, question_text: str) -> str:
     question_core = _PARENT_INSTRUCTION_PREFIX_RE.sub('', question_text).strip()
     if not question_core:
@@ -1231,7 +1248,7 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
             best_ratio = ratio
             best_strip_count = n
 
-    if best_strip_count > 0:
+    if best_strip_count > 0 and best_strip_count <= len(answer_words) * MAX_ECHO_STRIP_FRACTION:
         remaining = " ".join(answer_words[best_strip_count:]).strip()
         remaining = re.sub(r'^(?:Answer\s*[-:]\s*)', '', remaining, flags=re.IGNORECASE)
         return remaining.strip()
@@ -1285,7 +1302,7 @@ def strip_trailing_next_question_echo(answer_text: str, next_question_text: str 
             best_ratio = ratio
             best_strip_count = n
 
-    if best_strip_count > 0:
+    if best_strip_count > 0 and best_strip_count <= len(answer_words) * MAX_ECHO_STRIP_FRACTION:
         remaining_words = answer_words[:len(answer_words) - best_strip_count]
         return " ".join(remaining_words).strip()
 
@@ -1497,6 +1514,40 @@ or, if not found in this chunk:
 {"start_line": null}"""
 
 
+CANDIDATE_CONFIRM_SYSTEM_PROMPT = """You are confirming the TRUE starting line of a student's answer to a specific TARGET question, in OCR'd text from an exam assignment booklet.
+
+You are shown a SMALL NUMBER of CANDIDATE lines, each with a few lines of surrounding context, and each candidate is labeled with its own line number. At most ONE of these candidates is the genuine point where the student's answer to TARGET begins -- the others may be false positives (e.g. a passing mention of a similar topic inside a DIFFERENT answer, or content that only superficially resembles TARGET).
+
+Decide which candidate (if any) is the real start of TARGET's answer. If NONE of the candidates shown are genuinely correct, return null -- do not guess.
+
+Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
+
+{"start_line": 42}
+
+or, if none of the candidates are correct:
+
+{"start_line": null}"""
+
+
+def _get_line_context(answer_lines: list, idx: int, before: int = 1, after: int = 3) -> list:
+    lo = max(0, idx - before)
+    hi = min(len(answer_lines), idx + after + 1)
+    return [(j, answer_lines[j]) for j in range(lo, hi)]
+
+
+def _build_candidate_confirmation_prompt(answer_lines: list, candidate_indices: list, target_question: str) -> str:
+    blocks = []
+    for idx in candidate_indices:
+        context = _get_line_context(answer_lines, idx)
+        lines_block = "\n".join(f"[{j}] {text}" for j, text in context)
+        blocks.append(f"--- CANDIDATE at line {idx} ---\n{lines_block}")
+    return (
+        f"TARGET QUESTION:\n{target_question}\n\n"
+        f"CANDIDATE LINES (pick the ONE genuine start, or none):\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
 def _build_answer_start_prompt(numbered_lines: list, target_question: str, context_questions: list) -> str:
     context_block = "\n".join(f"- {q}" for q in context_questions) if context_questions else "(none)"
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
@@ -1586,6 +1637,36 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(answer_lines)
 
+    # Tier 1 (deterministic, zero LLM risk): pre-compute, for EVERY
+    # line in the whole document, whether it looks like a new-answer
+    # start and -- if so -- which question index it resolves to (via
+    # an explicit numeric label like "Ans 5-"/"उत्तर 5"/"Q5"), or -1 if
+    # it looks like a label but the number couldn't be resolved to any
+    # known question (ambiguous). This is computed ONCE up front, with
+    # no LLM calls at all, and gives a highly reliable anchor for the
+    # common case where students DO label their answers -- which is
+    # the normal case for these IGNOU-style booklets.
+    #
+    # FIX: this replaces the previous version's "always fully open-
+    # ended LLM text scan" as the FIRST resort. That approach had a
+    # confirmed, serious failure mode: when the LLM was shown a chunk
+    # of text and asked "does TARGET start here", it could mistake a
+    # passing/topical resemblance INSIDE THE PREVIOUS QUESTION'S OWN
+    # ANSWER for a genuine start -- accepting an early false start.
+    # Since each answer's END is always derived as (next found start -
+    # 1), one early false start doesn't just corrupt its own answer --
+    # it also truncates the PRECEDING answer, cutting it off well
+    # before its real end. This was confirmed to be the root cause of
+    # "almost all answers coming back half" in testing: a single early
+    # misfire early in the document cascades forward, since every
+    # subsequent search starts its cursor right after the (wrong)
+    # previous find. Deterministic label matching removes this
+    # cascading risk entirely for the common labeled case.
+    line_matches = [
+        _line_starts_new_answer_for_question(text, questions)
+        for _, text in numbered_lines
+    ]
+
     starts = {}  # question index -> start_line
     cursor = 0
     chunk_failures = []
@@ -1593,39 +1674,99 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
     for i, q in enumerate(questions):
         log(f"Sequentially searching for start of question {i+1}/{len(questions)} (from line {cursor})...")
 
-        remaining = [(idx, text) for idx, text in numbered_lines if idx >= cursor]
-        if not remaining:
-            log(f"WARNING: no lines left to search for question {i+1} -- skipping")
-            continue
-
-        line_chunks = _plain_chunk_lines_by_char_budget(remaining, SEQ_ANSWER_START_MAX_CHARS)
-        context_questions = [oq for j, oq in enumerate(questions) if j != i]
+        exact_candidates = [
+            idx for idx, m in enumerate(line_matches)
+            if idx >= cursor and m == i
+        ]
+        ambiguous_candidates = [
+            idx for idx, m in enumerate(line_matches)
+            if idx >= cursor and m == -1
+        ]
 
         found_start = None
-        for chunk in line_chunks:
-            user_prompt = _build_answer_start_prompt(chunk, q, context_questions)
+
+        if exact_candidates:
+            # Tier 1: an unambiguous, resolved numeric-label match
+            # (e.g. "Ans 5-" resolved specifically to question 5). No
+            # LLM call needed -- this is the most reliable signal
+            # available and carries no risk of semantic confusion with
+            # a neighboring answer. If more than one such candidate
+            # exists (a student re-referencing their own answer number
+            # in passing), the earliest one after the cursor is taken,
+            # consistent with the forward-only, in-order scan.
+            found_start = exact_candidates[0]
+            log(f"Question {i+1}: deterministic label match found at line {found_start}")
+
+        elif ambiguous_candidates:
+            # Tier 2: lines that LOOK like a label (e.g. contain
+            # "Ans-"/"उत्तर-" style markers) but whose number couldn't
+            # be resolved to a specific known question. Rather than an
+            # open-ended scan of the whole remaining document, the LLM
+            # is shown ONLY these few candidate lines (each with a
+            # small surrounding context window) and asked to confirm
+            # which ONE, if any, is genuinely the start of THIS
+            # question's answer. This drastically narrows the LLM's
+            # decision space compared to an open text scan, which is
+            # what caused early false positives before.
+            candidate_window = ambiguous_candidates[:8]  # cap prompt size
+            user_prompt = _build_candidate_confirmation_prompt(answer_lines, candidate_window, q)
             try:
                 start = _call_groq_with_retries(
-                    client, ANSWER_START_SYSTEM_PROMPT, user_prompt,
+                    client, CANDIDATE_CONFIRM_SYSTEM_PROMPT, user_prompt,
                     _parse_answer_start_response, budget, log
                 )
             except Exception as e:
-                log(f"WARNING: start-search chunk failed for question {i+1}: {e}")
+                log(f"WARNING: candidate-confirmation call failed for question {i+1}: {e}")
                 chunk_failures.append(str(e))
+                start = None
+
+            if start is not None and start in candidate_window and start >= cursor:
+                found_start = start
+                log(f"Question {i+1}: LLM-confirmed candidate match at line {found_start}")
+            elif start is not None:
+                log(
+                    f"WARNING: discarding LLM-confirmed start {start} for question "
+                    f"{i+1} -- not one of the offered candidates ({candidate_window})"
+                )
+
+        if found_start is None:
+            # Tier 3 (last resort): no label-like candidates exist at
+            # all anywhere in the remaining document for this question
+            # -- most likely the student restates the question in
+            # plain prose with no label. Fall back to the original
+            # open text scan across remaining chunks.
+            remaining = [(idx, text) for idx, text in numbered_lines if idx >= cursor]
+            if not remaining:
+                log(f"WARNING: no lines left to search for question {i+1} -- skipping")
                 continue
 
-            if start is not None:
-                min_idx = chunk[0][0]
-                max_idx = chunk[-1][0]
-                if min_idx <= start <= max_idx and start >= cursor:
-                    found_start = start
-                    break
-                else:
-                    log(
-                        f"WARNING: discarding out-of-range/backward start_line "
-                        f"{start} for question {i+1} (expected within "
-                        f"{max(min_idx, cursor)}-{max_idx})"
+            line_chunks = _plain_chunk_lines_by_char_budget(remaining, SEQ_ANSWER_START_MAX_CHARS)
+            context_questions = [oq for j, oq in enumerate(questions) if j != i]
+
+            for chunk in line_chunks:
+                user_prompt = _build_answer_start_prompt(chunk, q, context_questions)
+                try:
+                    start = _call_groq_with_retries(
+                        client, ANSWER_START_SYSTEM_PROMPT, user_prompt,
+                        _parse_answer_start_response, budget, log
                     )
+                except Exception as e:
+                    log(f"WARNING: start-search chunk failed for question {i+1}: {e}")
+                    chunk_failures.append(str(e))
+                    continue
+
+                if start is not None:
+                    min_idx = chunk[0][0]
+                    max_idx = chunk[-1][0]
+                    if min_idx <= start <= max_idx and start >= cursor:
+                        found_start = start
+                        break
+                    else:
+                        log(
+                            f"WARNING: discarding out-of-range/backward start_line "
+                            f"{start} for question {i+1} (expected within "
+                            f"{max(min_idx, cursor)}-{max_idx})"
+                        )
 
         if found_start is not None:
             starts[i] = found_start
@@ -1666,6 +1807,28 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
         answer_text = strip_decorative_artifacts(answer_text)
 
         qa_map[original_question] = answer_text
+
+    # FIX: surfaces likely-truncated answers instead of shipping them
+    # silently. An answer far shorter than the median of the OTHER
+    # matched answers in the SAME document is a strong signal that its
+    # start (or the next question's start, which determines its end)
+    # was found prematurely -- i.e. exactly the "answer came back half"
+    # failure mode. This doesn't drop or alter anything; it just makes
+    # the failure loud and points at which question(s) to check.
+    if len(qa_map) >= 3:
+        lengths = {q: len(a) for q, a in qa_map.items()}
+        sorted_lengths = sorted(lengths.values())
+        median_len = sorted_lengths[len(sorted_lengths) // 2]
+        for q, length in lengths.items():
+            if median_len > 0 and length < median_len * 0.35 and length < 400:
+                log(
+                    f"WARNING: answer for question {q[:60]!r} is only {length} "
+                    f"chars, much shorter than this document's median answer "
+                    f"length ({median_len} chars). This often means the answer's "
+                    f"start was found too late or the NEXT question's start was "
+                    f"found too early, truncating this answer. Worth checking "
+                    f"manually."
+                )
 
     log(f"Sequential mapping: {len(qa_map)} of {len(questions)} question(s) matched")
 
