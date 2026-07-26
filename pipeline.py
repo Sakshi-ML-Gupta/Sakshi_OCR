@@ -1,6 +1,5 @@
 import os
 import re
-import io
 import json
 import time
 import tempfile
@@ -31,102 +30,32 @@ def get_api_key(name: str) -> str:
 # 2. SCHEMAS FOR GROQ
 # =========================================================
 
-class QuestionItemSchema(BaseModel):
-    question_number: Optional[str] = Field(
-        default="", 
-        alias="question",
-        description="Question number e.g., '1' or 'Q1'"
+class QAPair(BaseModel):
+    question: str = Field(
+        description="The full question label and prompt e.g., 'Q1(a) What is momentum?'"
     )
-    sub_question: Optional[str] = Field(
-        default="", 
-        description="Sub-question identifier e.g., 'a', 'i', or '(a)'"
-    )
-    text: str = Field(
-        description="The actual question text string"
+    answer: str = Field(
+        description="The complete, uncut student answer extracted for this question."
     )
 
-    class Config:
-        populate_by_name = True
-
-class QuestionExtractionSchema(BaseModel):
-    questions: List[QuestionItemSchema] = Field(
-        description="List of all individual questions extracted in exact order."
-    )
-
-class SingleTargetLineSchema(BaseModel):
-    found: bool = Field(
-        description="True if the student's answer start line for the target question is found."
-    )
-    start_line_index: Optional[int] = Field(
-        default=None,
-        description="The exact line index (integer) where the answer BEGINS."
+class DocumentQASchema(BaseModel):
+    qa_pairs: List[QAPair] = Field(
+        description="List of all question-answer pairs extracted from the document in order."
     )
 
 
 # =========================================================
-# 3. OCR & ROOT NOISE PURGER
+# 3. DATALAB OCR & TEXT EXTRACTION
 # =========================================================
 
 DATALAB_BASE_URL = "https://www.datalab.to"
-
-# Wildcard patterns to catch variations in scribble/signature noise
-GARBAGE_PATTERNS = [
-    r'red\s*scribble',
-    r'signature\s*inside',
-    r'circle',
-    r'red\s*line',
-    r'extending\s*towards',
-    r'bottom\s*of\s*the\s*page',
-    r'teacher',
-    r'page\s*no',
-    r'date\b',
-    r'neel?\s*kamal',
-    r'takma\s*sinan',
-    r'\[\s*image\s*\]',
-    r'\*\*\s*image\s*\*\*'
-]
-
-GARBAGE_REGEX = re.compile('|'.join(GARBAGE_PATTERNS), re.IGNORECASE)
-
-def is_garbage_line(line_str: str) -> bool:
-    """Checks if a line contains garbage/signature descriptions."""
-    clean = line_str.strip()
-    if not clean:
-        return True
-    
-    # Remove extra spaces/newlines to catch split phrases
-    normalized_line = re.sub(r'\s+', ' ', clean)
-    
-    if GARBAGE_REGEX.search(normalized_line):
-        return True
-    
-    # Standalone numbers filter (Page numbers)
-    if re.match(r'^\s*\d{1,3}\s*$', clean):
-        return True
-        
-    return False
-
-def sanitize_text_blob(raw_text: str) -> str:
-    """Completely purges noise phrases from full text before passing to LLM."""
-    # First line by line pass
-    lines = [line.strip() for line in raw_text.split('\n') if not is_garbage_line(line)]
-    clean_text = '\n'.join(lines)
-    
-    # Second block-level regex purge for multi-line scribbles
-    clean_text = re.sub(
-        r'A\s+red\s+scribble[^\n]*bottom\s+of\s+the\s+page\.?', 
-        '', 
-        clean_text, 
-        flags=re.IGNORECASE | re.DOTALL
-    )
-    return clean_text.strip()
 
 def run_datalab_ocr(pdf_path: str, log=print) -> str:
     api_key = get_api_key("DATALAB_API_KEY")
     if not api_key:
         raise Exception("DATALAB_API_KEY missing!")
 
-    log("Scanned PDF detected. Submitting to Datalab OCR...")
+    log("Scanned PDF detected. Running Datalab OCR...")
     
     with open(pdf_path, "rb") as f:
         file_bytes = f.read()
@@ -143,51 +72,59 @@ def run_datalab_ocr(pdf_path: str, log=print) -> str:
     )
 
     if resp.status_code != 200:
-        raise Exception(f"Datalab submit error {resp.status_code}: {resp.text}")
+        raise Exception(f"Datalab submission failed: {resp.text}")
 
     data = resp.json()
     check_url = data["request_check_url"]
 
-    log("Polling OCR engine for results...")
     for _ in range(150):
         poll_resp = httpx.get(check_url, headers=headers, timeout=60)
         if poll_resp.status_code == 200:
             result = poll_resp.json()
             if result.get("status") == "complete":
-                raw_markdown = result.get("markdown") or ""
-                return sanitize_text_blob(raw_markdown)
+                return result.get("markdown") or ""
             if result.get("status") == "failed":
-                raise Exception(f"Datalab conversion failed: {result.get('error')}")
+                raise Exception(f"Datalab error: {result.get('error')}")
         time.sleep(2)
 
-    raise Exception("Datalab OCR conversion timed out.")
+    raise Exception("Datalab OCR timeout.")
 
 
-def extract_cleaned_lines(pdf_path: str, log=print) -> List[str]:
+def get_pdf_text(pdf_path: str, log=print) -> str:
     doc = fitz.open(pdf_path)
-    raw_lines = []
+    text_chunks = []
 
     for page in doc:
-        text = page.get_text("text")
-        for line in text.split("\n"):
-            if line.strip():
-                raw_lines.append(line.strip())
-                
+        t = page.get_text("text")
+        if t.strip():
+            text_chunks.append(t)
     doc.close()
 
-    full_raw = "\n".join(raw_lines)
+    full_text = "\n".join(text_chunks).strip()
 
-    if not raw_lines or len(full_raw) < 50:
-        log("No selectable text found in PyMuPDF. Triggering Datalab OCR...")
-        clean_text = run_datalab_ocr(pdf_path, log=log)
-    else:
-        clean_text = sanitize_text_blob(full_raw)
+    if len(full_text) < 50:
+        log("Native text not found. Fallback to OCR...")
+        full_text = run_datalab_ocr(pdf_path, log=log)
 
-    return [l.strip() for l in clean_text.split('\n') if l.strip()]
+    return full_text
+
+
+def post_clean_noise(text: str) -> str:
+    """Removes signature / scribble noise descriptions directly from extracted text."""
+    lines = text.split("\n")
+    cleaned = []
+    noise_pattern = re.compile(
+        r'(red\s*scribble|signature\s*inside|circle|red\s*line|extending\s*towards|bottom\s*of\s*the\s*page)',
+        re.IGNORECASE
+    )
+    for line in lines:
+        if not noise_pattern.search(line):
+            cleaned.append(line)
+    return "\n".join(cleaned).strip()
 
 
 # =========================================================
-# 4. DIRECT QA EXTRACTOR (SEQUENTIAL SINGLE-TARGET)
+# 4. DIRECT STRUCTURED EXTRACTOR
 # =========================================================
 
 class DirectQAExtractor:
@@ -198,16 +135,30 @@ class DirectQAExtractor:
         self.client = Groq(api_key=self.api_key)
         self.model = "llama-3.3-70b-versatile"
 
-    def extract_all_questions(self, full_text: str) -> List[str]:
-        system_prompt = """You are an exam paper analyzer.
-Extract all questions and sub-questions (e.g. Q1(a), Q1(b), Q2) in exact printed order.
+    def process(self, pdf_path: str, status_callback=None) -> List[Dict[str, Any]]:
+        def log(msg):
+            print(msg)
+            if status_callback:
+                status_callback(msg)
 
-Return JSON according to schema:
-- 'question': Main question number (e.g., '1')
-- 'sub_question': Sub-question identifier if present (e.g., 'a')
-- 'text': Question prompt text"""
+        log("1. Reading PDF text...")
+        raw_text = get_pdf_text(pdf_path, log=log)
+        
+        if not raw_text.strip():
+            raise Exception("Failed to extract text from document.")
 
-        user_prompt = f"Extract questions from this document:\n\n{full_text[:12000]}"
+        log("2. Mapping Questions and Answers...")
+
+        system_prompt = """You are an expert exam paper evaluator.
+Your task is to analyze the provided OCR document containing student answer sheets and extract ALL question-answer pairs.
+
+INSTRUCTIONS:
+1. Identify every question (e.g., Q1, Q1(a), Q2, Q3) in exact order.
+2. Group the COMPLETE student response under its respective question. DO NOT trim or cut answers midway.
+3. Ignore visual descriptions of annotations like 'red scribble' or 'signature' in the answer text.
+4. Output valid JSON matching the requested schema."""
+
+        user_prompt = f"DOCUMENT TEXT:\n\n{raw_text[:25000]}"
 
         completion = self.client.chat.completions.create(
             model=self.model,
@@ -217,193 +168,28 @@ Return JSON according to schema:
             ],
             response_format={
                 "type": "json_object",
-                "schema": QuestionExtractionSchema.model_json_schema()
+                "schema": DocumentQASchema.model_json_schema()
             },
             temperature=0.0
         )
-        
-        parsed = QuestionExtractionSchema.model_validate_json(completion.choices[0].message.content)
-        
-        formatted_questions = []
-        for q in parsed.questions:
-            q_num = (q.question_number or "").strip()
-            sub_q = (q.sub_question or "").strip()
-            q_text = (q.text or "").strip()
-            
-            prefix = ""
-            if q_num and sub_q:
-                prefix = f"Q{q_num}({sub_q})"
-            elif q_num:
-                prefix = f"Q{q_num}"
-            elif sub_q:
-                prefix = f"({sub_q})"
-                
-            full_str = f"{prefix} {q_text}".strip()
-            if full_str:
-                formatted_questions.append(full_str)
-                
-        return formatted_questions
 
-    def _extract_q_ids(self, q_str: str):
-        match = re.search(r'Q?(\d+)\s*[\.\(\-]?\s*([a-z]|\d+|i|ii|iii|iv|v)?', q_str, re.IGNORECASE)
-        if match:
-            main_q = match.group(1)
-            sub_q = match.group(2) if match.group(2) else ""
-            return main_q, sub_q
-        return "", ""
+        parsed = DocumentQASchema.model_validate_json(completion.choices[0].message.content)
 
-    def _regex_scan_start_line(self, target_q: str, lines: List[str], start_cursor: int) -> int:
-        main_q, sub_q = self._extract_q_ids(target_q)
-        if not main_q:
-            return -1
+        final_pairs = []
+        for pair in parsed.qa_pairs:
+            cleaned_answer = post_clean_noise(pair.answer)
+            final_pairs.append({
+                "question": pair.question.strip(),
+                "answer": cleaned_answer if cleaned_answer else "Answer text unavailable.",
+                "matched": True
+            })
 
-        for idx in range(start_cursor, len(lines)):
-            line_clean = lines[idx].lower().strip()
-
-            if sub_q:
-                patterns = [
-                    rf'\b(?:ans(?:wer)?|q(?:uestion)?)?\s*[\.\-]?\s*{main_q}\s*[\.\(\s\-]?\s*{sub_q}\b',
-                    rf'\b{main_q}\s*\({sub_q}\)',
-                    rf'\b{sub_q}\)'
-                ]
-            else:
-                patterns = [
-                    rf'\b(?:ans(?:wer)?|q(?:uestion)?)?\s*[\.\-]?\s*{main_q}\b'
-                ]
-
-            for pat in patterns:
-                if re.search(pat, line_clean, re.IGNORECASE):
-                    return idx
-
-        return -1
-
-    def _llm_search_single_target(self, target_q: str, lines: List[str], start_cursor: int) -> int:
-        chunk = lines[start_cursor:start_cursor + 120]
-        if not chunk:
-            return -1
-
-        formatted_block = "\n".join([f"[{start_cursor + i}] {text}" for i, text in enumerate(chunk)])
-        
-        system_prompt = """You are an accurate answer locator.
-Find the exact line index where the student BEGINS answering the TARGET QUESTION.
-Return JSON with 'found' (boolean) and 'start_line_index' (integer)."""
-
-        user_prompt = f"TARGET QUESTION: {target_q}\n\nLINES TO SEARCH:\n{formatted_block}"
-
-        try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                response_format={
-                    "type": "json_object",
-                    "schema": SingleTargetLineSchema.model_json_schema()
-                },
-                temperature=0.0
-            )
-
-            res = SingleTargetLineSchema.model_validate_json(completion.choices[0].message.content)
-            if res.found and res.start_line_index is not None and res.start_line_index >= start_cursor:
-                return res.start_line_index
-        except Exception:
-            pass
-
-        return -1
-
-    def process(self, pdf_path: str, status_callback=None) -> List[Dict[str, Any]]:
-        def log(msg):
-            print(msg)
-            if status_callback:
-                status_callback(msg)
-
-        log("1. Extracting & Cleaning text lines from PDF...")
-        lines = extract_cleaned_lines(pdf_path, log=log)
-        if not lines:
-            raise Exception("No text lines could be extracted.")
-
-        full_doc_text = "\n".join(lines)
-
-        log("2. Pass 1: Extracting Questions List...")
-        questions = self.extract_all_questions(full_doc_text)
-        if not questions:
-            return [{"question": "Full Sheet Content", "answer": full_doc_text, "matched": True}]
-
-        log(f"Extracted {len(questions)} distinct target questions.")
-
-        log("3. Pass 2: Sequential Start Line Search...")
-        starts = []
-        cursor = 0
-
-        for idx, q in enumerate(questions):
-            found_idx = self._regex_scan_start_line(q, lines, cursor)
-
-            if found_idx == -1:
-                found_idx = self._llm_search_single_target(q, lines, cursor)
-
-            if found_idx != -1:
-                starts.append({"question": q, "start": found_idx})
-                cursor = found_idx + 1
-            else:
-                starts.append({"question": q, "start": None})
-
-        log("4. Pass 3: Full Answer Slicing...")
-        num_q = len(starts)
-        num_lines = len(lines)
-
-        last_valid = 0
-        for i in range(num_q):
-            if starts[i]["start"] is None:
-                next_valid = num_lines
-                for j in range(i + 1, num_q):
-                    if starts[j]["start"] is not None:
-                        next_valid = starts[j]["start"]
-                        break
-                starts[i]["start"] = max(last_valid, min(last_valid + 1, next_valid - 1))
-            else:
-                last_valid = starts[i]["start"]
-
-        final_qa_pairs = []
-        for i in range(num_q):
-            q_text = starts[i]["question"]
-            s_idx = starts[i]["start"]
-
-            e_idx = num_lines - 1
-            for j in range(i + 1, num_q):
-                if starts[j]["start"] > s_idx:
-                    e_idx = starts[j]["start"] - 1
-                    break
-
-            if s_idx <= e_idx:
-                raw_ans_lines = lines[s_idx:e_idx + 1]
-                pure_lines = [l for l in raw_ans_lines if not is_garbage_line(l)]
-                raw_ans = "\n".join(pure_lines).strip()
-                
-                cleaned_ans = re.sub(
-                    r'^\s*(?:ans(?:wer)?|q(?:uestion)?|\d+[\.\)]?)\s*[\d\(\)a-z]*[:.\-]?\s*', 
-                    '', 
-                    raw_ans, 
-                    flags=re.IGNORECASE
-                ).strip()
-
-                final_qa_pairs.append({
-                    "question": q_text,
-                    "answer": cleaned_ans if cleaned_ans else raw_ans,
-                    "matched": True
-                })
-            else:
-                final_qa_pairs.append({
-                    "question": q_text,
-                    "answer": "Answer text unavailable.",
-                    "matched": True
-                })
-
-        return final_qa_pairs
+        log(f"Successfully mapped {len(final_pairs)} Q&A pairs.")
+        return final_pairs
 
 
 # =========================================================
-# 5. STREAMLIT APP WRAPPER
+# 5. STREAMLIT APP ENTRYPOINT
 # =========================================================
 
 def process_pdf(file_input, status_callback=None):
@@ -426,7 +212,7 @@ def process_pdf(file_input, status_callback=None):
     try:
         extractor = DirectQAExtractor()
         qa_pairs = extractor.process(tmp_path, status_callback=status_callback)
-        ocr_json = {"total_pages": 1, "status": "Processed Successfully"}
+        ocr_json = {"status": "Success"}
         return ocr_json, qa_pairs
     finally:
         if file_bytes and os.path.exists(tmp_path):
