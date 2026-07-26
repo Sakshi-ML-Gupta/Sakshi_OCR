@@ -5,7 +5,6 @@ import time
 import tempfile
 import httpx
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel, Field
 import fitz  # PyMuPDF
 from groq import Groq
 
@@ -27,25 +26,7 @@ def get_api_key(name: str) -> str:
 
 
 # =========================================================
-# 2. SCHEMAS FOR GROQ
-# =========================================================
-
-class QAPair(BaseModel):
-    question: str = Field(
-        description="The full question label and prompt e.g., 'Q1(a) What is momentum?'"
-    )
-    answer: str = Field(
-        description="The complete, uncut student answer extracted for this question."
-    )
-
-class DocumentQASchema(BaseModel):
-    qa_pairs: List[QAPair] = Field(
-        description="List of all question-answer pairs extracted from the document in order."
-    )
-
-
-# =========================================================
-# 3. DATALAB OCR & TEXT EXTRACTION
+# 2. DATALAB OCR & TEXT EXTRACTION
 # =========================================================
 
 DATALAB_BASE_URL = "https://www.datalab.to"
@@ -124,7 +105,7 @@ def post_clean_noise(text: str) -> str:
 
 
 # =========================================================
-# 4. DIRECT STRUCTURED EXTRACTOR
+# 3. ROBUST EXTRACTOR (PROMPT-BASED JSON)
 # =========================================================
 
 class DirectQAExtractor:
@@ -141,24 +122,35 @@ class DirectQAExtractor:
             if status_callback:
                 status_callback(msg)
 
-        log("1. Reading PDF text...")
+        log("1. Extracting text from PDF...")
         raw_text = get_pdf_text(pdf_path, log=log)
         
         if not raw_text.strip():
             raise Exception("Failed to extract text from document.")
 
-        log("2. Mapping Questions and Answers...")
+        log("2. Extracting Question-Answer pairs...")
 
-        system_prompt = """You are an expert exam paper evaluator.
-Your task is to analyze the provided OCR document containing student answer sheets and extract ALL question-answer pairs.
+        system_prompt = """You are an expert answer-sheet evaluator.
+Your job is to read the OCR document and extract ALL questions and student answers.
 
-INSTRUCTIONS:
-1. Identify every question (e.g., Q1, Q1(a), Q2, Q3) in exact order.
-2. Group the COMPLETE student response under its respective question. DO NOT trim or cut answers midway.
-3. Ignore visual descriptions of annotations like 'red scribble' or 'signature' in the answer text.
-4. Output valid JSON matching the requested schema."""
+Output MUST be a single valid JSON object with the key "qa_pairs".
+Format:
+{
+  "qa_pairs": [
+    {
+      "question": "Q1(a) What is newton's first law?",
+      "answer": "Complete text of the student's answer here without cutting off."
+    }
+  ]
+}
 
-        user_prompt = f"DOCUMENT TEXT:\n\n{raw_text[:25000]}"
+RULES:
+1. Preserve every question in the exact order found.
+2. Include the COMPLETE student answer for each question. Do NOT truncate or skip lines.
+3. Ignore noise descriptions like 'red scribble' or 'signature'.
+4. Do NOT output markdown codeblocks like ```json. Output ONLY raw JSON."""
+
+        user_prompt = f"DOCUMENT TEXT:\n\n{raw_text[:30000]}"
 
         completion = self.client.chat.completions.create(
             model=self.model,
@@ -166,30 +158,34 @@ INSTRUCTIONS:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            response_format={
-                "type": "json_object",
-                "schema": DocumentQASchema.model_json_schema()
-            },
+            response_format={"type": "json_object"},
             temperature=0.0
         )
 
-        parsed = DocumentQASchema.model_validate_json(completion.choices[0].message.content)
+        response_content = completion.choices[0].message.content.strip()
+        
+        # Parse output safely
+        data = json.loads(response_content)
+        raw_pairs = data.get("qa_pairs", [])
 
         final_pairs = []
-        for pair in parsed.qa_pairs:
-            cleaned_answer = post_clean_noise(pair.answer)
+        for pair in raw_pairs:
+            q_str = str(pair.get("question", "")).strip()
+            a_str = str(pair.get("answer", "")).strip()
+            
+            cleaned_answer = post_clean_noise(a_str)
             final_pairs.append({
-                "question": pair.question.strip(),
+                "question": q_str,
                 "answer": cleaned_answer if cleaned_answer else "Answer text unavailable.",
                 "matched": True
             })
 
-        log(f"Successfully mapped {len(final_pairs)} Q&A pairs.")
+        log(f"Successfully processed {len(final_pairs)} Q&A pairs.")
         return final_pairs
 
 
 # =========================================================
-# 5. STREAMLIT APP ENTRYPOINT
+# 4. STREAMLIT WRAPPER
 # =========================================================
 
 def process_pdf(file_input, status_callback=None):
