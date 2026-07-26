@@ -28,7 +28,7 @@ def get_api_key(name: str) -> str:
 
 
 # =========================================================
-# 2. SCHEMAS
+# 2. SCHEMAS FOR GROQ
 # =========================================================
 
 class QuestionItemSchema(BaseModel):
@@ -64,21 +64,49 @@ class SingleTargetLineSchema(BaseModel):
 
 
 # =========================================================
-# 3. OCR & STRICT NOISE CLEANUP
+# 3. OCR & ROOT NOISE PURGER
 # =========================================================
 
 DATALAB_BASE_URL = "https://www.datalab.to"
 
-# Regex pattern to destroy OCR noise, signatures, and red scribble descriptions
-NOISE_REGEX = re.compile(
-    r'(?:'
-    r'red\s*scribble|signature|circle|red\s*line|extending|towards\s*the\s*bottom|'
-    r'Teacher\'?s?\s*Signature|PAGE\s*NO|DATE\b|Neel?\s*Kamal|TAKMA\s*SINAN|'
-    r'^\s*\d{1,3}\s*$|'
-    r'\[\s*Image\s*\]|\*\*\s*Image\s*\*\*'
-    r')',
-    re.IGNORECASE
-)
+# Aggressive Garbage / Scribble / Teacher Marking Filter
+GARBAGE_PATTERNS = [
+    r'red\s*scribble',
+    r'signature\s*inside',
+    r'circle',
+    r'red\s*line',
+    r'extending\s*towards',
+    r'bottom\s*of\s*the\s*page',
+    r'Teacher\'?s?\s*Signature',
+    r'PAGE\s*NO',
+    r'DATE\b',
+    r'Neel?\s*Kamal',
+    r'TAKMA\s*SINAN',
+    r'\[\s*Image\s*\]',
+    r'\*\*\s*Image\s*\*\*'
+]
+
+GARBAGE_REGEX = re.compile('|'.join(GARBAGE_PATTERNS), re.IGNORECASE)
+
+def is_garbage_line(line_str: str) -> bool:
+    """Checks if a given line is OCR noise or teacher correction description."""
+    clean = line_str.strip()
+    if not clean:
+        return True
+    if GARBAGE_REGEX.search(clean):
+        return True
+    # Filter standalone numbers (page numbers)
+    if re.match(r'^\s*\d{1,3}\s*$', clean):
+        return True
+    return False
+
+def clean_ocr_text_block(raw_text: str) -> str:
+    """Removes all garbage lines from raw markdown text."""
+    filtered_lines = []
+    for line in raw_text.split('\n'):
+        if not is_garbage_line(line):
+            filtered_lines.append(line.strip())
+    return '\n'.join(filtered_lines)
 
 def run_datalab_ocr(pdf_path: str, log=print) -> str:
     api_key = get_api_key("DATALAB_API_KEY")
@@ -113,7 +141,8 @@ def run_datalab_ocr(pdf_path: str, log=print) -> str:
         if poll_resp.status_code == 200:
             result = poll_resp.json()
             if result.get("status") == "complete":
-                return result.get("markdown") or ""
+                raw_markdown = result.get("markdown") or ""
+                return clean_ocr_text_block(raw_markdown)
             if result.get("status") == "failed":
                 raise Exception(f"Datalab conversion failed: {result.get('error')}")
         time.sleep(2)
@@ -122,41 +151,29 @@ def run_datalab_ocr(pdf_path: str, log=print) -> str:
 
 
 def extract_cleaned_lines(pdf_path: str, log=print) -> List[str]:
-    """Extracts text lines and strips red scribble/signature noise completely."""
     doc = fitz.open(pdf_path)
     lines = []
 
     for page in doc:
         text = page.get_text("text")
         for line in text.split("\n"):
-            line_str = line.strip()
-            if line_str and not NOISE_REGEX.search(line_str):
-                lines.append(line_str)
+            if not is_garbage_line(line):
+                lines.append(line.strip())
                 
     doc.close()
 
     if not lines:
         log("No selectable text found in PyMuPDF. Triggering Datalab OCR...")
-        ocr_text = run_datalab_ocr(pdf_path, log=log)
-        for line in ocr_text.split("\n"):
-            line_str = line.strip()
-            # Strict Noise Filter
-            if line_str and not NOISE_REGEX.search(line_str):
-                lines.append(line_str)
+        ocr_cleaned_text = run_datalab_ocr(pdf_path, log=log)
+        for line in ocr_cleaned_text.split("\n"):
+            if not is_garbage_line(line):
+                lines.append(line.strip())
 
-    # Secondary Noise Cleaning on extracted list
-    cleaned_lines = []
-    for l in lines:
-        # Check if line contains heavy noise keywords
-        if "red scribble" in l.lower() or "signature inside a circle" in l.lower():
-            continue
-        cleaned_lines.append(l)
-
-    return cleaned_lines
+    return lines
 
 
 # =========================================================
-# 4. SEQUENTIAL EXTRACTOR WITH FULL-BODY ANSWER SLICING
+# 4. DIRECT QA EXTRACTOR (SEQUENTIAL SINGLE-TARGET)
 # =========================================================
 
 class DirectQAExtractor:
@@ -317,11 +334,11 @@ Return JSON with 'found' (boolean) and 'start_line_index' (integer)."""
             else:
                 starts.append({"question": q, "start": None})
 
-        log("4. Pass 3: Full Answer Slicing & Noise Wipe...")
+        log("4. Pass 3: Full Answer Slicing...")
         num_q = len(starts)
         num_lines = len(lines)
 
-        # Proportional Fill for unmapped question headers
+        # Interpolate start positions for unmapped headers so no text is lost
         last_valid = 0
         for i in range(num_q):
             if starts[i]["start"] is None:
@@ -339,7 +356,7 @@ Return JSON with 'found' (boolean) and 'start_line_index' (integer)."""
             q_text = starts[i]["question"]
             s_idx = starts[i]["start"]
 
-            # Compute boundary to next question's start index
+            # Compute boundary: current question ends right before next question starts
             e_idx = num_lines - 1
             for j in range(i + 1, num_q):
                 if starts[j]["start"] > s_idx:
@@ -349,13 +366,9 @@ Return JSON with 'found' (boolean) and 'start_line_index' (integer)."""
             if s_idx <= e_idx:
                 raw_ans_lines = lines[s_idx:e_idx + 1]
                 
-                # Filter noise lines from answer body
-                filtered_ans_lines = [
-                    l for l in raw_ans_lines 
-                    if not NOISE_REGEX.search(l) and "red scribble" not in l.lower()
-                ]
-
-                raw_ans = "\n".join(filtered_ans_lines).strip()
+                # Double-pass clean just in case
+                pure_lines = [l for l in raw_ans_lines if not is_garbage_line(l)]
+                raw_ans = "\n".join(pure_lines).strip()
                 
                 cleaned_ans = re.sub(
                     r'^\s*(?:ans(?:wer)?|q(?:uestion)?|\d+[\.\)]?)\s*[\d\(\)a-z]*[:.\-]?\s*', 
