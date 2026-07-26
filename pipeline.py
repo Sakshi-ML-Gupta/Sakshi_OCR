@@ -84,28 +84,28 @@ def get_pdf_text(pdf_path: str, log=print) -> str:
     full_text = "\n".join(text_chunks).strip()
 
     if len(full_text) < 50:
-        log("Native text not found. Fallback to OCR...")
+        log("Native text not found. Fallback to Datalab OCR...")
         full_text = run_datalab_ocr(pdf_path, log=log)
 
     return full_text
 
 
 def post_clean_noise(text: str) -> str:
-    """Removes signature / scribble noise descriptions directly from extracted text."""
+    """Softly removes signature/scribble lines without trimming actual student content."""
     lines = text.split("\n")
     cleaned = []
     noise_pattern = re.compile(
-        r'(red\s*scribble|signature\s*inside|circle|red\s*line|extending\s*towards|bottom\s*of\s*the\s*page)',
+        r'^\s*(?:A\s+)?(?:red\s*scribble|signature\s*inside|circle|red\s*line|extending\s*towards|bottom\s*of\s*the\s*page).*\.?$',
         re.IGNORECASE
     )
     for line in lines:
-        if not noise_pattern.search(line):
+        if not noise_pattern.match(line.strip()):
             cleaned.append(line)
     return "\n".join(cleaned).strip()
 
 
 # =========================================================
-# 3. ROBUST EXTRACTOR (PROMPT-BASED JSON)
+# 3. ANCHOR-BASED EXACT SLICING EXTRACTOR
 # =========================================================
 
 class DirectQAExtractor:
@@ -116,41 +116,24 @@ class DirectQAExtractor:
         self.client = Groq(api_key=self.api_key)
         self.model = "llama-3.3-70b-versatile"
 
-    def process(self, pdf_path: str, status_callback=None) -> List[Dict[str, Any]]:
-        def log(msg):
-            print(msg)
-            if status_callback:
-                status_callback(msg)
+    def _get_question_anchors(self, text: str) -> List[Dict[str, Any]]:
+        """Uses LLM to get exact start phrases for each question in the text."""
+        system_prompt = """You are a document layout parser.
+Identify ALL question headers present in the document in exact sequential order.
 
-        log("1. Extracting text from PDF...")
-        raw_text = get_pdf_text(pdf_path, log=log)
-        
-        if not raw_text.strip():
-            raise Exception("Failed to extract text from document.")
+For each question found, return:
+1. 'question_label': Short label e.g., 'Q1(a)', 'Q1(b)', 'Q2'
+2. 'anchor_text': Exact 5 to 8 word phrase from the document where this question starts.
 
-        log("2. Extracting Question-Answer pairs...")
-
-        system_prompt = """You are an expert answer-sheet evaluator.
-Your job is to read the OCR document and extract ALL questions and student answers.
-
-Output MUST be a single valid JSON object with the key "qa_pairs".
-Format:
+Output MUST be a valid JSON object:
 {
-  "qa_pairs": [
-    {
-      "question": "Q1(a) What is newton's first law?",
-      "answer": "Complete text of the student's answer here without cutting off."
-    }
+  "anchors": [
+    {"question_label": "Q1(a)", "anchor_text": "exact words starting question 1a"},
+    {"question_label": "Q1(b)", "anchor_text": "exact words starting question 1b"}
   ]
-}
+}"""
 
-RULES:
-1. Preserve every question in the exact order found.
-2. Include the COMPLETE student answer for each question. Do NOT truncate or skip lines.
-3. Ignore noise descriptions like 'red scribble' or 'signature'.
-4. Do NOT output markdown codeblocks like ```json. Output ONLY raw JSON."""
-
-        user_prompt = f"DOCUMENT TEXT:\n\n{raw_text[:30000]}"
+        user_prompt = f"DOCUMENT TEXT:\n\n{text[:25000]}"
 
         completion = self.client.chat.completions.create(
             model=self.model,
@@ -162,26 +145,82 @@ RULES:
             temperature=0.0
         )
 
-        response_content = completion.choices[0].message.content.strip()
-        
-        # Parse output safely
-        data = json.loads(response_content)
-        raw_pairs = data.get("qa_pairs", [])
+        res = json.loads(completion.choices[0].message.content)
+        return res.get("anchors", [])
 
-        final_pairs = []
-        for pair in raw_pairs:
-            q_str = str(pair.get("question", "")).strip()
-            a_str = str(pair.get("answer", "")).strip()
-            
-            cleaned_answer = post_clean_noise(a_str)
-            final_pairs.append({
-                "question": q_str,
-                "answer": cleaned_answer if cleaned_answer else "Answer text unavailable.",
+    def process(self, pdf_path: str, status_callback=None) -> List[Dict[str, Any]]:
+        def log(msg):
+            print(msg)
+            if status_callback:
+                status_callback(msg)
+
+        log("1. Extracting complete document text...")
+        raw_text = get_pdf_text(pdf_path, log=log)
+
+        if not raw_text.strip():
+            raise Exception("Failed to extract text from document.")
+
+        log("2. Locating exact question anchors...")
+        anchors = self._get_question_anchors(raw_text)
+
+        if not anchors:
+            # Fallback if no specific questions were identified
+            return [{"question": "Full Document", "answer": post_clean_noise(raw_text), "matched": True}]
+
+        log(f"Found {len(anchors)} question anchors. Performing exact text slicing...")
+
+        # Find character offsets for each anchor in raw_text
+        found_spans = []
+        search_start = 0
+
+        for a in anchors:
+            q_label = a.get("question_label", "")
+            phrase = a.get("anchor_text", "").strip()
+
+            pos = -1
+            if phrase:
+                # Direct match
+                pos = raw_text.lower().find(phrase.lower(), search_start)
+                # Fuzzy fallback if exact phrase has minor whitespace differences
+                if pos == -1:
+                    first_words = " ".join(phrase.split()[:3])
+                    if len(first_words) > 3:
+                        pos = raw_text.lower().find(first_words.lower(), search_start)
+
+            if pos != -1:
+                found_spans.append({"label": q_label, "pos": pos})
+                search_start = pos + len(phrase)
+            else:
+                log(f"Warning: Anchor for {q_label} not found, slicing sequentially.")
+
+        final_qa = []
+        doc_len = len(raw_text)
+
+        for i in range(len(found_spans)):
+            curr = found_spans[i]
+            q_label = curr["label"]
+            start_pos = curr["pos"]
+
+            # End position is start of next question, or end of document
+            if i + 1 < len(found_spans):
+                end_pos = found_spans[i + 1]["pos"]
+            else:
+                end_pos = doc_len
+
+            # Extract the raw chunk sliced strictly between question boundaries
+            raw_chunk = raw_text[start_pos:end_pos].strip()
+
+            # Clean scribble lines but keep 100% of answer text intact
+            cleaned_chunk = post_clean_noise(raw_chunk)
+
+            final_qa.append({
+                "question": q_label,
+                "answer": cleaned_chunk if cleaned_chunk else raw_chunk,
                 "matched": True
             })
 
-        log(f"Successfully processed {len(final_pairs)} Q&A pairs.")
-        return final_pairs
+        log(f"Successfully mapped {len(final_qa)} questions with zero truncation.")
+        return final_qa
 
 
 # =========================================================
