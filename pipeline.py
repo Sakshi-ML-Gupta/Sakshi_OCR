@@ -28,7 +28,7 @@ def get_api_key(name: str) -> str:
 
 
 # =========================================================
-# 2. STRICT PYDANTIC SCHEMAS FOR GROQ
+# 2. SCHEMAS
 # =========================================================
 
 class QuestionItemSchema(BaseModel):
@@ -64,10 +64,21 @@ class SingleTargetLineSchema(BaseModel):
 
 
 # =========================================================
-# 3. OCR & LINE EXTRACTION
+# 3. OCR & STRICT NOISE CLEANUP
 # =========================================================
 
 DATALAB_BASE_URL = "https://www.datalab.to"
+
+# Regex pattern to destroy OCR noise, signatures, and red scribble descriptions
+NOISE_REGEX = re.compile(
+    r'(?:'
+    r'red\s*scribble|signature|circle|red\s*line|extending|towards\s*the\s*bottom|'
+    r'Teacher\'?s?\s*Signature|PAGE\s*NO|DATE\b|Neel?\s*Kamal|TAKMA\s*SINAN|'
+    r'^\s*\d{1,3}\s*$|'
+    r'\[\s*Image\s*\]|\*\*\s*Image\s*\*\*'
+    r')',
+    re.IGNORECASE
+)
 
 def run_datalab_ocr(pdf_path: str, log=print) -> str:
     api_key = get_api_key("DATALAB_API_KEY")
@@ -110,37 +121,42 @@ def run_datalab_ocr(pdf_path: str, log=print) -> str:
     raise Exception("Datalab OCR conversion timed out.")
 
 
-def extract_numbered_lines_from_pdf(pdf_path: str, log=print) -> List[str]:
+def extract_cleaned_lines(pdf_path: str, log=print) -> List[str]:
+    """Extracts text lines and strips red scribble/signature noise completely."""
     doc = fitz.open(pdf_path)
     lines = []
-    
-    noise_re = re.compile(
-        r'(?:Teacher\'?s?\s*Signature|PAGE\s*NO|DATE\b|Neel?\s*Kamal|TAKMA\s*SINAN|^\s*\d{1,3}\s*$)',
-        re.IGNORECASE
-    )
 
     for page in doc:
         text = page.get_text("text")
         for line in text.split("\n"):
             line_str = line.strip()
-            if line_str and not noise_re.search(line_str):
+            if line_str and not NOISE_REGEX.search(line_str):
                 lines.append(line_str)
                 
     doc.close()
 
     if not lines:
-        log("No selectable text found in PDF. Triggering OCR engine...")
+        log("No selectable text found in PyMuPDF. Triggering Datalab OCR...")
         ocr_text = run_datalab_ocr(pdf_path, log=log)
         for line in ocr_text.split("\n"):
             line_str = line.strip()
-            if line_str and not noise_re.search(line_str):
+            # Strict Noise Filter
+            if line_str and not NOISE_REGEX.search(line_str):
                 lines.append(line_str)
 
-    return lines
+    # Secondary Noise Cleaning on extracted list
+    cleaned_lines = []
+    for l in lines:
+        # Check if line contains heavy noise keywords
+        if "red scribble" in l.lower() or "signature inside a circle" in l.lower():
+            continue
+        cleaned_lines.append(l)
+
+    return cleaned_lines
 
 
 # =========================================================
-# 4. SEQUENTIAL SINGLE-TARGET ENGINE
+# 4. SEQUENTIAL EXTRACTOR WITH FULL-BODY ANSWER SLICING
 # =========================================================
 
 class DirectQAExtractor:
@@ -198,7 +214,6 @@ Return JSON according to schema:
         return formatted_questions
 
     def _extract_q_ids(self, q_str: str):
-        """Extract pure digits and sub-parts (e.g., Q1(a) -> ('1', 'a'))"""
         match = re.search(r'Q?(\d+)\s*[\.\(\-]?\s*([a-z]|\d+|i|ii|iii|iv|v)?', q_str, re.IGNORECASE)
         if match:
             main_q = match.group(1)
@@ -232,7 +247,6 @@ Return JSON according to schema:
         return -1
 
     def _llm_search_single_target(self, target_q: str, lines: List[str], start_cursor: int) -> int:
-        """Single-target search call to LLM."""
         chunk = lines[start_cursor:start_cursor + 120]
         if not chunk:
             return -1
@@ -273,8 +287,8 @@ Return JSON with 'found' (boolean) and 'start_line_index' (integer)."""
             if status_callback:
                 status_callback(msg)
 
-        log("1. Extracting text lines from PDF...")
-        lines = extract_numbered_lines_from_pdf(pdf_path, log=log)
+        log("1. Extracting & Cleaning text lines from PDF...")
+        lines = extract_cleaned_lines(pdf_path, log=log)
         if not lines:
             raise Exception("No text lines could be extracted.")
 
@@ -287,31 +301,27 @@ Return JSON with 'found' (boolean) and 'start_line_index' (integer)."""
 
         log(f"Extracted {len(questions)} distinct target questions.")
 
-        log("3. Pass 2: Sequential Single-Target Start Line Search...")
+        log("3. Pass 2: Sequential Start Line Search...")
         starts = []
         cursor = 0
 
         for idx, q in enumerate(questions):
-            log(f"Searching Start Line for Q{idx+1}: {q[:30]}...")
-            
-            # Step A: Fast Deterministic Regex Match
             found_idx = self._regex_scan_start_line(q, lines, cursor)
 
-            # Step B: LLM Single Target Match Fallback
             if found_idx == -1:
                 found_idx = self._llm_search_single_target(q, lines, cursor)
 
             if found_idx != -1:
                 starts.append({"question": q, "start": found_idx})
-                cursor = found_idx + 1  # Forward progress guaranteed
+                cursor = found_idx + 1
             else:
                 starts.append({"question": q, "start": None})
 
-        log("4. Pass 3: Mathematical Slice Resolution...")
+        log("4. Pass 3: Full Answer Slicing & Noise Wipe...")
         num_q = len(starts)
         num_lines = len(lines)
 
-        # Sequential Fill for any missing target starts
+        # Proportional Fill for unmapped question headers
         last_valid = 0
         for i in range(num_q):
             if starts[i]["start"] is None:
@@ -324,12 +334,12 @@ Return JSON with 'found' (boolean) and 'start_line_index' (integer)."""
             else:
                 last_valid = starts[i]["start"]
 
-        # Deterministic Slice: Answer End = (Next Question Start - 1)
         final_qa_pairs = []
         for i in range(num_q):
             q_text = starts[i]["question"]
             s_idx = starts[i]["start"]
 
+            # Compute boundary to next question's start index
             e_idx = num_lines - 1
             for j in range(i + 1, num_q):
                 if starts[j]["start"] > s_idx:
@@ -337,7 +347,16 @@ Return JSON with 'found' (boolean) and 'start_line_index' (integer)."""
                     break
 
             if s_idx <= e_idx:
-                raw_ans = "\n".join(lines[s_idx:e_idx + 1]).strip()
+                raw_ans_lines = lines[s_idx:e_idx + 1]
+                
+                # Filter noise lines from answer body
+                filtered_ans_lines = [
+                    l for l in raw_ans_lines 
+                    if not NOISE_REGEX.search(l) and "red scribble" not in l.lower()
+                ]
+
+                raw_ans = "\n".join(filtered_ans_lines).strip()
+                
                 cleaned_ans = re.sub(
                     r'^\s*(?:ans(?:wer)?|q(?:uestion)?|\d+[\.\)]?)\s*[\d\(\)a-z]*[:.\-]?\s*', 
                     '', 
@@ -353,7 +372,7 @@ Return JSON with 'found' (boolean) and 'start_line_index' (integer)."""
             else:
                 final_qa_pairs.append({
                     "question": q_text,
-                    "answer": lines[s_idx] if s_idx < num_lines else "End of document.",
+                    "answer": "Answer text unavailable.",
                     "matched": True
                 })
 
