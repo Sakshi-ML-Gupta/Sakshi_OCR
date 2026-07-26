@@ -69,7 +69,7 @@ class SingleTargetLineSchema(BaseModel):
 
 DATALAB_BASE_URL = "https://www.datalab.to"
 
-# Aggressive Garbage / Scribble / Teacher Marking Filter
+# Wildcard patterns to catch variations in scribble/signature noise
 GARBAGE_PATTERNS = [
     r'red\s*scribble',
     r'signature\s*inside',
@@ -77,41 +77,54 @@ GARBAGE_PATTERNS = [
     r'red\s*line',
     r'extending\s*towards',
     r'bottom\s*of\s*the\s*page',
-    r'Teacher\'?s?\s*Signature',
-    r'PAGE\s*NO',
-    r'DATE\b',
-    r'Neel?\s*Kamal',
-    r'TAKMA\s*SINAN',
-    r'\[\s*Image\s*\]',
-    r'\*\*\s*Image\s*\*\*'
+    r'teacher',
+    r'page\s*no',
+    r'date\b',
+    r'neel?\s*kamal',
+    r'takma\s*sinan',
+    r'\[\s*image\s*\]',
+    r'\*\*\s*image\s*\*\*'
 ]
 
 GARBAGE_REGEX = re.compile('|'.join(GARBAGE_PATTERNS), re.IGNORECASE)
 
 def is_garbage_line(line_str: str) -> bool:
-    """Checks if a given line is OCR noise or teacher correction description."""
+    """Checks if a line contains garbage/signature descriptions."""
     clean = line_str.strip()
     if not clean:
         return True
-    if GARBAGE_REGEX.search(clean):
+    
+    # Remove extra spaces/newlines to catch split phrases
+    normalized_line = re.sub(r'\s+', ' ', clean)
+    
+    if GARBAGE_REGEX.search(normalized_line):
         return True
-    # Filter standalone numbers (page numbers)
+    
+    # Standalone numbers filter (Page numbers)
     if re.match(r'^\s*\d{1,3}\s*$', clean):
         return True
+        
     return False
 
-def clean_ocr_text_block(raw_text: str) -> str:
-    """Removes all garbage lines from raw markdown text."""
-    filtered_lines = []
-    for line in raw_text.split('\n'):
-        if not is_garbage_line(line):
-            filtered_lines.append(line.strip())
-    return '\n'.join(filtered_lines)
+def sanitize_text_blob(raw_text: str) -> str:
+    """Completely purges noise phrases from full text before passing to LLM."""
+    # First line by line pass
+    lines = [line.strip() for line in raw_text.split('\n') if not is_garbage_line(line)]
+    clean_text = '\n'.join(lines)
+    
+    # Second block-level regex purge for multi-line scribbles
+    clean_text = re.sub(
+        r'A\s+red\s+scribble[^\n]*bottom\s+of\s+the\s+page\.?', 
+        '', 
+        clean_text, 
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    return clean_text.strip()
 
 def run_datalab_ocr(pdf_path: str, log=print) -> str:
     api_key = get_api_key("DATALAB_API_KEY")
     if not api_key:
-        raise Exception("DATALAB_API_KEY missing! Required for scanned PDF text extraction.")
+        raise Exception("DATALAB_API_KEY missing!")
 
     log("Scanned PDF detected. Submitting to Datalab OCR...")
     
@@ -142,7 +155,7 @@ def run_datalab_ocr(pdf_path: str, log=print) -> str:
             result = poll_resp.json()
             if result.get("status") == "complete":
                 raw_markdown = result.get("markdown") or ""
-                return clean_ocr_text_block(raw_markdown)
+                return sanitize_text_blob(raw_markdown)
             if result.get("status") == "failed":
                 raise Exception(f"Datalab conversion failed: {result.get('error')}")
         time.sleep(2)
@@ -152,24 +165,25 @@ def run_datalab_ocr(pdf_path: str, log=print) -> str:
 
 def extract_cleaned_lines(pdf_path: str, log=print) -> List[str]:
     doc = fitz.open(pdf_path)
-    lines = []
+    raw_lines = []
 
     for page in doc:
         text = page.get_text("text")
         for line in text.split("\n"):
-            if not is_garbage_line(line):
-                lines.append(line.strip())
+            if line.strip():
+                raw_lines.append(line.strip())
                 
     doc.close()
 
-    if not lines:
-        log("No selectable text found in PyMuPDF. Triggering Datalab OCR...")
-        ocr_cleaned_text = run_datalab_ocr(pdf_path, log=log)
-        for line in ocr_cleaned_text.split("\n"):
-            if not is_garbage_line(line):
-                lines.append(line.strip())
+    full_raw = "\n".join(raw_lines)
 
-    return lines
+    if not raw_lines or len(full_raw) < 50:
+        log("No selectable text found in PyMuPDF. Triggering Datalab OCR...")
+        clean_text = run_datalab_ocr(pdf_path, log=log)
+    else:
+        clean_text = sanitize_text_blob(full_raw)
+
+    return [l.strip() for l in clean_text.split('\n') if l.strip()]
 
 
 # =========================================================
@@ -193,7 +207,7 @@ Return JSON according to schema:
 - 'sub_question': Sub-question identifier if present (e.g., 'a')
 - 'text': Question prompt text"""
 
-        user_prompt = f"Extract questions from this document:\n\n{full_text[:10000]}"
+        user_prompt = f"Extract questions from this document:\n\n{full_text[:12000]}"
 
         completion = self.client.chat.completions.create(
             model=self.model,
@@ -338,7 +352,6 @@ Return JSON with 'found' (boolean) and 'start_line_index' (integer)."""
         num_q = len(starts)
         num_lines = len(lines)
 
-        # Interpolate start positions for unmapped headers so no text is lost
         last_valid = 0
         for i in range(num_q):
             if starts[i]["start"] is None:
@@ -356,7 +369,6 @@ Return JSON with 'found' (boolean) and 'start_line_index' (integer)."""
             q_text = starts[i]["question"]
             s_idx = starts[i]["start"]
 
-            # Compute boundary: current question ends right before next question starts
             e_idx = num_lines - 1
             for j in range(i + 1, num_q):
                 if starts[j]["start"] > s_idx:
@@ -365,8 +377,6 @@ Return JSON with 'found' (boolean) and 'start_line_index' (integer)."""
 
             if s_idx <= e_idx:
                 raw_ans_lines = lines[s_idx:e_idx + 1]
-                
-                # Double-pass clean just in case
                 pure_lines = [l for l in raw_ans_lines if not is_garbage_line(l)]
                 raw_ans = "\n".join(pure_lines).strip()
                 
