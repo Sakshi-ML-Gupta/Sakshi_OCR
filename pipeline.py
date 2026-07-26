@@ -28,7 +28,7 @@ def get_api_key(name: str) -> str:
 
 
 # =========================================================
-# 2. SCHEMAS
+# 2. STRICT VALIDATION SCHEMAS FOR GROQ
 # =========================================================
 
 class QuestionItemSchema(BaseModel):
@@ -50,17 +50,17 @@ class QuestionItemSchema(BaseModel):
 
 class QuestionExtractionSchema(BaseModel):
     questions: List[QuestionItemSchema] = Field(
-        description="List of all individual questions and sub-questions extracted in exact order from the paper."
+        description="List of all individual questions extracted in exact order."
     )
 
-class MappingItem(BaseModel):
-    question_text: str = Field(description="The exact question text supplied.")
-    start_line_index: int = Field(description="0-based line index where the answer starts. Return -1 if not found.")
-    end_line_index: int = Field(description="0-based line index where the answer ends. Return -1 if not found.")
-
-
-class AnswerMappingResult(BaseModel):
-    mappings: List[MappingItem] = Field(description="Mapped question and answer boundaries.")
+class TargetLineSchema(BaseModel):
+    found: bool = Field(
+        description="True if the student's answer start line for the specified question is found."
+    )
+    start_line_index: Optional[int] = Field(
+        default=None,
+        description="The EXACT line index where the student BEGINS answering this question."
+    )
 
 
 # =========================================================
@@ -140,7 +140,7 @@ def extract_numbered_lines_from_pdf(pdf_path: str, log=print) -> List[str]:
 
 
 # =========================================================
-# 4. DIRECT GLOBAL MAPPER
+# 4. ROBUST BOUNDARY EXTRACTOR
 # =========================================================
 
 class DirectQAExtractor:
@@ -152,15 +152,15 @@ class DirectQAExtractor:
         self.model = "llama-3.3-70b-versatile"
 
     def extract_all_questions(self, full_text: str) -> List[str]:
-        system_prompt = """You are an exam paper structure analyzer.
-Extract EVERY question and sub-question (e.g., 1(a), 1(b), Q2, Q3.i) in exact order as printed.
+        system_prompt = """You are an exam structure analyzer.
+Extract all distinct questions and sub-questions (e.g., Q1, 1(a), Q2) in exact printed order.
 
 For each item, populate:
-- 'question': Main question number (e.g. '1')
-- 'sub_question': Sub question label if present (e.g. 'a')
-- 'text': The full wording of the question
+- 'question': Main question number/label (e.g., '1')
+- 'sub_question': Sub-question label if present (e.g., 'a')
+- 'text': The full question prompt/text
 
-Return strictly valid JSON according to the schema."""
+Return strictly valid JSON according to schema."""
 
         user_prompt = f"Extract all questions from this text:\n\n{full_text[:8000]}"
 
@@ -199,6 +199,63 @@ Return strictly valid JSON according to the schema."""
                 
         return formatted_questions
 
+    def _find_header_line(self, target_q: str, lines: List[str], start_idx: int) -> int:
+        """Fast Deterministic Search: Answer sheets me Q1, Ans 1, 1(a) patterns dhoondta hai."""
+        match = re.search(r'(?:Q(?:uestion)?\s*|\b)?(\d+(?:\([a-z0-9]+\)|[a-z])?)', target_q, re.IGNORECASE)
+        if not match:
+            return -1
+
+        q_id = match.group(1).lower().replace("(", r"\(").replace(")", r"\)")
+        
+        patterns = [
+            rf'^\s*(?:ans(?:wer)?|q(?:uestion)?)\s*[:.\-]?\s*{q_id}\b',
+            rf'^\s*{q_id}\s*[:.\-]',
+            rf'\banswer\s+to\s+q(?:uestion)?\s*[:.\-]?\s*{q_id}\b'
+        ]
+
+        for idx in range(start_idx, len(lines)):
+            line_str = lines[idx].lower()
+            for pat in patterns:
+                if re.search(pat, line_str, re.IGNORECASE):
+                    return idx
+        return -1
+
+    def _llm_search_start_line(self, target_q: str, lines: List[str], start_idx: int) -> int:
+        """LLM Search: Atomic call per question to avoid Groq json validation error."""
+        chunk = lines[start_idx:start_idx + 120]
+        if not chunk:
+            return -1
+
+        formatted_block = "\n".join([f"[{start_idx + i}] {text}" for i, text in enumerate(chunk)])
+        
+        system_prompt = """You are a line matching assistant.
+Locate the line index where the student BEGINS answering the TARGET QUESTION.
+Return `found: true` and the exact line number `start_line_index` if present."""
+
+        user_prompt = f"TARGET QUESTION: {target_q}\n\nANSWER SHEET LINES:\n{formatted_block}"
+
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={
+                    "type": "json_object",
+                    "schema": TargetLineSchema.model_json_schema()
+                },
+                temperature=0.0
+            )
+
+            res = TargetLineSchema.model_validate_json(completion.choices[0].message.content)
+            if res.found and res.start_line_index is not None and res.start_line_index >= start_idx:
+                return res.start_line_index
+        except Exception:
+            pass
+
+        return -1
+
     def process(self, pdf_path: str, status_callback=None) -> List[Dict[str, Any]]:
         def log(msg):
             print(msg)
@@ -215,66 +272,72 @@ Return strictly valid JSON according to the schema."""
 
         log("2. Extracting Target Questions...")
         questions = self.extract_all_questions(full_doc_text)
-        log(f"Extracted {len(questions)} distinct questions.")
+        log(f"Extracted {len(questions)} target questions.")
 
-        log("3. Mapping answers via Full-Context Model Alignment...")
-        
-        indexed_lines = "\n".join([f"[{idx}] {text}" for idx, text in enumerate(lines)])
-        questions_block = "\n".join([f"- {q}" for q in questions])
+        log("3. Sequential Answer Boundaries Resolution...")
+        starts = []
+        cursor = 0
 
-        system_prompt = """You are an accurate Answer Sheet Mapper.
-Given a list of QUESTIONS and a line-numbered STUDENT ANSWER SHEET:
-For EVERY question, locate the exact `start_line_index` and `end_line_index` in the line-numbered text.
-
-Rules:
-1. Do NOT guess or hallucinate line numbers. Look at the content carefully.
-2. An answer starts where student begins answering that question and ends before the next answer starts.
-3. If an answer to a question is NOT written in the sheet, set `start_line_index: -1` and `end_line_index: -1`.
-4. Return strictly JSON adhering to the schema."""
-
-        user_prompt = f"QUESTIONS:\n{questions_block}\n\nSTUDENT ANSWER SHEET LINES:\n{indexed_lines}"
-
-        try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                response_format={
-                    "type": "json_object",
-                    "schema": AnswerMappingResult.model_json_schema()
-                },
-                temperature=0.0
-            )
-
-            result = AnswerMappingResult.model_validate_json(completion.choices[0].message.content)
+        for idx, q in enumerate(questions):
+            log(f"Mapping Q{idx+1}: {q[:30]}...")
             
-            final_qa_pairs = []
-            for item in result.mappings:
-                s_idx = item.start_line_index
-                e_idx = item.end_line_index
+            # Step A: Fast Pattern Match
+            found_idx = self._find_header_line(q, lines, cursor)
+            
+            # Step B: LLM Fallback Search
+            if found_idx == -1:
+                found_idx = self._llm_search_start_line(q, lines, cursor)
 
-                if s_idx != -1 and e_idx != -1 and 0 <= s_idx <= e_idx < len(lines):
-                    ans_text = " ".join(lines[s_idx:e_idx + 1]).strip()
-                    # Clean up question prefixes from answer
-                    ans_text = re.sub(r'^\s*(?:Ans(?:wer)?\s*\d*\s*[.:\-]?|उत्तर\s*\d*|Q\.?\s*\d+)\s*', '', ans_text, flags=re.IGNORECASE).strip()
-                    matched = True
-                else:
-                    ans_text = "Answer not found in answer sheet."
-                    matched = False
+            if found_idx != -1:
+                starts.append({"question": q, "start": found_idx})
+                cursor = found_idx + 1
+            else:
+                starts.append({"question": q, "start": None})
+
+        # Step C: Mathematical Slice Resolution
+        final_qa_pairs = []
+        num_q = len(starts)
+
+        for i in range(num_q):
+            q_text = starts[i]["question"]
+            s_idx = starts[i]["start"]
+
+            if s_idx is None:
+                final_qa_pairs.append({
+                    "question": q_text,
+                    "answer": "Answer not found in answer sheet.",
+                    "matched": False
+                })
+                continue
+
+            e_idx = len(lines) - 1
+            for j in range(i + 1, num_q):
+                if starts[j]["start"] is not None and starts[j]["start"] > s_idx:
+                    e_idx = starts[j]["start"] - 1
+                    break
+
+            if s_idx <= e_idx:
+                raw_ans = " ".join(lines[s_idx:e_idx + 1]).strip()
+                cleaned_ans = re.sub(
+                    r'^\s*(?:ans(?:wer)?|q(?:uestion)?|\d+[\.\)]?)\s*[\d\(\)a-z]*[:.\-]?\s*', 
+                    '', 
+                    raw_ans, 
+                    flags=re.IGNORECASE
+                ).strip()
 
                 final_qa_pairs.append({
-                    "question": item.question_text,
-                    "answer": ans_text,
-                    "matched": matched
+                    "question": q_text,
+                    "answer": cleaned_ans if cleaned_ans else raw_ans,
+                    "matched": True
+                })
+            else:
+                final_qa_pairs.append({
+                    "question": q_text,
+                    "answer": "Answer not found in answer sheet.",
+                    "matched": False
                 })
 
-            return final_qa_pairs
-
-        except Exception as e:
-            log(f"Error mapping answers: {e}")
-            raise e
+        return final_qa_pairs
 
 
 # =========================================================
@@ -301,7 +364,7 @@ def process_pdf(file_input, status_callback=None):
     try:
         extractor = DirectQAExtractor()
         qa_pairs = extractor.process(tmp_path, status_callback=status_callback)
-        ocr_json = {"total_pages": 1, "status": "Direct Full-Context Mapped"}
+        ocr_json = {"total_pages": 1, "status": "Processed Successfully"}
         return ocr_json, qa_pairs
     finally:
         if file_bytes and os.path.exists(tmp_path):
