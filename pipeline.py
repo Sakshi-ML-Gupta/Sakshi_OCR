@@ -1140,44 +1140,43 @@ def _label_match_question_index(line: str, questions: list):
     # label text (e.g. "Ans 1(ii)-", "Ans 1 (b)-") and match it against
     # each candidate question's own sub-part marker -- if found, this
     # is still a fully deterministic, certain match.
-    sub_match = re.search(
-        r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]',
-        line[label_match.end() - 1: label_match.end() + 6]
-    ) or re.search(
-        r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]',
-        line[:label_match.end() + 10]
+    label_text_full = line[label_match.start():label_match.end() + 15]
+    
+    # Try multiple sub-part patterns
+    sub_match = (
+        re.search(r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]', label_text_full) or
+        re.search(r'[-–]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\b', label_text_full) or
+        # Also check the next few characters after the label
+        re.search(r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]', 
+                  line[label_match.end():label_match.end()+20])
     )
+    
     if sub_match:
         sub_label = sub_match.group(1).lower()
         for i in matching_indices:
-            q_sub_match = re.search(
-                r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]',
-                questions[i][:20]
+            q_text_lower = questions[i].lower()
+            # Check multiple positions in the question text for sub-part marker
+            q_sub_match = (
+                re.search(r'[\(\uff08]\s*' + re.escape(sub_match.group(1)) + r'\s*[\)\uff09]', q_text_lower) or
+                re.search(r'\b' + re.escape(sub_label) + r'\b', q_text_lower[:30])
             )
-            if q_sub_match and q_sub_match.group(1).lower() == sub_label:
+            if q_sub_match:
                 return i
-
-    # No reliable way to tell WHICH sibling sub-part this label refers
-    # to -- ambiguous. Defer to Tier 2, where the LLM is shown the
-    # actual target sub-part's text and can judge from context, rather
-    # than this function silently guessing the first one every time.
+    
+    # If we still can't disambiguate, try matching by looking at the NEXT line
+    # for sub-part indicators
+    label_line_num = -1
+    for idx, (line_num, text) in enumerate(numbered_lines) if 'numbered_lines' in dir() else []:
+        break  # We don't have numbered_lines here, skip this
+    
+    # No reliable way to tell - return -1 to let Tier 2/3 handle it
     return -1
 
 
-def _fuzzy_content_match_question_index(line: str, questions: list, min_fraction: float = 0.5):
+def _fuzzy_content_match_question_index(line: str, questions: list, min_fraction: float = 0.65):  # Changed from 0.5
     """
-    Fuzzy, LABEL-FREE match: true only when a line's distinctive words
-    substantially overlap with a specific question's distinctive words
-    (e.g. a student restating a question in plain prose with no "Ans-"
-    marker at all). Returns a question index or None.
-
-    This signal is deliberately treated as LESS reliable than an
-    explicit numeric label -- see _label_match_question_index above --
-    because it can fire on a line that merely CONTINUES an answer and
-    happens to reuse enough of the question's own vocabulary, not just
-    on the answer's genuine opening line. Callers should route matches
-    from this function through an LLM confirmation step (with
-    surrounding context) rather than trusting them directly.
+    Fuzzy, LABEL-FREE match with stricter threshold to prevent mid-answer false matches.
+    Increased min_fraction from 0.5 to 0.65 to require stronger vocabulary overlap.
     """
     line_words = sorted(set(re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(line))[:25]))
     if not line_words:
@@ -1196,7 +1195,6 @@ def _fuzzy_content_match_question_index(line: str, questions: list, min_fraction
             return i
 
     return None
-
 
 def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.5):
     """Backward-compatible combined check (label match OR fuzzy content
@@ -1322,7 +1320,7 @@ _PARENT_INSTRUCTION_PREFIX_RE = re.compile(
 # remove more than this fraction of the answer, it is far more likely
 # a false-positive topical-overlap match than a genuine restatement,
 # so it is skipped entirely (answer kept whole) instead.
-MAX_ECHO_STRIP_FRACTION = 0.35
+MAX_ECHO_STRIP_FRACTION = 0.25
 
 # A similarity ratio at or above this is treated as an unambiguous,
 # near-exact restatement match -- allowed to bypass MAX_ECHO_STRIP_FRACTION
@@ -1332,6 +1330,10 @@ NEAR_EXACT_RATIO = 0.95
 
 
 def strip_full_question_echo(answer_text: str, question_text: str) -> str:
+    # Don't attempt echo stripping on very short answers
+    if len(answer_text.split()) < 20:  # Skip if answer is less than 20 words
+        return answer_text
+        
     question_core = _PARENT_INSTRUCTION_PREFIX_RE.sub('', question_text).strip()
     if not question_core:
         question_core = question_text
@@ -1355,17 +1357,11 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
         prefix = " ".join(answer_words[:n])
         prefix_norm = _normalize_for_echo_compare(prefix)
         ratio = difflib.SequenceMatcher(None, prefix_norm, q_norm).ratio()
-        if ratio >= 0.75 and ratio > best_ratio:
+        # FIX: Increased threshold from 0.75 to 0.82 to reduce false positives
+        if ratio >= 0.82 and ratio > best_ratio:
             best_ratio = ratio
             best_strip_count = n
 
-    # FIX: a near-exact match (ratio close to 1.0) is unambiguously a
-    # genuine restatement, not a false-positive topical-overlap match --
-    # so it's allowed to strip even if it exceeds MAX_ECHO_STRIP_FRACTION
-    # (which exists specifically to guard against LOWER-confidence
-    # matches). Without this, a short answer whose question happens to
-    # be long relative to it could have a perfect, obviously-correct
-    # restatement match blocked purely because of the length ratio.
     if best_strip_count > 0 and (
         best_ratio >= NEAR_EXACT_RATIO
         or best_strip_count <= len(answer_words) * MAX_ECHO_STRIP_FRACTION
@@ -1375,7 +1371,6 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
         return remaining.strip()
 
     return answer_text
-
 
 def strip_trailing_next_question_echo(answer_text: str, next_question_text: str = None) -> str:
     """
