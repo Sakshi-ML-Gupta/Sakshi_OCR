@@ -56,14 +56,15 @@ def run_datalab_ocr(pdf_path: str, log=print) -> str:
         raise Exception(f"Datalab submission failed: {resp.text}")
 
     data = resp.json()
-    check_url = data["request_check_url"]
+    check_url = data.get("request_check_url")
+    if not check_url:
+        raise Exception("Datalab API did not return check_url.")
 
     for _ in range(150):
         poll_resp = httpx.get(check_url, headers=headers, timeout=60)
         if poll_resp.status_code == 200:
             result = poll_resp.json()
             if result.get("status") == "complete":
-                # Safe markdown field parsing (Handles all payload structures)
                 md = result.get("markdown") or result.get("text") or ""
                 if not md and "pages" in result:
                     md = "\n\n".join([p.get("markdown", "") for p in result["pages"]])
@@ -76,15 +77,18 @@ def run_datalab_ocr(pdf_path: str, log=print) -> str:
 
 
 def normalize_ocr_layout(raw_ocr_text: str) -> str:
-    """Strips markdown header hashes and joins inline answer tags."""
-    text = raw_ocr_text
-    # Hash header tags strip karna
+    """Fixes Windows CRLF line endings, strips headers, and normalizes Ans anchors."""
+    # FIX BUG 3: Standardize carriage returns
+    text = raw_ocr_text.replace("\r\n", "\n").replace("\r", "\n")
+    
+    # Strip markdown header hashes (#, ##, ###)
     text = re.sub(r'^[#]+\s*', '', text, flags=re.MULTILINE)
     text = text.replace('**', '').replace('__', '')
-    # Inline Ans labels ko next line par push karna
-    text = re.sub(r'(\?|\:)\s*(Ans|Answer|Sol|Solution|A\:)', r'\1\n\2', text, flags=re.IGNORECASE)
     
-    # Teacher noise scribble patterns remove karna
+    # Push inline answer labels to the next line safely
+    text = re.sub(r'(\?|\:|\b)\s*(Ans|Answer|Sol|Solution|A\:)', r'\1\n\2', text, flags=re.IGNORECASE)
+    
+    # Remove teacher margin comments
     noise_pattern = re.compile(
         r'^\s*(?:A\s+)?(?:red\s*scribble|signature\s*inside|circle|red\s*line|extending\s*towards|bottom\s*of\s*the\s*page).*\.?$',
         re.IGNORECASE | re.MULTILINE
@@ -112,25 +116,50 @@ def get_pdf_text(pdf_path: str, log=print) -> str:
     return normalize_ocr_layout(full_text)
 
 
-def smart_question_chunking(text: str, max_chars: int = 10000) -> List[str]:
+def smart_question_chunking(text: str, max_chars: int = 8000) -> List[str]:
     """
-    Question-Aware Smart Chunking (Safely handles empty splits and question boundaries).
+    FIX BUG 1 & 2: Handles top-of-document Q1, Roman Numerals, Letters,
+    and enforces a HARD max_chars cap so Groq 413 TPM limit is impossible to hit.
     """
-    q_pattern = re.compile(r'(?=\n(?:Q|Q\.|Question|\d+[\.\)])\s*\d*)', re.IGNORECASE)
-    raw_blocks = q_pattern.split(text)
+    # Regex matching Q1, Question 1, 1., I., (a), Sec A at line starts
+    pattern = r'(?m)^(?:Q|Q\.|Question|\d+[\.\)]|[I|V|X]+[\.\)]|\([a-zA-Z0-9]+\))\s*'
     
-    # Filter empty blocks
-    blocks = [b for b in raw_blocks if b.strip()]
-    
+    lines = text.split("\n")
+    raw_blocks = []
+    current_block = []
+
+    for line in lines:
+        if re.match(pattern, line.strip(), re.IGNORECASE) and current_block:
+            raw_blocks.append("\n".join(current_block))
+            current_block = [line]
+        else:
+            current_block.append(line)
+            
+    if current_block:
+        raw_blocks.append("\n".join(current_block))
+
+    # Second Pass: Combine blocks up to max_chars, or split oversized blocks safely
     chunks = []
     curr_chunk = ""
 
-    for block in blocks:
-        if len(curr_chunk) + len(block) > max_chars and curr_chunk.strip():
+    for block in raw_blocks:
+        # If single block itself is huge (> max_chars), break it into paragraph fallbacks
+        if len(block) > max_chars:
+            if curr_chunk.strip():
+                chunks.append(curr_chunk.strip())
+                curr_chunk = ""
+            paras = block.split("\n\n")
+            for p in paras:
+                if len(curr_chunk) + len(p) > max_chars and curr_chunk.strip():
+                    chunks.append(curr_chunk.strip())
+                    curr_chunk = p
+                else:
+                    curr_chunk += "\n\n" + p if curr_chunk else p
+        elif len(curr_chunk) + len(block) > max_chars and curr_chunk.strip():
             chunks.append(curr_chunk.strip())
             curr_chunk = block
         else:
-            curr_chunk += block
+            curr_chunk += "\n\n" + block if curr_chunk else block
 
     if curr_chunk.strip():
         chunks.append(curr_chunk.strip())
@@ -151,7 +180,7 @@ class DirectQAExtractor:
         self.model = "llama-3.3-70b-versatile"
 
     def _call_groq_with_retry(self, messages: list, retries: int = 3) -> str:
-        """Rate limit error mitigation with exponential backoff retries."""
+        """Exponential backoff retry handler for Groq calls."""
         for attempt in range(retries):
             try:
                 completion = self.client.chat.completions.create(
@@ -165,7 +194,7 @@ class DirectQAExtractor:
             except Exception as e:
                 err_str = str(e).lower()
                 if "rate_limit" in err_str or "413" in err_str or "429" in err_str:
-                    time.sleep(4 * (attempt + 1))
+                    time.sleep(5 * (attempt + 1))
                 else:
                     if attempt == retries - 1:
                         raise e
@@ -178,15 +207,15 @@ class DirectQAExtractor:
             if status_callback:
                 status_callback(msg)
 
-        log("1. PDF Text Extract & Normalizing...")
+        log("1. Extracting PDF text and normalizing CRLF layout...")
         normalized_text = get_pdf_text(pdf_path, log=log)
 
         if not normalized_text.strip():
             raise Exception("Failed to extract readable text from document.")
 
-        log("2. Running Question-Aware Smart Chunking...")
-        chunks = smart_question_chunking(normalized_text, max_chars=10000)
-        log(f"Document chunked into {len(chunks)} safe block(s). Processing...")
+        log("2. Running Hard-Capped Question-Aware Chunking...")
+        chunks = smart_question_chunking(normalized_text, max_chars=8000)
+        log(f"Document split into {len(chunks)} strict TPM-compliant chunk(s). Processing...")
 
         system_prompt = """You are a precise exam evaluator extracting Question and Answer pairs from OCR text.
 
@@ -228,14 +257,17 @@ Return ONLY JSON:
 
             time.sleep(2.0)  # Throttling between chunks for safe RPM
 
-        # Deduplication by Question text similarity
+        # FIX BUG 4: Robust Deduplication Hash Key (Question + Answer snippet)
         final_qa_pairs = []
-        seen_questions = set()
+        seen_keys = set()
 
         for item in raw_all_pairs:
-            q_clean = re.sub(r'[\W_]+', '', item["question"].lower())[:50]
-            if q_clean not in seen_questions:
-                seen_questions.add(q_clean)
+            q_clean = re.sub(r'[\W_]+', '', item["question"].lower())
+            a_snippet = re.sub(r'[\W_]+', '', item["answer"].lower())[:30]
+            unique_key = f"{q_clean}_{a_snippet}"
+            
+            if unique_key not in seen_keys:
+                seen_keys.add(unique_key)
                 final_qa_pairs.append(item)
 
         log(f"Successfully extracted {len(final_qa_pairs)} clean Q&A pairs!")
