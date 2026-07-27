@@ -1106,12 +1106,61 @@ def _label_match_question_index(line: str, questions: list):
     if not label_match:
         return None
     num_match = re.search(r'\d+', label_match.group(0))
-    if num_match:
-        label_num = num_match.group(0)
-        for i, q in enumerate(questions):
-            q_num_match = re.match(r'\s*(\d+)', q)
-            if q_num_match and q_num_match.group(1) == label_num:
+    if not num_match:
+        return -1
+
+    label_num = num_match.group(0)
+    matching_indices = [
+        i for i, q in enumerate(questions)
+        if (m := re.match(r'\s*(\d+)', q)) and m.group(1) == label_num
+    ]
+
+    if not matching_indices:
+        return -1
+
+    if len(matching_indices) == 1:
+        # Unique -- the parent number alone is enough to identify the
+        # question with certainty (the normal case for non-split
+        # questions).
+        return matching_indices[0]
+
+    # FIX: multiple questions share this same parent number -- this
+    # happens whenever a question has labeled sub-parts (e.g. "1.(i)",
+    # "1.(ii)", "1.(iii)" all extracted as separate canonical questions
+    # per QUESTION_PAPER_ONLY_SYSTEM_PROMPT's own splitting rules, but
+    # all sharing the parent number "1"). The OLD behavior here always
+    # returned matching_indices[0] -- i.e. ANY student label like
+    # "Ans 1-", regardless of which sub-part it actually answered,
+    # silently resolved to the FIRST sub-part every time. This meant
+    # sub-parts (ii), (iii), (iv) could never get a genuine Tier-1
+    # label match even when the student clearly labeled them, forcing
+    # them through much less reliable fuzzy/LLM fallback for no reason.
+    #
+    # First, try to read a sub-part indicator directly off the SAME
+    # label text (e.g. "Ans 1(ii)-", "Ans 1 (b)-") and match it against
+    # each candidate question's own sub-part marker -- if found, this
+    # is still a fully deterministic, certain match.
+    sub_match = re.search(
+        r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]',
+        line[label_match.end() - 1: label_match.end() + 6]
+    ) or re.search(
+        r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]',
+        line[:label_match.end() + 10]
+    )
+    if sub_match:
+        sub_label = sub_match.group(1).lower()
+        for i in matching_indices:
+            q_sub_match = re.search(
+                r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]',
+                questions[i][:20]
+            )
+            if q_sub_match and q_sub_match.group(1).lower() == sub_label:
                 return i
+
+    # No reliable way to tell WHICH sibling sub-part this label refers
+    # to -- ambiguous. Defer to Tier 2, where the LLM is shown the
+    # actual target sub-part's text and can judge from context, rather
+    # than this function silently guessing the first one every time.
     return -1
 
 
