@@ -1275,6 +1275,12 @@ _PARENT_INSTRUCTION_PREFIX_RE = re.compile(
 # so it is skipped entirely (answer kept whole) instead.
 MAX_ECHO_STRIP_FRACTION = 0.35
 
+# A similarity ratio at or above this is treated as an unambiguous,
+# near-exact restatement match -- allowed to bypass MAX_ECHO_STRIP_FRACTION
+# entirely, since the fraction cap exists to guard against LOWER-
+# confidence, possibly-false-positive matches, not near-perfect ones.
+NEAR_EXACT_RATIO = 0.95
+
 
 def strip_full_question_echo(answer_text: str, question_text: str) -> str:
     question_core = _PARENT_INSTRUCTION_PREFIX_RE.sub('', question_text).strip()
@@ -1304,7 +1310,17 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
             best_ratio = ratio
             best_strip_count = n
 
-    if best_strip_count > 0 and best_strip_count <= len(answer_words) * MAX_ECHO_STRIP_FRACTION:
+    # FIX: a near-exact match (ratio close to 1.0) is unambiguously a
+    # genuine restatement, not a false-positive topical-overlap match --
+    # so it's allowed to strip even if it exceeds MAX_ECHO_STRIP_FRACTION
+    # (which exists specifically to guard against LOWER-confidence
+    # matches). Without this, a short answer whose question happens to
+    # be long relative to it could have a perfect, obviously-correct
+    # restatement match blocked purely because of the length ratio.
+    if best_strip_count > 0 and (
+        best_ratio >= NEAR_EXACT_RATIO
+        or best_strip_count <= len(answer_words) * MAX_ECHO_STRIP_FRACTION
+    ):
         remaining = " ".join(answer_words[best_strip_count:]).strip()
         remaining = re.sub(r'^(?:Answer\s*[-:]\s*)', '', remaining, flags=re.IGNORECASE)
         return remaining.strip()
@@ -1358,7 +1374,10 @@ def strip_trailing_next_question_echo(answer_text: str, next_question_text: str 
             best_ratio = ratio
             best_strip_count = n
 
-    if best_strip_count > 0 and best_strip_count <= len(answer_words) * MAX_ECHO_STRIP_FRACTION:
+    if best_strip_count > 0 and (
+        best_ratio >= NEAR_EXACT_RATIO
+        or best_strip_count <= len(answer_words) * MAX_ECHO_STRIP_FRACTION
+    ):
         remaining_words = answer_words[:len(answer_words) - best_strip_count]
         return " ".join(remaining_words).strip()
 
@@ -1534,20 +1553,24 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
 
 # =========================================================
-# SEQUENTIAL SINGLE-TARGET ANSWER MAPPING
+# DOCUMENT-ORDER ANSWER MAPPING (formerly "sequential single-target")
 #
-# Alternative, structurally-safer mapping strategy: instead of asking
-# the LLM for a (start_line, end_line) pair PER QUESTION independently
-# (which can disagree with a neighboring question's guessed start and
-# overlap -- the swallowing bug _resolve_overlapping_answer_ranges only
-# patches up AFTER the fact), this walks through the questions IN ORDER
-# and, for each one, asks the LLM to find ONLY its start_line, searching
-# forward from a cursor that only ever advances. The end_line for
-# question i is then ALWAYS derived as (start_line of question i+1) - 1,
-# or the end of the document for the last matched question -- it is
-# NEVER independently guessed by the LLM. Two answers can therefore
-# never overlap or swallow each other: it's structurally impossible,
-# not just patched after the fact.
+# Structurally-safer mapping strategy: instead of asking the LLM for a
+# (start_line, end_line) pair PER QUESTION independently (which can
+# disagree with a neighboring question's guessed start and overlap --
+# the swallowing bug _resolve_overlapping_answer_ranges only patches up
+# AFTER the fact), each question's start_line is searched for
+# INDEPENDENTLY, wherever it actually is in the document -- with NO
+# assumption that students answer questions in the same order they are
+# printed on the question paper (a real, common source of failures:
+# many assignment booklets let students answer in whatever order they
+# choose). Once every start_line is found, all (start_line, question)
+# pairs are sorted by their ACTUAL PHYSICAL POSITION, and end_line for
+# each is ALWAYS derived as (the next answer's start, in that physical
+# order) - 1, or the end of the document for whichever answer
+# physically comes last -- it is NEVER independently guessed by the
+# LLM. Two answers can therefore never overlap or swallow each other:
+# it's structurally impossible, not just patched after the fact.
 
 SEQ_ANSWER_START_MAX_CHARS = 9000
 
@@ -1671,13 +1694,38 @@ def _plain_chunk_lines_by_char_budget(numbered_lines: list, max_chars: int) -> l
 
 def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_callback=None) -> dict:
     """
-    Sequential single-target search: for each question IN ORDER, search
-    forward (from a cursor that only ever advances) for just its
-    start_line. end_line is always DERIVED as (next matched question's
-    start_line - 1), or the end of the document for the last matched
-    question -- never independently guessed. This makes one answer
-    swallowing another's content structurally impossible, since only
-    ONE boundary (the start) is ever asked for or trusted per question.
+    Document-order boundary detection: each question's answer start is
+    searched for INDEPENDENTLY, anywhere in the document -- NOT gated
+    by a cursor that assumes questions are answered in the same order
+    they're printed on the question paper. Once every question's start
+    line is found (wherever it actually is), all (start_line,
+    question) pairs are sorted by their ACTUAL PHYSICAL POSITION in the
+    document, and each answer's end is derived as (the next answer's
+    start, in that physical order) - 1, or end-of-document for
+    whichever answer physically comes last.
+
+    FIX (root cause): the previous version searched for question i's
+    start using a cursor that only ever advanced forward as PREVIOUS
+    QUESTIONS (in question-list order) were found -- i.e. it assumed
+    the student answered question 1, then question 2, then question 3,
+    etc., in that exact order. This is a common but NOT universal
+    pattern -- many real assignment booklets (e.g. "attempt any N of
+    M" style, which IGNOU-style assignments frequently use) let
+    students answer in WHATEVER order they choose. The moment a
+    student's actual answer order differs even slightly from the
+    printed question order, the old cursor-gated search would either
+    never find a question's real (out-of-order, "earlier" in the
+    document) start at all, or -- worse -- lock onto the wrong
+    location, corrupting the whole downstream chain of derived
+    boundaries. This was confirmed to be the dominant, systemic cause
+    of imperfect output across virtually every document tested, since
+    strict order-preservation is the exception rather than the rule in
+    real student booklets. Searching each question independently,
+    without any ordering assumption, removes this failure mode
+    entirely -- the final end_line derivation step (see below) was
+    ALREADY order-agnostic (it sorts by found position, not by
+    question-list order), so this fix only needed to change how the
+    SEARCH itself is scoped.
     """
     def log(msg):
         print(msg)
@@ -1696,33 +1744,13 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(answer_lines)
 
-    # Tier 1 (deterministic, zero LLM risk): pre-compute, for EVERY
-    # line in the whole document, whether it carries an EXPLICIT,
-    # resolvable numeric answer-label (e.g. "Ans 5-"/"उत्तर 5"/"Q5").
-    # This is computed ONCE up front, with no LLM calls at all, and
-    # gives a highly reliable anchor for the common case where
-    # students DO label their answers.
-    #
-    # FIX (this round): the previous version used the COMBINED
-    # label-or-fuzzy-content matcher for this array, meaning a fuzzy,
-    # label-free content match (a line merely reusing enough of a
-    # question's own vocabulary) was trusted with the SAME zero-
-    # verification confidence as a genuine "Ans 5-" label. That is a
-    # confirmed real bug: a fuzzy content match can fire on a MIDDLE
-    # sentence of the true answer -- one that happens to repeat
-    # distinctive words -- rather than on the answer's actual opening
-    # line, especially when a student's question-restatement spans
-    # MULTIPLE OCR lines (so no single line alone has enough overlap
-    # to fire until a line or two INTO the restatement). Trusting that
-    # as if it were a certain label match caused the found start_line
-    # to land AFTER part of the true answer had already passed --
-    # exactly the "answer missing its start" symptom seen in testing.
-    #
-    # This version only lets an EXPLICIT, resolved numeric label into
-    # Tier 1. A fuzzy content-only match is now routed into Tier 2 and
-    # must be confirmed by the LLM (with surrounding BEFORE-context so
-    # it can correct to an earlier true start line if needed) instead
-    # of being trusted blindly.
+    # Tier 1 (deterministic, zero LLM risk, whole-document, order-free):
+    # scan EVERY line once for an explicit, resolvable numeric label
+    # (e.g. "Ans 5-"/"उत्तर 5"/"Q5"). For each question that has at
+    # least one such label anywhere in the document, its EARLIEST
+    # labeled occurrence is taken as its start -- regardless of where
+    # that falls relative to other questions' positions. No cursor, no
+    # ordering assumption.
     label_matches = [
         _label_match_question_index(text, questions)
         for _, text in numbered_lines
@@ -1733,61 +1761,38 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
     ]
 
     starts = {}  # question index -> start_line
-    cursor = 0
+    for idx, m in enumerate(label_matches):
+        if m is not None and m >= 0 and m not in starts:
+            starts[m] = idx
+            log(f"Question {m+1}: deterministic label match found at line {idx}")
+
     chunk_failures = []
+    claimed_lines = set(starts.values())
 
     for i, q in enumerate(questions):
-        log(f"Sequentially searching for start of question {i+1}/{len(questions)} (from line {cursor})...")
+        if i in starts:
+            continue
 
-        exact_candidates = [
-            idx for idx, m in enumerate(label_matches)
-            if idx >= cursor and m == i
-        ]
-        # FIX: ambiguous candidates now include BOTH unresolved labels
-        # (label present, number didn't match any question) AND fuzzy
-        # label-free content matches for THIS specific question -- both
-        # require LLM confirmation before being trusted, since neither
-        # is as certain as a resolved numeric label.
+        log(f"Searching whole document for start of question {i+1}/{len(questions)} (not yet found via label)...")
+
+        # Tier 2: lines that either LOOK like a label but couldn't be
+        # resolved to a specific question, OR only fuzzily match via
+        # shared vocabulary (no label at all) -- gathered from the
+        # WHOLE document, not restricted to "after" any other
+        # question's position. Lines already claimed as a DIFFERENT
+        # question's confident (Tier 1) start are excluded, to reduce
+        # confusion between neighboring answers.
         ambiguous_candidates = sorted(set(
-            [idx for idx, m in enumerate(label_matches) if idx >= cursor and m == -1]
-            + [idx for idx, m in enumerate(fuzzy_matches) if idx >= cursor and m == i]
-        ))
+            [idx for idx, m in enumerate(label_matches) if m == -1]
+            + [idx for idx, m in enumerate(fuzzy_matches) if m == i]
+        ) - claimed_lines)
 
         found_start = None
 
-        if exact_candidates:
-            # Tier 1: an unambiguous, resolved numeric-label match
-            # (e.g. "Ans 5-" resolved specifically to question 5). No
-            # LLM call needed -- this is the most reliable signal
-            # available and carries no risk of semantic confusion with
-            # a neighboring answer. If more than one such candidate
-            # exists (a student re-referencing their own answer number
-            # in passing), the earliest one after the cursor is taken,
-            # consistent with the forward-only, in-order scan.
-            found_start = exact_candidates[0]
-            log(f"Question {i+1}: deterministic label match found at line {found_start}")
-
-        elif ambiguous_candidates:
-            # Tier 2: lines that either LOOK like a label but couldn't
-            # be resolved to a specific question, OR only fuzzily match
-            # via shared vocabulary (no label at all). Rather than an
-            # open-ended scan of the whole remaining document, the LLM
-            # is shown ONLY these few candidate areas (each with
-            # several lines of context BEFORE and AFTER) and asked to
-            # confirm the true earliest start line -- which may be a
-            # line or two BEFORE the marked candidate itself, if the
-            # restatement spans multiple OCR lines. This both narrows
-            # the LLM's decision space (vs. an open text scan) AND
-            # lets it correct a fuzzy match that landed mid-restatement
-            # back to the genuine opening line.
+        if ambiguous_candidates:
             candidate_window = ambiguous_candidates[:8]  # cap prompt size
             user_prompt = _build_candidate_confirmation_prompt(answer_lines, candidate_window, q)
 
-            # Valid line numbers for this confirmation are ANY line
-            # shown in ANY candidate's context window (not just the
-            # exact candidate indices) -- this is what allows the LLM
-            # to report a true start that's slightly earlier than the
-            # marked candidate.
             valid_context_lines = set()
             for c_idx in candidate_window:
                 for j, _ in _get_line_context(answer_lines, c_idx):
@@ -1803,28 +1808,23 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
                 chunk_failures.append(str(e))
                 start = None
 
-            if start is not None and start in valid_context_lines and start >= cursor:
+            if start is not None and start in valid_context_lines and start not in claimed_lines:
                 found_start = start
                 log(f"Question {i+1}: LLM-confirmed candidate match at line {found_start}")
             elif start is not None:
                 log(
                     f"WARNING: discarding LLM-confirmed start {start} for question "
-                    f"{i+1} -- outside the shown candidate context "
-                    f"({sorted(valid_context_lines)})"
+                    f"{i+1} -- outside shown context or already claimed by another "
+                    f"question ({sorted(valid_context_lines)})"
                 )
 
         if found_start is None:
-            # Tier 3 (last resort): no label-like candidates exist at
-            # all anywhere in the remaining document for this question
-            # -- most likely the student restates the question in
-            # plain prose with no label. Fall back to the original
-            # open text scan across remaining chunks.
-            remaining = [(idx, text) for idx, text in numbered_lines if idx >= cursor]
-            if not remaining:
-                log(f"WARNING: no lines left to search for question {i+1} -- skipping")
-                continue
-
-            line_chunks = _plain_chunk_lines_by_char_budget(remaining, SEQ_ANSWER_START_MAX_CHARS)
+            # Tier 3 (last resort): no label-like or fuzzy candidates
+            # exist anywhere in the document for this question. Scan
+            # the WHOLE document (not "from a cursor") in chunks, in
+            # document order, and accept the first genuine match found
+            # that isn't already claimed by a different question.
+            line_chunks = _plain_chunk_lines_by_char_budget(numbered_lines, SEQ_ANSWER_START_MAX_CHARS)
             context_questions = [oq for j, oq in enumerate(questions) if j != i]
 
             for chunk in line_chunks:
@@ -1842,19 +1842,18 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
                 if start is not None:
                     min_idx = chunk[0][0]
                     max_idx = chunk[-1][0]
-                    if min_idx <= start <= max_idx and start >= cursor:
+                    if min_idx <= start <= max_idx and start not in claimed_lines:
                         found_start = start
                         break
                     else:
                         log(
-                            f"WARNING: discarding out-of-range/backward start_line "
-                            f"{start} for question {i+1} (expected within "
-                            f"{max(min_idx, cursor)}-{max_idx})"
+                            f"WARNING: discarding out-of-range/already-claimed "
+                            f"start_line {start} for question {i+1}"
                         )
 
         if found_start is not None:
             starts[i] = found_start
-            cursor = found_start + 1
+            claimed_lines.add(found_start)
             log(f"Question {i+1}: answer starts at line {found_start}")
         else:
             log(f"WARNING: could not find a start line for question {i+1} -- leaving unmatched")
@@ -2098,18 +2097,22 @@ def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print
 @_diagnose_tuple_errors
 def process_pdf(file_input, status_callback=None, use_sequential_mapping: bool = True):
     """
-    FIX (this round): `use_sequential_mapping` (default True, per request)
-    switches the answer-mapping stage to the sequential single-target
-    search strategy (map_answers_with_llm_sequential) instead of the
-    independent per-question range search (map_answers_with_llm). The
-    sequential strategy asks the LLM for only ONE boundary (a question's
-    start line) at a time, walking questions in order with a
-    monotonically-advancing cursor, and always DERIVES each answer's end
-    as (next matched question's start - 1) in plain Python -- never
+    FIX (this round): `use_sequential_mapping` (default True) switches
+    the answer-mapping stage to the document-order boundary-detection
+    strategy (map_answers_with_llm_sequential) instead of the
+    independent per-question range search (map_answers_with_llm). Each
+    question's start line is searched for independently, ANYWHERE in
+    the document -- with no assumption that the student answered
+    questions in the same order they're printed on the question paper
+    (a confirmed, systemic source of failures on real "attempt any N
+    of M" style booklets, where students commonly answer out of
+    order). Once found, all starts are sorted by their actual physical
+    position and each answer's end is DERIVED as (the next answer's
+    start, in that physical order) - 1 in plain Python -- never
     independently guessed by the LLM. This makes one answer swallowing
     another's content structurally impossible, rather than merely
-    patched up after the fact. Pass use_sequential_mapping=False to fall
-    back to the old independent-range approach if ever needed.
+    patched up after the fact. Pass use_sequential_mapping=False to
+    fall back to the old independent-range approach if ever needed.
     """
     def log(msg):
         print(msg)
