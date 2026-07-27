@@ -72,31 +72,17 @@ def run_datalab_ocr(pdf_path: str, log=print) -> str:
 
 
 def normalize_ocr_layout(raw_ocr_text: str) -> str:
-    """
-    ROOT CAUSE FIX:
-    Datalab OCR adds '#' headers or bold tags around questions, fusing the question
-    and the FIRST SENTENCE of the student's answer into the same header block line.
-    This function strips markdown tags and forces newline separations.
-    """
+    """Strips layout formatting trap tags and annotation noise."""
     text = raw_ocr_text
-    
-    # 1. Strip markdown header hashes (#, ##, ###)
     text = re.sub(r'^[#]+\s*', '', text, flags=re.MULTILINE)
-    
-    # 2. Unbold/Unitalicize formatting that traps first sentences
     text = text.replace('**', '').replace('__', '')
-    
-    # 3. Handle inline question-answer merging (e.g. "Q1. What is X? Ans: It is Y")
-    # Force newlines before answer indicators if trapped inline
     text = re.sub(r'(\?|\:)\s*(Ans|Answer|Sol|Solution|A\:)', r'\1\n\2', text, flags=re.IGNORECASE)
     
-    # 4. Remove teacher annotation artifacts
     noise_pattern = re.compile(
         r'^\s*(?:A\s+)?(?:red\s*scribble|signature\s*inside|circle|red\s*line|extending\s*towards|bottom\s*of\s*the\s*page).*\.?$',
         re.IGNORECASE | re.MULTILINE
     )
     text = noise_pattern.sub('', text)
-
     return text.strip()
 
 
@@ -116,12 +102,33 @@ def get_pdf_text(pdf_path: str, log=print) -> str:
         log("Running Datalab OCR...")
         full_text = run_datalab_ocr(pdf_path, log=log)
 
-    # Normalize layout to prevent first-sentence loss
     return normalize_ocr_layout(full_text)
 
 
+def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
+    """Splits huge text into Groq TPM-compliant chunks."""
+    paragraphs = text.split("\n\n")
+    chunks = []
+    current_chunk = []
+    current_len = 0
+
+    for para in paragraphs:
+        if current_len + len(para) > max_chars:
+            chunks.append("\n\n".join(current_chunk))
+            current_chunk = [para]
+            current_len = len(para)
+        else:
+            current_chunk.append(para)
+            current_len += len(para)
+
+    if current_chunk:
+        chunks.append("\n\n".join(current_chunk))
+
+    return chunks
+
+
 # =========================================================
-# 3. DIRECT EXTRACTOR WITH UNBOUNDED TOKEN CAPACITY
+# 3. DIRECT EXTRACTOR WITH RATE-LIMIT & CHUNKING LOGIC
 # =========================================================
 
 class DirectQAExtractor:
@@ -138,68 +145,74 @@ class DirectQAExtractor:
             if status_callback:
                 status_callback(msg)
 
-        log("1. Extracting and Normalizing OCR Text...")
+        log("1. Reading PDF and Normalizing OCR Text...")
         normalized_text = get_pdf_text(pdf_path, log=log)
 
         if not normalized_text.strip():
             raise Exception("Failed to extract text from document.")
 
-        log("2. Extracting Question-Answer pairs with full token capacity...")
+        log("2. Chunking text to meet Groq 12k Token Limit...")
+        # 12,000 characters is ~3,000 tokens per chunk (Safe below TPM limit)
+        chunks = chunk_text(normalized_text, max_chars=12000)
+        log(f"Document split into {len(chunks)} chunk(s). Processing...")
 
-        system_prompt = """You are a meticulous exam grader extracting Q&A pairs from OCR text.
+        system_prompt = """You are a precise exam evaluator extracting Question and Answer pairs from OCR text.
 
-STRICT EXTRACTION RULES:
-1. QUESTION SEPARATION:
-   - Identify every distinct question (e.g., Q1, 1(a), Question 2).
-   - Extract the full question prompt into 'question'.
+STRICT INSTRUCTIONS:
+1. Identify all complete Questions and Student Answers present in the snippet.
+2. Ensure the student's answer includes the VERY FIRST SENTENCE and is 100% UNTRUNCATED.
+3. Preserve all equations, text steps, and student explanations exactly as written.
+4. If a question is cut across boundaries, extract what is completely visible.
 
-2. COMPLETE ANSWER CAPTURE (ZERO LOSS):
-   - The student's answer starts IMMEDIATELY after the question ends.
-   - Include the VERY FIRST SENTENCE of the student's writing.
-   - Capture ALL words, sentences, steps, and paragraphs until the next question starts.
-   - ABSOLUTELY DO NOT summarize, shorten, cut off, or skip any part of the answer.
-
-OUTPUT REQUIREMENT:
 Return ONLY a JSON object:
 {
   "qa_pairs": [
     {
-      "question": "Full Question Header/Text",
-      "answer": "Complete, 100% untruncated student answer"
+      "question": "Full question header/text",
+      "answer": "Complete untruncated student answer"
     }
   ]
 }"""
 
-        user_prompt = f"RAW OCR DOCUMENT TEXT:\n\n{normalized_text}"
+        all_qa_pairs = []
 
-        completion = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-            max_completion_tokens=8192
-        )
-
-        response_content = completion.choices[0].message.content.strip()
-        data = json.loads(response_content)
-        raw_pairs = data.get("qa_pairs", [])
-
-        final_pairs = []
-        for pair in raw_pairs:
-            q_str = str(pair.get("question", "")).strip()
-            a_str = str(pair.get("answer", "")).strip()
+        for idx, chunk in enumerate(chunks):
+            log(f"Extracting Q&A from Chunk {idx + 1}/{len(chunks)}...")
             
-            final_pairs.append({
-                "question": q_str,
-                "answer": a_str if a_str else "Answer text unavailable.",
-                "matched": True
-            })
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"OCR TEXT SNIPPET:\n\n{chunk}"}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+                max_completion_tokens=4096
+            )
 
-        log(f"Successfully extracted {len(final_pairs)} Q&A pairs without truncation.")
-        return final_pairs
+            response_content = completion.choices[0].message.content.strip()
+            try:
+                data = json.loads(response_content)
+                raw_pairs = data.get("qa_pairs", [])
+                
+                for pair in raw_pairs:
+                    q_str = str(pair.get("question", "")).strip()
+                    a_str = str(pair.get("answer", "")).strip()
+                    if q_str and a_str:
+                        all_qa_pairs.append({
+                            "question": q_str,
+                            "answer": a_str,
+                            "matched": True
+                        })
+            except Exception as e:
+                log(f"Warning: Chunk {idx + 1} response JSON parsing error: {e}")
+
+            # Sleep briefly between chunk requests to avoid Groq Rate Limit bursts
+            if idx < len(chunks) - 1:
+                time.sleep(1.5)
+
+        log(f"Successfully mapped {len(all_qa_pairs)} total Q&A pairs without rate limits.")
+        return all_qa_pairs
 
 
 # =========================================================
