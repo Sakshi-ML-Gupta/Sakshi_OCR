@@ -63,7 +63,11 @@ def run_datalab_ocr(pdf_path: str, log=print) -> str:
         if poll_resp.status_code == 200:
             result = poll_resp.json()
             if result.get("status") == "complete":
-                return result.get("markdown") or ""
+                # Safe markdown field parsing (Handles all payload structures)
+                md = result.get("markdown") or result.get("text") or ""
+                if not md and "pages" in result:
+                    md = "\n\n".join([p.get("markdown", "") for p in result["pages"]])
+                return md
             if result.get("status") == "failed":
                 raise Exception(f"Datalab error: {result.get('error')}")
         time.sleep(2)
@@ -72,12 +76,15 @@ def run_datalab_ocr(pdf_path: str, log=print) -> str:
 
 
 def normalize_ocr_layout(raw_ocr_text: str) -> str:
-    """Strips layout formatting trap tags and annotation noise."""
+    """Strips markdown header hashes and joins inline answer tags."""
     text = raw_ocr_text
+    # Hash header tags strip karna
     text = re.sub(r'^[#]+\s*', '', text, flags=re.MULTILINE)
     text = text.replace('**', '').replace('__', '')
+    # Inline Ans labels ko next line par push karna
     text = re.sub(r'(\?|\:)\s*(Ans|Answer|Sol|Solution|A\:)', r'\1\n\2', text, flags=re.IGNORECASE)
     
+    # Teacher noise scribble patterns remove karna
     noise_pattern = re.compile(
         r'^\s*(?:A\s+)?(?:red\s*scribble|signature\s*inside|circle|red\s*line|extending\s*towards|bottom\s*of\s*the\s*page).*\.?$',
         re.IGNORECASE | re.MULTILINE
@@ -99,36 +106,40 @@ def get_pdf_text(pdf_path: str, log=print) -> str:
     full_text = "\n".join(text_chunks).strip()
 
     if len(full_text) < 50:
-        log("Running Datalab OCR...")
+        log("Running Datalab OCR for image PDF...")
         full_text = run_datalab_ocr(pdf_path, log=log)
 
     return normalize_ocr_layout(full_text)
 
 
-def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
-    """Splits huge text into Groq TPM-compliant chunks."""
-    paragraphs = text.split("\n\n")
+def smart_question_chunking(text: str, max_chars: int = 10000) -> List[str]:
+    """
+    Question-Aware Smart Chunking (Safely handles empty splits and question boundaries).
+    """
+    q_pattern = re.compile(r'(?=\n(?:Q|Q\.|Question|\d+[\.\)])\s*\d*)', re.IGNORECASE)
+    raw_blocks = q_pattern.split(text)
+    
+    # Filter empty blocks
+    blocks = [b for b in raw_blocks if b.strip()]
+    
     chunks = []
-    current_chunk = []
-    current_len = 0
+    curr_chunk = ""
 
-    for para in paragraphs:
-        if current_len + len(para) > max_chars:
-            chunks.append("\n\n".join(current_chunk))
-            current_chunk = [para]
-            current_len = len(para)
+    for block in blocks:
+        if len(curr_chunk) + len(block) > max_chars and curr_chunk.strip():
+            chunks.append(curr_chunk.strip())
+            curr_chunk = block
         else:
-            current_chunk.append(para)
-            current_len += len(para)
+            curr_chunk += block
 
-    if current_chunk:
-        chunks.append("\n\n".join(current_chunk))
+    if curr_chunk.strip():
+        chunks.append(curr_chunk.strip())
 
     return chunks
 
 
 # =========================================================
-# 3. DIRECT EXTRACTOR WITH RATE-LIMIT & CHUNKING LOGIC
+# 3. DIRECT EXTRACTOR WITH RETRY LOGIC & DEDUPLICATION
 # =========================================================
 
 class DirectQAExtractor:
@@ -139,80 +150,96 @@ class DirectQAExtractor:
         self.client = Groq(api_key=self.api_key)
         self.model = "llama-3.3-70b-versatile"
 
+    def _call_groq_with_retry(self, messages: list, retries: int = 3) -> str:
+        """Rate limit error mitigation with exponential backoff retries."""
+        for attempt in range(retries):
+            try:
+                completion = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                    max_completion_tokens=4096
+                )
+                return completion.choices[0].message.content.strip()
+            except Exception as e:
+                err_str = str(e).lower()
+                if "rate_limit" in err_str or "413" in err_str or "429" in err_str:
+                    time.sleep(4 * (attempt + 1))
+                else:
+                    if attempt == retries - 1:
+                        raise e
+                    time.sleep(2)
+        return "{}"
+
     def process(self, pdf_path: str, status_callback=None) -> List[Dict[str, Any]]:
         def log(msg):
             print(msg)
             if status_callback:
                 status_callback(msg)
 
-        log("1. Reading PDF and Normalizing OCR Text...")
+        log("1. PDF Text Extract & Normalizing...")
         normalized_text = get_pdf_text(pdf_path, log=log)
 
         if not normalized_text.strip():
-            raise Exception("Failed to extract text from document.")
+            raise Exception("Failed to extract readable text from document.")
 
-        log("2. Chunking text to meet Groq 12k Token Limit...")
-        # 12,000 characters is ~3,000 tokens per chunk (Safe below TPM limit)
-        chunks = chunk_text(normalized_text, max_chars=12000)
-        log(f"Document split into {len(chunks)} chunk(s). Processing...")
+        log("2. Running Question-Aware Smart Chunking...")
+        chunks = smart_question_chunking(normalized_text, max_chars=10000)
+        log(f"Document chunked into {len(chunks)} safe block(s). Processing...")
 
         system_prompt = """You are a precise exam evaluator extracting Question and Answer pairs from OCR text.
 
-STRICT INSTRUCTIONS:
-1. Identify all complete Questions and Student Answers present in the snippet.
-2. Ensure the student's answer includes the VERY FIRST SENTENCE and is 100% UNTRUNCATED.
-3. Preserve all equations, text steps, and student explanations exactly as written.
-4. If a question is cut across boundaries, extract what is completely visible.
+STRICT RULES:
+1. Extract ALL distinct questions and their complete student answers.
+2. Ensure the answer captures the VERY FIRST SENTENCE and contains NO TRUNCATION.
+3. Preserve math expressions, structural text, and all steps.
 
-Return ONLY a JSON object:
+Return ONLY JSON:
 {
   "qa_pairs": [
     {
-      "question": "Full question header/text",
-      "answer": "Complete untruncated student answer"
+      "question": "Full question text",
+      "answer": "Complete student answer"
     }
   ]
 }"""
 
-        all_qa_pairs = []
+        raw_all_pairs = []
 
         for idx, chunk in enumerate(chunks):
             log(f"Extracting Q&A from Chunk {idx + 1}/{len(chunks)}...")
             
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"OCR TEXT SNIPPET:\n\n{chunk}"}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-                max_completion_tokens=4096
-            )
+            response_content = self._call_groq_with_retry([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"OCR TEXT SNIPPET:\n\n{chunk}"}
+            ])
 
-            response_content = completion.choices[0].message.content.strip()
             try:
                 data = json.loads(response_content)
-                raw_pairs = data.get("qa_pairs", [])
-                
-                for pair in raw_pairs:
-                    q_str = str(pair.get("question", "")).strip()
-                    a_str = str(pair.get("answer", "")).strip()
-                    if q_str and a_str:
-                        all_qa_pairs.append({
-                            "question": q_str,
-                            "answer": a_str,
-                            "matched": True
-                        })
+                pairs = data.get("qa_pairs", [])
+                for p in pairs:
+                    q = str(p.get("question", "")).strip()
+                    a = str(p.get("answer", "")).strip()
+                    if q and a:
+                        raw_all_pairs.append({"question": q, "answer": a, "matched": True})
             except Exception as e:
-                log(f"Warning: Chunk {idx + 1} response JSON parsing error: {e}")
+                log(f"Warning: JSON parse error in Chunk {idx + 1}: {e}")
 
-            # Sleep briefly between chunk requests to avoid Groq Rate Limit bursts
-            if idx < len(chunks) - 1:
-                time.sleep(1.5)
+            time.sleep(2.0)  # Throttling between chunks for safe RPM
 
-        log(f"Successfully mapped {len(all_qa_pairs)} total Q&A pairs without rate limits.")
-        return all_qa_pairs
+        # Deduplication by Question text similarity
+        final_qa_pairs = []
+        seen_questions = set()
+
+        for item in raw_all_pairs:
+            q_clean = re.sub(r'[\W_]+', '', item["question"].lower())[:50]
+            if q_clean not in seen_questions:
+                seen_questions.add(q_clean)
+                final_qa_pairs.append(item)
+
+        log(f"Successfully extracted {len(final_qa_pairs)} clean Q&A pairs!")
+        return final_qa_pairs
 
 
 # =========================================================
