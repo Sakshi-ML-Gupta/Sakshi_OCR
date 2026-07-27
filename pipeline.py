@@ -75,32 +75,6 @@ def _coerce_name(name, default_name="document.pdf"):
         return default_name
 
 
-# =========================================================
-# DIAGNOSTIC GUARD
-#
-# This module's OWN code cannot produce the exact error
-# "expected str, bytes or os.PathLike object, not tuple" -- that precise
-# message is only ever raised by Python's os.fspath()/open() built-ins,
-# and this module contains zero raw open() calls; every Path()/read_bytes()
-# call here is already guarded by an isinstance() check before it runs
-# (see _normalize_file_input and _coerce_name above). This has been
-# verified directly: feeding every realistic tuple shape (filename+bytes,
-# enumerate-style, zip-style, nested tuples) into _normalize_file_input
-# produces a clear, different TypeError every time, never this one.
-#
-# That means if this exact error is still happening, it is occurring
-# OUTSIDE this module -- most likely in the calling app's own code
-# (e.g. a raw open(...) call on something that isn't a path) BEFORE
-# process_pdf()/process_reference() is ever reached.
-#
-# This decorator can't fix a bug in code it doesn't contain, but it
-# converts an ambiguous crash into an UNAMBIGUOUS one: if this exact
-# error somehow still surfaces while a call is genuinely inside this
-# module, the wrapped function catches it, attaches the literal type
-# and repr of whatever was passed in, and re-raises with a message
-# that makes the true source impossible to mistake next time.
-# =========================================================
-
 def _diagnose_tuple_errors(func):
     import functools
 
@@ -121,10 +95,6 @@ def _diagnose_tuple_errors(func):
 
     return wrapper
 
-
-# =========================================================
-# CONCURRENCY GUARD
-# =========================================================
 
 _groq_call_lock = threading.Lock()
 
@@ -1046,7 +1016,7 @@ ANSWER_MAP_MAX_CHARS_PER_CHUNK = 11000
 ANSWER_MAP_ABSOLUTE_MAX_CHARS = 60000
 
 _ANSWER_START_RE = re.compile(
-    r'^\s*(?:Ans(?:wer)?[.\s:-]+\d*|उत्तर\s*\d*\s*[\-\:]?|प्र[०.\s]*\d*|Q\.?\s*\d+[.\s:-])',
+    r'^\s*(?:Ans(?:wer)?[.\s]+\d*|उत्तर\s*\d*\s*[\-\:]?|प्र[०.\s]*\d*|Q\.?\s*\d+[.\s:-])',
     re.IGNORECASE
 )
 
@@ -1075,33 +1045,6 @@ def _distinctive_words(text: str, max_words: int = 20) -> list:
 
 
 def _label_match_question_index(line: str, questions: list):
-    """
-    Checks ONLY for an explicit numeric answer-label (e.g. "Ans 5-",
-    "उत्तर 5", "Q5") and resolves it to a specific question index via
-    the label's own number. Returns:
-      - an integer index if the label's number resolves to a known question
-      - -1 if the line looks like a label but its number can't be resolved
-      - None if the line has no label pattern at all
-
-    FIX: this is a NEW, separate function split out of the old combined
-    _line_starts_new_answer_for_question. That function ALSO fell back
-    to fuzzy word-overlap matching when no label was present, and BOTH
-    kinds of match were being treated as equally trustworthy by the
-    sequential mapper -- but they are not. A resolved numeric label is
-    essentially certain (the student wrote "Ans 5-", there's no
-    ambiguity about which question that is). A fuzzy content match is
-    just a guess based on shared vocabulary, and can easily land on a
-    MIDDLE sentence of the true answer (one that happens to repeat
-    enough distinctive words) rather than the answer's actual first
-    line -- silently skipping over the answer's real opening lines.
-    This was confirmed as the cause of "answers missing their start"
-    in testing: a fuzzy match was blindly trusted as if it were a
-    label match, so the found start_line landed AFTER the answer's
-    true beginning. Keeping label detection in its own function lets
-    the caller trust ONLY this signal directly, and route fuzzy
-    content matches through LLM confirmation instead (see
-    _fuzzy_content_match_question_index below).
-    """
     label_match = _ANSWER_START_RE.match(line)
     if not label_match:
         return None
@@ -1119,65 +1062,29 @@ def _label_match_question_index(line: str, questions: list):
         return -1
 
     if len(matching_indices) == 1:
-        # Unique -- the parent number alone is enough to identify the
-        # question with certainty (the normal case for non-split
-        # questions).
         return matching_indices[0]
 
-    # FIX: multiple questions share this same parent number -- this
-    # happens whenever a question has labeled sub-parts (e.g. "1.(i)",
-    # "1.(ii)", "1.(iii)" all extracted as separate canonical questions
-    # per QUESTION_PAPER_ONLY_SYSTEM_PROMPT's own splitting rules, but
-    # all sharing the parent number "1"). The OLD behavior here always
-    # returned matching_indices[0] -- i.e. ANY student label like
-    # "Ans 1-", regardless of which sub-part it actually answered,
-    # silently resolved to the FIRST sub-part every time. This meant
-    # sub-parts (ii), (iii), (iv) could never get a genuine Tier-1
-    # label match even when the student clearly labeled them, forcing
-    # them through much less reliable fuzzy/LLM fallback for no reason.
-    #
-    # First, try to read a sub-part indicator directly off the SAME
-    # label text (e.g. "Ans 1(ii)-", "Ans 1 (b)-") and match it against
-    # each candidate question's own sub-part marker -- if found, this
-    # is still a fully deterministic, certain match.
-    label_text_full = line[label_match.start():label_match.end() + 15]
-    
-    # Try multiple sub-part patterns
-    sub_match = (
-        re.search(r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]', label_text_full) or
-        re.search(r'[-–]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\b', label_text_full) or
-        # Also check the next few characters after the label
-        re.search(r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]', 
-                  line[label_match.end():label_match.end()+20])
+    sub_match = re.search(
+        r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]',
+        line[label_match.end() - 1: label_match.end() + 6]
+    ) or re.search(
+        r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]',
+        line[:label_match.end() + 10]
     )
-    
     if sub_match:
         sub_label = sub_match.group(1).lower()
         for i in matching_indices:
-            q_text_lower = questions[i].lower()
-            # Check multiple positions in the question text for sub-part marker
-            q_sub_match = (
-                re.search(r'[\(\uff08]\s*' + re.escape(sub_match.group(1)) + r'\s*[\)\uff09]', q_text_lower) or
-                re.search(r'\b' + re.escape(sub_label) + r'\b', q_text_lower[:30])
+            q_sub_match = re.search(
+                r'[\(\uff08]\s*([ivxIVX]+|[a-zA-Z]|[\u0915-\u0939])\s*[\)\uff09]',
+                questions[i][:20]
             )
-            if q_sub_match:
+            if q_sub_match and q_sub_match.group(1).lower() == sub_label:
                 return i
-    
-    # If we still can't disambiguate, try matching by looking at the NEXT line
-    # for sub-part indicators
-    label_line_num = -1
-    for idx, (line_num, text) in enumerate(numbered_lines) if 'numbered_lines' in dir() else []:
-        break  # We don't have numbered_lines here, skip this
-    
-    # No reliable way to tell - return -1 to let Tier 2/3 handle it
+
     return -1
 
 
-def _fuzzy_content_match_question_index(line: str, questions: list, min_fraction: float = 0.65):  # Changed from 0.5
-    """
-    Fuzzy, LABEL-FREE match with stricter threshold to prevent mid-answer false matches.
-    Increased min_fraction from 0.5 to 0.65 to require stronger vocabulary overlap.
-    """
+def _fuzzy_content_match_question_index(line: str, questions: list, min_fraction: float = 0.5):
     line_words = sorted(set(re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(line))[:25]))
     if not line_words:
         return None
@@ -1196,12 +1103,8 @@ def _fuzzy_content_match_question_index(line: str, questions: list, min_fraction
 
     return None
 
+
 def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.5):
-    """Backward-compatible combined check (label match OR fuzzy content
-    match), kept for the existing answer-boundary-aware chunking used
-    by the independent-range mapper (map_answers_with_llm). The
-    sequential mapper below uses the two split-out functions directly
-    instead, so it can apply different trust levels to each signal."""
     label_result = _label_match_question_index(line, questions)
     if label_result is not None:
         return label_result
@@ -1306,34 +1209,11 @@ _PARENT_INSTRUCTION_PREFIX_RE = re.compile(
 )
 
 
-# FIX: a hard safety cap on how much of an answer echo-stripping is
-# ever allowed to remove. Confirmed real-world failure mode: on some
-# documents the echo-similarity check (SequenceMatcher ratio over
-# normalized text) found a "good enough" match against a LARGE portion
-# of the answer purely because the question and answer share a lot of
-# common/topical vocabulary -- not because the answer actually
-# restates the question. Without a ceiling, this could strip away
-# roughly HALF of a genuine answer's own original content, which
-# matches the "answers coming back half" symptom seen in testing. A
-# real question-restatement echo is always a SHORT opening sentence
-# relative to a multi-paragraph answer -- if the computed strip would
-# remove more than this fraction of the answer, it is far more likely
-# a false-positive topical-overlap match than a genuine restatement,
-# so it is skipped entirely (answer kept whole) instead.
-MAX_ECHO_STRIP_FRACTION = 0.25
-
-# A similarity ratio at or above this is treated as an unambiguous,
-# near-exact restatement match -- allowed to bypass MAX_ECHO_STRIP_FRACTION
-# entirely, since the fraction cap exists to guard against LOWER-
-# confidence, possibly-false-positive matches, not near-perfect ones.
+MAX_ECHO_STRIP_FRACTION = 0.35
 NEAR_EXACT_RATIO = 0.95
 
 
 def strip_full_question_echo(answer_text: str, question_text: str) -> str:
-    # Don't attempt echo stripping on very short answers
-    if len(answer_text.split()) < 20:  # Skip if answer is less than 20 words
-        return answer_text
-        
     question_core = _PARENT_INSTRUCTION_PREFIX_RE.sub('', question_text).strip()
     if not question_core:
         question_core = question_text
@@ -1357,8 +1237,7 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
         prefix = " ".join(answer_words[:n])
         prefix_norm = _normalize_for_echo_compare(prefix)
         ratio = difflib.SequenceMatcher(None, prefix_norm, q_norm).ratio()
-        # FIX: Increased threshold from 0.75 to 0.82 to reduce false positives
-        if ratio >= 0.82 and ratio > best_ratio:
+        if ratio >= 0.75 and ratio > best_ratio:
             best_ratio = ratio
             best_strip_count = n
 
@@ -1372,22 +1251,8 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
 
     return answer_text
 
-def strip_trailing_next_question_echo(answer_text: str, next_question_text: str = None) -> str:
-    """
-    FIX (new): the mirror-image bug of strip_full_question_echo -- instead of
-    an answer's OPENING lines restating ITS OWN question, this catches an
-    answer's TRAILING lines already bleeding into the START of the NEXT
-    question's text (i.e. the next question got glued onto the tail end of
-    this answer, before a real boundary/chunk break kicked in). If the tail
-    of `answer_text` looks like it substantially echoes the opening of
-    `next_question_text`, that echoed tail is stripped off.
 
-    Same conservative design as strip_full_question_echo: only searches a
-    tight window (70%-130% of the next question's own word count) around the
-    END of the answer, and only strips if similarity is high (>=0.75) --
-    answers that legitimately share a little topical vocabulary with the
-    next question (but don't actually contain it) are left untouched.
-    """
+def strip_trailing_next_question_echo(answer_text: str, next_question_text: str = None) -> str:
     if not next_question_text:
         return answer_text
 
@@ -1430,40 +1295,21 @@ def strip_trailing_next_question_echo(answer_text: str, next_question_text: str 
 
 # =========================================================
 # DECORATIVE / NON-CONTENT ARTIFACT CLEANUP
-#
-# FIX (new): Chandra OCR output on some documents includes decorative
-# section markers that are not real student content at all -- e.g.
-# markdown-style headers like "### \u2605 \u092a\u094d\u0930\u0936\u094d\u0928\u094b\u0924\u094d\u0924\u0930 \u0928\u0902: 3 \u2605"
-# ("### \u2605 Question-Answer No: 3 \u2605") or booklet section labels like
-# "\u092d\u093e\u0917 - 1" ("Part - 1"). These are OCR'd verbatim like any
-# other line, so without an explicit cleanup step they leak straight
-# into the final answer text.
-#
-# This is a pure TEXT-CLEANUP concern, kept deliberately separate from
-# is_noise()/NOISE_RE (which decides whether to drop a whole LINE
-# outright, e.g. teacher-signature lines) -- a decorative marker can
-# appear on the SAME line as real content after OCR line-merging, so it
-# needs to be stripped out of a line/string rather than only checked
-# at the whole-line level.
 # =========================================================
 
 DECORATIVE_ARTIFACT_RE = re.compile(
     r'(?:'
-    r'\u092d\u093e\u0917\s*[-\u2013\u2014]?\s*\d+'                      # \u092d\u093e\u0917 - 1  ("Part - 1")
-    r'|#{1,6}\s*[\u2605\u2606\u2726\u2727\u273f\u2740]+[^\n]*'        # "### \u2605 ..." markdown header with a star
-    r'|[\u2605\u2606\u2726\u2727\u273f\u2740]+[^\u2605\u2606\n]{0,80}[\u2605\u2606\u2726\u2727\u273f\u2740]+'  # \u2605 ... \u2605 wrapped text
-    r'|\u092a\u094d\u0930\u0936\u094d\u0928\u094b\u0924\u094d\u0924\u0930\s*\u0928\u0902\.?\s*[:.]?\s*\d+'  # \u092a\u094d\u0930\u0936\u094d\u0928\u094b\u0924\u094d\u0924\u0930 \u0928\u0902: 3
-    r'|[\u2605\u2606\u2726\u2727\u273f\u2740#]{2,}'                    # bare runs of stars/hashes
+    r'\u092d\u093e\u0917\s*[-\u2013\u2014]?\s*\d+'
+    r'|#{1,6}\s*[\u2605\u2606\u2726\u2727\u273f\u2740]+[^\n]*'
+    r'|[\u2605\u2606\u2726\u2727\u273f\u2740]+[^\u2605\u2606\n]{0,80}[\u2605\u2606\u2726\u2727\u273f\u2740]+'
+    r'|\u092a\u094d\u0930\u0936\u094d\u0928\u094b\u0924\u094d\u0924\u0930\s*\u0928\u0902\.?\s*[:.]?\s*\d+'
+    r'|[\u2605\u2606\u2726\u2727\u273f\u2740#]{2,}'
     r')',
     re.UNICODE
 )
 
 
 def strip_decorative_artifacts(text: str) -> str:
-    """Removes decorative section markers / star-headers / '\u092d\u093e\u0917 - N'
-    style labels from a piece of text, collapsing whitespace afterward.
-    Safe to call on both a single OCR line and a fully-joined answer
-    string."""
     if not text:
         return text
     cleaned = DECORATIVE_ARTIFACT_RE.sub(' ', text)
@@ -1472,10 +1318,6 @@ def strip_decorative_artifacts(text: str) -> str:
 
 
 def _is_decorative_header_only(line: str) -> bool:
-    """True if, once decorative markup is stripped out, essentially
-    nothing meaningful is left on the line -- i.e. the WHOLE line was
-    just a section-header decoration, not real content, and should be
-    dropped entirely rather than left as an empty/near-empty line."""
     stripped = DECORATIVE_ARTIFACT_RE.sub('', line).strip()
     return len(stripped) < 3
 
@@ -1583,9 +1425,6 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         answer_text = strip_question_restatement(answer_text)
         answer_text = strip_full_question_echo(answer_text, original_question)
 
-        # FIX: also strip a NEXT-question echo bleeding into the tail of
-        # this answer (see strip_trailing_next_question_echo above), and
-        # clean out any decorative section-header artifacts.
         next_question = resolved_ranges[idx_r + 1] if idx_r + 1 < len(resolved_ranges) else None
         next_question_text = ref_to_question[next_question["ref"]] if next_question else None
         answer_text = strip_trailing_next_question_echo(answer_text, next_question_text)
@@ -1597,24 +1436,8 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
 
 # =========================================================
-# DOCUMENT-ORDER ANSWER MAPPING (formerly "sequential single-target")
-#
-# Structurally-safer mapping strategy: instead of asking the LLM for a
-# (start_line, end_line) pair PER QUESTION independently (which can
-# disagree with a neighboring question's guessed start and overlap --
-# the swallowing bug _resolve_overlapping_answer_ranges only patches up
-# AFTER the fact), each question's start_line is searched for
-# INDEPENDENTLY, wherever it actually is in the document -- with NO
-# assumption that students answer questions in the same order they are
-# printed on the question paper (a real, common source of failures:
-# many assignment booklets let students answer in whatever order they
-# choose). Once every start_line is found, all (start_line, question)
-# pairs are sorted by their ACTUAL PHYSICAL POSITION, and end_line for
-# each is ALWAYS derived as (the next answer's start, in that physical
-# order) - 1, or the end of the document for whichever answer
-# physically comes last -- it is NEVER independently guessed by the
-# LLM. Two answers can therefore never overlap or swallow each other:
-# it's structurally impossible, not just patched after the fact.
+# DOCUMENT-ORDER ANSWER MAPPING
+# =========================================================
 
 SEQ_ANSWER_START_MAX_CHARS = 9000
 
@@ -1728,8 +1551,6 @@ or, if none of the targets start in this chunk:
 
 
 def _build_batch_start_prompt(numbered_lines: list, remaining_targets: list) -> str:
-    """remaining_targets: list of (question_idx, question_text) tuples
-    still needing a start line."""
     targets_block = "\n".join(f"[REF-{idx}] {q}" for idx, q in remaining_targets)
     lines_block = "\n".join(f"[{j}] {text}" for j, text in numbered_lines)
     return (
@@ -1773,11 +1594,6 @@ def _parse_batch_start_response(content: str) -> list:
 
 
 def _plain_chunk_lines_by_char_budget(numbered_lines: list, max_chars: int) -> list:
-    """Simple, boundary-agnostic char-budget chunking (no answer-start
-    awareness needed here -- the sequential search itself walks chunk
-    by chunk across the document until it finds the target, so a break
-    landing mid-answer is harmless: it just means the target's start,
-    if present, is looked for a bit further along)."""
     if not numbered_lines:
         return []
 
@@ -1800,41 +1616,171 @@ def _plain_chunk_lines_by_char_budget(numbered_lines: list, max_chars: int) -> l
     return chunks
 
 
-def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_callback=None) -> dict:
-    """
-    Document-order boundary detection: each question's answer start is
-    searched for INDEPENDENTLY, anywhere in the document -- NOT gated
-    by a cursor that assumes questions are answered in the same order
-    they're printed on the question paper. Once every question's start
-    line is found (wherever it actually is), all (start_line,
-    question) pairs are sorted by their ACTUAL PHYSICAL POSITION in the
-    document, and each answer's end is derived as (the next answer's
-    start, in that physical order) - 1, or end-of-document for
-    whichever answer physically comes last.
+# =========================================================
+# MERGED / SPLIT ANSWER DETECTION  (NEW)
+#
+# Rationale: the pipeline previously only ever *warned* about a
+# suspiciously short answer (see the median-length check at the end of
+# map_answers_with_llm_sequential). A warning that nobody reads doesn't
+# fix anything. This adds an actual detection + re-verification pass
+# that runs after boundaries are derived:
+#
+#   - "split" detection: two ADJACENT matched answers whose boundary
+#     falls suspiciously close to a spot where the SECOND answer's own
+#     opening restatement is still bleeding across from the first
+#     answer's tail (i.e. what should have been ONE cut was made a few
+#     lines too early or too late, leaving one answer abnormally short
+#     and its neighbor abnormally long, or vice versa).
+#   - "merged" detection: a SINGLE matched answer that is far longer
+#     than the document's median AND contains, embedded inside it, an
+#     unmistakable label match (_label_match_question_index) for a
+#     DIFFERENT question than the one it's currently assigned to --
+#     i.e. two students' answers (or one student's answers to two
+#     different questions) got glued into one span because the
+#     in-between boundary was never found.
+#
+# Neither check silently "fixes" anything on its own (that would just
+# swap one guess for another) -- each flags the specific line number
+# where the suspected mis-boundary is, and re-runs the SAME
+# candidate-confirmation LLM call already used elsewhere in the
+# pipeline, scoped tightly to just that neighborhood, to attempt an
+# actual correction with real evidence rather than a heuristic.
+# =========================================================
 
-    FIX (root cause): the previous version searched for question i's
-    start using a cursor that only ever advanced forward as PREVIOUS
-    QUESTIONS (in question-list order) were found -- i.e. it assumed
-    the student answered question 1, then question 2, then question 3,
-    etc., in that exact order. This is a common but NOT universal
-    pattern -- many real assignment booklets (e.g. "attempt any N of
-    M" style, which IGNOU-style assignments frequently use) let
-    students answer in WHATEVER order they choose. The moment a
-    student's actual answer order differs even slightly from the
-    printed question order, the old cursor-gated search would either
-    never find a question's real (out-of-order, "earlier" in the
-    document) start at all, or -- worse -- lock onto the wrong
-    location, corrupting the whole downstream chain of derived
-    boundaries. This was confirmed to be the dominant, systemic cause
-    of imperfect output across virtually every document tested, since
-    strict order-preservation is the exception rather than the rule in
-    real student booklets. Searching each question independently,
-    without any ordering assumption, removes this failure mode
-    entirely -- the final end_line derivation step (see below) was
-    ALREADY order-agnostic (it sorts by found position, not by
-    question-list order), so this fix only needed to change how the
-    SEARCH itself is scoped.
+def _detect_embedded_foreign_label(
+    answer_lines: list, start: int, end: int, own_question_idx: int, questions: list
+):
+    """Scan a matched answer's own line range for a label match
+    pointing at a DIFFERENT question than the one it's assigned to.
+    Returns the line index of the first such foreign label, or None."""
+    for j in range(start, end + 1):
+        if not (0 <= j < len(answer_lines)):
+            continue
+        m = _label_match_question_index(answer_lines[j], questions)
+        if m is not None and m >= 0 and m != own_question_idx:
+            return j
+    return None
+
+
+def detect_and_reverify_boundaries(
+    answer_lines: list, questions: list, qa_map: dict,
+    matched_order: list, client, budget, log
+) -> dict:
     """
+    matched_order: list of (question_idx, start_line, end_line) tuples,
+    sorted by physical position in the document (this is exactly the
+    ordering map_answers_with_llm_sequential already computes internally
+    before deriving qa_map -- pass it straight through).
+
+    Returns a possibly-updated qa_map. Falls back to the original
+    mapping for any question where re-verification is inconclusive --
+    this only ever tightens a boundary it can support with a fresh LLM
+    check, it never removes or invents content on a hunch.
+    """
+    if len(matched_order) < 2:
+        return qa_map
+
+    lengths = [end - start for _, start, end in matched_order]
+    if not lengths:
+        return qa_map
+    sorted_lengths = sorted(lengths)
+    median_len_lines = sorted_lengths[len(sorted_lengths) // 2]
+
+    flagged = []
+
+    # Merged-answer detection: a long span with a foreign label buried inside it.
+    for pos, (q_idx, start, end) in enumerate(matched_order):
+        span = end - start
+        if median_len_lines > 0 and span > median_len_lines * 2.5 and span > 20:
+            foreign_line = _detect_embedded_foreign_label(
+                answer_lines, start, end, q_idx, questions
+            )
+            if foreign_line is not None:
+                flagged.append(("merged", pos, foreign_line))
+                log(
+                    f"Possible MERGED answers detected: question "
+                    f"{q_idx + 1}'s span (lines {start}-{end}) contains what "
+                    f"looks like a label for a different question at line "
+                    f"{foreign_line}. Re-verifying that boundary..."
+                )
+
+    # Split-answer detection: an abnormally short answer directly next
+    # to an abnormally long neighbor -- classic sign the cut landed a
+    # few lines off in one direction.
+    for pos in range(len(matched_order) - 1):
+        q_idx_a, start_a, end_a = matched_order[pos]
+        q_idx_b, start_b, end_b = matched_order[pos + 1]
+        span_a = end_a - start_a
+        span_b = end_b - start_b
+        if median_len_lines <= 0:
+            continue
+        if span_a < median_len_lines * 0.3 and span_b > median_len_lines * 1.3:
+            flagged.append(("split_boundary", pos, end_a))
+            log(
+                f"Possible SPLIT/misplaced boundary detected between "
+                f"question {q_idx_a + 1} (short, {span_a} lines) and "
+                f"question {q_idx_b + 1} (long, {span_b} lines) at line "
+                f"{end_a}. Re-verifying that boundary..."
+            )
+
+    if not flagged:
+        return qa_map
+
+    # Re-verify each flagged boundary with the same candidate-confirmation
+    # call already used elsewhere, scoped to a small window around the
+    # suspected line -- this either produces a corrected, evidence-backed
+    # start line for the affected question, or leaves the original
+    # mapping untouched if the LLM can't confirm anything better.
+    updated_map = dict(qa_map)
+
+    for kind, pos, suspect_line in flagged:
+        if kind == "merged":
+            q_idx, start, end = matched_order[pos]
+            candidate_window = [suspect_line]
+        else:
+            q_idx_b, start_b, end_b = matched_order[pos + 1]
+            q_idx = q_idx_b
+            start, end = start_b, end_b
+            candidate_window = [max(start_b - 3, suspect_line)]
+
+        target_question = questions[q_idx]
+        user_prompt = _build_candidate_confirmation_prompt(
+            answer_lines, candidate_window, target_question
+        )
+        try:
+            confirmed_start = _call_groq_with_retries(
+                client, CANDIDATE_CONFIRM_SYSTEM_PROMPT, user_prompt,
+                _parse_answer_start_response, budget, log
+            )
+        except Exception as e:
+            log(f"WARNING: boundary re-verification call failed, keeping original mapping: {e}")
+            continue
+
+        if confirmed_start is None:
+            log(f"Re-verification inconclusive for question {q_idx + 1} -- keeping original mapping.")
+            continue
+
+        new_start = max(start, min(confirmed_start, end))
+        verbatim_lines = [
+            answer_lines[j] for j in range(new_start, end + 1)
+            if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
+        ]
+        if not verbatim_lines:
+            continue
+
+        answer_text = " ".join(verbatim_lines).strip()
+        answer_text = strip_question_restatement(answer_text)
+        answer_text = strip_full_question_echo(answer_text, target_question)
+        answer_text = strip_decorative_artifacts(answer_text)
+
+        if len(answer_text) > len(updated_map.get(target_question, "")):
+            log(f"Applied re-verified boundary correction for question {q_idx + 1}.")
+            updated_map[target_question] = answer_text
+
+    return updated_map
+
+
+def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_callback=None) -> dict:
     def log(msg):
         print(msg)
         if status_callback:
@@ -1852,13 +1798,6 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
     numbered_lines = list(enumerate(answer_lines))
     total_lines = len(answer_lines)
 
-    # Tier 1 (deterministic, zero LLM risk, whole-document, order-free):
-    # scan EVERY line once for an explicit, resolvable numeric label
-    # (e.g. "Ans 5-"/"उत्तर 5"/"Q5"). For each question that has at
-    # least one such label anywhere in the document, its EARLIEST
-    # labeled occurrence is taken as its start -- regardless of where
-    # that falls relative to other questions' positions. No cursor, no
-    # ordering assumption.
     label_matches = [
         _label_match_question_index(text, questions)
         for _, text in numbered_lines
@@ -1868,7 +1807,7 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
         for _, text in numbered_lines
     ]
 
-    starts = {}  # question index -> start_line
+    starts = {}
     for idx, m in enumerate(label_matches):
         if m is not None and m >= 0 and m not in starts:
             starts[m] = idx
@@ -1883,22 +1822,15 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
 
         log(f"Searching whole document for start of question {i+1}/{len(questions)} (not yet found via label)...")
 
-        # Tier 2: lines that either LOOK like a label but couldn't be
-        # resolved to a specific question, OR only fuzzily match via
-        # shared vocabulary (no label at all) -- gathered from the
-        # WHOLE document, not restricted to "after" any other
-        # question's position. Lines already claimed as a DIFFERENT
-        # question's confident (Tier 1) start are excluded, to reduce
-        # confusion between neighboring answers.
         ambiguous_candidates = sorted(set(
             [idx for idx, m in enumerate(label_matches) if m == -1]
             + [idx for idx, m in enumerate(fuzzy_matches) if m == i]
         ) - claimed_lines)
 
         if not ambiguous_candidates:
-            continue  # nothing to try here -- goes to the batched Tier 3 pass below
+            continue
 
-        candidate_window = ambiguous_candidates[:8]  # cap prompt size
+        candidate_window = ambiguous_candidates[:8]
         user_prompt = _build_candidate_confirmation_prompt(answer_lines, candidate_window, q)
 
         valid_context_lines = set()
@@ -1927,29 +1859,6 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
                 f"question ({sorted(valid_context_lines)})"
             )
 
-    # Tier 3 (last resort, BATCHED): any questions still unmatched after
-    # Tier 1 + Tier 2 have no label-like or fuzzy candidates anywhere in
-    # the document at all.
-    #
-    # FIX (this round): the previous version scanned the ENTIRE document,
-    # chunk by chunk, SEPARATELY for EVERY unmatched question -- i.e. if
-    # 5 questions reached Tier 3 and the document split into 10 chunks,
-    # that was 5 x 10 = 50 large LLM calls (each close to the free-tier's
-    # entire 8000 TPM budget on its own, given ~9000-char chunks). This
-    # was confirmed to be the dominant cause of Groq's token/rate-limit
-    # budget being exhausted mid-run, leaving many documents with no
-    # usable output at all after a long wait.
-    #
-    # This version scans the document chunks only ONCE, TOTAL, regardless
-    # of how many questions still need Tier 3 -- each chunk is shown
-    # together with the FULL LIST of still-remaining targets, and the LLM
-    # reports every target (if any) that genuinely starts in that chunk.
-    # As targets are found, they're removed from the "still needed" list,
-    # so later chunks show a shrinking target list and -- once every
-    # remaining target has been found -- scanning stops early instead of
-    # continuing through the rest of the document for nothing. This turns
-    # Tier 3's cost from O(unmatched_questions x chunks) into O(chunks),
-    # a large reduction whenever more than one question needs it.
     still_unmatched = [i for i in range(len(questions)) if i not in starts]
     if still_unmatched:
         log(
@@ -1961,7 +1870,7 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
 
         for chunk in line_chunks:
             if not still_unmatched:
-                break  # every remaining target has already been found
+                break
 
             remaining_targets = [(i, questions[i]) for i in still_unmatched]
             user_prompt = _build_batch_start_prompt(chunk, remaining_targets)
@@ -2003,12 +1912,9 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
     for i in still_unmatched:
         log(f"WARNING: could not find a start line for question {i+1} -- leaving unmatched")
 
-    # Build ranges: end of question i is ALWAYS (start of the NEXT
-    # matched question) - 1, or end-of-document for the last matched
-    # question. This is a pure Python derivation -- never asked of the
-    # LLM -- so overlap between answers is structurally impossible.
     matched_indices = sorted(starts.keys(), key=lambda i: starts[i])
 
+    matched_order = []
     qa_map = {}
     for pos, q_idx in enumerate(matched_indices):
         start = starts[q_idx]
@@ -2017,6 +1923,8 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
             end = next_start - 1
         else:
             end = total_lines - 1
+
+        matched_order.append((q_idx, start, end))
 
         verbatim_lines = [
             answer_lines[j] for j in range(start, end + 1)
@@ -2036,13 +1944,17 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
 
         qa_map[original_question] = answer_text
 
-    # FIX: surfaces likely-truncated answers instead of shipping them
-    # silently. An answer far shorter than the median of the OTHER
-    # matched answers in the SAME document is a strong signal that its
-    # start (or the next question's start, which determines its end)
-    # was found prematurely -- i.e. exactly the "answer came back half"
-    # failure mode. This doesn't drop or alter anything; it just makes
-    # the failure loud and points at which question(s) to check.
+    # NEW: actual merged/split detection + re-verification pass, instead
+    # of only logging a warning. This re-checks flagged boundaries against
+    # real OCR evidence via the same LLM call used elsewhere and only
+    # applies a correction when it can support one -- see
+    # detect_and_reverify_boundaries() above for exactly what it checks
+    # and why each check exists.
+    if len(matched_order) >= 2:
+        qa_map = detect_and_reverify_boundaries(
+            answer_lines, questions, qa_map, matched_order, client, budget, log
+        )
+
     if len(qa_map) >= 3:
         lengths = {q: len(a) for q, a in qa_map.items()}
         sorted_lengths = sorted(lengths.values())
@@ -2052,10 +1964,9 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
                 log(
                     f"WARNING: answer for question {q[:60]!r} is only {length} "
                     f"chars, much shorter than this document's median answer "
-                    f"length ({median_len} chars). This often means the answer's "
-                    f"start was found too late or the NEXT question's start was "
-                    f"found too early, truncating this answer. Worth checking "
-                    f"manually."
+                    f"length ({median_len} chars) even after the re-verification "
+                    f"pass above. This still may indicate truncation -- worth "
+                    f"checking manually."
                 )
 
     log(f"Sequential mapping: {len(qa_map)} of {len(questions)} question(s) matched")
@@ -2073,40 +1984,99 @@ def map_answers_with_llm_sequential(answer_lines: list, questions: list, status_
     return qa_map
 
 
-NOISE_RE = re.compile(
-    r'(?:Teacher\'?s?\s*Signature'
-    r'|Tancher\'?s?\s*Signature'
-    r'|Facebook\'?s?\s*Signature'
-    r'|PAGE\s*NO'
-    r'|^\s*DATE\b'
-    r'|Neel?\s*Kamal'
-    r'|Neal?\s*Kamal'
-    r'|Need?\s*Komal'
-    r'|Nod\s*Komal'
-    r'|TAKMA\s*SINAN'
-    r'|^\s*\d{1,3}\s*$)',
+# =========================================================
+# NOISE FILTERING  (generalized -- no memorized per-document anchors)
+#
+# FIX (this round): the previous NOISE_RE hardcoded specific garbled
+# OCR misreadings of ONE document's teacher/signature line (e.g. "Neel
+# Kamal", "TAKMA SINAN", "Facebook's Signature"). Those strings are
+# accidental artifacts of one specific OCR run on one specific
+# document -- they will never recur verbatim on a different booklet,
+# and hardcoding them directly contradicts "adaptive to any PDF
+# layout." They're replaced below with PATTERN-based detection that
+# generalizes:
+#
+#   - Signature/date lines are detected structurally: a short line
+#     (few words) that is immediately followed or preceded by another
+#     short line, where at least one contains a recognizable label
+#     word ("Signature", "Date", "हस्ताक्षर", "दिनांक") OR is simply a
+#     very short (<=3 word) line sitting between two much longer
+#     paragraph lines -- a strong structural signal of a signature/
+#     name/date strip regardless of exactly how OCR garbled the name.
+#   - Page-number-only lines (bare digits) are kept as before -- that
+#     check was already anchor-free.
+#
+# This trades a little recall (it may occasionally miss a signature
+# line with no structural markers at all) for actually working across
+# different documents, instead of only the one it was tuned to.
+# =========================================================
+
+SIGNATURE_LABEL_RE = re.compile(
+    r'(?:teacher|student|learner|invigilator|examiner|parent)?\s*'
+    r'(?:\'?s)?\s*'
+    r'(?:signature|sign\.?|हस्ताक्षर)'
+    r'|(?:^\s*date\s*[:.\-]?\s*$)'
+    r'|(?:^\s*दिनांक\s*[:.\-]?\s*$)'
+    r'|page\s*no\.?\s*[:.\-]?\s*\d*\s*$',
     re.IGNORECASE
 )
 
+# A bare short "name-like" line (1-4 words, no sentence punctuation,
+# no digits beyond a lone page number) sitting by itself is treated as
+# a candidate signature/name-strip line ONLY when it also matches the
+# structural check in is_noise() below (short + isolated), never on
+# word-content alone -- this avoids depending on any specific name.
+_BARE_SHORT_LINE_RE = re.compile(r'^[^\d.:,;!?]{1,40}$')
+
 
 def is_noise(line: str) -> bool:
-    # FIX: also treats a line as noise if, once decorative section-header
-    # markup (star-wrapped headers, "\u092d\u093e\u0917 - N", "\u092a\u094d\u0930\u0936\u094d\u0928\u094b\u0924\u094d\u0924\u0930 \u0928\u0902: N",
-    # bare runs of stars/hashes, etc.) is stripped out, essentially
-    # nothing real is left on the line. Real content lines that merely
-    # CONTAIN some decorative markup alongside genuine text are NOT
-    # dropped here -- they go through strip_decorative_artifacts() at
-    # the answer-text level instead, so only real content is removed by
-    # this line-level check.
     if _is_decorative_header_only(line):
         return True
-    return bool(NOISE_RE.search(line))
+
+    stripped = line.strip()
+
+    if re.fullmatch(r'\d{1,3}', stripped):
+        return True
+
+    if SIGNATURE_LABEL_RE.search(stripped):
+        return True
+
+    return False
+
+
+def is_noise_structural(line: str, prev_line: str = "", next_line: str = "") -> bool:
+    """
+    Optional, STRONGER structural check: call this instead of is_noise()
+    when you have access to surrounding lines (e.g. while flattening
+    pages) to also catch bare, unlabeled short name/signature-strip
+    lines -- WITHOUT relying on any memorized name string. A short
+    (<=4 words), punctuation-light line is only flagged as noise if it
+    sits between two much longer lines (i.e. it looks like an isolated
+    strip, not a normal short sentence in the middle of prose).
+    """
+    if is_noise(line):
+        return True
+
+    stripped = line.strip()
+    if not stripped or not _BARE_SHORT_LINE_RE.match(stripped):
+        return False
+
+    word_count = len(stripped.split())
+    if word_count == 0 or word_count > 4:
+        return False
+
+    prev_len = len(prev_line.strip())
+    next_len = len(next_line.strip())
+    # Isolated short line between two much longer paragraph lines --
+    # structurally looks like a signature/name strip, not prose.
+    if prev_len > 60 and next_len > 60:
+        return True
+
+    return False
 
 
 # =========================================================
 # FIND QUESTION BOUNDARIES IN ANSWER PAGES -- similarity based
-# UNCHANGED. Kept for backward compatibility / callers that may still
-# reference it directly.
 # =========================================================
 
 def normalize(text: str) -> str:
@@ -2241,24 +2211,6 @@ def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print
 
 @_diagnose_tuple_errors
 def process_pdf(file_input, status_callback=None, use_sequential_mapping: bool = True):
-    """
-    FIX (this round): `use_sequential_mapping` (default True) switches
-    the answer-mapping stage to the document-order boundary-detection
-    strategy (map_answers_with_llm_sequential) instead of the
-    independent per-question range search (map_answers_with_llm). Each
-    question's start line is searched for independently, ANYWHERE in
-    the document -- with no assumption that the student answered
-    questions in the same order they're printed on the question paper
-    (a confirmed, systemic source of failures on real "attempt any N
-    of M" style booklets, where students commonly answer out of
-    order). Once found, all starts are sorted by their actual physical
-    position and each answer's end is DERIVED as (the next answer's
-    start, in that physical order) - 1 in plain Python -- never
-    independently guessed by the LLM. This makes one answer swallowing
-    another's content structurally impossible, rather than merely
-    patched up after the fact. Pass use_sequential_mapping=False to
-    fall back to the old independent-range approach if ever needed.
-    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -2294,17 +2246,22 @@ def process_pdf(file_input, status_callback=None, use_sequential_mapping: bool =
 
     log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
 
-    answer_lines = []
+    # FIX: flatten with the STRUCTURAL noise check (is_noise_structural),
+    # which has access to neighboring lines, so bare/unlabeled
+    # signature-strip lines can still be caught without relying on any
+    # memorized name string (see is_noise_structural's docstring above).
+    raw_lines_per_page = []
     for page in answer_pages:
-        for line in page["raw_text"].split("\n"):
-            if not is_noise(line):
-                # FIX: also strip decorative artifacts that appear
-                # ALONGSIDE real content on a line (not just lines that
-                # are decoration-only, already filtered by is_noise()
-                # above) before this line ever reaches answer_lines.
-                cleaned_line = strip_decorative_artifacts(line)
-                if cleaned_line:
-                    answer_lines.append(cleaned_line)
+        raw_lines_per_page.extend(page["raw_text"].split("\n"))
+
+    answer_lines = []
+    for i, line in enumerate(raw_lines_per_page):
+        prev_line = raw_lines_per_page[i - 1] if i > 0 else ""
+        next_line = raw_lines_per_page[i + 1] if i + 1 < len(raw_lines_per_page) else ""
+        if not is_noise_structural(line, prev_line, next_line):
+            cleaned_line = strip_decorative_artifacts(line)
+            if cleaned_line:
+                answer_lines.append(cleaned_line)
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
