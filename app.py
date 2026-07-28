@@ -150,12 +150,29 @@ if st.session_state.result:
     st.success(f"Done — {len(qa_pairs)} Q&A pair(s) extracted "
                f"from {ocr_json['total_pages']} page(s).")
 
-    for i, qa in enumerate(qa_pairs, start=1):
-        with st.expander(f"Q{i}: {qa['question'][:90]}"):
-            st.markdown("**Question:**")
-            st.write(qa["question"])
+    # ❌ TRIPPED CODE:
+# for i, qa in enumerate(qa_pairs, start=1):
+#     with st.expander(f"Q{i}: {qa['question'][:90]}"):
+
+# ✅ FIXED CODE:
+for i, qa in enumerate(qa_pairs, start=1):
+    # Agar qa ek String hai:
+    if isinstance(qa, str):
+        q_title = qa[:90]
+        q_text = qa
+        a_text = ""
+    # Agar qa ek Dictionary hai:
+    else:
+        q_title = qa.get('question', '')[:90]
+        q_text = qa.get('question', '')
+        a_text = qa.get('answer', '')
+
+    with st.expander(f"Q{i}: {q_title}"):
+        st.markdown("**Question:**")
+        st.write(q_text)
+        if a_text:
             st.markdown("**Answer:**")
-            st.write(qa["answer"] if qa["answer"] else "_(no answer text matched)_")
+            st.write(a_text)
 
     import json
     result_json = json.dumps(qa_pairs, ensure_ascii=False, indent=2)
