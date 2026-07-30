@@ -57,15 +57,15 @@ with st.sidebar:
     st.divider()
     st.caption(
         "Required secrets/env vars:\n\n"
-        "- `DATALAB_API_KEY`\n"
+        "- `MISTRAL_API_KEY`\n"
         "- `GROQ_API_KEY`"
     )
 
     missing_keys = []
     try:
         from pdf_processor import get_api_key
-        if not get_api_key("DATALAB_API_KEY"):
-            missing_keys.append("DATALAB_API_KEY")
+        if not get_api_key("MISTRAL_API_KEY"):
+            missing_keys.append("MISTRAL_API_KEY")
         if not get_api_key("GROQ_API_KEY"):
             missing_keys.append("GROQ_API_KEY")
     except Exception:
