@@ -1680,7 +1680,7 @@ def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print
 # COMPLETE PIPELINE
 # =========================================================
 
-@_tuple_error_diagnostic
+@_diagnose_tuple_errors
 def process_pdf(file_input, status_callback=None):
     def log(msg):
         print(msg)
