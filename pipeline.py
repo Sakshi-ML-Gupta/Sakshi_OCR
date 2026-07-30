@@ -211,7 +211,18 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
             f"into smaller files before uploading."
         )
 
-    from mistralai import Mistral
+    # CHANGED: mistralai SDK v2.0.0 (released March 2026) moved the
+    # Mistral client class from the top-level `mistralai` package to
+    # `mistralai.client` -- `from mistralai import Mistral` now raises
+    # "cannot import name 'Mistral' from 'mistralai' (unknown location)"
+    # on v2.x, even though it's still correct for v1.x. Trying both
+    # import paths makes this work regardless of which SDK version got
+    # installed in your environment (e.g. Streamlit Cloud pulling the
+    # latest release without a version pin).
+    try:
+        from mistralai import Mistral
+    except ImportError:
+        from mistralai.client import Mistral
 
     client = Mistral(api_key=api_key)
 
