@@ -3,11 +3,11 @@ import io
 import re
 import json
 import time
+import base64
 import difflib
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import fitz
-import httpx
 from pathlib import Path
 
 # =========================================================
@@ -159,61 +159,31 @@ def preprocess_pdf(file_bytes, dpi=250):
 
 
 # =========================================================
-# OCR -- Datalab (Chandra model) via /convert endpoint
-# (unchanged from original)
+# OCR -- Mistral OCR (mistral-ocr-latest) via the official SDK
+#
+# CHANGED FROM ORIGINAL: switched from Datalab (Chandra model, a raw
+# httpx submit-then-poll flow) to Mistral's OCR API.
+#
+# Two structural simplifications fall out of this switch:
+#   1. Mistral's OCR endpoint is SYNCHRONOUS (results in seconds for
+#      the standard endpoint) -- no submit/poll loop is needed at all,
+#      removing an entire class of "polling timed out after 5 minutes"
+#      failures that could happen with Datalab.
+#   2. Mistral's response already returns page-separated markdown
+#      (`response.pages[i].markdown`), so the fragile regex-based
+#      `_split_paginated_markdown` / `PAGE_BREAK_PATTERNS` machinery
+#      that tried to re-derive page boundaries from a single flat
+#      markdown blob is no longer needed at all -- Mistral does that
+#      splitting for us, correctly, every time.
+#
+# The rest of the pipeline (build_ocr_json, identify_questions_with_llm,
+# map_answers_with_llm, etc.) is untouched: it only cares about the
+# `pages` list shape ({"page_number": int, "raw_text": str}), which is
+# preserved exactly.
 # =========================================================
 
-DATALAB_BASE_URL = "https://www.datalab.to"
-
-PAGE_BREAK_PATTERNS = [
-    re.compile(r'\n?\{(\d+)\}-{3,}\n?'),
-    re.compile(r'\n?-{2,}\{(\d+)\}-{2,}\n?'),
-    re.compile(r'\n-{3,}\s*Page\s*\d+\s*-{3,}\n', re.IGNORECASE),
-    re.compile(r'\n\s*\[PAGE\s*(\d+)\]\s*\n', re.IGNORECASE),
-    re.compile(r'\n\s*<!--\s*page\s*(\d+)\s*-->\s*\n', re.IGNORECASE),
-]
-
-
-def _split_paginated_markdown(markdown: str, page_count_hint: int = None, log=print) -> list:
-    best_parts = None
-
-    for pattern in PAGE_BREAK_PATTERNS:
-        matches = list(pattern.finditer(markdown))
-        if not matches:
-            continue
-
-        parts = []
-        start = 0
-        for m in matches:
-            parts.append(markdown[start:m.start()].strip())
-            start = m.end()
-        parts.append(markdown[start:].strip())
-        parts = [p for p in parts if p]
-
-        if len(parts) <= 1:
-            continue
-
-        if page_count_hint and len(parts) == page_count_hint:
-            return parts
-
-        if best_parts is None or len(parts) > len(best_parts):
-            best_parts = parts
-
-    if best_parts:
-        return best_parts
-
-    if '\f' in markdown:
-        parts = [p.strip() for p in markdown.split('\f') if p.strip()]
-        if len(parts) > 1:
-            return parts
-
-    log(
-        f"WARNING: No page-break marker recognized in Datalab output "
-        f"(length={len(markdown)} chars, page_count_hint={page_count_hint}). "
-        f"Treating entire document as a single page. "
-        f"First 200 chars: {markdown[:200]!r}"
-    )
-    return [markdown.strip()]
+MISTRAL_OCR_MODEL = "mistral-ocr-latest"
+MISTRAL_OCR_MAX_MB = 50  # Mistral's documented per-request file size limit
 
 
 def run_ocr(file_content: bytes, file_name: str, status_callback=None):
@@ -229,97 +199,80 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
             f"run_ocr() expected file_content as bytes, got {type(file_content).__name__}"
         )
 
-    api_key = get_api_key("DATALAB_API_KEY")
+    api_key = get_api_key("MISTRAL_API_KEY")
     if not api_key:
-        raise Exception("DATALAB_API_KEY not found in secrets or environment")
+        raise Exception("MISTRAL_API_KEY not found in secrets or environment")
 
     size_mb = len(file_content) / (1024 * 1024)
-    MAX_MB  = 45
-    if size_mb > MAX_MB:
+    if size_mb > MISTRAL_OCR_MAX_MB:
         raise Exception(
-            f"File is {size_mb:.1f}MB, which exceeds the {MAX_MB}MB upload limit. "
-            f"Try compressing the PDF or splitting it into smaller files before uploading."
+            f"File is {size_mb:.1f}MB, which exceeds the {MISTRAL_OCR_MAX_MB}MB "
+            f"Mistral OCR upload limit. Try compressing the PDF or splitting it "
+            f"into smaller files before uploading."
         )
 
-    headers = {"X-API-Key": api_key}
+    from mistralai import Mistral
 
-    log(f"Submitting document to Datalab (Chandra OCR)... ({size_mb:.1f}MB)")
+    client = Mistral(api_key=api_key)
 
-    resp = httpx.post(
-        f"{DATALAB_BASE_URL}/api/v1/convert",
-        headers=headers,
-        files={"file": (file_name, file_content, "application/pdf")},
-        data={
-            "output_format": "markdown",
-            "mode": "accurate",
-            "paginate": "true"
-        },
-        timeout=120
-    )
+    log(f"Submitting document to Mistral OCR ({MISTRAL_OCR_MODEL})... ({size_mb:.1f}MB)")
 
-    if resp.status_code != 200:
-        raise Exception(f"Datalab submit error {resp.status_code}: {resp.text}")
+    # Embed the PDF directly as a base64 data URI -- this is the
+    # documented approach for local files and avoids a separate
+    # upload-then-get-signed-url round trip for typical exam-booklet
+    # sized documents. If you routinely process very large files
+    # (100+ pages / near the 50MB ceiling), switch to
+    # client.files.upload(...) + client.files.get_signed_url(...) and
+    # pass that signed URL as document_url instead -- ask if you need
+    # that variant.
+    encoded = base64.b64encode(file_content).decode("utf-8")
+    data_uri = f"data:application/pdf;base64,{encoded}"
 
-    data = resp.json()
+    try:
+        ocr_response = client.ocr.process(
+            model=MISTRAL_OCR_MODEL,
+            document={
+                "type": "document_url",
+                "document_url": data_uri,
+            },
+            include_image_base64=False,  # we only need text -- skip
+                                          # embedded image payloads to
+                                          # keep the response small/fast
+        )
+    except Exception as e:
+        raise Exception(f"Mistral OCR request failed: {e}") from e
 
-    if not data.get("success", True):
-        raise Exception(f"Datalab submit failed: {data.get('error')}")
+    log("OCR complete -- parsing pages...")
 
-    check_url = data["request_check_url"]
-    log("Document submitted -- polling for OCR result...")
-
-    max_polls = 150
-    poll_interval = 2
-
-    result = None
-    for attempt in range(max_polls):
-        poll_resp = httpx.get(check_url, headers=headers, timeout=60)
-
-        if poll_resp.status_code != 200:
-            raise Exception(f"Datalab poll error {poll_resp.status_code}: {poll_resp.text}")
-
-        result = poll_resp.json()
-        status = result.get("status")
-
-        if status == "complete":
-            log("OCR complete -- parsing pages...")
-            break
-
-        if status == "failed" or result.get("error"):
-            raise Exception(f"Datalab conversion failed: {result.get('error')}")
-
-        if attempt % 5 == 0:
-            log(f"Still processing... ({attempt * poll_interval}s elapsed)")
-
-        time.sleep(poll_interval)
-    else:
-        raise Exception("Datalab conversion timed out after 5 minutes")
-
-    if not result.get("success", True):
-        raise Exception(f"Datalab conversion error: {result.get('error')}")
-
-    markdown = result.get("markdown") or ""
-
-    if not markdown.strip():
-        raise Exception("Datalab returned empty markdown output")
-
-    page_count_hint = result.get("page_count")
-    page_texts = _split_paginated_markdown(markdown, page_count_hint, log=log)
+    mistral_pages = getattr(ocr_response, "pages", None)
+    if not mistral_pages:
+        raise Exception("Mistral OCR returned no pages")
 
     pages = []
-    for idx, text in enumerate(page_texts):
+    for i, p in enumerate(mistral_pages):
+        page_index = getattr(p, "index", None)
+        markdown = getattr(p, "markdown", "") or ""
+        # Mistral's page index is 0-based (matches the 0-based `pages`
+        # request parameter documented for this endpoint); fall back
+        # to enumeration order if a page is ever missing an index.
+        page_number = (page_index + 1) if isinstance(page_index, int) else i + 1
         pages.append({
-            "page_number": idx + 1,
-            "raw_text":    text
+            "page_number": page_number,
+            "raw_text": markdown,
         })
+
+    if not any(p["raw_text"].strip() for p in pages):
+        raise Exception("Mistral OCR returned empty markdown output for all pages")
 
     log(f"OCR done -- {len(pages)} page(s) extracted")
 
-    if len(pages) == 1 and size_mb > 1.0:
+    usage = getattr(ocr_response, "usage_info", None)
+    pages_processed = getattr(usage, "pages_processed", None) if usage else None
+    if pages_processed and pages_processed != len(pages):
         log(
-            f"WARNING: Only 1 page extracted from a {size_mb:.1f}MB file. "
-            f"This usually means the page-break marker format was not recognized. "
-            f"Markdown length: {len(markdown)} chars."
+            f"NOTE: Mistral reports {pages_processed} page(s) processed, but "
+            f"{len(pages)} page object(s) were parsed from the response -- "
+            f"check the raw response if this looks wrong."
         )
 
     return pages
