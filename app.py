@@ -1,10 +1,11 @@
 import json
+import threading
 import traceback
 from datetime import datetime
 
 import streamlit as st
 
-from pipeline import (
+from pdf_processor import (
     process_pdf,
     process_reference,
     save_outputs,
@@ -107,12 +108,18 @@ if mode == "Assignment booklet (Q&A mapping)":
         reset_run_state()
 
         log_placeholder = st.empty()
+        _log_lock = threading.Lock()
 
         def status_callback(msg: str):
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            st.session_state.logs.append(f"[{timestamp}] {msg}")
-            # keep the log box scrolled to the latest lines
-            log_placeholder.code("\n".join(st.session_state.logs[-200:]), language=None)
+            # NOTE: with the concurrent chunk processing in
+            # pdf_processor.py, this callback can now be invoked from
+            # multiple worker threads at roughly the same time. A lock
+            # keeps the session-state append and the placeholder redraw
+            # atomic per call, avoiding interleaved/garbled log output.
+            with _log_lock:
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                st.session_state.logs.append(f"[{timestamp}] {msg}")
+                log_placeholder.code("\n".join(st.session_state.logs[-200:]), language=None)
 
         with st.spinner("Processing... this can take a few minutes for large documents"):
             try:
