@@ -4,4 +4,4 @@ python-dotenv
 groq
 openai
 google-genai
-mistralai
+mistralai==1.9.11
