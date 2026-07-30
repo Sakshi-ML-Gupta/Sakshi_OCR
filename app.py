@@ -1,201 +1,242 @@
-"""
-Streamlit app for OCR'ing mixed printed/handwritten assignment PDFs
-and extracting clean Question -> Answer pairs.
-
-Run with:
-    streamlit run app.py
-"""
-
 import json
 import traceback
-# THIS MUST BE THE VERY FIRST CUSTOM IMPORT
-import diagnose_tuple_errors  # noqa: F401  (imported for its side effect)
+from datetime import datetime
 
 import streamlit as st
-from pipeline import process_pdf
 
-st.set_page_config(page_title="Assignment OCR + Q&A Extractor", layout="wide")
-st.title("Assignment OCR + Question/Answer Extractor")
-st.caption(
-    "Upload a scanned assignment PDF (mixed printed questions + "
-    "handwritten answers). The pipeline OCRs the document, identifies "
-    "the real exam questions, and matches them to the student's answers."
+from pdf_processor import (
+    process_pdf,
+    process_reference,
+    save_outputs,
+)
+
+st.set_page_config(
+    page_title="Assignment OCR & Question-Answer Mapper",
+    page_icon="📝",
+    layout="wide",
 )
 
 # =========================================================
-# SESSION STATE -- THE RERUN GUARD
+# SESSION STATE
 # =========================================================
 
-if "is_processing" not in st.session_state:
-    st.session_state.is_processing = False
+if "logs" not in st.session_state:
+    st.session_state.logs = []
 if "result" not in st.session_state:
-    st.session_state.result = None
+    st.session_state.result = None  # (ocr_json, qa_pairs)
+if "reference_result" not in st.session_state:
+    st.session_state.reference_result = None
 if "error" not in st.session_state:
     st.session_state.error = None
-if "pending_file_bytes" not in st.session_state:
-    st.session_state.pending_file_bytes = None
-if "pending_file_name" not in st.session_state:
-    st.session_state.pending_file_name = None
 
 
-# =========================================================
-# FILE UPLOAD
-# =========================================================
-
-uploaded_file = st.file_uploader(
-    "Upload assignment PDF",
-    type=["pdf"],
-    disabled=st.session_state.is_processing,
-)
-
-process_clicked = st.button(
-    "Process document",
-    disabled=st.session_state.is_processing or uploaded_file is None,
-)
-
-# Step 1: Capture file bytes and set state
-if process_clicked and not st.session_state.is_processing:
-    st.session_state.pending_file_bytes = uploaded_file.getvalue()
-    st.session_state.pending_file_name = uploaded_file.name
-    st.session_state.is_processing = True
+def reset_run_state():
+    st.session_state.logs = []
     st.session_state.result = None
     st.session_state.error = None
-    st.rerun()
-
-# Step 2: Long-running processing call
-if (
-    st.session_state.is_processing
-    and st.session_state.result is None
-    and st.session_state.error is None
-):
-    status_box = st.empty()
-    log_lines = []
-
-    def status_callback(msg):
-        log_lines.append(msg)
-        status_box.text("\n".join(log_lines[-12:]))
-
-    try:
-        file_bytes = st.session_state.pending_file_bytes
-        file_name = st.session_state.pending_file_name
-
-        ocr_json, qa_pairs = process_pdf(
-            (file_name, file_bytes),
-            status_callback=status_callback,
-        )
-        st.session_state.result = (ocr_json, qa_pairs)
-
-    except Exception as e:
-        st.session_state.error = f"{e}\n\n```\n{traceback.format_exc()}\n```"
-
-    finally:
-        st.session_state.is_processing = False
-        st.session_state.pending_file_bytes = None
-        st.session_state.pending_file_name = None
-        st.rerun()
 
 
 # =========================================================
-# RESULTS / ERROR DISPLAY
+# SIDEBAR
 # =========================================================
 
-if st.session_state.error:
-    st.error(st.session_state.error)
-    if st.button("Dismiss"):
-        st.session_state.error = None
-        st.rerun()
-
-if st.session_state.result:
-    ocr_json, qa_pairs = st.session_state.result
-
-    st.success(
-        f"Done — {len(qa_pairs)} Q&A pair(s) extracted "
-        f"from {ocr_json.get('total_pages', 0)} page(s)."
+with st.sidebar:
+    st.header("⚙️ Settings")
+    st.caption(
+        "This app OCRs a scanned exam assignment booklet, detects the "
+        "official question paper pages, and maps each question to the "
+        "student's answer."
     )
 
-    # Safe display loop handling both String & Dictionary formats
-    for i, qa in enumerate(qa_pairs, start=1):
-        if isinstance(qa, str):
-            q_title = qa[:90]
-            q_text = qa
-            a_text = ""
-        elif isinstance(qa, dict):
-            q_text = qa.get("question", "")
-            q_title = q_text[:90] if q_text else f"Question {i}"
-            a_text = qa.get("answer", "")
-        else:
-            q_text = str(qa)
-            q_title = q_text[:90]
-            a_text = ""
-
-        with st.expander(f"Q{i}: {q_title}"):
-            st.markdown("**Question:**")
-            st.write(q_text)
-            if a_text:
-                st.markdown("**Answer:**")
-                st.write(a_text)
+    mode = st.radio(
+        "What do you want to process?",
+        options=["Assignment booklet (Q&A mapping)", "Reference book (OCR only)"],
+        index=0,
+    )
 
     st.divider()
-
-    # JSON Download & Reset Actions (Out of the loop)
-    result_json = json.dumps(qa_pairs, ensure_ascii=False, indent=2)
-    st.download_button(
-        "Download Q&A pairs as JSON",
-        data=result_json,
-        file_name="qa_pairs.json",
-        mime="application/json",
+    st.caption(
+        "Required secrets/env vars:\n\n"
+        "- `DATALAB_API_KEY`\n"
+        "- `GROQ_API_KEY`"
     )
 
-    if st.button("Process another file"):
-        st.session_state.result = None
+    missing_keys = []
+    try:
+        from pdf_processor import get_api_key
+        if not get_api_key("DATALAB_API_KEY"):
+            missing_keys.append("DATALAB_API_KEY")
+        if not get_api_key("GROQ_API_KEY"):
+            missing_keys.append("GROQ_API_KEY")
+    except Exception:
+        pass
+
+    if missing_keys:
+        st.warning(f"Missing: {', '.join(missing_keys)}. Add them to `.streamlit/secrets.toml` or your `.env` file.")
+    else:
+        st.success("API keys detected ✅")
+
+
+# =========================================================
+# MAIN AREA
+# =========================================================
+
+st.title("📝 Assignment OCR & Question-Answer Mapper")
+
+if mode == "Assignment booklet (Q&A mapping)":
+    st.write(
+        "Upload a scanned exam assignment PDF (question paper + handwritten "
+        "answers mixed together). The app will OCR it, find the question "
+        "paper pages, extract the canonical question list, and map each "
+        "question to the student's verbatim answer."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Upload assignment PDF", type=["pdf"], key="assignment_uploader"
+    )
+
+    col_run, col_clear = st.columns([1, 1])
+    run_clicked = col_run.button("🚀 Process document", type="primary", disabled=uploaded_file is None)
+    clear_clicked = col_clear.button("🗑️ Clear results")
+
+    if clear_clicked:
+        reset_run_state()
         st.rerun()
 
-# =========================================================
-# FULL PIPELINE WRAPPER FOR APP.PY
-# =========================================================
-@_diagnose_tuple_errors
-def process_pdf(file_input, status_callback=None):
-    """
-    Complete end-to-end processing wrapper for app.py:
-    1. Runs OCR on PDF
-    2. Identifies question paper & canonical questions
-    3. Sequentially maps answers
-    4. Returns tuple: (ocr_json, qa_pairs)
-    """
-    file_bytes, file_name = _normalize_file_input(file_input, default_name="assignment.pdf")
+    if run_clicked and uploaded_file is not None:
+        reset_run_state()
 
-    # 1. Run OCR
-    pages_raw = run_ocr_cached(file_bytes, file_name, status_callback)
-    ocr_json = build_ocr_json(pages_raw)
+        log_placeholder = st.empty()
 
-    pages = [{"page_number": p["page_number"], "raw_text": p["raw_text"]} for p in pages_raw]
+        def status_callback(msg: str):
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            st.session_state.logs.append(f"[{timestamp}] {msg}")
+            # keep the log box scrolled to the latest lines
+            log_placeholder.code("\n".join(st.session_state.logs[-200:]), language=None)
 
-    # 2. Extract Questions & Classify Pages
-    qp_indices, questions, admin_indices = identify_questions_with_llm(pages, status_callback)
+        with st.spinner("Processing... this can take a few minutes for large documents"):
+            try:
+                file_bytes = uploaded_file.getvalue()
+                ocr_json, qa_pairs = process_pdf(
+                    (uploaded_file.name, file_bytes), status_callback=status_callback
+                )
+                st.session_state.result = (ocr_json, qa_pairs)
+            except Exception as e:
+                st.session_state.error = f"{e}\n\n{traceback.format_exc()}"
 
-    # 3. Extract Answer Lines
-    answer_pages = [p for i, p in enumerate(pages) if i not in qp_indices and i not in admin_indices]
-    answer_lines = []
-    for p in answer_pages:
-        answer_lines.extend(p["raw_text"].splitlines())
+    # ---- Show logs even after the run (from session state) ----
+    if st.session_state.logs and st.session_state.result is None and st.session_state.error is None:
+        st.code("\n".join(st.session_state.logs[-200:]), language=None)
 
-    # 4. Map Answers Sequentially
-    ranges = map_answers_sequential(answer_lines, questions, status_callback)
+    # ---- Error ----
+    if st.session_state.error:
+        st.error("Processing failed. See details below.")
+        with st.expander("Show full error / logs", expanded=True):
+            st.code(st.session_state.error)
+            if st.session_state.logs:
+                st.text("--- Log trail ---")
+                st.code("\n".join(st.session_state.logs[-200:]), language=None)
 
-    # 5. Format into Q&A Pairs Dictionary
-    qa_pairs = []
-    for r in ranges:
-        ref = r["ref"]
-        # Convert REF-A -> 0, REF-B -> 1 ...
-        q_idx = ord(ref.split("-")[-1]) - ord("A")
-        
-        q_text = questions[q_idx] if q_idx < len(questions) else f"Question {q_idx + 1}"
-        ans_lines = answer_lines[r["start_line"] : r["end_line"] + 1]
-        ans_text = "\n".join(ans_lines).strip()
+    # ---- Result ----
+    if st.session_state.result:
+        ocr_json, qa_pairs = st.session_state.result
+        matched = sum(1 for qa in qa_pairs if qa.get("matched"))
+        total = len(qa_pairs)
 
-        qa_pairs.append({
-            "question": q_text,
-            "answer": ans_text if ans_text else "Answer text not found."
-        })
+        st.success(f"Done! Matched {matched} of {total} questions.")
 
-    return ocr_json, qa_pairs
+        tab_qa, tab_ocr, tab_logs = st.tabs(["📋 Q&A Pairs", "📄 Raw OCR", "🪵 Logs"])
+
+        with tab_qa:
+            for i, qa in enumerate(qa_pairs, start=1):
+                status_icon = "✅" if qa.get("matched") else "⚠️ no match found"
+                with st.expander(f"Q{i}. {qa['question'][:100]}{'...' if len(qa['question']) > 100 else ''}  —  {status_icon}"):
+                    st.markdown("**Question:**")
+                    st.write(qa["question"])
+                    st.markdown("**Answer:**")
+                    if qa.get("answer"):
+                        st.write(qa["answer"])
+                    else:
+                        st.info("No answer text was matched for this question.")
+
+        with tab_ocr:
+            st.caption(f"Total pages OCR'd: {ocr_json.get('total_pages', 0)}")
+            for page in ocr_json.get("pages", []):
+                with st.expander(f"Page {page['page_number']}"):
+                    st.text(page["text"])
+
+        with tab_logs:
+            st.code("\n".join(st.session_state.logs), language=None)
+
+        st.divider()
+        st.subheader("⬇️ Downloads")
+
+        base_name = (uploaded_file.name.rsplit(".", 1)[0] if uploaded_file else "document")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "Download OCR JSON",
+                data=json.dumps(ocr_json, ensure_ascii=False, indent=2),
+                file_name=f"{base_name}_ocr.json",
+                mime="application/json",
+            )
+        with col2:
+            st.download_button(
+                "Download Q&A Pairs JSON",
+                data=json.dumps(qa_pairs, ensure_ascii=False, indent=2),
+                file_name=f"{base_name}_qa_pairs.json",
+                mime="application/json",
+            )
+
+else:  # Reference book (OCR only)
+    st.write(
+        "Upload a reference book PDF. The app will OCR every page and "
+        "return the full text as JSON (no question/answer mapping)."
+    )
+
+    ref_file = st.file_uploader("Upload reference PDF", type=["pdf"], key="reference_uploader")
+
+    col_run, col_clear = st.columns([1, 1])
+    ref_run_clicked = col_run.button("🚀 OCR reference book", type="primary", disabled=ref_file is None)
+    ref_clear_clicked = col_clear.button("🗑️ Clear results", key="ref_clear")
+
+    if ref_clear_clicked:
+        st.session_state.reference_result = None
+        st.rerun()
+
+    if ref_run_clicked and ref_file is not None:
+        log_placeholder = st.empty()
+        logs = []
+
+        def ref_status_callback(msg: str):
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            logs.append(f"[{timestamp}] {msg}")
+            log_placeholder.code("\n".join(logs[-200:]), language=None)
+
+        with st.spinner("Running OCR..."):
+            try:
+                file_bytes = ref_file.getvalue()
+                ocr_json = process_reference(
+                    (ref_file.name, file_bytes), status_callback=ref_status_callback
+                )
+                st.session_state.reference_result = ocr_json
+            except Exception as e:
+                st.error(f"OCR failed: {e}")
+                st.code(traceback.format_exc())
+
+    if st.session_state.reference_result:
+        ocr_json = st.session_state.reference_result
+        st.success(f"OCR complete — {ocr_json.get('total_pages', 0)} page(s)")
+
+        for page in ocr_json.get("pages", []):
+            with st.expander(f"Page {page['page_number']}"):
+                st.text(page["text"])
+
+        base_name = (ref_file.name.rsplit(".", 1)[0] if ref_file else "reference")
+        st.download_button(
+            "Download OCR JSON",
+            data=json.dumps(ocr_json, ensure_ascii=False, indent=2),
+            file_name=f"{base_name}_ocr.json",
+            mime="application/json",
+        )
