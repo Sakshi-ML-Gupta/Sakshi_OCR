@@ -9,7 +9,7 @@ Run with:
 import json
 import traceback
 # THIS MUST BE THE VERY FIRST CUSTOM IMPORT
-import tuple_error_diagnostic  # noqa: F401  (imported for its side effect)
+import diagnose_tuple_errors  # noqa: F401  (imported for its side effect)
 
 import streamlit as st
 from pipeline import process_pdf
