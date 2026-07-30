@@ -140,6 +140,60 @@ _groq_concurrency_semaphore = threading.Semaphore(MAX_CONCURRENT_GROQ_CALLS)
 
 
 # =========================================================
+# STREAMLIT THREAD-CONTEXT PROPAGATION
+#
+# FIX: parallelizing chunk calls via ThreadPoolExecutor (see above)
+# means `status_callback` -- passed in from the caller, and in
+# Streamlit apps typically touching `st.session_state` and/or a
+# `st.empty()` placeholder to show live logs -- now gets INVOKED FROM
+# WORKER THREADS instead of the main thread. Streamlit's session state
+# is only attached to the thread that Streamlit itself runs the script
+# on; any other thread touching `st.session_state` raises exactly the
+# "st.session_state has no attribute ..." / missing ScriptRunContext
+# error confirmed in real usage, because Streamlit has no way to know
+# which session a plain background thread belongs to.
+#
+# This is a generic module with no hard dependency on Streamlit (it's
+# also used outside Streamlit, e.g. via a CLI or plain script), so it
+# can't unconditionally import streamlit. Instead: capture the current
+# thread's Streamlit ScriptRunContext (if any -- this call itself is
+# safe to make from a non-Streamlit context, it just returns None) on
+# the MAIN thread right before dispatching work, then attach that same
+# context to each worker thread before it runs. This is Streamlit's own
+# documented pattern for using session state safely from background
+# threads. Outside Streamlit (ctx is None), this is a complete no-op.
+# =========================================================
+
+def _get_streamlit_ctx():
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx()
+    except Exception:
+        return None
+
+
+def _with_streamlit_ctx(fn, ctx):
+    """Wraps fn so that, when it runs on a NEW worker thread, that
+    thread first gets the captured Streamlit ctx attached -- making it
+    safe for fn (or anything it calls, like status_callback) to touch
+    st.session_state / st widgets without raising a missing-context
+    error. A complete no-op if ctx is None (i.e. not running under
+    Streamlit, or context capture failed for any reason)."""
+    if ctx is None:
+        return fn
+
+    def wrapper(*args, **kwargs):
+        try:
+            from streamlit.runtime.scriptrunner import add_script_run_ctx
+            add_script_run_ctx(threading.current_thread(), ctx)
+        except Exception:
+            pass
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+# =========================================================
 # PREPROCESS PDF
 # =========================================================
 
@@ -928,8 +982,12 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     ordered_results = [None] * len(chunks)
     chunk_failures = []
 
+    ctx = _get_streamlit_ctx()  # captured on the calling (main) thread
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_GROQ_CALLS) as executor:
-        futures = [executor.submit(process_one_chunk, i, chunk) for i, chunk in enumerate(chunks)]
+        futures = [
+            executor.submit(_with_streamlit_ctx(process_one_chunk, ctx), i, chunk)
+            for i, chunk in enumerate(chunks)
+        ]
         for future in as_completed(futures):
             i, qp_pages_1based, err = future.result()
             if err is not None:
@@ -1425,8 +1483,12 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     chunk_failures = []
     chunk_zero_matches = 0
 
+    ctx = _get_streamlit_ctx()  # captured on the calling (main) thread
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_GROQ_CALLS) as executor:
-        futures = [executor.submit(process_one_chunk, i, chunk) for i, chunk in enumerate(chunks)]
+        futures = [
+            executor.submit(_with_streamlit_ctx(process_one_chunk, ctx), i, chunk)
+            for i, chunk in enumerate(chunks)
+        ]
         for future in as_completed(futures):
             i, accepted, err, was_zero = future.result()
             if err is not None:
