@@ -1796,23 +1796,27 @@ NOISE_RE = re.compile(
     # a whole line that is JUST a date, nothing else.
     r'|^\s*\d{1,2}\s*[/\-.]\s*\d{1,2}\s*[/\-.]\s*\d{2,4}\s*$'
     # NEW: generic "Page X" / "Page X of Y" lines.
-    r'|^\s*Page\s*\d+(?:\s*(?:of|\/)\s*\d+)?\s*$'
-    # NEW (this round -- "answer main Section/bhag/prashna/Q/Ans hata
-    # do jo unnecessary ho"): a line that is JUST a bare section/part/
-    # question/answer LABEL with no other real content -- e.g. a
-    # printed "Section - A" or "भाग-1" header repeated in the margin,
-    # or a stray "Q.5" / "Ans-" left on its own line after slicing.
-    # Deliberately whole-line-only ($  anchored) so genuine prose that
-    # happens to START with these words (e.g. "Answer: the theme of...")
-    # is never touched -- only lines that are NOTHING BUT the label.
-    r'|^\s*Section\s*[-:]?\s*[A-Za-z0-9]{0,3}\s*$'
-    r'|^\s*(?:भाग|अनुभाग)\s*[-:]?\s*[०-९0-9]{0,3}\s*$'
-    r'|^\s*Ans(?:wer)?\s*(?:\d+\s*[.:\-]?\s*\d*|[.:\-]\s*\d*)\s*$'
-    r'|^\s*उत्तर\s*(?:\d+\s*[\-\:]?\s*\d*|[\-\:]\s*\d*)\s*$'
-    r'|^\s*(?:प्र|प्रश्न)[०.\s]*(?:\d+[.\s:-]*\d*|[.\s:-]+\d*)\s*$'
-    r'|^\s*Q\s*(?:\d+[.\s:-]*\d*|\.\s*\d*)\s*$)',
+    r'|^\s*Page\s*\d+(?:\s*(?:of|\/)\s*\d+)?\s*$)',
     re.IGNORECASE
 )
+# REVERTED (this round -- fixes "worse than before, only 8 mapped"):
+# a previous round added whole-line Section/भाग/Ans/Q/उत्तर/प्र label
+# patterns HERE, in NOISE_RE. That was wrong: NOISE_RE runs on
+# `answer_lines` BEFORE boundary detection/chunking ever happens, and
+# lines like "Ans-5" or "उत्तर-6" standing alone are EXACTLY the
+# primary signal `_line_starts_new_answer_for_question` (via
+# `_ANSWER_START_RE`) uses to recognize where a new answer starts.
+# Deleting those lines before the boundary detector ever sees them
+# silently blinded it for every answer that uses a standalone label
+# line -- directly causing far fewer answers to get matched than
+# before this "improvement" was added.
+#
+# These labels are still correctly stripped from the user-visible
+# output -- just at the right point in the pipeline: `final_answer_cleanup`
+# (applied to the FINISHED answer text, after mapping is already done)
+# removes any leftover Section/भाग/Ans/Q/उत्तर/प्र tokens. By that point
+# their job as a boundary signal is already finished, so removing them
+# is purely cosmetic and safe.
 
 
 def is_noise(line: str) -> bool:
@@ -1843,8 +1847,20 @@ def is_noise(line: str) -> bool:
 
 def _normalize_margin_line(line: str) -> str:
     text = line.strip().lower()
-    text = re.sub(r'\d+', '#', text)  # "Page 4" and "Page 17" -> same key
-    text = re.sub(r'[^\w\s#]', '', text, flags=re.UNICODE)
+    # FIX (this round -- fixes "worse than before, only 8 mapped"):
+    # collapsing digits to a placeholder made ANY structurally-similar-
+    # but-content-different line (most importantly "Ans-5" vs "Ans-6"
+    # vs "Ans-7") normalize to the exact same signature, so a perfectly
+    # ordinary per-page answer label could get misdetected as a
+    # repeated letterhead purely because it recurs with a different
+    # number each time. Requiring near-literal repetition (only
+    # case/punctuation normalized, digits left as-is) is much safer --
+    # it still catches genuine fixed letterhead text (which doesn't
+    # change per page), while leaving alone anything that varies by
+    # page/number. Page-number footers specifically are already
+    # handled by the dedicated "Page X of Y" pattern in NOISE_RE, so
+    # nothing is lost by not collapsing digits here.
+    text = re.sub(r'[^\w\s]', '', text, flags=re.UNICODE)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
@@ -1887,6 +1903,22 @@ def detect_margin_boilerplate_lines(pages: list, margin_lines: int = 3,
         margin_candidates = lines[:margin_lines] + lines[-margin_lines:]
         seen_on_this_page = set()
         for line in margin_candidates:
+            # FIX (this round -- fixes "worse than before, only 8
+            # mapped"): a line like "Ans-5" answers the boundary-
+            # detector's most reliable question ("does a new answer
+            # start here?"), but _normalize_margin_line collapses
+            # digits to a placeholder, so "Ans-5", "Ans-6", "Ans-7" all
+            # normalize to the SAME signature -- making a perfectly
+            # normal per-page answer label look exactly like a repeated
+            # letterhead once it appears near the top/bottom of enough
+            # pages (which is common, since students often start a new
+            # answer right at the top of a page). That falsely flagged
+            # these labels as boilerplate and silently deleted them
+            # before boundary detection ever ran, blinding it for every
+            # answer that used one. Never treat an answer-start-shaped
+            # line as boilerplate, no matter how often it recurs.
+            if _ANSWER_START_RE.match(line):
+                continue
             norm = _normalize_margin_line(line)
             # require a little real content -- very short normalized
             # strings (e.g. just "#" from a lone page number, already
