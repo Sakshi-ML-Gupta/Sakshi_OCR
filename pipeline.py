@@ -128,14 +128,24 @@ def _diagnose_tuple_errors(func):
 #     a single run actually reduce wall-clock latency.
 # =========================================================
 
-MAX_CONCURRENT_GROQ_CALLS = 4  # tuned conservatively: high enough to
-# meaningfully parallelize chunk calls (typically 3-6x latency
-# reduction for documents with several chunks), low enough that the
-# existing TokenBudgetTracker + Groq's own 429 retry/backoff logic
-# can still absorb the burstier concurrent request pattern without
-# spiraling into constant rate-limit errors. Raise cautiously if your
-# Groq tier has a comfortably higher TPM ceiling.
-
+MAX_CONCURRENT_GROQ_CALLS = 2  # CHANGED (this round -- likely root
+# cause of "only a handful of answers got mapped"): 4 concurrent calls
+# looks like a reasonable middle ground in isolation, but Groq's
+# free-tier budget is only 8000 TPM, and a single answer-mapping chunk
+# at the configured max size already costs roughly 6000+ tokens by
+# itself. Firing 4 of those at once could try to spend 24000+ tokens
+# in the same ~1s window -- wildly over budget -- causing a burst of
+# 429s. Each chunk gets `max_retries` (4) attempts with escalating
+# backoff before giving up for good; when the whole run is this
+# oversubscribed, MULTIPLE chunks can simultaneously exhaust their
+# retries and fail outright, and every question whose answer lived in
+# one of those failed chunks never gets mapped at all -- exactly the
+# reported symptom. Reduced to 2, which still gives a real latency win
+# over fully sequential processing, but keeps concurrent token demand
+# closer to what an 8000 TPM budget can actually absorb without a
+# retry-exhaustion cascade. If you're on a paid Groq tier with a much
+# higher TPM ceiling, this can safely be raised again (try 3-4 and
+# watch the logs for repeated "Waiting Xs" / rate-limit warnings).
 _groq_concurrency_semaphore = threading.Semaphore(MAX_CONCURRENT_GROQ_CALLS)
 
 
@@ -1076,20 +1086,19 @@ Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape
 If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any of these answers."""
 
 
-def _build_answer_map_user_prompt(numbered_lines, questions, common_words=frozenset()):
-    questions_block = "\n".join(f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions))
+def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
+    questions_block = "\n".join(
+        f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
+    )
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
-    shared_note = ""
-    if common_words:
-        shared_note = (
-            f"\n\nNOTE: these words appear in 2+ of the questions above, so ignore "
-            f"them when matching -- use only UNIQUE words per question: "
-            f"{', '.join(sorted(common_words))}"
-        )
     return (
-        f"OFFICIAL QUESTIONS:\n{questions_block}{shared_note}\n\n"
+        f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label -- "
+        f"use the REF label, not retyped question text, to identify which "
+        f"question an answer belongs to):\n{questions_block}\n\n"
         f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}"
     )
+
+
 def _parse_answer_map_llm_response(content: str) -> list:
     content = content.strip()
 
@@ -1201,13 +1210,31 @@ def _compute_cross_question_common_words(questions: list, max_words: int = 20) -
     question's answer swallows the other's, and the other gets partial
     or no match at all -- exactly the reported symptom.
 
-    Fix: compute which SIGNIFICANT words are shared across 2+ different
-    questions IN THIS DOCUMENT'S OWN question list, and treat those as
-    additional, document-specific stopwords on top of the generic list
-    -- so only words that are actually UNIQUE to one particular
-    question get used to recognize its answer boundary. This adapts
-    automatically to whatever questions are actually present, rather
-    than needing hardcoded topic words.
+    Fix: compute which SIGNIFICANT words are shared across MULTIPLE
+    different questions IN THIS DOCUMENT'S OWN question list, and treat
+    those as additional, document-specific stopwords on top of the
+    generic list -- so only words that are actually UNIQUE to one
+    particular question get used to recognize its answer boundary.
+
+    FIX (this round -- corrects a REGRESSION the above caused, "only 4
+    answers mapped"): a flat "shared in 2+ questions -> excluded"
+    threshold is fine for a short document with 2-3 questions, but
+    breaks down badly on a longer paper where MANY questions share the
+    same broad subject (e.g. 10 questions all about the same author/
+    play/topic) -- there, almost every real content word ends up shared
+    across at least 2 questions somewhere, so nearly ALL words get
+    excluded as "common", leaving most questions with few or NO
+    distinctive words at all. With no distinctive words, the boundary
+    detector can never recognize that question's answer starting at
+    all, so it silently gets swallowed into whatever came before it --
+    exactly why only a handful of (label-marked) answers were mapped.
+
+    The threshold now SCALES with how many questions there are: a word
+    must be shared across a sizeable FRACTION of the questions (not
+    just any 2) before being treated as noise, so genuinely widespread
+    subject words get filtered on long papers, while incidental overlap
+    between just one or two neighboring questions on a long paper does
+    NOT wipe out those questions' only distinguishing vocabulary.
     """
     from collections import Counter
     doc_word_counts = Counter()
@@ -1216,7 +1243,21 @@ def _compute_cross_question_common_words(questions: list, max_words: int = 20) -
         for w in words_in_q:
             if w not in _QUESTION_STOPWORDS:
                 doc_word_counts[w] += 1
-    return frozenset(w for w, c in doc_word_counts.items() if c >= 2)
+
+    num_questions = len(questions)
+    if num_questions <= 3:
+        # Small documents: 2 shared questions really is "shared by
+        # (nearly) everything", so the original flat threshold is
+        # still appropriate here.
+        threshold = 2
+    else:
+        # Larger documents: require a proportionally larger share
+        # (roughly a third of all questions, minimum 3) before a word
+        # is considered generic "noise" rather than a real distinguisher
+        # between a couple of neighboring questions.
+        threshold = max(3, round(num_questions * 0.34))
+
+    return frozenset(w for w, c in doc_word_counts.items() if c >= threshold)
 
 
 def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.5,
@@ -1238,6 +1279,15 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
 
     for i, q in enumerate(questions):
         q_distinctive = _distinctive_words(q, extra_stopwords=common_words)
+        # FIX (safety floor): if excluding the shared/common words left
+        # this particular question with too few words to ever match
+        # ANYTHING (a real risk on documents where most vocabulary ends
+        # up flagged as shared), fall back to the words filtered by
+        # only the generic stopword list -- some signal, even if not
+        # perfectly discriminating, beats having none at all and never
+        # detecting this question's answer boundary.
+        if len(q_distinctive) < 2:
+            q_distinctive = _distinctive_words(q)
         if not q_distinctive:
             continue
         matched = sum(
@@ -1351,20 +1401,46 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
 
 
 def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
-    sorted_ranges = sorted(answer_ranges, key=lambda r: (r["start_line"], r["end_line"]))
+    sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
     resolved = []
-    last_claimed_end = -1
-    for r in sorted_ranges:
+    for i, r in enumerate(sorted_ranges):
         r = dict(r)
-        if r["start_line"] <= last_claimed_end:
-            r["start_line"] = last_claimed_end + 1
+        if i + 1 < len(sorted_ranges):
+            next_start = sorted_ranges[i + 1]["start_line"]
+            if r["end_line"] >= next_start:
+                r["end_line"] = next_start - 1
         if r["end_line"] >= r["start_line"]:
             resolved.append(r)
-            last_claimed_end = max(last_claimed_end, r["end_line"])
     return resolved
 
 
 def _merge_or_pick_best_range(r1: dict, r2: dict, gap_tolerance: int = 12) -> dict:
+    """
+    NEW (this round -- addresses "merge / skip / no-match" reports):
+    replaces the old "keep whichever range is longer" dedup for a ref
+    that appears in more than one chunk (which happens naturally now
+    that chunks overlap, and could already happen before whenever an
+    answer landed near a chunk boundary).
+
+    "Keep the longer one" throws away information: if chunk A found
+    lines 40-55 for REF-C and chunk B (which starts with overlap lines
+    50-58) found lines 50-63 for the SAME REF-C, the real answer is
+    40-63 -- but the old logic would have kept only 50-63 and silently
+    dropped lines 40-49.
+
+    This merges the two ranges into their union WHENEVER they overlap
+    or are within `gap_tolerance` lines of each other -- which is
+    exactly the situation created by an overlap-carried or
+    boundary-adjacent split. gap_tolerance was raised from 3 to 12
+    alongside the larger CHUNK_OVERLAP_LINES/FORCED_BREAK_OVERLAP_LINES
+    above, since a bigger overlap window means two genuinely-continuous
+    ranges reported by different chunk calls can legitimately end up a
+    bit further apart than before. If the two ranges are genuinely far
+    apart (a real disjoint result, which would indicate a different
+    kind of mismatch, not a boundary split), it falls back to keeping
+    the longer one rather than risk merging in unrelated lines from a
+    large, unrelated gap.
+    """
     lo = min(r1["start_line"], r2["start_line"])
     hi = max(r1["end_line"], r2["end_line"])
     gap = max(r2["start_line"] - r1["end_line"], r1["start_line"] - r2["end_line"])
@@ -1525,13 +1601,11 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     chunks = _chunk_lines_by_char_budget(numbered_lines, questions)
     log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
 
-    common_words_for_prompt = _compute_cross_question_common_words(questions)
-
     def process_one_chunk(i, chunk):
         line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
         log(f"Asking LLM to map answers in chunk {i+1}/{len(chunks)} (lines {line_range})...")
 
-        user_prompt = _build_answer_map_user_prompt(chunk, questions, common_words_for_prompt)
+        user_prompt = _build_answer_map_user_prompt(chunk, questions)
         try:
             chunk_ranges = _call_groq_with_retries(
                 client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
@@ -1548,15 +1622,13 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             if r["ref"] not in ref_to_question:
                 log(f"WARNING: discarding answer mapping with unknown ref {r['ref']!r}")
                 continue
-            clipped_start = max(r["start_line"], min_idx)
-            clipped_end = min(r["end_line"], max_idx)
-            if clipped_start <= clipped_end:
-                accepted.append({"ref": r["ref"], "start_line": clipped_start, "end_line": clipped_end})
+            if min_idx <= r["start_line"] <= max_idx and min_idx <= r["end_line"] <= max_idx:
+                accepted.append(r)
             else:
                 log(
-                    f"WARNING: discarding empty/invalid answer mapping for "
+                    f"WARNING: discarding out-of-range answer mapping for "
                     f"{r['ref']}: lines {r['start_line']}-{r['end_line']} "
-                    f"has no overlap with this chunk's range {min_idx}-{max_idx}"
+                    f"outside this chunk's range {min_idx}-{max_idx}"
                 )
 
         log(f"Chunk {i+1}/{len(chunks)}: mapped {len(accepted)} answer(s)")
