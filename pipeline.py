@@ -1076,18 +1076,28 @@ Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape
 If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any of these answers."""
 
 
-def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
+def _build_answer_map_user_prompt(numbered_lines: list, questions: list, common_words: frozenset = frozenset()) -> str:
     questions_block = "\n".join(
         f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
     )
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
+
+    shared_vocab_note = ""
+    if common_words:
+        shared_vocab_note = (
+            f"\n\nNOTE: the following words appear in TWO OR MORE of the official "
+            f"questions above, so they CANNOT be used to distinguish which question "
+            f"an answer belongs to -- ignore them when matching, and instead look for "
+            f"words/phrases that are UNIQUE to just one question: "
+            f"{', '.join(sorted(common_words))}"
+        )
+
     return (
         f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label -- "
         f"use the REF label, not retyped question text, to identify which "
-        f"question an answer belongs to):\n{questions_block}\n\n"
+        f"question an answer belongs to):\n{questions_block}{shared_vocab_note}\n\n"
         f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}"
     )
-
 
 def _parse_answer_map_llm_response(content: str) -> list:
     content = content.strip()
@@ -1364,37 +1374,19 @@ def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
 
 
 def _merge_or_pick_best_range(r1: dict, r2: dict, gap_tolerance: int = 12) -> dict:
-    """
-    NEW (this round -- addresses "merge / skip / no-match" reports):
-    replaces the old "keep whichever range is longer" dedup for a ref
-    that appears in more than one chunk (which happens naturally now
-    that chunks overlap, and could already happen before whenever an
-    answer landed near a chunk boundary).
-
-    "Keep the longer one" throws away information: if chunk A found
-    lines 40-55 for REF-C and chunk B (which starts with overlap lines
-    50-58) found lines 50-63 for the SAME REF-C, the real answer is
-    40-63 -- but the old logic would have kept only 50-63 and silently
-    dropped lines 40-49.
-
-    This merges the two ranges into their union WHENEVER they overlap
-    or are within `gap_tolerance` lines of each other -- which is
-    exactly the situation created by an overlap-carried or
-    boundary-adjacent split. gap_tolerance was raised from 3 to 12
-    alongside the larger CHUNK_OVERLAP_LINES/FORCED_BREAK_OVERLAP_LINES
-    above, since a bigger overlap window means two genuinely-continuous
-    ranges reported by different chunk calls can legitimately end up a
-    bit further apart than before. If the two ranges are genuinely far
-    apart (a real disjoint result, which would indicate a different
-    kind of mismatch, not a boundary split), it falls back to keeping
-    the longer one rather than risk merging in unrelated lines from a
-    large, unrelated gap.
-    """
     lo = min(r1["start_line"], r2["start_line"])
     hi = max(r1["end_line"], r2["end_line"])
     gap = max(r2["start_line"] - r1["end_line"], r1["start_line"] - r2["end_line"])
 
-    if gap <= gap_tolerance:
+    # NEW: only auto-merge when the two ranges genuinely look like the
+    # SAME continuous answer split across the CHUNK_OVERLAP_LINES zone
+    # (i.e. real overlap or a tiny adjacent gap). If they're merely
+    # "close enough" per the old flat tolerance, that's exactly the
+    # case that lets a similar-question mismatch quietly merge two
+    # different answers into one. Require actual overlap (gap <= 0) OR
+    # a very small gap for the union; otherwise fall back to picking
+    # the longer, more confident range.
+    if gap <= 0 or gap <= min(gap_tolerance, 3):
         merged = dict(r1)
         merged["start_line"], merged["end_line"] = lo, hi
         return merged
@@ -1550,11 +1542,13 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     chunks = _chunk_lines_by_char_budget(numbered_lines, questions)
     log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
 
+    common_words_for_prompt = _compute_cross_question_common_words(questions)
+
     def process_one_chunk(i, chunk):
         line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
         log(f"Asking LLM to map answers in chunk {i+1}/{len(chunks)} (lines {line_range})...")
 
-        user_prompt = _build_answer_map_user_prompt(chunk, questions)
+        user_prompt = _build_answer_map_user_prompt(chunk, questions, common_words_for_prompt)
         try:
             chunk_ranges = _call_groq_with_retries(
                 client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
