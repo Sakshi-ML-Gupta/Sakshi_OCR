@@ -1135,7 +1135,22 @@ ANSWER_MAP_ABSOLUTE_MAX_CHARS = 60000
 # CHUNK_OVERLAP_PAGES used for page-chunking above. See the note on
 # _chunk_lines_by_char_budget below for why this matters for the
 # merge/skip/no-match bugs.
-CHUNK_OVERLAP_LINES = 8
+#
+# INCREASED (this round -- addresses "last pages/paragraphs not
+# mapping, answer becomes half"): 8 lines was too thin a safety margin
+# specifically for FORCED breaks (should_force_break_absolute), which
+# happen when no genuine answer-start is ever found (e.g. the true
+# LAST answer in the document, which by definition has no "next
+# question" to bound it) -- these are exactly the highest-risk splits,
+# since they land at an arbitrary character-count boundary with zero
+# semantic justification, right in the middle of real content.
+CHUNK_OVERLAP_LINES = 15
+
+# A forced break (hit ANSWER_MAP_ABSOLUTE_MAX_CHARS with no genuine
+# boundary in sight) gets a bigger overlap than a normal answer-start
+# break, since it's the case most likely to be splitting genuine
+# content mid-answer rather than at an intentional boundary.
+FORCED_BREAK_OVERLAP_LINES = 40
 
 _ANSWER_START_RE = re.compile(
     r'^\s*(?:Ans(?:wer)?[.\s:-]+\d*|उत्तर\s*\d*\s*[\-\:]?|प्र[०.\s]*\d*|Q\.?\s*\d+[.\s:-])',
@@ -1264,7 +1279,17 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
 
         if should_break_at_answer_start or should_force_break_absolute:
             chunks.append(current_chunk)
-            overlap = current_chunk[-overlap_lines:] if overlap_lines > 0 else []
+            # FIX: a forced break (no genuine boundary found, just hit
+            # the hard char ceiling) gets a BIGGER overlap than a
+            # normal boundary break -- it's the case most likely to be
+            # slicing through the middle of real content, most notably
+            # the document's final answer, which has no "next question"
+            # to ever trigger a genuine boundary break at all.
+            this_break_overlap = (
+                FORCED_BREAK_OVERLAP_LINES if should_force_break_absolute and not should_break_at_answer_start
+                else overlap_lines
+            )
+            overlap = current_chunk[-this_break_overlap:] if this_break_overlap > 0 else []
             current_chunk = list(overlap)
             current_chars = sum(len(t) for _, t in current_chunk)
             past_target = False
@@ -1295,7 +1320,7 @@ def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
     return resolved
 
 
-def _merge_or_pick_best_range(r1: dict, r2: dict) -> dict:
+def _merge_or_pick_best_range(r1: dict, r2: dict, gap_tolerance: int = 12) -> dict:
     """
     NEW (this round -- addresses "merge / skip / no-match" reports):
     replaces the old "keep whichever range is longer" dedup for a ref
@@ -1310,18 +1335,23 @@ def _merge_or_pick_best_range(r1: dict, r2: dict) -> dict:
     dropped lines 40-49.
 
     This merges the two ranges into their union WHENEVER they overlap
-    or are only a few lines apart (gap <= 3) -- which is exactly the
-    situation created by an overlap-carried or boundary-adjacent split.
-    If the two ranges are genuinely far apart (a real disjoint result,
-    which would indicate a different kind of mismatch, not a boundary
-    split), it falls back to keeping the longer one rather than risk
-    merging in unrelated lines from a large, unrelated gap.
+    or are within `gap_tolerance` lines of each other -- which is
+    exactly the situation created by an overlap-carried or
+    boundary-adjacent split. gap_tolerance was raised from 3 to 12
+    alongside the larger CHUNK_OVERLAP_LINES/FORCED_BREAK_OVERLAP_LINES
+    above, since a bigger overlap window means two genuinely-continuous
+    ranges reported by different chunk calls can legitimately end up a
+    bit further apart than before. If the two ranges are genuinely far
+    apart (a real disjoint result, which would indicate a different
+    kind of mismatch, not a boundary split), it falls back to keeping
+    the longer one rather than risk merging in unrelated lines from a
+    large, unrelated gap.
     """
     lo = min(r1["start_line"], r2["start_line"])
     hi = max(r1["end_line"], r2["end_line"])
     gap = max(r2["start_line"] - r1["end_line"], r1["start_line"] - r2["end_line"])
 
-    if gap <= 3:
+    if gap <= gap_tolerance:
         merged = dict(r1)
         merged["start_line"], merged["end_line"] = lo, hi
         return merged
@@ -1513,6 +1543,43 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
     resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
 
+    # FIX (this round -- addresses "last pages/paragraphs not mapping,
+    # answer becomes half"): the range with the HIGHEST start_line is,
+    # by construction, the LAST answer in the document -- there is no
+    # question after it to give the chunker a genuine boundary to break
+    # on, and no LATER range for the overlap-resolution step above to
+    # clip against. That combination means this last answer is the one
+    # most likely to get an artificially early end_line: a forced
+    # (absolute-max) chunk split can cut it off mid-answer, or the LLM
+    # itself may simply stop at a conservative point if it isn't sure
+    # the answer keeps going in the (limited) text it was shown.
+    #
+    # Since NOTHING else can legitimately claim lines that come after
+    # this last matched range and before the end of the document (there
+    # is no other question left to answer), any such trailing lines are
+    # safe to fold into this last range rather than silently dropping
+    # them. This directly recovers the "answer got cut in half at the
+    # very end" symptom.
+    if resolved_ranges:
+        last_range = max(resolved_ranges, key=lambda r: r["start_line"])
+        true_end = len(answer_lines) - 1
+        if last_range["end_line"] < true_end:
+            # Only extend through genuinely meaningful trailing content --
+            # stop early if the remaining tail is entirely blank/noise
+            # (e.g. trailing signature lines, blank OCR artifacts), so we
+            # don't glue unrelated boilerplate onto the real answer.
+            trailing = [
+                answer_lines[j] for j in range(last_range["end_line"] + 1, true_end + 1)
+            ]
+            if any(t.strip() and not is_noise(t) for t in trailing):
+                log(
+                    f"Extending last matched answer ({last_range['ref']}) from "
+                    f"line {last_range['end_line']} to {true_end} -- no later "
+                    f"question exists to claim these trailing lines, so they "
+                    f"must belong to this answer."
+                )
+                last_range["end_line"] = true_end
+
     log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
 
     if not resolved_ranges:
@@ -1561,13 +1628,123 @@ NOISE_RE = re.compile(
     r'|Need?\s*Komal'
     r'|Nod\s*Komal'
     r'|TAKMA\s*SINAN'
-    r'|^\s*\d{1,3}\s*$)',
+    r'|^\s*\d{1,3}\s*$'
+    # NEW: generic date formats commonly printed on assignment cover
+    # sheets / margins (e.g. "12/03/2024", "12-03-24", "12.03.2024") --
+    # a whole line that is JUST a date, nothing else.
+    r'|^\s*\d{1,2}\s*[/\-.]\s*\d{1,2}\s*[/\-.]\s*\d{2,4}\s*$'
+    # NEW: generic "Page X" / "Page X of Y" lines.
+    r'|^\s*Page\s*\d+(?:\s*(?:of|\/)\s*\d+)?\s*$'
+    # NEW (this round -- "answer main Section/bhag/prashna/Q/Ans hata
+    # do jo unnecessary ho"): a line that is JUST a bare section/part/
+    # question/answer LABEL with no other real content -- e.g. a
+    # printed "Section - A" or "भाग-1" header repeated in the margin,
+    # or a stray "Q.5" / "Ans-" left on its own line after slicing.
+    # Deliberately whole-line-only ($  anchored) so genuine prose that
+    # happens to START with these words (e.g. "Answer: the theme of...")
+    # is never touched -- only lines that are NOTHING BUT the label.
+    r'|^\s*Section\s*[-:]?\s*[A-Za-z0-9]{0,3}\s*$'
+    r'|^\s*(?:भाग|अनुभाग)\s*[-:]?\s*[०-९0-9]{0,3}\s*$'
+    r'|^\s*Ans(?:wer)?\s*(?:\d+\s*[.:\-]?\s*\d*|[.:\-]\s*\d*)\s*$'
+    r'|^\s*उत्तर\s*(?:\d+\s*[\-\:]?\s*\d*|[\-\:]\s*\d*)\s*$'
+    r'|^\s*(?:प्र|प्रश्न)[०.\s]*(?:\d+[.\s:-]*\d*|[.\s:-]+\d*)\s*$'
+    r'|^\s*Q\s*(?:\d+[.\s:-]*\d*|\.\s*\d*)\s*$)',
     re.IGNORECASE
 )
 
 
 def is_noise(line: str) -> bool:
     return bool(NOISE_RE.search(line))
+
+
+# =========================================================
+# PAGE MARGIN / BOILERPLATE DETECTION
+#
+# NEW (this round -- "pages main margin bhi add karo, company
+# name/date/page number answer main aa raha hai"): fixed regexes (like
+# NOISE_RE above) can only catch noise patterns we already know to
+# expect. A scanned assignment booklet's printed letterhead/margin
+# (university name, programme code, a repeated footer, etc.) is
+# DOCUMENT-SPECIFIC text that no generic regex can anticipate -- but it
+# has one very reliable property: it is the letterhead, so it repeats,
+# near-verbatim, in the same TOP/BOTTOM margin position on most pages.
+#
+# This detects that repetition directly instead of guessing the exact
+# wording: normalize each candidate margin line (lowercase, numbers
+# collapsed to a placeholder so "Page 4" and "Page 17" count as the
+# SAME recurring pattern, punctuation stripped), then count how many
+# distinct pages each normalized line appears on. Anything that shows
+# up in the margin of a large fraction of pages is almost certainly
+# printed boilerplate, not the student's own answer content, and gets
+# excluded when the answer text is assembled.
+# =========================================================
+
+def _normalize_margin_line(line: str) -> str:
+    text = line.strip().lower()
+    text = re.sub(r'\d+', '#', text)  # "Page 4" and "Page 17" -> same key
+    text = re.sub(r'[^\w\s#]', '', text, flags=re.UNICODE)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def detect_margin_boilerplate_lines(pages: list, margin_lines: int = 3,
+                                      min_page_fraction: float = 0.3,
+                                      min_pages_absolute: int = 3) -> set:
+    """
+    Returns a set of NORMALIZED line signatures (see
+    _normalize_margin_line) that recur often enough, in a margin
+    position, across `pages` to be treated as printed boilerplate
+    rather than real content -- e.g. a university/company name, a
+    repeated date stamp, or "Page X of Y" style footers.
+
+    `margin_lines`: how many lines at the very TOP and very BOTTOM of
+    each page's raw text are considered "margin position" candidates --
+    printed letterheads/footers live there, not in the middle of a
+    page's body text, so mid-page repeats (e.g. a student reusing a
+    common phrase) are never flagged.
+
+    `min_page_fraction` / `min_pages_absolute`: a normalized line must
+    appear on at least this fraction of pages (and at least this many
+    pages in absolute terms, to avoid false positives on very short
+    documents) before it's treated as boilerplate -- a genuine one-off
+    line, even if it happens to sit in the margin zone of a single
+    page, is left alone.
+    """
+    import collections
+
+    if not pages:
+        return set()
+
+    counts = collections.Counter()
+    total_pages = len(pages)
+
+    for page in pages:
+        lines = [l for l in page["raw_text"].split("\n") if l.strip()]
+        if not lines:
+            continue
+        margin_candidates = lines[:margin_lines] + lines[-margin_lines:]
+        seen_on_this_page = set()
+        for line in margin_candidates:
+            norm = _normalize_margin_line(line)
+            # require a little real content -- very short normalized
+            # strings (e.g. just "#" from a lone page number, already
+            # caught by NOISE_RE anyway) are too generic to safely
+            # treat as a unique boilerplate signature.
+            if len(norm) < 6:
+                continue
+            if norm in seen_on_this_page:
+                continue  # count each page at most once per line
+            seen_on_this_page.add(norm)
+            counts[norm] += 1
+
+    threshold = max(min_pages_absolute, int(total_pages * min_page_fraction))
+    return {norm for norm, count in counts.items() if count >= threshold}
+
+
+def _is_margin_boilerplate(line: str, boilerplate_signatures: set) -> bool:
+    if not boilerplate_signatures:
+        return False
+    return _normalize_margin_line(line) in boilerplate_signatures
 
 
 # =========================================================
@@ -1683,6 +1860,52 @@ def slice_raw_answers_by_boundaries(answer_lines: list, boundaries: list) -> lis
     return qa_pairs
 
 
+# =========================================================
+# FINAL ANSWER POSTPROCESSING
+#
+# NEW (this round -- "end main postprocessing bhi add karo jismain
+# section, bhag, prashna, Q, Ans woh sab remove hojaye jo unnecessary
+# ho answer main"): strip_question_restatement / strip_full_question_echo
+# above already clean up a label or restated question at the very
+# START of an answer. This is a broader, final safety-net pass that
+# runs on the FINISHED answer text (after all slicing/merging/joining
+# is done) and removes any STANDALONE section/part/question/answer
+# label tokens that ended up ANYWHERE in the text -- e.g. a leftover
+# "Section - B" or "भाग-2" heading that fell inside a merged/extended
+# range, or a stray "Q.5" / "Ans-" that survived because it wasn't the
+# very first token of the sliced text.
+#
+# Deliberately conservative: only removes a token when it is NOT
+# attached to surrounding letters/digits (word-boundary-safe), so real
+# prose that happens to contain these words as part of a sentence (a
+# student legitimately writing "Answer to this question requires...")
+# is left completely untouched -- only isolated label-shaped tokens
+# (matching the same label patterns used elsewhere in this module) are
+# removed.
+# =========================================================
+
+_STANDALONE_LABEL_TOKEN_RE = re.compile(
+    r'(?<!\S)(?:'
+    r'Section\s*[-:]?\s*[A-Za-z0-9]{1,3}(?!\S)'
+    r'|(?:भाग|अनुभाग)\s*[-:]?\s*[०-९0-9]{1,3}(?!\S)'
+    r'|Ans(?:wer)?\s*(?:\d+\s*[.:\-]?\s*\d*|[.:\-]\s*\d*)(?!\S)'
+    r'|उत्तर\s*(?:\d+\s*[\-\:]?\s*\d*|[\-\:]\s*\d*)(?!\S)'
+    r'|प्र[०.\s]*(?:\d+[.\s:-]*\d*|[.\s:-]+\d*)(?!\S)'
+    r'|प्रश्न[.\s]*(?:\d+[.\s:-]*\d*|[.\s:-]+\d*)(?!\S)'
+    r'|Q\s*(?:\d+[.\s:-]*\d*|\.\s*\d*)(?!\S)'
+    r')',
+    re.IGNORECASE
+)
+
+
+def final_answer_cleanup(text: str) -> str:
+    if not text:
+        return text
+    cleaned = _STANDALONE_LABEL_TOKEN_RE.sub(' ', text)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
 def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print) -> bool:
     total_chars = sum(len(l) for l in answer_lines)
     avg_chars_per_question = total_chars / max(num_questions, 1)
@@ -1743,11 +1966,28 @@ def process_pdf(file_input, status_callback=None):
 
     log(f"Answer pages: {[i+1 for i in answer_page_indices]}")
 
+    # NEW: detect repeated margin/letterhead content (university name,
+    # date stamp, "Page X of Y" footers, etc.) across the WHOLE document
+    # -- not just the answer pages -- since a printed letterhead
+    # typically appears on every page (question paper pages included),
+    # so using all pages gives the most reliable signal of what's
+    # genuinely boilerplate versus what's unique per-page content.
+    margin_boilerplate = detect_margin_boilerplate_lines(pages)
+    if margin_boilerplate:
+        log(
+            f"Detected {len(margin_boilerplate)} recurring margin/letterhead "
+            f"line pattern(s) across the document -- excluding these from "
+            f"answer text (e.g. university name, date stamps, page footers)."
+        )
+
     answer_lines = []
     for page in answer_pages:
         for line in page["raw_text"].split("\n"):
-            if not is_noise(line):
-                answer_lines.append(line)
+            if is_noise(line):
+                continue
+            if _is_margin_boilerplate(line, margin_boilerplate):
+                continue
+            answer_lines.append(line)
 
     log(f"Flattened {len(answer_lines)} answer lines")
 
@@ -1782,9 +2022,10 @@ def process_pdf(file_input, status_callback=None):
 
     qa_pairs = []
     for q in official_questions:
+        raw_answer = qa_map.get(q, "")
         qa_pairs.append({
             "question": q,
-            "answer": qa_map.get(q, ""),
+            "answer": final_answer_cleanup(raw_answer),
             "matched": q in qa_map,
         })
 
