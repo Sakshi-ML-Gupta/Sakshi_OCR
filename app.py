@@ -5,7 +5,7 @@ from datetime import datetime
 
 import streamlit as st
 
-from pipeline import (
+from pdf_processor import (
     process_pdf,
     process_reference,
     save_outputs,
