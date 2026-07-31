@@ -892,14 +892,32 @@ def _parse_canonical_questions_response(content: str) -> list:
     return [str(q).strip() for q in questions if str(q).strip()]
 
 
-def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
+def extract_canonical_questions(qp_pages: list, status_callback=None) -> tuple:
+    """
+    Returns (questions, error_reason). error_reason is None on success
+    (including the legitimate "LLM looked at the page and found no
+    questions" case); it's a string describing what went wrong when the
+    LLM call/parsing itself failed.
+
+    CHANGED (this round -- debugging "no questions extracted" failures):
+    previously this swallowed any exception into a log warning and just
+    returned an empty list, indistinguishable from the LLM genuinely
+    deciding there were no questions on the page. That made the final
+    "Question paper pages were identified, but no questions were
+    extracted" error in process_pdf uninformative -- it couldn't say
+    WHY, which is exactly what's needed to tell "OCR text on this page
+    is too garbled to parse" apart from "Groq call failed/rate-limited"
+    apart from "this page was wrongly classified as a question paper
+    page in the first place". Propagating the reason lets the final
+    exception include it directly.
+    """
     def log(msg):
         print(msg)
         if status_callback:
             status_callback(msg)
 
     if not qp_pages:
-        return []
+        return [], "No question-paper pages were passed in to extract from."
 
     from groq import Groq
 
@@ -920,10 +938,18 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
         )
     except Exception as e:
         log(f"WARNING: canonical question extraction failed: {e}")
-        return []
+        return [], str(e)
 
     log(f"Canonical question list: {len(questions)} question(s), single consistent pass")
-    return questions
+    if not questions:
+        return [], (
+            "The LLM call succeeded but returned zero questions for this "
+            "page's text -- this usually means the page's OCR text doesn't "
+            "actually look like a printed question paper to the model (a "
+            "page-classification false positive), or the OCR text on this "
+            "page is too garbled/incomplete to recognize any questions in it."
+        )
+    return questions, None
 
 
 def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
@@ -1044,14 +1070,16 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
                 )
 
     qp_pages_full = [pages[i] for i in qp_page_indices_0based]
-    questions = extract_canonical_questions(qp_pages_full, status_callback)
+    questions, extraction_error = extract_canonical_questions(qp_pages_full, status_callback)
 
     log(
         f"Final result: {len(qp_page_indices_0based)} question paper "
         f"page(s), {len(questions)} canonical question(s)"
     )
+    if extraction_error:
+        log(f"NOTE: canonical question extraction did not succeed -- {extraction_error}")
 
-    return qp_page_indices_0based, questions
+    return qp_page_indices_0based, questions, extraction_error
 
 
 # =========================================================
@@ -2089,7 +2117,7 @@ def process_pdf(file_input, status_callback=None):
     ocr_json = build_ocr_json(pages)
     log(f"Total pages: {ocr_json['total_pages']}")
 
-    qp_page_indices, official_questions = identify_questions_with_llm(pages, status_callback)
+    qp_page_indices, official_questions, extraction_error = identify_questions_with_llm(pages, status_callback)
 
     log(f"Question paper pages detected: {[p+1 for p in qp_page_indices] if qp_page_indices else 'none'}")
     log(f"Official questions extracted: {len(official_questions)}")
@@ -2101,9 +2129,24 @@ def process_pdf(file_input, status_callback=None):
         )
 
     if not official_questions:
+        # CHANGED: previously this only said pages were detected but
+        # nothing else -- with no way to tell an API/parsing failure
+        # apart from a genuine "this page doesn't look like a question
+        # paper" LLM decision apart from badly garbled OCR text. Now
+        # includes the actual reason (propagated from
+        # extract_canonical_questions) and a text sample of the
+        # detected page(s) so the real cause is visible immediately.
+        qp_text_samples = {
+            p + 1: pages[p]["raw_text"][:800] for p in qp_page_indices
+        }
         raise Exception(
             "Question paper pages were identified, but no questions were extracted.\n"
-            f"Detected pages: {[p+1 for p in qp_page_indices]}"
+            f"Detected pages: {[p+1 for p in qp_page_indices]}\n"
+            f"Reason: {extraction_error or 'unknown'}\n\n"
+            f"Raw OCR text of the detected page(s) (first 800 chars each), "
+            f"check whether this actually looks like a printed question "
+            f"paper -- if not, this was likely a page-classification "
+            f"false positive:\n{json.dumps(qp_text_samples, ensure_ascii=False, indent=2)}"
         )
 
     answer_page_indices = [i for i in range(len(pages)) if i not in qp_page_indices]
