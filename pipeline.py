@@ -1062,6 +1062,7 @@ Important guidance for finding boundaries correctly:
 - Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
 - Use the EXACT REF label (e.g. "REF-A") to identify each question. Do NOT retype or paraphrase the question text itself -- the REF label is all that's needed.
 - NOTE: student answers usually appear in roughly the SAME sequential order as the official questions are listed above. If a question's answer text doesn't obviously restate or resemble the question's own wording, use its POSITION in the question list -- relative to answers you can already identify with confidence for its neighboring questions -- as a secondary signal for where that answer likely falls in the text.
+- CRITICAL for SIMILAR questions: if two or more official questions share a lot of general topic vocabulary (e.g. both are about the same author, text, historical period, or broad theme), do NOT rely on that shared vocabulary to tell their answers apart -- it will make BOTH answers look like a match for either question. Instead, look for whatever is UNIQUELY different between those specific questions (a particular sub-topic, a named example, a specific angle of comparison, a distinct instruction like "compare" vs "contrast" vs "list") and use THAT to decide which text belongs to which. If you genuinely cannot tell them apart from content alone, fall back to the sequential-position signal above rather than assigning most or all of the shared content to only one of them -- a wrong split that gives each question SOME of its rightful content is better than one question getting everything and the other getting nothing.
 
 Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
 
@@ -1176,12 +1177,49 @@ _QUESTION_STOPWORDS = {
 }
 
 
-def _distinctive_words(text: str, max_words: int = 20) -> list:
+def _distinctive_words(text: str, max_words: int = 20, extra_stopwords: frozenset = frozenset()) -> list:
     words = re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(text))[:max_words]
-    return sorted(set(w for w in words if w not in _QUESTION_STOPWORDS))
+    return sorted(set(w for w in words if w not in _QUESTION_STOPWORDS and w not in extra_stopwords))
 
 
-def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.5):
+def _compute_cross_question_common_words(questions: list, max_words: int = 20) -> frozenset:
+    """
+    FIX (this round -- addresses "2 similar questions ka answer mix ho
+    raha hai"): `_distinctive_words` only filtered GENERIC stopwords
+    (how/why/explain/discuss/etc.), not words that are specific to this
+    document's own question set but happen to be shared between two or
+    more of ITS questions. When two official questions are worded
+    similarly -- e.g. both about the same author, text, or broad topic
+    -- those shared topic words pass right through the generic filter
+    and get counted as "distinctive" for BOTH questions. The result: a
+    line that's actually part of question B's answer scores a fuzzy
+    match against question A too (since they share vocabulary), so the
+    boundary detector either fails to recognize a genuine new start for
+    B (the line looks like "more of A" instead), or -- just as bad --
+    randomly attributes B's opening lines to A. Either way, one
+    question's answer swallows the other's, and the other gets partial
+    or no match at all -- exactly the reported symptom.
+
+    Fix: compute which SIGNIFICANT words are shared across 2+ different
+    questions IN THIS DOCUMENT'S OWN question list, and treat those as
+    additional, document-specific stopwords on top of the generic list
+    -- so only words that are actually UNIQUE to one particular
+    question get used to recognize its answer boundary. This adapts
+    automatically to whatever questions are actually present, rather
+    than needing hardcoded topic words.
+    """
+    from collections import Counter
+    doc_word_counts = Counter()
+    for q in questions:
+        words_in_q = set(re.findall(r'[a-z]{3,}', _normalize_for_overlap_match(q))[:max_words])
+        for w in words_in_q:
+            if w not in _QUESTION_STOPWORDS:
+                doc_word_counts[w] += 1
+    return frozenset(w for w, c in doc_word_counts.items() if c >= 2)
+
+
+def _line_starts_new_answer_for_question(line: str, questions: list, min_fraction: float = 0.5,
+                                            common_words: frozenset = frozenset()):
     label_match = _ANSWER_START_RE.match(line)
     if label_match:
         num_match = re.search(r'\d+', label_match.group(0))
@@ -1198,7 +1236,7 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
         return None
 
     for i, q in enumerate(questions):
-        q_distinctive = _distinctive_words(q)
+        q_distinctive = _distinctive_words(q, extra_stopwords=common_words)
         if not q_distinctive:
             continue
         matched = sum(
@@ -1255,6 +1293,11 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
     if not numbered_lines:
         return []
 
+    # Computed ONCE for the whole chunking pass (not per-line) -- see
+    # _compute_cross_question_common_words docstring for why this
+    # matters when two official questions are worded similarly.
+    common_words = _compute_cross_question_common_words(questions)
+
     chunks = []
     current_chunk = []
     current_chars = 0
@@ -1267,7 +1310,7 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
         if current_chunk and current_chars + line_chars > max_chars:
             past_target = True
 
-        matched_q_idx = _line_starts_new_answer_for_question(text, questions)
+        matched_q_idx = _line_starts_new_answer_for_question(text, questions, common_words=common_words)
         is_genuine_new_start = matched_q_idx is not None and (
             matched_q_idx == -1 or matched_q_idx != current_question_idx
         )
@@ -1400,6 +1443,24 @@ _PARENT_INSTRUCTION_PREFIX_RE = re.compile(
 
 
 def strip_full_question_echo(answer_text: str, question_text: str) -> str:
+    """
+    FIX (structure-preservation round): the previous implementation did
+    `answer_text.split()` (which splits on ANY whitespace, including
+    newlines) and then rebuilt the retained portion with
+    `" ".join(...)` -- so even though the CALLER now preserves the
+    document's original line breaks (see map_answers_with_llm), this
+    function was silently flattening them right back into one run-on
+    line whenever it stripped an echoed question prefix. That's exactly
+    what corrupted structured content (tables, numbered/lettered lists,
+    parenthetical groupings) into garbled text.
+
+    This version locates the same echoed-prefix word window as before,
+    but instead of rebuilding from split words, it works out the
+    CHARACTER offset where that prefix ends in the ORIGINAL string and
+    slices from there -- so every line break, space, and piece of
+    formatting in the retained portion is preserved byte-for-byte,
+    exactly "as it is, jaise PDF mein hai".
+    """
     question_core = _PARENT_INSTRUCTION_PREFIX_RE.sub('', question_text).strip()
     if not question_core:
         question_core = question_text
@@ -1409,28 +1470,41 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
     if q_word_count == 0:
         return answer_text
 
-    answer_words = answer_text.split()
-    if not answer_words:
+    # Word spans as (start_char, end_char) positions in the ORIGINAL
+    # answer_text -- this lets us slice by character index later
+    # instead of rebuilding the string from split tokens.
+    word_spans = [m.span() for m in re.finditer(r'\S+', answer_text)]
+    if not word_spans:
         return answer_text
 
     min_n = max(3, int(q_word_count * 0.7))
-    max_n = min(len(answer_words), int(q_word_count * 1.3) + 2)
+    max_n = min(len(word_spans), int(q_word_count * 1.3) + 2)
 
-    best_strip_count = 0
+    best_strip_end_char = 0
     best_ratio = 0.0
 
     for n in range(min_n, max_n + 1):
-        prefix = " ".join(answer_words[:n])
+        if n > len(word_spans):
+            break
+        prefix_end_char = word_spans[n - 1][1]
+        prefix = answer_text[:prefix_end_char]
         prefix_norm = _normalize_for_echo_compare(prefix)
         ratio = difflib.SequenceMatcher(None, prefix_norm, q_norm).ratio()
         if ratio >= 0.75 and ratio > best_ratio:
             best_ratio = ratio
-            best_strip_count = n
+            best_strip_end_char = prefix_end_char
 
-    if best_strip_count > 0:
-        remaining = " ".join(answer_words[best_strip_count:]).strip()
+    if best_strip_end_char > 0:
+        # Strip only the echoed prefix; keep everything after it -- and
+        # ANY newlines/formatting within it -- exactly as originally
+        # written. Only trim the handful of whitespace characters
+        # immediately bridging the echo and the real content, not
+        # collapse internal structure.
+        remaining = answer_text[best_strip_end_char:]
+        remaining = remaining.lstrip(' \t')
+        remaining = re.sub(r'^\n+', '', remaining)
         remaining = re.sub(r'^(?:Answer\s*[-:]\s*)', '', remaining, flags=re.IGNORECASE)
-        return remaining.strip()
+        return remaining
 
     return answer_text
 
@@ -1609,7 +1683,16 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             if 0 <= j < len(answer_lines) and answer_lines[j].strip() and not is_noise(answer_lines[j])
         ]
         original_question = ref_to_question[r["ref"]]
-        answer_text = " ".join(verbatim_lines).strip()
+        # FIX: previously joined with a single space (" ".join(...)),
+        # which FLATTENS the original OCR'd line structure into one
+        # run-on string -- destroying tables, numbered/lettered lists,
+        # and parenthetical groupings exactly as printed in the PDF
+        # (e.g. a Devanagari consonant-group listing like "(क) ख (ख)
+        # ग (ग)..." across several lines came out garbled once every
+        # line break was replaced by a plain space). Joining with "\n"
+        # instead preserves the document's own line breaks verbatim --
+        # "as it is, jaise PDF mein hai" -- with no reformatting.
+        answer_text = "\n".join(verbatim_lines).strip()
         answer_text = strip_question_restatement(answer_text)
         answer_text = strip_full_question_echo(answer_text, original_question)
         qa_map[original_question] = answer_text
@@ -1902,8 +1985,19 @@ def final_answer_cleanup(text: str) -> str:
     if not text:
         return text
     cleaned = _STANDALONE_LABEL_TOKEN_RE.sub(' ', text)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return cleaned
+    # FIX (structure-preservation round): `re.sub(r'\s+', ' ', ...)`
+    # matches `\n` too, so this used to collapse every line break in
+    # the answer into a single space -- flattening tables, numbered/
+    # lettered lists, and parenthetical groupings into garbled run-on
+    # text even after upstream code started preserving them. Only
+    # collapse HORIZONTAL whitespace (spaces/tabs) here; leave newlines
+    # (and blank lines from removed standalone-label lines) alone, only
+    # trimming down any excessive run of 3+ blank lines to a max of one
+    # blank line for readability.
+    cleaned = re.sub(r'[ \t]+', ' ', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    cleaned = '\n'.join(line.strip() for line in cleaned.split('\n'))
+    return cleaned.strip()
 
 
 def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print) -> bool:
