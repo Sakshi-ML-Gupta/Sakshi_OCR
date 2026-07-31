@@ -1076,29 +1076,20 @@ Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape
 If NONE of the official questions' answers appear in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any of these answers."""
 
 
-def _build_answer_map_user_prompt(numbered_lines: list, questions: list, common_words: frozenset = frozenset()) -> str:
-    questions_block = "\n".join(
-        f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
-    )
+def _build_answer_map_user_prompt(numbered_lines, questions, common_words=frozenset()):
+    questions_block = "\n".join(f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions))
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in numbered_lines)
-
-    shared_vocab_note = ""
+    shared_note = ""
     if common_words:
-        shared_vocab_note = (
-            f"\n\nNOTE: the following words appear in TWO OR MORE of the official "
-            f"questions above, so they CANNOT be used to distinguish which question "
-            f"an answer belongs to -- ignore them when matching, and instead look for "
-            f"words/phrases that are UNIQUE to just one question: "
+        shared_note = (
+            f"\n\nNOTE: these words appear in 2+ of the questions above, so ignore "
+            f"them when matching -- use only UNIQUE words per question: "
             f"{', '.join(sorted(common_words))}"
         )
-
     return (
-        f"OFFICIAL QUESTIONS (each tagged with its own [REF-X] label -- "
-        f"use the REF label, not retyped question text, to identify which "
-        f"question an answer belongs to):\n{questions_block}{shared_vocab_note}\n\n"
+        f"OFFICIAL QUESTIONS:\n{questions_block}{shared_note}\n\n"
         f"STUDENT'S ANSWER TEXT (line-numbered):\n{lines_block}"
     )
-
 def _parse_answer_map_llm_response(content: str) -> list:
     content = content.strip()
 
@@ -1360,16 +1351,16 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
 
 
 def _resolve_overlapping_answer_ranges(answer_ranges: list) -> list:
-    sorted_ranges = sorted(answer_ranges, key=lambda r: r["start_line"])
+    sorted_ranges = sorted(answer_ranges, key=lambda r: (r["start_line"], r["end_line"]))
     resolved = []
-    for i, r in enumerate(sorted_ranges):
+    last_claimed_end = -1
+    for r in sorted_ranges:
         r = dict(r)
-        if i + 1 < len(sorted_ranges):
-            next_start = sorted_ranges[i + 1]["start_line"]
-            if r["end_line"] >= next_start:
-                r["end_line"] = next_start - 1
+        if r["start_line"] <= last_claimed_end:
+            r["start_line"] = last_claimed_end + 1
         if r["end_line"] >= r["start_line"]:
             resolved.append(r)
+            last_claimed_end = max(last_claimed_end, r["end_line"])
     return resolved
 
 
@@ -1378,15 +1369,7 @@ def _merge_or_pick_best_range(r1: dict, r2: dict, gap_tolerance: int = 12) -> di
     hi = max(r1["end_line"], r2["end_line"])
     gap = max(r2["start_line"] - r1["end_line"], r1["start_line"] - r2["end_line"])
 
-    # NEW: only auto-merge when the two ranges genuinely look like the
-    # SAME continuous answer split across the CHUNK_OVERLAP_LINES zone
-    # (i.e. real overlap or a tiny adjacent gap). If they're merely
-    # "close enough" per the old flat tolerance, that's exactly the
-    # case that lets a similar-question mismatch quietly merge two
-    # different answers into one. Require actual overlap (gap <= 0) OR
-    # a very small gap for the union; otherwise fall back to picking
-    # the longer, more confident range.
-    if gap <= 0 or gap <= min(gap_tolerance, 3):
+    if gap <= gap_tolerance:
         merged = dict(r1)
         merged["start_line"], merged["end_line"] = lo, hi
         return merged
@@ -1565,13 +1548,15 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             if r["ref"] not in ref_to_question:
                 log(f"WARNING: discarding answer mapping with unknown ref {r['ref']!r}")
                 continue
-            if min_idx <= r["start_line"] <= max_idx and min_idx <= r["end_line"] <= max_idx:
-                accepted.append(r)
+            clipped_start = max(r["start_line"], min_idx)
+            clipped_end = min(r["end_line"], max_idx)
+            if clipped_start <= clipped_end:
+                accepted.append({"ref": r["ref"], "start_line": clipped_start, "end_line": clipped_end})
             else:
                 log(
-                    f"WARNING: discarding out-of-range answer mapping for "
+                    f"WARNING: discarding empty/invalid answer mapping for "
                     f"{r['ref']}: lines {r['start_line']}-{r['end_line']} "
-                    f"outside this chunk's range {min_idx}-{max_idx}"
+                    f"has no overlap with this chunk's range {min_idx}-{max_idx}"
                 )
 
         log(f"Chunk {i+1}/{len(chunks)}: mapped {len(accepted)} answer(s)")
