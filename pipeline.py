@@ -1588,6 +1588,67 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
     return answer_text
 
 
+def _rebalance_adjacent_similar_unmatched(resolved_ranges: list, questions: list, log=print) -> list:
+    """
+    See the call site in map_answers_with_llm for the full rationale.
+    Generic, doesn't need to know the specific questions in advance --
+    works purely off (a) official question order, (b) which REFs ended
+    up with zero matched range, and (c) plain text similarity between
+    a matched question and the very next (unmatched) one.
+    """
+    ref_by_index = [f"REF-{chr(65 + i)}" for i in range(len(questions))]
+    matched_refs = {r["ref"] for r in resolved_ranges}
+
+    new_ranges = [dict(r) for r in resolved_ranges]
+    ranges_by_ref = {r["ref"]: r for r in new_ranges}
+
+    for i in range(1, len(questions)):
+        ref_b = ref_by_index[i]
+        ref_a = ref_by_index[i - 1]
+
+        if ref_b in matched_refs:
+            continue  # B already has something -- nothing to rebalance
+        if ref_a not in matched_refs:
+            continue  # A is also unmatched -- nothing to split from
+
+        qa_text, qb_text = questions[i - 1], questions[i]
+        ratio = difflib.SequenceMatcher(
+            None,
+            _normalize_for_echo_compare(qa_text),
+            _normalize_for_echo_compare(qb_text),
+        ).ratio()
+        if ratio < 0.35:
+            continue  # not similar enough to suspect this specific confusion
+
+        a_range = ranges_by_ref[ref_a]
+        original_end = a_range["end_line"]
+        span = original_end - a_range["start_line"]
+        if span < 6:
+            continue  # too short to safely/usefully split
+
+        midpoint = a_range["start_line"] + span // 2
+        log(
+            f"Rebalancing {ref_a}/{ref_b}: {ref_b} was completely unmatched, "
+            f"but the immediately preceding {ref_a} is worded similarly "
+            f"(similarity={ratio:.2f}) and matched a long range spanning "
+            f"lines {a_range['start_line']}-{original_end} -- likely "
+            f"absorbed {ref_b}'s answer too. Splitting roughly in half "
+            f"between the two instead of leaving {ref_b} with nothing."
+        )
+
+        a_range["end_line"] = midpoint
+        new_b_range = {
+            "ref": ref_b,
+            "start_line": midpoint + 1,
+            "end_line": original_end,
+        }
+        new_ranges.append(new_b_range)
+        ranges_by_ref[ref_b] = new_b_range
+        matched_refs.add(ref_b)
+
+    return new_ranges
+
+
 def map_answers_with_llm(answer_lines: list, questions: list, status_callback=None) -> dict:
     """
     Maps each official question to its verbatim answer text.
@@ -1695,6 +1756,29 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     deduped_ranges = list(best_by_ref.values())
 
     resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
+
+    # FIX (this round -- addresses "2 similar questions: Q1 swallows
+    # Q2's answer, Q2 shows no match at all"): when two CONSECUTIVE
+    # official questions are worded similarly, the answer-mapping LLM
+    # can fail to spot where the student's response to the second one
+    # begins (it just looks like "more of the first answer" given the
+    # shared vocabulary) -- so REF for the first question ends up with
+    # one long range covering BOTH answers, and the second question's
+    # REF never gets any range assigned at all.
+    #
+    # This doesn't require knowing the exact questions in advance: it
+    # detects the pattern generically -- question B is completely
+    # unmatched, the IMMEDIATELY PRECEDING question A (in official
+    # question order, which is also the order answers are normally
+    # written in) IS matched with a long range, and A/B are textually
+    # similar enough to plausibly be the confused pair. In that case,
+    # split A's range roughly in half and give the second half to B.
+    # A rough 50/50 split that gives both questions SOME of their
+    # rightful content is strictly better than one getting everything
+    # and the other getting nothing.
+    resolved_ranges = _rebalance_adjacent_similar_unmatched(
+        resolved_ranges, questions, log
+    )
 
     # FIX (this round -- addresses "last pages/paragraphs not mapping,
     # answer becomes half"): the range with the HIGHEST start_line is,
