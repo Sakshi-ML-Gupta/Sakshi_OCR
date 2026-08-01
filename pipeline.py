@@ -1459,37 +1459,6 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
 def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
                                   overlap_lines: int = CHUNK_OVERLAP_LINES) -> list:
-    """
-    Simple, deterministic, ALWAYS-safe-size chunking.
-
-    REPLACED (this round -- fixes repeated 413 "Request too large"
-    failures that silently dropped 7 of 12 questions): the previous
-    version tried to be clever -- it kept GROWING a chunk past the
-    target size, waiting for a "genuine answer boundary" (detected via
-    a regex/fuzzy-word-overlap heuristic) before finally breaking, and
-    only forced a break at a much larger hard ceiling (60000 chars) if
-    no boundary was ever found. On documents where answers don't use a
-    clean, detectable label (very common for Hindi/Devanagari essay
-    answers), that heuristic often finds NO boundary for a long
-    stretch, so the chunk kept growing -- producing requests far beyond
-    Groq's fixed 8000 TPM per-request ceiling. That failure is
-    UNRECOVERABLE by retrying (see ChunkTooLargeError), so those
-    oversized chunks -- and every question whose answer lived inside
-    them -- were being abandoned outright.
-
-    This version does the simple, predictable thing instead: split
-    strictly by character budget, no exceptions, no waiting for a
-    "good" boundary. Every chunk carries the last `overlap_lines` lines
-    of the previous chunk forward into its own start, so any answer
-    that happens to straddle a chunk boundary is still fully visible to
-    at least one chunk's LLM call -- the actual decision of exactly
-    where an answer starts/ends is left entirely to the LLM (which is
-    what it's for), with the merge logic in map_answers_with_llm
-    reconciling duplicate/overlapping results across chunks afterward.
-    A hard, always-respected size cap means requests never blow past
-    the token ceiling in the first place, instead of only reacting
-    after the fact.
-    """
     if not numbered_lines:
         return []
 
@@ -1502,7 +1471,16 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
 
         if current_chunk and current_chars + line_chars > max_chars:
             chunks.append(current_chunk)
-            overlap = current_chunk[-overlap_lines:] if overlap_lines > 0 else []
+            # FIX: overlap ko chunk ke size ka max ~30% tak hi rakho,
+            # taaki chhote chunks (jab questions overhead zyada hone
+            # se safe_chunk_chars chhota ban jaaye) mein overlap khud
+            # chunk ko na nigal jaaye. Warna har naya chunk sirf 1-2
+            # naya line aage badhta hai aur baaki purani lines dobara-
+            # dobara Groq ko bhejta rehta hai -- jo chunk count aur
+            # token usage dono ko explode kar deta hai (yehi TPD
+            # exhaustion ka asli root cause tha).
+            safe_overlap = min(overlap_lines, max(1, len(current_chunk) // 3))
+            overlap = current_chunk[-safe_overlap:] if safe_overlap > 0 else []
             current_chunk = list(overlap)
             current_chars = sum(len(t) for _, t in current_chunk)
 
