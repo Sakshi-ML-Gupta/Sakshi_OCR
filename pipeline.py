@@ -250,6 +250,34 @@ MISTRAL_OCR_MODEL = "mistral-ocr-latest"
 MISTRAL_OCR_MAX_MB = 50  # Mistral's documented per-request file size limit
 
 
+_OCR_DUPLICATE_PAREN_RE = re.compile(r'\((\w+)\)\s*[a-zA-Z]{1,4}\s*\(\1\)', re.IGNORECASE)
+
+
+def _fix_ocr_duplicate_parenthetical_artifacts(text: str) -> str:
+    """
+    FIX (real example confirmed via uploaded page image): a student
+    hand-draws a curved bracket/arc or arrow in red ink connecting or
+    annotating letters (e.g. linking "क(ka)" to the next letter, or
+    circling it). Mistral OCR can misread that ink stroke as a short
+    junk run of letters, and when it sits between two identical
+    parenthetical annotations, the result is a duplicated, garbled
+    pattern like "(ka)bb(ka)" instead of the student's actual single
+    "(ka)". Confirmed real examples: "(ka)bb(ka)", "(cha)cc(cha)",
+    "(la)ee(la)", "(dha)ff(dha)", "(ya)uu(ya)", etc. -- always the SAME
+    parenthesized word on both sides with a short (1-4 letter) junk
+    token between them.
+
+    This collapses exactly that pattern back down to a single copy --
+    "(ka)bb(ka)" -> "(ka)" -- since a false positive would require the
+    exact same word to coincidentally appear twice in a row with junk
+    between it, which essentially never happens in genuine prose. Any
+    text that ISN'T this specific duplicate-with-junk-between shape is
+    left completely untouched, so normal parenthetical content (marks,
+    dates, translations, etc.) is unaffected.
+    """
+    return _OCR_DUPLICATE_PAREN_RE.sub(r'(\1)', text)
+
+
 def run_ocr(file_content: bytes, file_name: str, status_callback=None):
     def log(msg):
         print(msg)
@@ -327,6 +355,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
     for i, p in enumerate(mistral_pages):
         page_index = getattr(p, "index", None)
         markdown = getattr(p, "markdown", "") or ""
+        markdown = _fix_ocr_duplicate_parenthetical_artifacts(markdown)
         # Mistral's page index is 0-based (matches the 0-based `pages`
         # request parameter documented for this endpoint); fall back
         # to enumeration order if a page is ever missing an index.
