@@ -393,7 +393,17 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 
 TPM_LIMIT = 8000
 TPM_SAFETY_FRACTION = 0.85
-CHARS_PER_TOKEN_ESTIMATE = 2.0
+# LOWERED (this round -- root-fixes repeated 413 "Request too large"
+# failures): 2.0 chars/token is a reasonable average for English, but
+# Hindi/Devanagari text tokenizes noticeably denser -- the real logs
+# showed actual Groq-reported "Requested" token counts consistently
+# higher than this estimate would have predicted for the same content,
+# which is exactly why proactive pacing kept under-anticipating real
+# request sizes right up until the hard per-request ceiling. 1.4 is a
+# more realistic, conservative estimate for Devanagari-heavy academic
+# documents; if your documents are purely English, requests will simply
+# come in comfortably under budget (safe direction to be wrong in).
+CHARS_PER_TOKEN_ESTIMATE = 1.4
 
 MAX_CHARS_PER_CHUNK = 6000
 CHUNK_OVERLAP_PAGES = 1
@@ -572,6 +582,50 @@ _RATE_LIMIT_DETAIL_RE = re.compile(
     re.IGNORECASE | re.DOTALL
 )
 
+# NEW (fixes "map hue answers bhi wrong h" / 7 of 12 questions never
+# mapped): distinguishes a genuinely UNRECOVERABLE "this single request
+# is too large" error from a normal, waitable rate limit. Groq returns
+# this specific shape -- "Request too large ... Limit 8000, Requested
+# 8192, please reduce your message size and try again" -- with NO
+# "Used" figure and NO "try again in Xs" duration at all, because
+# there's nothing to wait out: the request itself exceeds the model's
+# hard per-request ceiling regardless of how much of the rolling
+# window is currently free. `_RATE_LIMIT_DETAIL_RE` above requires both
+# "Used" and a wait duration to match, so it silently failed to match
+# THIS error shape and fell through to a generic exponential backoff
+# retry -- which is guaranteed to fail every single time, since no
+# amount of waiting shrinks the request. That's exactly what the real
+# log showed: 5 retries, ~25-75s wasted, all failing with the identical
+# "too large" error, before the whole chunk (and every question whose
+# answer lived in it) was abandoned.
+_REQUEST_TOO_LARGE_RE = re.compile(
+    r'Request too large.*?Limit\s+(\d+),\s*Requested\s+(\d+)',
+    re.IGNORECASE | re.DOTALL
+)
+
+
+class ChunkTooLargeError(Exception):
+    """Raised when a single request permanently exceeds the model's
+    per-request token ceiling -- signals the CALLER to split the chunk
+    and retry with smaller pieces, since retrying the same request will
+    never succeed no matter how many attempts or how long it waits."""
+    def __init__(self, limit: int, requested: int):
+        self.limit = limit
+        self.requested = requested
+        super().__init__(
+            f"Request permanently too large: {requested} tokens requested, "
+            f"{limit} token limit. This cannot be fixed by retrying/waiting "
+            f"-- the request itself must be made smaller."
+        )
+
+
+def _parse_request_too_large(message: str):
+    m = _REQUEST_TOO_LARGE_RE.search(message)
+    if not m:
+        return None
+    limit, requested = m.groups()
+    return {"limit": int(limit), "requested": int(requested)}
+
 
 def _parse_rate_limit_detail(message: str):
     m = _RATE_LIMIT_DETAIL_RE.search(message)
@@ -731,6 +785,22 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 
         except (groq.RateLimitError, groq.BadRequestError) as e:
             last_error = e
+
+            # Check for the UNRECOVERABLE "too large" shape FIRST --
+            # retrying this is guaranteed to fail every time (see
+            # ChunkTooLargeError docstring), so fail immediately instead
+            # of burning `max_retries` attempts and their backoff waits
+            # on something that can never succeed.
+            too_large = _parse_request_too_large(str(e))
+            if too_large:
+                log(
+                    f"Chunk LLM call permanently too large (attempt {attempt}): "
+                    f"{too_large['requested']} tokens requested vs "
+                    f"{too_large['limit']} limit -- this cannot be fixed by "
+                    f"retrying, failing fast so the caller can split the chunk."
+                )
+                raise ChunkTooLargeError(too_large["limit"], too_large["requested"]) from e
+
             detail = _parse_rate_limit_detail(str(e))
 
             if detail and detail["limit_type"] == "TPD":
@@ -1167,34 +1237,62 @@ def _parse_answer_map_llm_response(content: str) -> list:
     return result
 
 
-ANSWER_MAP_MAX_CHARS_PER_CHUNK = 11000
-ANSWER_MAP_ABSOLUTE_MAX_CHARS = 60000
+ANSWER_MAP_MAX_CHARS_PER_CHUNK = 11000  # upper-bound safety cap only --
+# see _compute_safe_chunk_char_budget below, which normally computes a
+# SMALLER, document-specific safe size than this ceiling.
+
+# NEW (this round -- root-fixes repeated 413 "Request too large"
+# failures): instead of assuming a fixed, guessed char budget per
+# chunk, compute the SAFE budget at runtime from the ACTUAL system
+# prompt and questions-block size for THIS document. Every chunk resends
+# the full official-questions list, so a document with many/long
+# questions eats far more of the token budget on overhead alone before
+# a single line of answer text is even included -- a fixed guess can't
+# account for that and was exactly why real requests came in at
+# 8000-9800 tokens against an 8000 hard ceiling. Deliberately targets
+# well under the 6800 safe-budget ceiling (85% of Groq's 8000 TPM) to
+# leave generous headroom for (a) Hindi/Devanagari text tokenizing
+# denser than any fixed char/token ratio can perfectly predict, and
+# (b) per-request overhead Groq counts that isn't visible in the raw
+# prompt text.
+ANSWER_MAP_TARGET_TOKENS = 6000
 
 # NEW: overlap between consecutive answer-mapping line-chunks, mirroring
-# CHUNK_OVERLAP_PAGES used for page-chunking above. See the note on
-# _chunk_lines_by_char_budget below for why this matters for the
-# merge/skip/no-match bugs.
-#
-# INCREASED (this round -- addresses "last pages/paragraphs not
-# mapping, answer becomes half"): 8 lines was too thin a safety margin
-# specifically for FORCED breaks (should_force_break_absolute), which
-# happen when no genuine answer-start is ever found (e.g. the true
-# LAST answer in the document, which by definition has no "next
-# question" to bound it) -- these are exactly the highest-risk splits,
-# since they land at an arbitrary character-count boundary with zero
-# semantic justification, right in the middle of real content.
+# CHUNK_OVERLAP_PAGES used for page-chunking above. Every chunk carries
+# the last CHUNK_OVERLAP_LINES lines of the previous chunk forward into
+# its own start, so an answer that happens to straddle a chunk boundary
+# is still fully visible to at least one chunk's LLM call.
 CHUNK_OVERLAP_LINES = 15
-
-# A forced break (hit ANSWER_MAP_ABSOLUTE_MAX_CHARS with no genuine
-# boundary in sight) gets a bigger overlap than a normal answer-start
-# break, since it's the case most likely to be splitting genuine
-# content mid-answer rather than at an intentional boundary.
-FORCED_BREAK_OVERLAP_LINES = 40
 
 _ANSWER_START_RE = re.compile(
     r'^\s*(?:Ans(?:wer)?[.\s:-]+\d*|उत्तर\s*\d*\s*[\-\:]?|प्र[०.\s]*\d*|Q\.?\s*\d+[.\s:-])',
     re.IGNORECASE
 )
+
+
+def _compute_safe_chunk_char_budget(system_prompt: str, questions_block: str,
+                                      target_tokens: int = ANSWER_MAP_TARGET_TOKENS,
+                                      max_chars_cap: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK) -> int:
+    """
+    Computes how many characters of answer-LINE content can safely fit
+    in one chunk, given the ACTUAL system prompt and questions block for
+    THIS specific document -- rather than assuming a fixed budget that
+    could be badly wrong for documents with many or long questions
+    (every chunk resends the FULL official-questions list, so more/
+    longer questions directly eats into how much answer text can safely
+    fit in the same request before hitting the token ceiling).
+
+    Falls back to a small minimum if the fixed overhead alone already
+    eats most of the target budget (e.g. an unusually large number of
+    questions) -- in that case, chunks are just smaller and there are
+    more of them, which is a purely a latency trade-off, never a
+    correctness one (ChunkTooLargeError + auto-split remains as a
+    hard safety net regardless).
+    """
+    overhead_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(questions_block) + 800
+    remaining_tokens = max(300, target_tokens - overhead_tokens)
+    safe_chars = int(remaining_tokens * CHARS_PER_TOKEN_ESTIMATE)
+    return max(1000, min(safe_chars, max_chars_cap))
 
 
 def _normalize_for_overlap_match(text: str) -> str:
@@ -1331,93 +1429,53 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
 
 def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
-                                  absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS,
                                   overlap_lines: int = CHUNK_OVERLAP_LINES) -> list:
     """
-    Answer-boundary-aware chunking.
+    Simple, deterministic, ALWAYS-safe-size chunking.
 
-    FIX (this round -- addresses "merge / skip / no-match" reports):
-    the previous version started every new chunk EMPTY right after a
-    break, with zero overlap into the previous chunk. Page-chunking
-    (see `_chunk_pages_by_char_budget` above) already carries
-    CHUNK_OVERLAP_PAGES=1 forward for exactly this reason, but the
-    line-chunker had no equivalent -- a real, confirmed asymmetry.
+    REPLACED (this round -- fixes repeated 413 "Request too large"
+    failures that silently dropped 7 of 12 questions): the previous
+    version tried to be clever -- it kept GROWING a chunk past the
+    target size, waiting for a "genuine answer boundary" (detected via
+    a regex/fuzzy-word-overlap heuristic) before finally breaking, and
+    only forced a break at a much larger hard ceiling (60000 chars) if
+    no boundary was ever found. On documents where answers don't use a
+    clean, detectable label (very common for Hindi/Devanagari essay
+    answers), that heuristic often finds NO boundary for a long
+    stretch, so the chunk kept growing -- producing requests far beyond
+    Groq's fixed 8000 TPM per-request ceiling. That failure is
+    UNRECOVERABLE by retrying (see ChunkTooLargeError), so those
+    oversized chunks -- and every question whose answer lived inside
+    them -- were being abandoned outright.
 
-    Consequence of that asymmetry: `_line_starts_new_answer_for_question`
-    is a heuristic (formal label OR fuzzy word-overlap with the
-    question text), not a guarantee. When it mis-detects a boundary --
-    either missing a genuine answer-start (student paraphrased instead
-    of restating) or firing on a false positive -- the chunk break can
-    land INSIDE an answer. With zero overlap, each side of that split
-    answer is only ever seen by ONE chunk's LLM call, so:
-      - the chunk containing the FIRST half returns a truncated range
-        (it never saw the rest, since the chunk simply ends)
-      - the chunk containing the SECOND half returns a range that
-        looks like an unrelated fresh start
-      - the old "keep whichever range is longer" dedup then picks ONE
-        of the two truncated halves and throws the other away --
-        producing exactly the observed "answer skipped" or "answer cut
-        short" symptom.
-
-    FIX: carry the last `overlap_lines` lines of a chunk forward into
-    the START of the next chunk. If the break point was wrong, the
-    overlap gives the NEXT chunk's LLM call a chance to see the tail of
-    the PREVIOUS answer too -- so at least one of the two chunk calls
-    ends up seeing the complete answer. Combined with the improved
-    merge logic in `map_answers_with_llm` below (which now MERGES
-    overlapping/adjacent ranges for the same ref instead of just
-    picking the longer one), this recovers the full answer instead of
-    silently keeping a truncated half.
+    This version does the simple, predictable thing instead: split
+    strictly by character budget, no exceptions, no waiting for a
+    "good" boundary. Every chunk carries the last `overlap_lines` lines
+    of the previous chunk forward into its own start, so any answer
+    that happens to straddle a chunk boundary is still fully visible to
+    at least one chunk's LLM call -- the actual decision of exactly
+    where an answer starts/ends is left entirely to the LLM (which is
+    what it's for), with the merge logic in map_answers_with_llm
+    reconciling duplicate/overlapping results across chunks afterward.
+    A hard, always-respected size cap means requests never blow past
+    the token ceiling in the first place, instead of only reacting
+    after the fact.
     """
     if not numbered_lines:
         return []
 
-    # Computed ONCE for the whole chunking pass (not per-line) -- see
-    # _compute_cross_question_common_words docstring for why this
-    # matters when two official questions are worded similarly.
-    common_words = _compute_cross_question_common_words(questions)
-
     chunks = []
     current_chunk = []
     current_chars = 0
-    past_target = False
-    current_question_idx = None
 
     for idx, text in numbered_lines:
         line_chars = len(text)
 
         if current_chunk and current_chars + line_chars > max_chars:
-            past_target = True
-
-        matched_q_idx = _line_starts_new_answer_for_question(text, questions, common_words=common_words)
-        is_genuine_new_start = matched_q_idx is not None and (
-            matched_q_idx == -1 or matched_q_idx != current_question_idx
-        )
-
-        should_break_at_answer_start = past_target and is_genuine_new_start
-        should_force_break_absolute = (
-            current_chunk and current_chars + line_chars > absolute_max_chars
-        )
-
-        if should_break_at_answer_start or should_force_break_absolute:
             chunks.append(current_chunk)
-            # FIX: a forced break (no genuine boundary found, just hit
-            # the hard char ceiling) gets a BIGGER overlap than a
-            # normal boundary break -- it's the case most likely to be
-            # slicing through the middle of real content, most notably
-            # the document's final answer, which has no "next question"
-            # to ever trigger a genuine boundary break at all.
-            this_break_overlap = (
-                FORCED_BREAK_OVERLAP_LINES if should_force_break_absolute and not should_break_at_answer_start
-                else overlap_lines
-            )
-            overlap = current_chunk[-this_break_overlap:] if this_break_overlap > 0 else []
+            overlap = current_chunk[-overlap_lines:] if overlap_lines > 0 else []
             current_chunk = list(overlap)
             current_chars = sum(len(t) for _, t in current_chunk)
-            past_target = False
-
-        if is_genuine_new_start and matched_q_idx != -1:
-            current_question_idx = matched_q_idx
 
         current_chunk.append((idx, text))
         current_chars += line_chars
@@ -1460,10 +1518,9 @@ def _merge_or_pick_best_range(r1: dict, r2: dict, gap_tolerance: int = 12) -> di
     or are within `gap_tolerance` lines of each other -- which is
     exactly the situation created by an overlap-carried or
     boundary-adjacent split. gap_tolerance was raised from 3 to 12
-    alongside the larger CHUNK_OVERLAP_LINES/FORCED_BREAK_OVERLAP_LINES
-    above, since a bigger overlap window means two genuinely-continuous
-    ranges reported by different chunk calls can legitimately end up a
-    bit further apart than before. If the two ranges are genuinely far
+    alongside CHUNK_OVERLAP_LINES above, since a bigger overlap window
+    means two genuinely-continuous ranges reported by different chunk
+    calls can legitimately end up a bit further apart than before. If the two ranges are genuinely far
     apart (a real disjoint result, which would indicate a different
     kind of mismatch, not a boundary split), it falls back to keeping
     the longer one rather than risk merging in unrelated lines from a
@@ -1685,24 +1742,72 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     budget = _TokenBudgetTracker()
 
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
+    questions_block_for_sizing = "\n".join(
+        f"[REF-{chr(65+i)}] {q}" for i, q in enumerate(questions)
+    )
+    safe_chunk_chars = _compute_safe_chunk_char_budget(
+        ANSWER_MAP_SYSTEM_PROMPT, questions_block_for_sizing
+    )
+    log(
+        f"Computed safe per-chunk size: {safe_chunk_chars} chars of answer "
+        f"text (based on {len(questions)} question(s)' overhead in every "
+        f"chunk request)"
+    )
 
     numbered_lines = list(enumerate(answer_lines))
-    chunks = _chunk_lines_by_char_budget(numbered_lines, questions)
+    chunks = _chunk_lines_by_char_budget(numbered_lines, questions, max_chars=safe_chunk_chars)
     log(f"Split {len(answer_lines)} answer line(s) into {len(chunks)} LLM chunk(s) for answer mapping")
 
-    def process_one_chunk(i, chunk):
-        line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
-        log(f"Asking LLM to map answers in chunk {i+1}/{len(chunks)} (lines {line_range})...")
+    def _process_chunk_with_split(chunk, label, depth=0):
+        """
+        Returns (accepted_ranges, had_zero_matches, error_or_None).
 
+        NEW (fixes "7 of 12 questions never mapped at all"): recursively
+        splits `chunk` in half whenever the call raises
+        ChunkTooLargeError, instead of giving up on the WHOLE chunk (and
+        therefore every question whose answer lived anywhere inside it).
+        A too-large error can never be fixed by retrying the same
+        request -- only by making the request smaller -- so this is the
+        correct response, not another retry loop.
+        """
         user_prompt = _build_answer_map_user_prompt(chunk, questions)
         try:
             chunk_ranges = _call_groq_with_retries(
                 client, ANSWER_MAP_SYSTEM_PROMPT, user_prompt,
                 _parse_answer_map_llm_response, budget, log
             )
+        except ChunkTooLargeError as e:
+            if len(chunk) < 8 or depth >= 4:
+                log(
+                    f"WARNING: {label} is still too large after {depth} "
+                    f"split(s) and has only {len(chunk)} line(s) left -- "
+                    f"cannot split further, giving up on this piece: {e}"
+                )
+                return [], False, str(e)
+
+            mid = len(chunk) // 2
+            left, right = chunk[:mid], chunk[mid:]
+            log(
+                f"{label} was too large for a single request ({e.requested} "
+                f"tokens vs {e.limit} limit) -- splitting into 2 smaller "
+                f"pieces ({len(left)} + {len(right)} lines) and retrying "
+                f"each separately instead of abandoning the whole chunk."
+            )
+            left_accepted, left_zero, left_err = _process_chunk_with_split(
+                left, f"{label}.L", depth + 1
+            )
+            right_accepted, right_zero, right_err = _process_chunk_with_split(
+                right, f"{label}.R", depth + 1
+            )
+            combined = left_accepted + right_accepted
+            combined_err = None
+            if left_err and right_err:
+                combined_err = f"both halves failed: {left_err} | {right_err}"
+            return combined, (left_zero and right_zero and not combined), combined_err
+
         except Exception as e:
-            log(f"WARNING: chunk {i+1}/{len(chunks)} answer-mapping failed, skipping: {e}")
-            return i, [], str(e), False
+            log(f"WARNING: {label} answer-mapping failed, skipping: {e}")
+            return [], False, str(e)
 
         valid_indices = {idx for idx, _ in chunk}
         min_idx, max_idx = min(valid_indices), max(valid_indices)
@@ -1720,8 +1825,15 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
                     f"outside this chunk's range {min_idx}-{max_idx}"
                 )
 
-        log(f"Chunk {i+1}/{len(chunks)}: mapped {len(accepted)} answer(s)")
-        return i, accepted, None, (len(chunk_ranges) == 0)
+        log(f"{label}: mapped {len(accepted)} answer(s)")
+        return accepted, (len(chunk_ranges) == 0), None
+
+    def process_one_chunk(i, chunk):
+        label = f"Chunk {i+1}/{len(chunks)}"
+        line_range = f"{chunk[0][0]}-{chunk[-1][0]}" if chunk else "empty"
+        log(f"Asking LLM to map answers in {label} (lines {line_range})...")
+        accepted, was_zero, err = _process_chunk_with_split(chunk, label)
+        return i, accepted, err, was_zero
 
     all_ranges = []
     chunk_failures = []
