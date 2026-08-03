@@ -299,6 +299,32 @@ def _fix_ocr_duplicate_parenthetical_artifacts(text: str) -> str:
     return text
 
 
+# NEW (confirmed via real output): a template/branding watermark can
+# get OCR'd as if it were real text, embedded MID-SENTENCE inside the
+# student's own (here, Hindi) content -- e.g. "...जहाँ सेकेंड भाषाएं
+# Title Page और बोलियाँ..." -- "Title Page" clearly isn't part of that
+# sentence. Because it's embedded mid-line rather than confined to its
+# own line, a whole-line noise filter (NOISE_RE) can never catch it;
+# this does a substring-level removal instead, word-boundary safe, so
+# it's stripped wherever it appears without disturbing the surrounding
+# genuine content. Extend this tuple if other watermark text turns up
+# in your documents (e.g. "CLASSTIME", seen printed on some notebook
+# brands' pages).
+_KNOWN_WATERMARK_PHRASES = ("Title Page", "CLASSTIME")
+
+_WATERMARK_PHRASE_RE = re.compile(
+    r'\b(?:' + '|'.join(re.escape(p) for p in _KNOWN_WATERMARK_PHRASES) + r')\b',
+    re.IGNORECASE
+)
+
+
+def _strip_known_watermark_phrases(text: str) -> str:
+    cleaned = _WATERMARK_PHRASE_RE.sub('', text)
+    # a removed mid-sentence phrase can leave a double space behind
+    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    return cleaned
+
+
 def run_ocr(file_content: bytes, file_name: str, status_callback=None):
     def log(msg):
         print(msg)
@@ -377,6 +403,7 @@ def run_ocr(file_content: bytes, file_name: str, status_callback=None):
         page_index = getattr(p, "index", None)
         markdown = getattr(p, "markdown", "") or ""
         markdown = _fix_ocr_duplicate_parenthetical_artifacts(markdown)
+        markdown = _strip_known_watermark_phrases(markdown)
         # Mistral's page index is 0-based (matches the 0-based `pages`
         # request parameter documented for this endpoint); fall back
         # to enumeration order if a page is ever missing an index.
@@ -1940,31 +1967,55 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
     # itself may simply stop at a conservative point if it isn't sure
     # the answer keeps going in the (limited) text it was shown.
     #
-    # Since NOTHING else can legitimately claim lines that come after
-    # this last matched range and before the end of the document (there
-    # is no other question left to answer), any such trailing lines are
-    # safe to fold into this last range rather than silently dropping
-    # them. This directly recovers the "answer got cut in half at the
-    # very end" symptom.
-    if resolved_ranges:
-        last_range = max(resolved_ranges, key=lambda r: r["start_line"])
-        true_end = len(answer_lines) - 1
-        if last_range["end_line"] < true_end:
-            # Only extend through genuinely meaningful trailing content --
-            # stop early if the remaining tail is entirely blank/noise
-            # (e.g. trailing signature lines, blank OCR artifacts), so we
-            # don't glue unrelated boilerplate onto the real answer.
-            trailing = [
-                answer_lines[j] for j in range(last_range["end_line"] + 1, true_end + 1)
-            ]
-            if any(t.strip() and not is_noise(t) for t in trailing):
-                log(
-                    f"Extending last matched answer ({last_range['ref']}) from "
-                    f"line {last_range['end_line']} to {true_end} -- no later "
-                    f"question exists to claim these trailing lines, so they "
-                    f"must belong to this answer."
-                )
-                last_range["end_line"] = true_end
+    # CRITICAL FIX (this round -- real, confirmed corruption): the
+    # previous version assumed "the range with the highest start_line
+    # has nothing after it" -- but that's only true if it's ALSO the
+    # actual LAST OFFICIAL QUESTION. If some LATER question(s) in the
+    # official list simply failed to get matched at all (for any other
+    # reason -- a chunk failure, a boundary the LLM missed, etc.), an
+    # EARLIER question that merely happens to have the latest matched
+    # start_line was being treated as "the end of the document" and
+    # blindly extended all the way to the true end -- silently
+    # swallowing whatever content actually belonged to those later,
+    # unmatched questions. This was confirmed in real output: one
+    # question's "answer" ended up containing several OTHER questions'
+    # entire essays concatenated together, including a trailing
+    # structural marker that belongs to a subsequent question.
+    #
+    # The safe version only extends when the matched ref genuinely IS
+    # the last official question (by question order, not by where its
+    # text happened to start) -- the only case where "nothing else
+    # could legitimately claim this" is actually guaranteed true.
+    if resolved_ranges and questions:
+        last_official_ref = f"REF-{chr(65 + len(questions) - 1)}"
+        last_range = next(
+            (r for r in resolved_ranges if r["ref"] == last_official_ref), None
+        )
+        if last_range is not None:
+            true_end = len(answer_lines) - 1
+            if last_range["end_line"] < true_end:
+                # Only extend through genuinely meaningful trailing content --
+                # stop early if the remaining tail is entirely blank/noise
+                # (e.g. trailing signature lines, blank OCR artifacts), so we
+                # don't glue unrelated boilerplate onto the real answer.
+                trailing = [
+                    answer_lines[j] for j in range(last_range["end_line"] + 1, true_end + 1)
+                ]
+                if any(t.strip() and not is_noise(t) for t in trailing):
+                    log(
+                        f"Extending last matched answer ({last_range['ref']}, "
+                        f"which is the actual final official question) from "
+                        f"line {last_range['end_line']} to {true_end} -- no "
+                        f"later question exists to claim these trailing lines."
+                    )
+                    last_range["end_line"] = true_end
+        elif log:
+            log(
+                f"NOTE: the final official question ({last_official_ref}) "
+                f"wasn't matched, so no trailing-extension was applied to "
+                f"any answer -- avoids incorrectly extending an unrelated "
+                f"earlier answer into content that might belong to it."
+            )
 
     log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
 
@@ -2029,7 +2080,12 @@ NOISE_RE = re.compile(
     # a whole line that is JUST a date, nothing else.
     r'|^\s*\d{1,2}\s*[/\-.]\s*\d{1,2}\s*[/\-.]\s*\d{2,4}\s*$'
     # NEW: generic "Page X" / "Page X of Y" lines.
-    r'|^\s*Page\s*\d+(?:\s*(?:of|\/)\s*\d+)?\s*$)',
+    r'|^\s*Page\s*\d+(?:\s*(?:of|\/)\s*\d+)?\s*$'
+    # NEW (confirmed via real output): "प्रश्नोत्तर नं. 9 रबड़ (ग)"-style
+    # recurring printed structural marker (an answer-sheet serial code,
+    # only the number and bracketed letter change between occurrences)
+    # -- not the student's own content, so treat the whole line as noise.
+    r'|^\s*प्रश्नोत्तर\s*नं\.?\s*\d+.*$)',
     re.IGNORECASE
 )
 # REVERTED (this round -- fixes "worse than before, only 8 mapped"):
