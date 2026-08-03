@@ -128,24 +128,22 @@ def _diagnose_tuple_errors(func):
 #     a single run actually reduce wall-clock latency.
 # =========================================================
 
-MAX_CONCURRENT_GROQ_CALLS = 2  # CHANGED (this round -- likely root
-# cause of "only a handful of answers got mapped"): 4 concurrent calls
-# looks like a reasonable middle ground in isolation, but Groq's
-# free-tier budget is only 8000 TPM, and a single answer-mapping chunk
-# at the configured max size already costs roughly 6000+ tokens by
-# itself. Firing 4 of those at once could try to spend 24000+ tokens
-# in the same ~1s window -- wildly over budget -- causing a burst of
-# 429s. Each chunk gets `max_retries` (4) attempts with escalating
-# backoff before giving up for good; when the whole run is this
-# oversubscribed, MULTIPLE chunks can simultaneously exhaust their
-# retries and fail outright, and every question whose answer lived in
-# one of those failed chunks never gets mapped at all -- exactly the
-# reported symptom. Reduced to 2, which still gives a real latency win
-# over fully sequential processing, but keeps concurrent token demand
-# closer to what an 8000 TPM budget can actually absorb without a
-# retry-exhaustion cascade. If you're on a paid Groq tier with a much
-# higher TPM ceiling, this can safely be raised again (try 3-4 and
-# watch the logs for repeated "Waiting Xs" / rate-limit warnings).
+MAX_CONCURRENT_GROQ_CALLS = 1  # CHANGED (this round -- chunks are now
+# sized much closer to the full per-request budget, see
+# ANSWER_MAP_TARGET_TOKENS): 2 concurrent answer-mapping chunk calls at
+# ~7000 tokens each would combine to ~14000 tokens -- almost double the
+# 8000 TPM ceiling -- in the same instant. The proactive pacing logic
+# would then force the second call to wait out nearly the FULL 60s
+# window before the first chunk's usage "expires", since a single big
+# chunk alone already occupies most of the window. That means
+# concurrency=2 wouldn't actually run two chunks in parallel here in
+# practice -- it would just add confusing "waiting 55s" log noise while
+# behaving like sequential processing anyway. Concurrency genuinely
+# helps when individual chunks are small relative to the TPM budget
+# (e.g. the question-identification stage's smaller page-chunks); for
+# answer-mapping's now-larger chunks, sequential (1) is both simpler
+# and no slower in practice. If you're on a paid Groq tier with a much
+# higher TPM ceiling, this can be raised again.
 _groq_concurrency_semaphore = threading.Semaphore(MAX_CONCURRENT_GROQ_CALLS)
 
 
@@ -252,6 +250,20 @@ MISTRAL_OCR_MAX_MB = 50  # Mistral's documented per-request file size limit
 
 _OCR_DUPLICATE_PAREN_RE = re.compile(r'\((\w+)\)\s*[a-zA-Z]{1,4}\s*\(\1\)', re.IGNORECASE)
 
+# NEW (confirmed via real examples: "uccu (cha)cc(cha)...", "cddc
+# (ta)cc(ta)...", "effe (la)ee(la)...", "uvvu (pa)vv(pa)..."): a short
+# junk word ALSO shows up immediately before the first parenthetical
+# group in a duplicate-annotation run -- almost certainly the same kind
+# of misread (likely the hand-drawn star/asterisk marker or numbering
+# in the margin) as the "(X)junk(X)" duplication itself. Only stripped
+# when immediately followed by that same recognizable
+# "(word)junk(word)" shape, so it never touches a genuine short word
+# that happens to start a line normally.
+_OCR_LEADING_JUNK_BEFORE_PARENS_RE = re.compile(
+    r'(^[ \t]*(?:\d+[.\)]\s*)?)[a-zA-Z]{2,6}(?=\s*\(\w+\)\s*[a-zA-Z]{1,4}\s*\(\w+\))',
+    re.MULTILINE
+)
+
 
 def _fix_ocr_duplicate_parenthetical_artifacts(text: str) -> str:
     """
@@ -265,17 +277,26 @@ def _fix_ocr_duplicate_parenthetical_artifacts(text: str) -> str:
     "(ka)". Confirmed real examples: "(ka)bb(ka)", "(cha)cc(cha)",
     "(la)ee(la)", "(dha)ff(dha)", "(ya)uu(ya)", etc. -- always the SAME
     parenthesized word on both sides with a short (1-4 letter) junk
-    token between them.
+    token between them. A similar junk token also shows up immediately
+    BEFORE the first group in such a run (e.g. "uccu (cha)cc(cha)...");
+    that's stripped too, but only when it's directly followed by the
+    same recognizable duplicate shape.
 
-    This collapses exactly that pattern back down to a single copy --
-    "(ka)bb(ka)" -> "(ka)" -- since a false positive would require the
-    exact same word to coincidentally appear twice in a row with junk
-    between it, which essentially never happens in genuine prose. Any
-    text that ISN'T this specific duplicate-with-junk-between shape is
-    left completely untouched, so normal parenthetical content (marks,
-    dates, translations, etc.) is unaffected.
+    Both patterns are collapsed/removed -- "(ka)bb(ka)" -> "(ka)",
+    "uccu (cha)cc(cha)" -> "(cha)" -- since a false positive would
+    require the exact same word to coincidentally repeat right after
+    itself with junk between, or a short junk-looking word to
+    coincidentally precede that exact shape, neither of which happens
+    in genuine prose. Anything that ISN'T this specific shape is left
+    completely untouched.
     """
-    return _OCR_DUPLICATE_PAREN_RE.sub(r'(\1)', text)
+    text = _OCR_LEADING_JUNK_BEFORE_PARENS_RE.sub(r'\1', text)
+    text = _OCR_DUPLICATE_PAREN_RE.sub(r'(\1)', text)
+    # cosmetic: removing the leading junk word can leave a double space
+    # behind (e.g. "2.  (cha)") -- collapse horizontal whitespace only,
+    # never touching newlines/structure.
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    return text
 
 
 def run_ocr(file_content: bytes, file_name: str, status_callback=None):
@@ -1185,30 +1206,20 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
 # LLM-BASED ANSWER MAPPING (Groq)
 # =========================================================
 
-ANSWER_MAP_SYSTEM_PROMPT = """You are analyzing a student's handwritten answers (OCR'd) from an exam assignment booklet. You are given:
-1. A numbered list of the OFFICIAL exam questions, each tagged with a reference label like [REF-A], [REF-B], etc.
-2. The student's answer text, with each line prefixed by its line number in [brackets].
+ANSWER_MAP_SYSTEM_PROMPT = """Match each OFFICIAL question below (labeled [REF-A], [REF-B], ...) to the line range where the student's answer to it appears in the line-numbered answer text.
 
-Your task: for EACH official question, find the SINGLE LINE NUMBER where the student's answer to that question STARTS in the text shown. Do NOT try to figure out where the answer ends -- only the starting line matters, the ending will be computed separately.
+Rules:
+- A new answer usually starts at a restated question, a label ("Ans 5-", "उत्तर 6-", "प्र. 8"), or a clear topic shift.
+- If a REF's answer isn't present in this text, omit it entirely -- do not invent a range.
+- Ranges must never overlap. If unsure exactly where one answer ends, end it earlier rather than swallowing content that belongs to the next one.
+- Use the exact [bracket] line numbers shown, and the exact REF label -- never retype or paraphrase the question text.
+- Answers usually follow the same order as the official questions. If a question's wording doesn't obviously match anything in the text, use its position relative to confidently-matched neighbors as a fallback signal.
+- If two questions share a lot of topic vocabulary (same author/text/theme), don't use that shared vocabulary to tell them apart -- it fits both. Find what's UNIQUELY different between them instead (a specific sub-topic, named example, or distinct instruction like compare vs list). If genuinely indistinguishable, split the content roughly between them rather than giving one everything and the other nothing.
 
-Guidance:
-- A new answer typically begins where the student restates or references a question (e.g. "Ans 5-", "उत्तर 6-", "प्र. 8", a question number, or a clear topic shift matching the next question's subject).
-- If a question's answer does NOT start anywhere in the text shown, do NOT invent a start line -- omit that REF entirely from your output. It may start in a different chunk of the document.
-- Use the line numbers EXACTLY as given in [brackets] -- do not estimate, guess, or renumber.
-- Use the EXACT REF label (e.g. "REF-A") to identify each question. Do NOT retype or paraphrase the question text itself.
-- Student answers usually appear in roughly the SAME sequential order as the official questions are listed above -- use this as a secondary signal when a start doesn't obviously restate the question's own wording.
-- CRITICAL for SIMILAR questions: if two or more official questions share a lot of general topic vocabulary, do NOT rely on that shared vocabulary alone -- find whatever is UNIQUELY different between them (a specific sub-topic, a named example, a distinct instruction like "compare" vs "contrast") to decide which start line belongs to which question. If genuinely undecidable from content alone, fall back to sequential order.
+Output ONLY this JSON shape, nothing else:
+{"answers": [{"ref": "REF-A", "start_line": 12, "end_line": 18}]}
+If nothing in this text matches any official question, return {"answers": []}."""
 
-Return ONLY valid JSON (no markdown fences, no commentary) in exactly this shape:
-
-{
-  "answers": [
-    {"ref": "REF-A", "start_line": 12},
-    {"ref": "REF-B", "start_line": 19}
-  ]
-}
-
-If NONE of the official questions' answers START anywhere in the text shown, return {"answers": []} -- that is a valid and expected result for a chunk that doesn't contain any answer's beginning."""
 
 def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
     questions_block = "\n".join(
@@ -1225,6 +1236,7 @@ def _build_answer_map_user_prompt(numbered_lines: list, questions: list) -> str:
 
 def _parse_answer_map_llm_response(content: str) -> list:
     content = content.strip()
+
     if content.startswith("```"):
         content = re.sub(r'^```(?:json)?\s*\n?', '', content)
         content = re.sub(r'\n?```\s*$', '', content)
@@ -1233,7 +1245,9 @@ def _parse_answer_map_llm_response(content: str) -> list:
     try:
         data = json.loads(content)
     except json.JSONDecodeError as e:
-        raise ValueError(f"LLM did not return valid JSON: {e}\nRaw content (first 500 chars): {content[:500]!r}")
+        raise ValueError(
+            f"LLM did not return valid JSON: {e}\nRaw content (first 500 chars): {content[:500]!r}"
+        )
 
     if not isinstance(data, dict) or "answers" not in data:
         raise ValueError(f"LLM response missing 'answers' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
@@ -1246,12 +1260,13 @@ def _parse_answer_map_llm_response(content: str) -> list:
     for item in answers:
         if not isinstance(item, dict):
             continue
-        if "ref" not in item or "start_line" not in item:
+        if "ref" not in item or "start_line" not in item or "end_line" not in item:
             continue
         try:
             result.append({
                 "ref": str(item["ref"]).strip().upper(),
                 "start_line": int(item["start_line"]),
+                "end_line": int(item["end_line"]),
             })
         except (ValueError, TypeError):
             continue
@@ -1277,7 +1292,7 @@ ANSWER_MAP_MAX_CHARS_PER_CHUNK = 11000  # upper-bound safety cap only --
 # denser than any fixed char/token ratio can perfectly predict, and
 # (b) per-request overhead Groq counts that isn't visible in the raw
 # prompt text.
-ANSWER_MAP_TARGET_TOKENS = 6000
+ANSWER_MAP_TARGET_TOKENS = 7000
 
 # NEW: overlap between consecutive answer-mapping line-chunks, mirroring
 # CHUNK_OVERLAP_PAGES used for page-chunking above. Every chunk carries
@@ -1452,6 +1467,37 @@ def _line_starts_new_answer_for_question(line: str, questions: list, min_fractio
 def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
                                   overlap_lines: int = CHUNK_OVERLAP_LINES) -> list:
+    """
+    Simple, deterministic, ALWAYS-safe-size chunking.
+
+    REPLACED (this round -- fixes repeated 413 "Request too large"
+    failures that silently dropped 7 of 12 questions): the previous
+    version tried to be clever -- it kept GROWING a chunk past the
+    target size, waiting for a "genuine answer boundary" (detected via
+    a regex/fuzzy-word-overlap heuristic) before finally breaking, and
+    only forced a break at a much larger hard ceiling (60000 chars) if
+    no boundary was ever found. On documents where answers don't use a
+    clean, detectable label (very common for Hindi/Devanagari essay
+    answers), that heuristic often finds NO boundary for a long
+    stretch, so the chunk kept growing -- producing requests far beyond
+    Groq's fixed 8000 TPM per-request ceiling. That failure is
+    UNRECOVERABLE by retrying (see ChunkTooLargeError), so those
+    oversized chunks -- and every question whose answer lived inside
+    them -- were being abandoned outright.
+
+    This version does the simple, predictable thing instead: split
+    strictly by character budget, no exceptions, no waiting for a
+    "good" boundary. Every chunk carries the last `overlap_lines` lines
+    of the previous chunk forward into its own start, so any answer
+    that happens to straddle a chunk boundary is still fully visible to
+    at least one chunk's LLM call -- the actual decision of exactly
+    where an answer starts/ends is left entirely to the LLM (which is
+    what it's for), with the merge logic in map_answers_with_llm
+    reconciling duplicate/overlapping results across chunks afterward.
+    A hard, always-respected size cap means requests never blow past
+    the token ceiling in the first place, instead of only reacting
+    after the fact.
+    """
     if not numbered_lines:
         return []
 
@@ -1464,16 +1510,7 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
 
         if current_chunk and current_chars + line_chars > max_chars:
             chunks.append(current_chunk)
-            # FIX: overlap ko chunk ke size ka max ~30% tak hi rakho,
-            # taaki chhote chunks (jab questions overhead zyada hone
-            # se safe_chunk_chars chhota ban jaaye) mein overlap khud
-            # chunk ko na nigal jaaye. Warna har naya chunk sirf 1-2
-            # naya line aage badhta hai aur baaki purani lines dobara-
-            # dobara Groq ko bhejta rehta hai -- jo chunk count aur
-            # token usage dono ko explode kar deta hai (yehi TPD
-            # exhaustion ka asli root cause tha).
-            safe_overlap = min(overlap_lines, max(1, len(current_chunk) // 3))
-            overlap = current_chunk[-safe_overlap:] if safe_overlap > 0 else []
+            overlap = current_chunk[-overlap_lines:] if overlap_lines > 0 else []
             current_chunk = list(overlap)
             current_chars = sum(len(t) for _, t in current_chunk)
 
@@ -1816,16 +1853,16 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             if r["ref"] not in ref_to_question:
                 log(f"WARNING: discarding answer mapping with unknown ref {r['ref']!r}")
                 continue
-            if min_idx <= r["start_line"] <= max_idx:
+            if min_idx <= r["start_line"] <= max_idx and min_idx <= r["end_line"] <= max_idx:
                 accepted.append(r)
             else:
                 log(
-                    f"WARNING: discarding out-of-range start line for "
-                    f"{r['ref']}: line {r['start_line']} outside this "
-                    f"chunk's range {min_idx}-{max_idx}"
+                    f"WARNING: discarding out-of-range answer mapping for "
+                    f"{r['ref']}: lines {r['start_line']}-{r['end_line']} "
+                    f"outside this chunk's range {min_idx}-{max_idx}"
                 )
 
-        log(f"{label}: found {len(accepted)} answer-start(s)")
+        log(f"{label}: mapped {len(accepted)} answer(s)")
         return accepted, (len(chunk_ranges) == 0), None
 
     def process_one_chunk(i, chunk):
@@ -1835,11 +1872,11 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
         accepted, was_zero, err = _process_chunk_with_split(chunk, label)
         return i, accepted, err, was_zero
 
-    all_starts = []
+    all_ranges = []
     chunk_failures = []
     chunk_zero_matches = 0
 
-    ctx = _get_streamlit_ctx()
+    ctx = _get_streamlit_ctx()  # captured on the calling (main) thread
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_GROQ_CALLS) as executor:
         futures = [
             executor.submit(_with_streamlit_ctx(process_one_chunk, ctx), i, chunk)
@@ -1850,11 +1887,84 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
             if err is not None:
                 chunk_failures.append(err)
             else:
-                all_starts.extend(accepted)
+                all_ranges.extend(accepted)
                 if was_zero:
                     chunk_zero_matches += 1
 
-    resolved_ranges = _derive_ranges_from_starts(all_starts, len(answer_lines), log)
+    # Merge (not just "pick longer") ranges for the same ref across
+    # chunks -- see _merge_or_pick_best_range docstring for why this
+    # matters now that chunks overlap.
+    best_by_ref = {}
+    for r in all_ranges:
+        existing = best_by_ref.get(r["ref"])
+        if existing is None:
+            best_by_ref[r["ref"]] = r
+        else:
+            best_by_ref[r["ref"]] = _merge_or_pick_best_range(existing, r)
+
+    deduped_ranges = list(best_by_ref.values())
+
+    resolved_ranges = _resolve_overlapping_answer_ranges(deduped_ranges)
+
+    # FIX (this round -- addresses "2 similar questions: Q1 swallows
+    # Q2's answer, Q2 shows no match at all"): when two CONSECUTIVE
+    # official questions are worded similarly, the answer-mapping LLM
+    # can fail to spot where the student's response to the second one
+    # begins (it just looks like "more of the first answer" given the
+    # shared vocabulary) -- so REF for the first question ends up with
+    # one long range covering BOTH answers, and the second question's
+    # REF never gets any range assigned at all.
+    #
+    # This doesn't require knowing the exact questions in advance: it
+    # detects the pattern generically -- question B is completely
+    # unmatched, the IMMEDIATELY PRECEDING question A (in official
+    # question order, which is also the order answers are normally
+    # written in) IS matched with a long range, and A/B are textually
+    # similar enough to plausibly be the confused pair. In that case,
+    # split A's range roughly in half and give the second half to B.
+    # A rough 50/50 split that gives both questions SOME of their
+    # rightful content is strictly better than one getting everything
+    # and the other getting nothing.
+    resolved_ranges = _rebalance_adjacent_similar_unmatched(
+        resolved_ranges, questions, log
+    )
+
+    # FIX (this round -- addresses "last pages/paragraphs not mapping,
+    # answer becomes half"): the range with the HIGHEST start_line is,
+    # by construction, the LAST answer in the document -- there is no
+    # question after it to give the chunker a genuine boundary to break
+    # on, and no LATER range for the overlap-resolution step above to
+    # clip against. That combination means this last answer is the one
+    # most likely to get an artificially early end_line: a forced
+    # (absolute-max) chunk split can cut it off mid-answer, or the LLM
+    # itself may simply stop at a conservative point if it isn't sure
+    # the answer keeps going in the (limited) text it was shown.
+    #
+    # Since NOTHING else can legitimately claim lines that come after
+    # this last matched range and before the end of the document (there
+    # is no other question left to answer), any such trailing lines are
+    # safe to fold into this last range rather than silently dropping
+    # them. This directly recovers the "answer got cut in half at the
+    # very end" symptom.
+    if resolved_ranges:
+        last_range = max(resolved_ranges, key=lambda r: r["start_line"])
+        true_end = len(answer_lines) - 1
+        if last_range["end_line"] < true_end:
+            # Only extend through genuinely meaningful trailing content --
+            # stop early if the remaining tail is entirely blank/noise
+            # (e.g. trailing signature lines, blank OCR artifacts), so we
+            # don't glue unrelated boilerplate onto the real answer.
+            trailing = [
+                answer_lines[j] for j in range(last_range["end_line"] + 1, true_end + 1)
+            ]
+            if any(t.strip() and not is_noise(t) for t in trailing):
+                log(
+                    f"Extending last matched answer ({last_range['ref']}) from "
+                    f"line {last_range['end_line']} to {true_end} -- no later "
+                    f"question exists to claim these trailing lines, so they "
+                    f"must belong to this answer."
+                )
+                last_range["end_line"] = true_end
 
     log(f"Final answer mapping: {len(resolved_ranges)} of {len(questions)} question(s) matched")
 
@@ -1901,42 +2011,6 @@ def map_answers_with_llm(answer_lines: list, questions: list, status_callback=No
 
     return qa_map
 
-def _derive_ranges_from_starts(all_starts: list, total_lines: int, log=print) -> list:
-    """
-    Turns {ref: start_line} points into full non-overlapping,
-    gap-free ranges. Since each answer's end is defined purely as
-    'the line right before the NEXT matched answer starts' (or the
-    end of the document for the last one), overlaps and gaps between
-    consecutive matched answers are impossible by construction --
-    unlike the old approach where the LLM guessed both start AND end
-    per chunk, which is exactly what caused chunk-boundary truncation
-    and merge conflicts.
-    """
-    starts_by_ref = {}
-    for r in all_starts:
-        ref, sl = r["ref"], r["start_line"]
-        if ref not in starts_by_ref or sl < starts_by_ref[ref]:
-            starts_by_ref[ref] = sl  # earliest reported start wins
-
-    sorted_starts = sorted(starts_by_ref.items(), key=lambda kv: kv[1])
-
-    # Guard against two different refs claiming the exact same start
-    # line (rare, but would otherwise produce a zero/negative-length
-    # range) -- nudge forward by 1 and log it.
-    deduped = []
-    last_start = -1
-    for ref, sl in sorted_starts:
-        if sl <= last_start:
-            log(f"WARNING: {ref} start_line {sl} collides with previous answer's start -- nudging forward")
-            sl = last_start + 1
-        deduped.append((ref, sl))
-        last_start = sl
-
-    ranges = []
-    for i, (ref, sl) in enumerate(deduped):
-        end = deduped[i + 1][1] - 1 if i + 1 < len(deduped) else total_lines - 1
-        ranges.append({"ref": ref, "start_line": sl, "end_line": end})
-    return ranges
 
 NOISE_RE = re.compile(
     r'(?:Teacher\'?s?\s*Signature'
