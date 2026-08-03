@@ -2400,6 +2400,89 @@ def final_answer_cleanup(text: str) -> str:
     return cleaned.strip()
 
 
+# =========================================================
+# CROSS-ANSWER DUPLICATE-CONTENT REMOVAL
+#
+# NEW (confirmed via real output): on documents where several official
+# questions are thematically very close (e.g. "राष्ट्रभाषा" / "राजभाषा"
+# / "संपर्क भाषा" -- all sub-questions about Hindi language policy),
+# even with the similar-question guidance in the prompt, the
+# answer-mapping LLM can still occasionally assign one question's
+# entire, ALREADY-CORRECTLY-MATCHED answer text a SECOND time as part
+# of a different question's range -- confirmed in real output where
+# question 9(ग)'s complete, correct answer showed up VERBATIM a second
+# time inside question 9(घ)'s answer.
+#
+# This is a deterministic, code-level safety net that doesn't depend
+# on getting the LLM's judgment right on a hard case: after every
+# answer is built, check every pair of DIFFERENT answers -- if one
+# answer's full text appears verbatim (after light whitespace
+# normalization) inside another, longer answer, remove that duplicated
+# block from the longer one. The shorter answer is trusted as the
+# correct, precisely-scoped one and is never modified.
+# =========================================================
+
+def _normalize_for_duplicate_check(text: str) -> str:
+    return re.sub(r'\s+', ' ', text.strip())
+
+
+def remove_cross_answer_duplicate_content(qa_pairs: list, log=print) -> list:
+    items = [(qa["question"], qa.get("answer", "")) for qa in qa_pairs]
+    updated = {}
+
+    for i, (qi, ai_orig) in enumerate(items):
+        ai = updated.get(qi, ai_orig)
+        if not ai or len(ai) < 30:
+            continue
+        for j, (qj, aj) in enumerate(items):
+            if i == j or not aj or len(aj) < 30:
+                continue
+            if len(aj) >= len(ai):
+                continue  # only ever trim duplication OUT of the longer one
+
+            aj_stripped = aj.strip()
+            if not aj_stripped:
+                continue
+
+            new_val = None
+
+            # Fast path: exact substring match -- handles the common
+            # case where formatting is identical between the two
+            # occurrences (as confirmed in the real example).
+            if aj_stripped in ai:
+                new_val = ai.replace(aj_stripped, '', 1)
+            else:
+                # Fallback: whitespace-flexible match, for cases where
+                # minor formatting differs between the two occurrences
+                # (extra spaces, different line breaks). Capped to a
+                # reasonable word count to avoid an excessively large/
+                # slow regex pattern on very long answers.
+                words = aj_stripped.split()
+                if 3 <= len(words) <= 400:
+                    pattern = re.compile(r'\s+'.join(re.escape(w) for w in words))
+                    candidate, n = pattern.subn('', ai, count=1)
+                    if n:
+                        new_val = candidate
+
+            if new_val is not None and new_val != ai:
+                new_val = re.sub(r'[ \t]{2,}', ' ', new_val)
+                new_val = re.sub(r'\n{3,}', '\n\n', new_val).strip()
+                log(
+                    f"Removed content belonging to another question "
+                    f"({qj[:50]}...) that had been duplicated into this "
+                    f"answer ({qi[:50]}...) -- kept the original, "
+                    f"correctly-scoped answer for that other question "
+                    f"untouched."
+                )
+                ai = new_val
+                updated[qi] = ai
+
+    for qa in qa_pairs:
+        if qa["question"] in updated:
+            qa["answer"] = updated[qa["question"]]
+    return qa_pairs
+
+
 def _sanity_check_answer_pages(answer_lines: list, num_questions: int, log=print) -> bool:
     total_chars = sum(len(l) for l in answer_lines)
     avg_chars_per_question = total_chars / max(num_questions, 1)
@@ -2537,6 +2620,15 @@ def process_pdf(file_input, status_callback=None):
             "answer": final_answer_cleanup(raw_answer),
             "matched": q in qa_map,
         })
+
+    # NEW: catches the confirmed real case where one question's answer
+    # ends up containing ANOTHER question's already-correct answer
+    # duplicated verbatim inside it (most likely on documents with
+    # several thematically close-together questions) -- see
+    # remove_cross_answer_duplicate_content docstring for the full
+    # rationale. Runs after all answers are finalized, as a pure
+    # deterministic cleanup pass independent of the LLM calls.
+    qa_pairs = remove_cross_answer_duplicate_content(qa_pairs, log)
 
     log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
 
