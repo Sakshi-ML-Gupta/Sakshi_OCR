@@ -112,7 +112,7 @@ def ocr_pages_with_mistral(pdf_path: str, page_numbers: List[int], api_key: str,
     if not page_numbers:
         return {}
 
-    from mistralai import Mistral
+    from mistralai.client import Mistral
 
     client = Mistral(api_key=api_key)
     with open(pdf_path, "rb") as f:
