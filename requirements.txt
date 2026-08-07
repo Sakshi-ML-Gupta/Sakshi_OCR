@@ -1,7 +1,6 @@
-streamlit
-pymupdf
-python-dotenv
-groq
-openai
-google-genai
-mistralai==1.9.11
+PyMuPDF>=1.24.0        # fast native text extraction (avoids paying for OCR on digital PDFs)
+mistralai>=1.0.0        # Mistral OCR API (handles scans, handwriting, multilingual, complex layout)
+groq>=0.11.0            # Groq-hosted LLM for fast/cheap semantic Q-A segmentation fallback
+rapidfuzz>=3.9.0        # fuzzy matching for de-duplication and anti-hallucination validation
+pydantic>=2.7.0         # schema validation for output JSON
+tqdm>=4.66.0            # progress bars for long documents
