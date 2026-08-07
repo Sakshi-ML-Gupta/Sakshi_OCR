@@ -1,9 +1,4 @@
-PyMuPDF>=1.24.0        # fast native text extraction (avoids paying for OCR on digital PDFs)
-mistralai>=2.0.0        # Mistral OCR API v2 SDK (handles scans, handwriting, multilingual, complex layout)
-                         # NOTE: v2 import path is `from mistralai.client import Mistral`
-                         # (v1.x used `from mistralai import Mistral` — different, will break if downgraded)
-groq>=0.11.0            # Groq-hosted LLM for fast/cheap semantic Q-A segmentation fallback
-rapidfuzz>=3.9.0        # fuzzy matching for de-duplication and anti-hallucination validation
-pydantic>=2.7.0         # schema validation for output JSON
-tqdm>=4.66.0            # progress bars for long documents
+streamlit>=1.37.0
+anthropic>=0.34.0
+requests>=2.31.0
 streamlit>=1.38.0        # web UI (app.py)
