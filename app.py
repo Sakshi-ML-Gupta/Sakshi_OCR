@@ -5,7 +5,7 @@ Run with:
     streamlit run app.py
 
 Requires environment variables:
-    ANTHROPIC_API_KEY
+    GROQ_API_KEY   — free key: https://console.groq.com/keys
     DATALAB_API_KEY
 """
 
@@ -15,6 +15,22 @@ import json
 import traceback
 
 import streamlit as st
+
+# --- Bridge Streamlit Cloud Secrets -> os.environ -----------------------
+# Streamlit Cloud's "Secrets" manager only populates st.secrets, NOT
+# os.environ. pipeline.py reads keys via os.environ (so it stays runnable
+# outside Streamlit too, e.g. plain CLI/cron use), so we copy any matching
+# secrets into the process environment here, before pipeline.py is
+# imported/called. Locally (no secrets.toml), this silently no-ops and you
+# just rely on real environment variables / a .env you've loaded yourself.
+try:
+    for _key in ("GROQ_API_KEY", "DATALAB_API_KEY", "GROQ_MODEL"):
+        if _key in st.secrets and not os.environ.get(_key):
+            os.environ[_key] = st.secrets[_key]
+except Exception:
+    # st.secrets raises if no secrets.toml exists at all (e.g. pure local
+    # run with only real env vars set) — that's fine, just continue.
+    pass
 
 import pipeline
 
@@ -32,16 +48,20 @@ st.caption(
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Status")
-    anthropic_ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    groq_ok = bool(os.environ.get("GROQ_API_KEY"))
     datalab_ok = bool(os.environ.get("DATALAB_API_KEY"))
-    st.write(("✅" if anthropic_ok else "❌") + " ANTHROPIC_API_KEY")
+    # (checked fresh from os.environ here, AFTER the st.secrets bridge above
+    # has already run — so this reflects the real runtime state)
+    st.write(("✅" if groq_ok else "❌") + " GROQ_API_KEY")
     st.write(("✅" if datalab_ok else "❌") + " DATALAB_API_KEY")
-    if not (anthropic_ok and datalab_ok):
+    if not groq_ok:
+        st.caption("Free key: [console.groq.com/keys](https://console.groq.com/keys)")
+    if not (groq_ok and datalab_ok):
         st.warning("Set both API keys as environment variables before running.")
 
     st.divider()
     st.header("Pipeline settings")
-    st.caption(f"Model: `{pipeline.CLAUDE_MODEL}`")
+    st.caption(f"Model: `{pipeline.GROQ_MODEL}` (Groq free tier)")
     st.caption(f"Max chars/chunk: {pipeline.MAX_CHARS_PER_CHUNK}")
     st.caption(f"Min lines between starts: {pipeline.MIN_LINES_BETWEEN_STARTS}")
     st.caption(f"Max refinement passes: {pipeline.MAX_REFINEMENT_PASSES}")
