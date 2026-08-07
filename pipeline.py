@@ -2621,14 +2621,24 @@ def process_pdf(file_input, status_callback=None):
             "matched": q in qa_map,
         })
 
-    # NEW: catches the confirmed real case where one question's answer
-    # ends up containing ANOTHER question's already-correct answer
-    # duplicated verbatim inside it (most likely on documents with
-    # several thematically close-together questions) -- see
-    # remove_cross_answer_duplicate_content docstring for the full
-    # rationale. Runs after all answers are finalized, as a pure
-    # deterministic cleanup pass independent of the LLM calls.
-    qa_pairs = remove_cross_answer_duplicate_content(qa_pairs, log)
+    # REVERTED (this round -- caused a serious regression: "almost
+    # every answer wrong"): remove_cross_answer_duplicate_content was
+    # too aggressive on documents where several questions are
+    # thematically close together (e.g. related civics/language-policy
+    # essays). Students on such documents often legitimately REUSE
+    # similar phrasing across different, otherwise-correct answers
+    # (a common opening line, a similar closing sentence, etc.). Any
+    # SHORT answer whose full text happened to consist mostly of one
+    # such shared phrase would then get treated as "duplicated content"
+    # and stripped out of every OTHER longer answer that happened to
+    # contain that same shared phrase too -- even though those other
+    # answers were using it as their own genuine content, not as an
+    # erroneous copy. On a document with heavy phrase-level overlap
+    # between answers, this could corrupt most of them at once, which
+    # is exactly what was reported. The function remains defined below
+    # (unused) in case a much more conservative version -- e.g. only
+    # triggering on very long, clearly-non-generic duplicated blocks --
+    # is worth revisiting later, but it is NOT safe to run unconditionally.
 
     log(f"Done -- {len(qa_pairs)} Q-A pairs ({matched_count} matched)")
 
