@@ -36,9 +36,14 @@ with st.sidebar:
     st.header("Settings")
 
     # Falls back to Streamlit Cloud secrets if configured, so the app can be
-    # deployed without asking every user to paste a key.
-    default_mistral = st.secrets.get("MISTRAL_API_KEY", "") if hasattr(st, "secrets") else ""
-    default_groq = st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else ""
+    # deployed without asking every user to paste a key. st.secrets raises
+    # (rather than returning a default) when no secrets.toml exists at all,
+    # so this needs a try/except, not just a hasattr check.
+    try:
+        default_mistral = st.secrets.get("MISTRAL_API_KEY", "")
+        default_groq = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        default_mistral, default_groq = "", ""
 
     mistral_key = st.text_input(
         "Mistral API key (OCR)", value=default_mistral, type="password",
