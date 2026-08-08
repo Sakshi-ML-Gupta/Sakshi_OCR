@@ -24,7 +24,14 @@ import time
 
 import streamlit as st
 
-from pipeline import run_ocr_pipeline, extract_qa_pairs
+import fitz  # PyMuPDF
+
+from pipeline import (
+    run_ocr_pipeline,
+    extract_qa_pairs,
+    auto_tune_batch_size,
+    TARGET_MAX_SECONDS,
+)
 
 st.set_page_config(page_title="Exam Evaluator — OCR", page_icon="📝", layout="wide")
 
@@ -65,6 +72,24 @@ if run and uploaded_file is not None:
     pdf_bytes = uploaded_file.read()
     filename = uploaded_file.name
 
+    page_count = fitz.open(stream=pdf_bytes, filetype="pdf").page_count
+    batch_size, est_seconds, feasible = auto_tune_batch_size(page_count)
+
+    if feasible:
+        st.caption(
+            f"{page_count} pages · auto-tuned batch size {batch_size} · "
+            f"estimated time ≈ {est_seconds:.0f}s (target ≤ {TARGET_MAX_SECONDS:.0f}s)"
+        )
+    else:
+        st.warning(
+            f"{page_count} pages at your current GEMINI_RPM can't fit under "
+            f"{TARGET_MAX_SECONDS:.0f}s even at the largest safe batch size "
+            f"(estimated ≈ {est_seconds:.0f}s / {est_seconds/60:.1f} min). "
+            f"This is a free-tier rate-limit floor, not something the code "
+            f"can work around without a higher-RPM key. Proceeding anyway "
+            f"at the fastest configuration available."
+        )
+
     progress_bar = st.progress(0, text="Starting OCR...")
     status = st.empty()
 
@@ -74,7 +99,9 @@ if run and uploaded_file is not None:
     t0 = time.time()
     try:
         with status.status("Running OCR on all pages...", expanded=False):
-            full_ocr_json = run_ocr_pipeline(pdf_bytes, filename=filename, progress_cb=_progress)
+            full_ocr_json = run_ocr_pipeline(
+                pdf_bytes, filename=filename, progress_cb=_progress, batch_size=batch_size
+            )
         ocr_time = time.time() - t0
 
         with status.status("Mapping questions to answers...", expanded=False):
