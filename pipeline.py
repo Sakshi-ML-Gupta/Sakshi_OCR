@@ -54,6 +54,7 @@ import io
 import re
 import json
 import time
+import math
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -79,6 +80,57 @@ MAX_WORKERS = int(os.environ.get("OCR_MAX_WORKERS", "3"))          # concurrency
 MAX_RETRIES = int(os.environ.get("OCR_MAX_RETRIES", "5"))
 OCR_MAX_TOKENS = int(os.environ.get("OCR_MAX_TOKENS", "8000"))
 QA_MAX_TOKENS = int(os.environ.get("QA_MAX_TOKENS", "8000"))
+
+# --------------------------------------------------------------------------
+# Latency budget / auto-tuning.
+# On the free tier, wall-clock time is dominated by the rate limiter, not by
+# model speed: total_time ~= (num_requests - 1) * (60/RPM) + one call's own
+# processing time. The only lever that reduces num_requests for a fixed
+# page count is a bigger batch size (fewer, larger requests). This section
+# picks the largest batch size (up to a safety cap, since cramming too many
+# pages into one call hurts per-page transcription accuracy and can hit
+# output-token limits) that keeps the estimated wall-clock time under the
+# target budget.
+# --------------------------------------------------------------------------
+TARGET_MAX_SECONDS = float(os.environ.get("TARGET_MAX_SECONDS", "210"))  # ~3.5 min, leaves buffer under 4 min
+MAX_BATCH_CAP = int(os.environ.get("OCR_MAX_BATCH_CAP", "8"))
+MIN_BATCH = 2
+_CALL_BASE_LATENCY_SEC = float(os.environ.get("OCR_CALL_BASE_LATENCY_SEC", "4.0"))
+_CALL_PER_IMAGE_LATENCY_SEC = float(os.environ.get("OCR_CALL_PER_IMAGE_LATENCY_SEC", "2.5"))
+
+
+def estimate_latency_seconds(page_count: int, batch_size: int, rpm: float = None,
+                              extra_calls: int = 1) -> float:
+    """Rough wall-clock estimate for OCR + Q-A mapping, dominated by the
+    rate-limiter's dispatch spacing (the free tier's real bottleneck)."""
+    if page_count <= 0:
+        return 0.0
+    rpm = rpm or GEMINI_RPM
+    num_ocr_requests = math.ceil(page_count / batch_size)
+    total_requests = num_ocr_requests + extra_calls  # +1 for the Q-A mapping call
+    interval = 60.0 / max(0.001, rpm)
+    dispatch_span = max(0, total_requests - 1) * interval
+    tail_latency = _CALL_BASE_LATENCY_SEC + _CALL_PER_IMAGE_LATENCY_SEC * min(batch_size, 4)
+    return dispatch_span + tail_latency
+
+
+def auto_tune_batch_size(page_count: int, target_seconds: float = None, rpm: float = None,
+                          max_batch: int = MAX_BATCH_CAP, min_batch: int = MIN_BATCH):
+    """
+    Picks the smallest batch size (best per-page accuracy) that still keeps
+    the estimated total latency under target_seconds. If nothing fits even
+    at max_batch, returns max_batch with feasible=False so the caller can
+    warn the user honestly instead of silently exceeding their budget.
+    """
+    target_seconds = target_seconds or TARGET_MAX_SECONDS
+    rpm = rpm or GEMINI_RPM
+    best_batch = max_batch
+    best_est = estimate_latency_seconds(page_count, max_batch, rpm=rpm)
+    for b in range(min_batch, max_batch + 1):
+        est = estimate_latency_seconds(page_count, b, rpm=rpm)
+        if est <= target_seconds:
+            return b, est, True
+    return best_batch, best_est, (best_est <= target_seconds)
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
@@ -345,12 +397,16 @@ def _chunk(seq, size):
         yield seq[i:i + size]
 
 
-def run_ocr_pipeline(pdf_bytes: bytes, filename: str = "document.pdf", progress_cb=None) -> dict:
+def run_ocr_pipeline(pdf_bytes: bytes, filename: str = "document.pdf", progress_cb=None,
+                      batch_size: int = None) -> dict:
     """
-    Full OCR of every page. Pages are grouped into small batches (fewer
-    requests -> respects free-tier RPD) and batches run concurrently, each
-    call paced by the global rate limiter (respects free-tier RPM).
+    Full OCR of every page. Pages are grouped into batches (fewer requests
+    -> respects free-tier RPD and the requested latency budget) and batches
+    run concurrently, each call paced by the global rate limiter (respects
+    free-tier RPM).
 
+    batch_size: pages per API call. Defaults to PAGES_PER_BATCH; pass the
+    result of auto_tune_batch_size() to target a specific latency budget.
     progress_cb: optional callable(done:int, total:int) for UI progress bars.
     Returns the FULL OCR JSON structure (verbatim content for every page).
     """
@@ -358,7 +414,7 @@ def run_ocr_pipeline(pdf_bytes: bytes, filename: str = "document.pdf", progress_
     images = pdf_to_images(pdf_bytes)
     total = len(images)
     numbered = list(enumerate(images, start=1))
-    batches = list(_chunk(numbered, PAGES_PER_BATCH))
+    batches = list(_chunk(numbered, batch_size or PAGES_PER_BATCH))
 
     results_by_page = {}
     done_pages = 0
