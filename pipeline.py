@@ -102,18 +102,6 @@ _groq_call_lock = threading.Lock()
 
 # =========================================================
 # PROMPT REUSE / RESPONSE CACHE
-#
-# Several call sites in this module can end up asking the LLM the exact
-# same question twice: the sequential answer-search slides a window
-# forward and, if the document is re-processed or a retry re-sends the
-# same window, the (system_prompt, user_prompt) pair is byte-identical.
-# The "retry with a reminder" paths also re-issue the ORIGINAL prompt as
-# part of the reminder in some flows. Caching the parsed result per
-# (system_prompt, user_prompt) hash means these repeats cost zero
-# tokens and zero latency -- no network round trip at all -- instead of
-# silently eating into the TPM budget and adding a full request's worth
-# of wait time. This is process-local and safe: it only ever serves a
-# result that was already produced for the exact same input.
 # =========================================================
 
 _response_cache_lock = threading.Lock()
@@ -137,9 +125,6 @@ def _cache_get(key: str):
 def _cache_put(key: str, value) -> None:
     with _response_cache_lock:
         if len(_RESPONSE_CACHE) >= _RESPONSE_CACHE_MAX_ENTRIES:
-            # Cheap eviction: drop an arbitrary ~10% of entries rather than
-            # tracking LRU order, since hit-rate here is about avoiding
-            # exact repeats within one run, not long-term caching.
             for k in list(_RESPONSE_CACHE.keys())[: _RESPONSE_CACHE_MAX_ENTRIES // 10]:
                 _RESPONSE_CACHE.pop(k, None)
         _RESPONSE_CACHE[key] = value
@@ -147,26 +132,12 @@ def _cache_put(key: str, value) -> None:
 
 # =========================================================
 # SEMANTIC CHUNKING HELPERS
-#
-# The original chunkers cut purely on a running character count, which
-# can slice a chunk/window right in the middle of a sentence or answer.
-# That doesn't corrupt correctness (everything is still line-indexed),
-# but it does make it *harder* for the model to recognize a boundary
-# that's been cut mid-thought, which drives up the "not found, try next
-# window" and "missed answer, retry" rates -- i.e. more LLM calls, more
-# tokens, more latency, more rate-limit pressure for the same document.
-# These helpers nudge a computed cut point to the nearest natural
-# paragraph/sentence boundary (blank line, or a line ending in sentence
-# punctuation incl. Devanagari '।'/'॥') when one exists nearby, instead
-# of accepting whatever line the raw char-budget happened to land on.
 # =========================================================
 
 _SENTENCE_END_RE = re.compile(r'[.!?।॥][\'"”’]?\s*$')
 
 
 def _is_semantic_break_line(line: str) -> bool:
-    """True if `line` is a good place to end a chunk/window: blank, or
-    the end of a sentence/paragraph rather than a mid-sentence cut."""
     stripped = line.strip()
     if not stripped:
         return True
@@ -174,15 +145,6 @@ def _is_semantic_break_line(line: str) -> bool:
 
 
 def _nudge_to_semantic_break(lines: list, ideal_idx: int, lookahead: int = 6, lookback: int = 3) -> int:
-    """
-    Given a 0-based index into `lines` (a list of raw line strings) that a
-    pure char-budget cut landed on, return a nearby index that ends on a
-    semantic boundary (blank line or sentence end) if one exists within
-    `lookahead` lines forward or `lookback` lines back -- otherwise return
-    ideal_idx unchanged. Prefers extending forward slightly (to finish the
-    thought) over cutting back, since a few extra lines cost far less than
-    an extra round trip caused by a badly-placed cut.
-    """
     n = len(lines)
     if n == 0:
         return ideal_idx
@@ -575,26 +537,6 @@ class _TokenBudgetTracker:
 def _max_user_prompt_chars(system_prompt: str, budget: "_TokenBudgetTracker",
                              output_reserve_tokens: int = 400, floor_chars: int = 1500,
                              ceiling_chars: int = 20000) -> int:
-    """
-    THE CORE RATE-LIMIT FIX: previously every chunk/window size was a
-    hardcoded constant (6000 / 11000 chars) chosen without reference to
-    the account's actual TPM limit. Once the fixed system-prompt cost is
-    subtracted, a single call could already be requesting close to (or
-    over) the whole safe per-minute budget -- guaranteeing a rate-limit
-    hit on nearly every call, no matter how carefully wait_if_needed()
-    paced things afterward.
-
-    This computes the largest safe user-prompt size given: the model's
-    CURRENT safe TPM budget (budget.safe_limit, which self-corrects from
-    real 429 responses via record_actual_from_error), minus this specific
-    system prompt's token cost, minus a reserve for the completion. The
-    result is clamped to [floor_chars, ceiling_chars] so it never
-    collapses to something impractically small or balloons past a
-    sensible single-call size.
-
-    Using the actual budget also means chunk/window sizing automatically
-    adapts if Groq reports a different real limit than TPM_LIMIT assumes.
-    """
     system_tokens = _estimate_tokens(system_prompt)
     available_tokens = budget.safe_limit - system_tokens - output_reserve_tokens
     available_chars = int(available_tokens * CHARS_PER_TOKEN_ESTIMATE)
@@ -718,13 +660,25 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                               use_cache: bool = True):
     import groq
 
-    # Prompt reuse: an identical (system_prompt, user_prompt) pair has,
-    # by definition, already been answered deterministically (temperature
-    # 0.0) if we've seen it before in this process. Serve it from cache
-    # instead of spending tokens/time/rate-limit budget on a call whose
-    # answer we already know. This is the single biggest lever against
-    # both latency and TPM pressure for the retry/overlap-heavy call
-    # patterns in this module.
+    # =====================================================================
+    # FIX: Groq's response_format={"type": "json_object"} REQUIRES the
+    # literal word "json" to appear somewhere in the messages, or it
+    # rejects the request with a 400 error -- every single time, on every
+    # retry, since retrying doesn't change the prompt. Several of this
+    # module's system prompts (QUESTION_PAPER_ONLY_SYSTEM_PROMPT,
+    # ANSWER_MAP_SYSTEM_PROMPT, SEQUENTIAL_SEARCH_SYSTEM_PROMPT) describe
+    # the required output shape with raw braces/examples but never
+    # literally say the word "json", which silently broke every call
+    # using them (visible as repeated 400s exhausting all retries).
+    #
+    # Guarding it HERE, once, in the shared call path -- rather than
+    # patching each prompt string individually -- means this can never
+    # regress again even if a new system prompt is added later without
+    # remembering to include the word.
+    # =====================================================================
+    if "json" not in system_prompt.lower() and "json" not in user_prompt.lower():
+        system_prompt = system_prompt.rstrip() + "\n\nRespond with a single valid JSON object only."
+
     cache_key = _prompt_cache_key(system_prompt, user_prompt) if use_cache else None
     if cache_key is not None:
         cached = _cache_get(cache_key)
@@ -904,7 +858,7 @@ Rules for multi-part questions:
 - Preserve EXACT original text -- no paraphrase, no translation. You may prepend parent numbering for self-containment.
 - Keep printed order; sub-parts of one parent stay together in their own order.
 
-Return ONLY: {"questions": ["<exact text 1>", "<exact text 2>", ...]}"""
+Return ONLY this JSON object: {"questions": ["<exact text 1>", "<exact text 2>", ...]}"""
 
 
 def _build_canonical_questions_prompt(qp_pages: list) -> str:
@@ -988,9 +942,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     client = Groq(api_key=api_key)
     budget = _TokenBudgetTracker()
 
-    # Dynamic, TPM-aware chunk size: fits as much as the account's actual
-    # safe per-minute budget allows for THIS system prompt, instead of a
-    # fixed guess that could already exceed the safe budget on its own.
     dynamic_max_chars = _max_user_prompt_chars(QP_SYSTEM_PROMPT, budget, output_reserve_tokens=700)
     chunks = _chunk_pages_by_char_budget(pages, max_chars=dynamic_max_chars)
     log(f"Split {len(pages)} page(s) into {len(chunks)} LLM chunk(s) "
@@ -1034,9 +985,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
         qp_pages_1based = _recover_pages(qp_pages_1based, "question-paper")
         admin_pages_1based = _recover_pages(admin_pages_1based, "admin")
 
-        # A page can't legitimately be both -- if the model contradicted
-        # itself, keep it as a question-paper page (the more consequential
-        # classification to get right) and drop it from admin.
         admin_pages_1based = [p for p in admin_pages_1based if p not in qp_pages_1based]
 
         log(
@@ -1065,26 +1013,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     log(f"Admin/cover pages identified: {len(admin_page_indices_0based)} page(s) "
         f"(these will be excluded from BOTH question and answer text)")
 
-    # =====================================================================
-    # FIX (this round): PREVIOUSLY this block only LOGGED a warning when an
-    # outlier-length "question paper" page was detected -- it never actually
-    # fixed the misclassification. That meant the real start of a student's
-    # answer (the page where they restate the question before writing their
-    # actual response) stayed wrongly excluded from answer_lines forever,
-    # which is the confirmed, reproducible cause of "answers missing their
-    # first paragraph/page" in production.
-    #
-    # This version RECLASSIFIES the outlier page as an answer page instead
-    # of just warning about it. Safety conditions, so this can't run away
-    # and eat a genuinely long/legitimate question paper page:
-    #   - only reclassifies pages that are >3x the median AND >1500 chars
-    #     (same thresholds as before -- these were already conservative)
-    #   - never reclassifies away MORE THAN HALF of the detected question
-    #     paper pages in one document (if that many are "outliers", the
-    #     detection itself is unreliable and blind reclassification would
-    #     likely do more harm than good -- better to leave it as a logged
-    #     warning in that edge case and let a human check)
-    # =====================================================================
     if len(qp_page_indices_0based) >= 2:
         qp_page_lengths = [
             (i, len(pages[i]["raw_text"])) for i in qp_page_indices_0based
@@ -1121,9 +1049,6 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
                 f"{[p+1 for p in outliers]}"
             )
 
-    # Stage 2: single consistent pass over the CONFIRMED question-paper
-    # pages' full text, producing one canonical, non-fragmented question
-    # list.
     qp_pages_full = [pages[i] for i in qp_page_indices_0based]
     questions = extract_canonical_questions(qp_pages_full, status_callback)
 
@@ -1155,42 +1080,9 @@ Rules:
 - If told this chunk CONTINUES an answer from a previous chunk, the opening lines likely belong to that REF even without seeing the earlier part.
 - CRITICAL: this chunk is short and usually has only 1-3 distinct answers. Scan ALL the way to the last line before responding -- do not stop after the first match. Missing a present answer is a serious error.
 
-Return ONLY: {"answers": [{"ref": "REF-A", "start_line": 12, "end_line": 18}]}
+Return ONLY this JSON object: {"answers": [{"ref": "REF-A", "start_line": 12, "end_line": 18}]}
 No matches here -> {"answers": []}, which is valid."""
 
-
-# =========================================================
-# SEQUENTIAL SINGLE-TARGET ANSWER MAPPING (recommended, default)
-#
-# This replaces the multi-answer-per-call chunking above with a much
-# simpler and more reliable design, built around three ideas:
-#
-#   1. Only ever ask the LLM to find ONE thing per call: "does REF-X's
-#      answer begin somewhere in this window of text, and if so, on
-#      which line?" A single yes/no + one integer is a task a model
-#      essentially cannot "give up halfway through" -- there is no
-#      halfway. This directly eliminates the "does 2-3 answers then
-#      stops" failure mode, because no call is ever asked to do more
-#      than one thing.
-#
-#   2. A question's answer START is always searched for beginning
-#      exactly where the PREVIOUS question's answer was confirmed to
-#      start (never independently re-guessed), so there's no gap where
-#      a page/paragraph could be silently skipped between two answers.
-#
-#   3. A question's answer END is NEVER asked of the LLM at all. It is
-#      always computed in plain Python as
-#      (next confirmed answer's start_line - 1), or end-of-document for
-#      the last question. This removes the entire class of bugs where
-#      the LLM invents a wrong or truncated end line -- there is
-#      structurally no way for one answer to swallow or lose part of
-#      another, because ranges are built by construction to be
-#      contiguous and non-overlapping.
-#
-# If a window doesn't contain the target start, the search simply moves
-# forward to the next window of text and asks again -- it keeps going
-# until it either finds the start or reaches the end of the document.
-# =========================================================
 
 SEQUENTIAL_SEARCH_SYSTEM_PROMPT = """Find exactly ONE thing in line-numbered OCR text from a student's exam answer booklet: the line where the response to ONE SPECIFIC question begins.
 
@@ -1203,7 +1095,7 @@ Decide: does the response to THIS EXACT question begin in this window?
 - CRITICAL: the same fact/definition can legitimately appear in more than one answer, or be restated as a recap. Similar earlier wording does NOT disqualify a later genuine occurrence -- judge each occurrence on its own context.
 - If the answer isn't in this window, say so plainly -- don't force a match.
 
-Return ONLY: {"found": true, "start_line": 42} or {"found": false}
+Return ONLY this JSON object: {"found": true, "start_line": 42} or {"found": false}
 start_line must be one of the exact [line_number]s shown -- never estimate, always earliest correct line."""
 
 
@@ -1247,8 +1139,8 @@ def _parse_sequential_search_response(content: str) -> tuple:
     return True, start_line
 
 
-SEQUENTIAL_SEARCH_WINDOW_CHARS = 11000  # same safe-per-call char budget used elsewhere in this module
-SEQUENTIAL_SEARCH_MAX_WINDOWS = 200  # generous safety cap; a real document will exhaust far sooner
+SEQUENTIAL_SEARCH_WINDOW_CHARS = 11000
+SEQUENTIAL_SEARCH_MAX_WINDOWS = 200
 
 
 def _find_answer_start_sequential(client, numbered_lines: list, question_text: str, ref_label: str,
@@ -1256,20 +1148,10 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                                     window_chars: int = SEQUENTIAL_SEARCH_WINDOW_CHARS,
                                     max_windows: int = SEQUENTIAL_SEARCH_MAX_WINDOWS,
                                     extra_reminder: str = None):
-    """
-    Slides forward through numbered_lines in non-overlapping windows,
-    starting at search_from_idx, asking a single yes/no+line-number
-    question per window, until the target's start is found or the
-    document is exhausted. Returns the found start_line, or None.
-    """
     total_lines = len(numbered_lines)
     pointer = search_from_idx
     windows_tried = 0
 
-    # TPM-aware window size: this is the most frequently-called prompt in
-    # the whole pipeline (one call per window per question), so sizing it
-    # off the real budget rather than a fixed 11000-char guess is what
-    # actually stops repeated rate-limit hits here.
     effective_window_chars = _max_user_prompt_chars(
         SEQUENTIAL_SEARCH_SYSTEM_PROMPT, budget, output_reserve_tokens=60
     )
@@ -1284,11 +1166,6 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
             chars += len(numbered_lines[idx][1])
             idx += 1
 
-        # Semantic nudge: if the raw char-budget cut landed mid-paragraph,
-        # extend a few lines forward (or pull back) to the nearest blank
-        # line / sentence end, so the model isn't asked to judge a window
-        # that's severed mid-thought right at its edge. Cheap in chars,
-        # saves a whole extra window+call when it avoids a missed match.
         if idx < total_lines and window:
             raw_lines_only = [numbered_lines[k][1] for k in range(pointer, min(idx + 6, total_lines))]
             local_break = _nudge_to_semantic_break(raw_lines_only, idx - pointer - 1, lookahead=6, lookback=2)
@@ -1321,7 +1198,7 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
                 f"treating this window as a non-match"
             )
 
-        pointer = idx  # move forward to the next window, no overlap
+        pointer = idx
         windows_tried += 1
 
     return None
@@ -1329,45 +1206,6 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
 
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
-    """
-    RECOMMENDED default answer-mapping strategy (see module docstring
-    above the SEQUENTIAL_SEARCH_SYSTEM_PROMPT for the full rationale).
-
-    For each question in order:
-      1. Search forward from wherever the previous question's answer was
-         confirmed to start, for a line where THIS question's answer
-         begins.
-      2. Once found, the previous question's END is computed as
-         (this start - 1) -- never asked of the LLM.
-    The very last question's answer runs to the end of the document.
-
-    If a question's start can't be found anywhere from the search
-    pointer to the end of the document, it's recorded as unmatched, and
-    the search for the NEXT question continues from the SAME pointer
-    (its answer wasn't necessarily lost -- it may simply not exist, e.g.
-    the student skipped it).
-
-    FIX (this round): previously returned only a plain {question: text}
-    dict, giving you no way to see WHERE each answer actually came from
-    -- which is exactly the trust problem you flagged ("I don't know
-    from where the Q-A is paired"). This now returns a LIST of dicts,
-    one per question, each carrying:
-      - start_line / end_line: the exact 0-based indices into
-        answer_lines this answer was sliced from (so you can look them
-        up directly)
-      - start_page / end_page: the OCR page number(s) the answer spans,
-        if answer_line_pages was provided (lets you flip straight to the
-        right page(s) of the source PDF to eyeball it)
-      - answer_raw: the UNMODIFIED verbatim join of the sliced lines --
-        exactly what the OCR produced, before any cleanup
-      - answer: the same text after the (optional) restatement-stripping
-        cleanup -- so you can directly compare "raw" vs "cleaned" and
-        see precisely what, if anything, was removed and why. Nothing
-        is ever ADDED to answer_raw at this stage -- it is a plain
-        Python slice of the OCR text, never LLM-generated -- so if
-        answer_raw itself looks embellished/"enhanced", that happened
-        upstream in the OCR step (see notes in run_ocr), not here.
-    """
     def log(msg):
         print(msg)
         if status_callback:
@@ -1386,7 +1224,7 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
     total_lines = len(numbered_lines)
 
     ref_to_question = {f"REF-{chr(65+i)}": q for i, q in enumerate(questions)}
-    found_starts = {}  # ref -> start_line
+    found_starts = {}
     pointer = 0
 
     for i, q in enumerate(questions):
@@ -1397,17 +1235,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             client, numbered_lines, q, ref, pointer, budget, log
         )
 
-        # =================================================================
-        # FIX: retry once with an explicit reminder before giving up.
-        # Real failure pattern reported: the same definition/explanation
-        # can legitimately appear more than once across different answers
-        # (e.g. two related questions both require explaining the same
-        # concept). A model can be biased to read a repeated definition as
-        # "already covered, not a new start" and wrongly report found=false
-        # even though this occurrence genuinely IS a new answer. Since this
-        # retry happens BEFORE pointer is advanced, it's safe -- it can only
-        # recover a genuine match, never corrupt an already-confirmed range.
-        # =================================================================
         if start_line is None:
             log(f"  first pass found nothing for {ref} -- retrying once with an explicit reminder...")
             retry_reminder = (
@@ -1440,10 +1267,6 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 f"for over this same remaining text."
             )
 
-    # End of each answer = the next (in document order) confirmed
-    # answer's start, minus one. Computed purely in Python -- never
-    # asked of the LLM, so it can never be wrong in the way an
-    # LLM-guessed end line could be.
     ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
     ranges = []
     for idx, (ref, start) in enumerate(ordered):
@@ -1639,10 +1462,6 @@ def _chunk_lines_by_char_budget(numbered_lines: list, questions: list,
                                   max_chars: int = ANSWER_MAP_MAX_CHARS_PER_CHUNK,
                                   absolute_max_chars: int = ANSWER_MAP_ABSOLUTE_MAX_CHARS,
                                   max_answers_per_chunk: int = MAX_ANSWERS_PER_CHUNK) -> list:
-    """
-    Returns a list of (chunk, carry_over_question_idx, expected_new_indices)
-    tuples.
-    """
     if not numbered_lines:
         return []
 
