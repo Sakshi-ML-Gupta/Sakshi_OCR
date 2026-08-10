@@ -62,6 +62,7 @@ with st.sidebar:
     st.divider()
     st.header("Pipeline settings")
     st.caption(f"Model: `{pipeline.GROQ_MODEL}` (Groq free tier)")
+    st.caption(f"TPM budget: {pipeline.GROQ_TPM_LIMIT} (using {int(pipeline.GROQ_TPM_SAFETY_MARGIN*100)}% as safety margin)")
     st.caption(f"Max chars/chunk: {pipeline.MAX_CHARS_PER_CHUNK}")
     st.caption(f"Min lines between starts: {pipeline.MIN_LINES_BETWEEN_STARTS}")
     st.caption(f"Max refinement passes: {pipeline.MAX_REFINEMENT_PASSES}")
@@ -91,7 +92,11 @@ if run_clicked and uploaded is not None:
         f.write(uploaded.getbuffer())
 
     st.session_state.error = None
-    with st.spinner("Running full pipeline — this can take a few minutes for long assignments..."):
+    with st.spinner(
+        "Running full pipeline — on the free tier this can take several minutes "
+        "for long assignments, since the pipeline paces requests to stay under "
+        "Groq's rate limit and auto-retries if it still hits one..."
+    ):
         try:
             st.session_state.result = pipeline.run_full_pipeline(tmp_path)
         except Exception as e:
