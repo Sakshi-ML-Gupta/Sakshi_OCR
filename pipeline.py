@@ -513,6 +513,33 @@ class _TokenBudgetTracker:
             self.tpm_limit = limit
             self.safe_limit = limit * TPM_SAFETY_FRACTION
 
+    def record_actual_limit(self, limit: int, log=None):
+        """
+        FIX: previously the ONLY way this tracker ever learned the real
+        account TPM limit was from a 429 error's message -- but since
+        wait_if_needed() paces proactively against the hardcoded
+        TPM_LIMIT=8000 guess, a 429 may never actually happen even when
+        the real limit is far higher, so the tracker would keep pacing
+        against a wrong, overly conservative number FOREVER, causing
+        needless ~60s waits before every single call.
+
+        Groq's API returns the real per-minute token limit on every
+        successful response via the 'x-ratelimit-limit-tokens' header.
+        Reading that on every call (see _call_groq_with_retries) means
+        the tracker self-corrects to the account's ACTUAL limit within
+        one call, instead of only ever discovering it via a rate-limit
+        error that proactive pacing was specifically designed to avoid.
+        """
+        if not limit or limit == self.tpm_limit:
+            return
+        if log:
+            log(
+                f"Learned real Groq TPM limit from response headers: {limit} "
+                f"(was assuming {self.tpm_limit}) -- adjusting pacing budget accordingly"
+            )
+        self.tpm_limit = limit
+        self.safe_limit = limit * TPM_SAFETY_FRACTION
+
     def reset_window(self):
         self.events.clear()
 
@@ -699,7 +726,12 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
 
         try:
             with _groq_call_lock:
-                response = client.chat.completions.create(
+                # with_raw_response lets us read Groq's real rate-limit
+                # headers (x-ratelimit-limit-tokens) on every successful
+                # call, so the budget tracker learns the account's ACTUAL
+                # TPM limit instead of pacing forever against the
+                # hardcoded TPM_LIMIT guess -- see record_actual_limit().
+                raw_response = client.chat.completions.with_raw_response.create(
                     model=GROQ_MODEL,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -708,6 +740,15 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
                     response_format={"type": "json_object"},
                     temperature=0.0,
                 )
+                response = raw_response.parse()
+
+                real_limit_header = raw_response.headers.get("x-ratelimit-limit-tokens")
+                if real_limit_header:
+                    try:
+                        budget.record_actual_limit(int(real_limit_header), log=log)
+                    except (ValueError, TypeError):
+                        pass
+
             budget.record_usage(estimated_tokens)
             content = response.choices[0].message.content
             parsed = response_parser(content)
@@ -1090,6 +1131,7 @@ Given: (1) the target question's exact text, (2) a window of answer text, each l
 
 Decide: does the response to THIS EXACT question begin in this window?
 - It typically starts where the student restates/references the question ("Ans 5-", "उत्तर 6-", "प्र. 8", matching number) OR, with no label, where content clearly starts on this question's distinctive topic.
+- CRITICAL: section/heading markers -- decorative symbols (★, #, ##, ऋ, ☆, lines of dashes/asterisks), a "भाग-N" (Part N) label, "प्रश्नोत्तर नं. N" (Q&A no. N), a bolded/standalone title line, or any visually-set-off heading -- are just as strong a boundary signal as "Ans-"/"उत्तर". If such a marker appears immediately before content that matches THIS question's topic, the answer starts right after (or at) that marker, even though it isn't a plain "Ans-" label. Do not let content following a heading marker get treated as a continuation of whatever came before the marker.
 - Don't confuse with a DIFFERENT question's answer even if it appears earlier in the window.
 - CRITICAL: report the EARLIEST line, including any short intro/transition sentence before the topic becomes explicit -- never a later line just because it's more clearly on-topic. Skipping the true opening line is a serious error.
 - CRITICAL: the same fact/definition can legitimately appear in more than one answer, or be restated as a recap. Similar earlier wording does NOT disqualify a later genuine occurrence -- judge each occurrence on its own context.
@@ -1204,6 +1246,37 @@ def _find_answer_start_sequential(client, numbered_lines: list, question_text: s
     return None
 
 
+def _heuristic_find_answer_start(answer_lines: list, question_text: str, search_from_idx: int, log=print):
+    """
+    Zero-cost (no LLM call) last-resort fallback for when BOTH sequential
+    LLM search passes (original + reminder retry) fail to find a
+    question's answer start.
+
+    FIX: without this, a question the LLM genuinely missed had no
+    recovery path at all -- its answer text was silently swallowed into
+    whichever neighboring question's range happened to span those lines
+    (visible as "no answer match found" for the missing question, and an
+    unrelated extra chunk of text tacked onto a DIFFERENT question's
+    answer). This is exactly the failure mode of section/heading-marker
+    boundaries (e.g. "#### \u2605 \u092d\u093e\u0917- 3 \u2605 ...") that don't look
+    like a plain "Ans-"/"\u0909\u0924\u094d\u0924\u0930" label.
+
+    Reuses the existing keyword-overlap matcher (_line_starts_new_answer_for_question)
+    that was already defined in this module for the older chunk-based
+    mapper but wasn't wired into the sequential path. Purely local
+    string comparison -- no network call, no tokens spent.
+    """
+    for idx in range(search_from_idx, len(answer_lines)):
+        line = answer_lines[idx]
+        if not line.strip():
+            continue
+        matched_idx = _line_starts_new_answer_for_question(line, [question_text], min_fraction=0.5)
+        if matched_idx == 0:
+            log(f"  heuristic keyword-overlap fallback found a plausible start at line {idx}: {line[:80]!r}")
+            return idx
+    return None
+
+
 def map_answers_sequential(answer_lines: list, questions: list, status_callback=None,
                              answer_line_pages: list = None) -> list:
     def log(msg):
@@ -1254,6 +1327,10 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             )
             if start_line is not None:
                 log(f"  retry recovered {ref} starting at line {start_line}")
+
+        if start_line is None:
+            log(f"  both LLM passes failed for {ref} -- trying zero-cost keyword-overlap fallback before giving up...")
+            start_line = _heuristic_find_answer_start(answer_lines, q, pointer, log)
 
         if start_line is not None:
             found_starts[ref] = start_line
