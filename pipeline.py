@@ -70,7 +70,117 @@ DATALAB_API_KEY = _get_env("DATALAB_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 CHARS_PER_TOKEN_ESTIMATE = 4.0
-MAX_CHARS_PER_CHUNK = 9000
+
+# Smaller chunks = smaller per-request token cost, which matters a lot on
+# Groq's free tier (12,000 TPM as of writing). More requests overall, but
+# each one comfortably fits the budget when combined with the rate limiter
+# below. If you're on a paid Groq tier with a much higher TPM limit, bump
+# this back up via the env var to cut down on total request count instead.
+MAX_CHARS_PER_CHUNK = int(os.environ.get("MAX_CHARS_PER_CHUNK", "4000"))
+
+# --- Free-tier rate limiting -------------------------------------------
+# Groq's free tier enforces Tokens-Per-Minute (TPM), not just requests/min.
+# We track a rolling 60s window of (timestamp, tokens_used) and, before each
+# call, sleep if the call would push us over GROQ_TPM_LIMIT * safety margin.
+# This is a proactive pacer to reduce how often we even hit a 429 — the
+# retry-with-backoff in _call_groq_with_retry() is the safety net for when
+# we still do (e.g. other traffic on the same org key).
+GROQ_TPM_LIMIT = int(os.environ.get("GROQ_TPM_LIMIT", "12000"))
+GROQ_TPM_SAFETY_MARGIN = 0.85  # stay under 85% of the limit, leave headroom
+_token_usage_log = []  # list of (timestamp, tokens) — module-level, single-process
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, int(len(text) / CHARS_PER_TOKEN_ESTIMATE))
+
+
+def _rate_limit_wait(estimated_request_tokens: int):
+    """
+    Proactively sleeps if sending this request would push us over
+    GROQ_TPM_LIMIT * GROQ_TPM_SAFETY_MARGIN within the trailing 60s window.
+    """
+    now = time.time()
+    global _token_usage_log
+    _token_usage_log = [(t, n) for (t, n) in _token_usage_log if now - t < 60]
+
+    used = sum(n for _, n in _token_usage_log)
+    budget = GROQ_TPM_LIMIT * GROQ_TPM_SAFETY_MARGIN
+
+    if used + estimated_request_tokens > budget:
+        if _token_usage_log:
+            oldest_time = _token_usage_log[0][0]
+            wait_for = max(0.5, 60 - (now - oldest_time) + 0.5)
+        else:
+            wait_for = 5.0
+        log.info(
+            f"Rate limiter: {used}+{estimated_request_tokens} tokens would exceed "
+            f"{budget:.0f}/min budget, sleeping {wait_for:.1f}s..."
+        )
+        time.sleep(wait_for)
+        _rate_limit_wait(estimated_request_tokens)  # re-check after sleeping
+
+
+def _record_token_usage(tokens: int):
+    _token_usage_log.append((time.time(), tokens))
+
+
+def _parse_retry_after_seconds(error_message: str, default: float = 8.0) -> float:
+    match = re.search(r"try again in ([\d.]+)s", error_message)
+    if match:
+        try:
+            return float(match.group(1)) + 0.5  # small buffer
+        except ValueError:
+            pass
+    return default
+
+
+def _call_groq_with_retry(
+    client: Groq,
+    messages: list,
+    max_tokens: int,
+    max_retries: int = 5,
+):
+    """
+    Central wrapper for every Groq call in this pipeline. Handles:
+      - proactive TPM pacing (via _rate_limit_wait)
+      - reactive 429 retry with the exact wait time Groq reports
+      - generic transient-error backoff as a fallback
+
+    NOTE on "reusing the system prompt": Groq's chat.completions API is
+    stateless — there is no server-side prompt cache on the free tier, so
+    the system prompt is billed as input tokens on every call regardless of
+    how this function is written. The only real levers for token cost are
+    (a) a shorter system prompt, (b) smaller chunks, (c) smaller max_tokens.
+    This function optimizes around that reality (pacing + retry) rather than
+    pretending caching is possible when it isn't.
+    """
+    import groq as _groq_sdk
+
+    prompt_chars = sum(len(m.get("content", "")) for m in messages)
+    estimated_tokens = _estimate_tokens("x" * prompt_chars) + max_tokens
+
+    for attempt in range(1, max_retries + 1):
+        _rate_limit_wait(estimated_tokens)
+        try:
+            resp = client.chat.completions.create(
+                model=GROQ_MODEL,
+                max_tokens=max_tokens,
+                messages=messages,
+            )
+            actual_tokens = getattr(getattr(resp, "usage", None), "total_tokens", estimated_tokens)
+            _record_token_usage(actual_tokens)
+            return resp
+        except _groq_sdk.RateLimitError as e:
+            wait_s = _parse_retry_after_seconds(str(e))
+            log.warning(f"Groq 429 (attempt {attempt}/{max_retries}), waiting {wait_s:.1f}s...")
+            _record_token_usage(estimated_tokens)  # assume it counted against us anyway
+            time.sleep(wait_s)
+        except (_groq_sdk.APIConnectionError, _groq_sdk.APITimeoutError, _groq_sdk.InternalServerError) as e:
+            wait_s = min(30, 2 ** attempt)
+            log.warning(f"Groq transient error (attempt {attempt}/{max_retries}): {e}, waiting {wait_s}s...")
+            time.sleep(wait_s)
+
+    raise RuntimeError(f"Groq call failed after {max_retries} retries (rate limit or transient errors).")
 
 # Proximity-gap validation: two candidate start-lines closer than this are
 # treated as a false-positive risk (per AMBIGUOUS START-LINE RULE in the
@@ -246,13 +356,13 @@ def extract_questions(client: Groq, numbered_lines: dict) -> list:
     chunks = chunk_numbered_lines(numbered_lines)
     all_questions = []
     for start, end, block in chunks:
-        resp = client.chat.completions.create(
-            model=GROQ_MODEL,
-            max_tokens=2000,
+        resp = _call_groq_with_retry(
+            client,
             messages=[
                 {"role": "system", "content": QUESTION_EXTRACTION_SYSTEM_PROMPT},
                 {"role": "user", "content": block},
             ],
+            max_tokens=1000,
         )
         parsed = _safe_json_parse(resp.choices[0].message.content)
         if parsed and "questions" in parsed:
@@ -295,13 +405,13 @@ def map_answers_with_llm_sequential(
                 f"creating a new qa_pair.]\n\n" + user_msg
             )
 
-        resp = client.chat.completions.create(
-            model=GROQ_MODEL,
-            max_tokens=4000,
+        resp = _call_groq_with_retry(
+            client,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
             ],
+            max_tokens=1500,
         )
         parsed = _safe_json_parse(resp.choices[0].message.content)
         if not parsed:
@@ -490,13 +600,13 @@ def run_refinement_loop(
             "\n\nCURRENT qa_pairs:\n" + json.dumps(current_payload, indent=2)
         )
 
-        resp = client.chat.completions.create(
-            model=GROQ_MODEL,
-            max_tokens=4000,
+        resp = _call_groq_with_retry(
+            client,
             messages=[
                 {"role": "system", "content": REFINEMENT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
+            max_tokens=1500,
         )
         parsed = _safe_json_parse(resp.choices[0].message.content)
         if not parsed or "qa_pairs" not in parsed:
