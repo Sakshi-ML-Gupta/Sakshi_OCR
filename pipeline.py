@@ -964,6 +964,37 @@ def extract_canonical_questions(qp_pages: list, status_callback=None) -> list:
         log(f"WARNING: canonical question extraction failed: {e}")
         return []
 
+    # =========================================================================
+    # FIX: this single-pass extraction had NO deduplication at all -- unlike
+    # Stage 1's chunk merge (_merge_chunk_results), which already calls
+    # _dedup_questions() on its output. When the LLM occasionally emits the
+    # same question twice (most often while applying the multi-part
+    # sub-question splitting rules and getting confused about whether a
+    # parent question was already emitted as its own entry), the duplicate
+    # went straight through unfiltered.
+    #
+    # This is not just cosmetic: two near-identical question texts directly
+    # breaks answer mapping downstream. map_answers_sequential searches for
+    # each question's answer by TOPIC/content -- given two near-duplicate
+    # questions, the second one's search can find a false "start" somewhere
+    # in the MIDDLE of the first (real, single) answer, since the topic
+    # looks like a match. That silently splits one genuine answer into two
+    # "half" answers, one wrongly attributed to each duplicate REF. Reusing
+    # the same near-duplicate detector already used in Stage 1 (character
+    # similarity + word overlap, not just exact-string match) here closes
+    # that hole at the source, before it can ever reach answer mapping.
+    # =========================================================================
+    deduped_questions = _dedup_questions(questions)
+    if len(deduped_questions) < len(questions):
+        removed = len(questions) - len(deduped_questions)
+        log(
+            f"WARNING: Stage-2 extraction returned {len(questions)} question(s), but "
+            f"{removed} of them were near-duplicates of an earlier entry -- removed "
+            f"before answer mapping to prevent one real answer being wrongly split "
+            f"across duplicate questions."
+        )
+    questions = deduped_questions
+
     log(f"Canonical question list: {len(questions)} question(s), single consistent pass")
     return questions
 
