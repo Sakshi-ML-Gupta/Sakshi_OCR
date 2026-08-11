@@ -1329,20 +1329,79 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
                 log(f"  retry recovered {ref} starting at line {start_line}")
 
         if start_line is None:
-            log(f"  both LLM passes failed for {ref} -- trying zero-cost keyword-overlap fallback before giving up...")
-            start_line = _heuristic_find_answer_start(answer_lines, q, pointer, log)
-
-        if start_line is not None:
+            log(
+                f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
+                f"to the end of the document ({total_lines} lines) via forward search. "
+                f"Will retry with a full-document, order-independent recovery pass after "
+                f"all questions have been processed (see below) -- this covers cases "
+                f"where the student answered questions out of the question-paper order."
+            )
+        else:
             found_starts[ref] = start_line
             log(f"  found {ref} starting at line {start_line}")
             pointer = start_line + 1
-        else:
-            log(
-                f"WARNING: could not find the start of {ref} anywhere from line {pointer} "
-                f"to the end of the document ({total_lines} lines) -- marking as unmatched. "
-                f"The search pointer is NOT advanced, so the next question is still searched "
-                f"for over this same remaining text."
+
+    # =========================================================================
+    # OUT-OF-ORDER RECOVERY PASS
+    #
+    # The main loop above shares ONE pointer that only ever moves forward,
+    # advancing past whatever question was just found. That's correct and
+    # efficient when the student answers questions in the same order as
+    # the question paper -- but students often don't. If a LATER question
+    # (by question-paper order) is physically written BEFORE an EARLIER
+    # question in the answer booklet, the shared pointer -- having just
+    # found that later question further ahead -- ends up positioned PAST
+    # the earlier question's true (earlier) location. A forward-only
+    # search can then never find it: it gets reported as unmatched, and
+    # its text is silently absorbed into whichever neighboring confirmed
+    # range happens to span those lines.
+    #
+    # Fix: for anything still unmatched after the main pass, search the
+    # ENTIRE document again from line 0, completely ignoring the shared
+    # pointer / question-paper order. Any start line this finds simply
+    # gets added to found_starts -- the final ranges below are always
+    # built by SORTING found_starts by physical line number (not by
+    # question order), so a recovered out-of-order start automatically
+    # carves its answer back out of whatever range had wrongly absorbed
+    # it, with no special-casing needed.
+    # =========================================================================
+    unmatched_refs = [
+        f"REF-{chr(65+i)}" for i in range(len(questions))
+        if f"REF-{chr(65+i)}" not in found_starts
+    ]
+    if unmatched_refs:
+        log(
+            f"Main forward pass left {len(unmatched_refs)} question(s) unmatched: "
+            f"{unmatched_refs}. Running full-document, order-independent recovery "
+            f"pass (covers answers written out of question-paper order)..."
+        )
+        for ref in unmatched_refs:
+            q_idx = ord(ref[-1]) - 65
+            q = questions[q_idx]
+            log(f"  recovery search for {ref} across the FULL document (from line 0)...")
+
+            recovered_start = _find_answer_start_sequential(
+                client, numbered_lines, q, ref, 0, budget, log
             )
+
+            if recovered_start is None:
+                log(f"  recovery LLM search also failed for {ref} -- trying zero-cost keyword-overlap fallback...")
+                recovered_start = _heuristic_find_answer_start(answer_lines, q, 0, log)
+
+            if recovered_start is None:
+                log(f"  could not recover {ref} anywhere in the document -- leaving unmatched")
+                continue
+
+            if recovered_start in found_starts.values():
+                log(
+                    f"  recovery found {ref} at line {recovered_start}, but another "
+                    f"question already claims that exact line -- skipping to avoid "
+                    f"a conflicting range"
+                )
+                continue
+
+            log(f"  recovery pass found {ref} starting at line {recovered_start} (out-of-order answer)")
+            found_starts[ref] = recovered_start
 
     ordered = sorted(found_starts.items(), key=lambda kv: kv[1])
     ranges = []
