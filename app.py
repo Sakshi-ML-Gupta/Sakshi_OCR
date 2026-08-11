@@ -4,7 +4,7 @@ import streamlit as st
 # NOTE: change this import if your pipeline module has a different filename.
 # This assumes the module you shared is saved as `pipeline.py` in the same folder.
 import pipeline
-pipeline.process_pdf(file_input)  # This should work if the file is named pipeline.py
+pipeline.process_pdf(file_input, status_callback=None)  # This should work if the file is named pipeline.py
 
 
 st.set_page_config(page_title="Exam Answer Extractor", layout="wide")
