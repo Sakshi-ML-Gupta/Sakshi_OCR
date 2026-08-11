@@ -71,6 +71,14 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 CHARS_PER_TOKEN_ESTIMATE = 4.0
 
+# Devanagari (and most non-Latin scripts) tokenize far denser than English —
+# often close to 1 token per character rather than ~4 chars per token. Since
+# these assignments mix Hindi and English freely, using the English-only
+# ratio badly under-estimates token cost for any chunk with real Devanagari
+# content, which is exactly why the pacer still let 429s through: it thought
+# chunks were cheaper than they actually were.
+DEVANAGARI_CHARS_PER_TOKEN_ESTIMATE = 1.2
+
 # Smaller chunks = smaller per-request token cost, which matters a lot on
 # Groq's free tier (12,000 TPM as of writing). More requests overall, but
 # each one comfortably fits the budget when combined with the rate limiter
@@ -86,12 +94,31 @@ MAX_CHARS_PER_CHUNK = int(os.environ.get("MAX_CHARS_PER_CHUNK", "4000"))
 # retry-with-backoff in _call_groq_with_retry() is the safety net for when
 # we still do (e.g. other traffic on the same org key).
 GROQ_TPM_LIMIT = int(os.environ.get("GROQ_TPM_LIMIT", "12000"))
-GROQ_TPM_SAFETY_MARGIN = 0.85  # stay under 85% of the limit, leave headroom
+GROQ_TPM_SAFETY_MARGIN = float(os.environ.get("GROQ_TPM_SAFETY_MARGIN", "0.75"))  # stay under 75% of the limit
 _token_usage_log = []  # list of (timestamp, tokens) — module-level, single-process
 
 
+_DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+
+
 def _estimate_tokens(text: str) -> int:
-    return max(1, int(len(text) / CHARS_PER_TOKEN_ESTIMATE))
+    """
+    Script-aware token estimate. Mixed Hindi/English text is common in these
+    assignments, and Devanagari characters cost far more tokens each than
+    Latin ones, so we detect the proportion of Devanagari characters and
+    blend the two ratios accordingly rather than assuming pure English.
+    """
+    if not text:
+        return 1
+    devanagari_chars = len(_DEVANAGARI_RE.findall(text))
+    total_chars = len(text)
+    devanagari_frac = devanagari_chars / total_chars if total_chars else 0.0
+
+    ratio = (
+        devanagari_frac * DEVANAGARI_CHARS_PER_TOKEN_ESTIMATE
+        + (1 - devanagari_frac) * CHARS_PER_TOKEN_ESTIMATE
+    )
+    return max(1, int(total_chars / ratio))
 
 
 def _rate_limit_wait(estimated_request_tokens: int):
@@ -182,6 +209,50 @@ def _call_groq_with_retry(
 
     raise RuntimeError(f"Groq call failed after {max_retries} retries (rate limit or transient errors).")
 
+
+def _call_groq_json_with_retry(
+    client: Groq,
+    system_prompt: str,
+    user_msg: str,
+    max_tokens: int,
+    required_key: str,
+    max_parse_retries: int = 2,
+):
+    """
+    Wraps _call_groq_with_retry with an additional layer: if the model's
+    response doesn't parse as JSON or is missing the expected key, re-prompt
+    once or twice with an explicit correction nudge instead of silently
+    dropping the chunk's content (this is what happened to chunk 271-286 in
+    production — a bad parse just vanished the questions in that range).
+    Returns the parsed dict, or None if it still fails after retries (the
+    caller is responsible for logging/warning in that case).
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg},
+    ]
+    last_raw = None
+    for attempt in range(1, max_parse_retries + 2):  # +1 for the initial try
+        resp = _call_groq_with_retry(client, messages=messages, max_tokens=max_tokens)
+        raw = resp.choices[0].message.content
+        last_raw = raw
+        parsed = _safe_json_parse(raw)
+        if parsed and required_key in parsed:
+            return parsed
+        if attempt <= max_parse_retries:
+            log.warning(f"JSON parse/shape failure (attempt {attempt}), re-prompting with correction...")
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": (
+                    f"Your last response was not valid JSON with a top-level '{required_key}' key. "
+                    f"Return ONLY valid JSON in the exact format specified, no markdown fences, no prose."
+                )},
+            ]
+    log.error(f"Giving up on this chunk after {max_parse_retries + 1} attempts. Last raw response: {last_raw[:300] if last_raw else None}")
+    return None
+
 # Proximity-gap validation: two candidate start-lines closer than this are
 # treated as a false-positive risk (per AMBIGUOUS START-LINE RULE in the
 # mapper system prompt).
@@ -197,20 +268,47 @@ MAPPER_SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "mapper_syst
 
 def _load_mapper_system_prompt() -> str:
     """
-    Loads the strict line-range mapper system prompt from disk so it's easy
-    to iterate on the prompt without touching this file. Falls back to an
-    inline copy if the file isn't present (e.g. first run before you've
-    saved mapper_system_prompt.txt next to this script).
+    Loads the strict line-range mapper system prompt from disk. This file is
+    the single most important input to the entire pipeline — it's what
+    enforces the raw-only, no-guessing, no-fragmenting answer mapping rules.
+
+    Previously this silently fell back to a minimal inline stub when the
+    file was missing. That was a mistake: the stub has none of the hard
+    rules, ambiguity handling, or few-shot examples, and running with it
+    silently produces much worse mappings without any obvious error — which
+    is exactly what happened in production (14/26 pairs failed validation
+    in one run because this file wasn't deployed). Now this fails loudly
+    instead, so a missing file is caught immediately rather than discovered
+    later as mysteriously bad output.
+
+    Set ALLOW_MAPPER_PROMPT_FALLBACK=1 in the environment to explicitly opt
+    into the degraded inline stub anyway (e.g. for quick local smoke tests).
     """
     if os.path.exists(MAPPER_SYSTEM_PROMPT_PATH):
         with open(MAPPER_SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as f:
-            return f.read()
-    log.warning(
-        "mapper_system_prompt.txt not found next to pipeline.py — "
-        "using inline fallback copy. Save your prompt as mapper_system_prompt.txt "
-        "to make edits without touching code."
+            content = f.read()
+        if len(content.strip()) < 500:
+            raise RuntimeError(
+                f"mapper_system_prompt.txt exists at {MAPPER_SYSTEM_PROMPT_PATH} but looks "
+                f"truncated/empty ({len(content)} chars). Refusing to run with a corrupted "
+                f"prompt file — check the file wasn't cut off during upload/commit."
+            )
+        return content
+
+    if os.environ.get("ALLOW_MAPPER_PROMPT_FALLBACK") == "1":
+        log.warning(
+            "mapper_system_prompt.txt not found — ALLOW_MAPPER_PROMPT_FALLBACK=1 is set, "
+            "so proceeding with the degraded inline stub. Mapping quality WILL be worse."
+        )
+        return _INLINE_MAPPER_SYSTEM_PROMPT
+
+    raise RuntimeError(
+        f"mapper_system_prompt.txt not found at {MAPPER_SYSTEM_PROMPT_PATH}. This file is "
+        f"required — it contains the hard rules, ambiguity handling, and few-shot examples "
+        f"that make answer mapping reliable. Add it to your repo next to pipeline.py and "
+        f"redeploy. (To run anyway with a degraded fallback for a quick local test only, "
+        f"set ALLOW_MAPPER_PROMPT_FALLBACK=1.)"
     )
-    return _INLINE_MAPPER_SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -464,19 +562,17 @@ def extract_questions(client: Groq, numbered_lines: dict) -> list:
     chunks = semantic_chunk_numbered_lines(numbered_lines)
     all_questions = []
     for start, end, block in chunks:
-        resp = _call_groq_with_retry(
+        parsed = _call_groq_json_with_retry(
             client,
-            messages=[
-                {"role": "system", "content": QUESTION_EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": block},
-            ],
+            system_prompt=QUESTION_EXTRACTION_SYSTEM_PROMPT,
+            user_msg=block,
             max_tokens=1000,
+            required_key="questions",
         )
-        parsed = _safe_json_parse(resp.choices[0].message.content)
-        if parsed and "questions" in parsed:
+        if parsed:
             all_questions.extend(parsed["questions"])
         else:
-            log.warning(f"Question extraction: failed to parse chunk {start}-{end}")
+            log.warning(f"Question extraction: chunk {start}-{end} failed after retries — questions in this range may be missing.")
     return all_questions
 
 
@@ -513,17 +609,15 @@ def map_answers_with_llm_sequential(
                 f"creating a new qa_pair.]\n\n" + user_msg
             )
 
-        resp = _call_groq_with_retry(
+        parsed = _call_groq_json_with_retry(
             client,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg},
-            ],
+            system_prompt=system_prompt,
+            user_msg=user_msg,
             max_tokens=1500,
+            required_key="qa_pairs",
         )
-        parsed = _safe_json_parse(resp.choices[0].message.content)
         if not parsed:
-            result.warnings.append(f"Chunk {start}-{end}: mapper returned unparseable output.")
+            result.warnings.append(f"Chunk {start}-{end}: mapper returned unparseable output after retries.")
             continue
 
         chunk_pairs = parsed.get("qa_pairs", [])
@@ -662,19 +756,17 @@ def extract_answer_markers(client: Groq, numbered_lines: dict) -> list:
     chunks = semantic_chunk_numbered_lines(numbered_lines)
     all_markers = []
     for start, end, block in chunks:
-        resp = _call_groq_with_retry(
+        parsed = _call_groq_json_with_retry(
             client,
-            messages=[
-                {"role": "system", "content": ANSWER_MARKER_EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": block},
-            ],
+            system_prompt=ANSWER_MARKER_EXTRACTION_SYSTEM_PROMPT,
+            user_msg=block,
             max_tokens=800,
+            required_key="answer_markers",
         )
-        parsed = _safe_json_parse(resp.choices[0].message.content)
-        if parsed and "answer_markers" in parsed:
+        if parsed:
             all_markers.extend(parsed["answer_markers"])
         else:
-            log.warning(f"Answer marker extraction: failed to parse chunk {start}-{end}")
+            log.warning(f"Answer marker extraction: chunk {start}-{end} failed after retries.")
     return all_markers
 
 
@@ -846,17 +938,15 @@ def run_refinement_loop(
             "\n\nCURRENT qa_pairs:\n" + json.dumps(current_payload, indent=2)
         )
 
-        resp = _call_groq_with_retry(
+        parsed = _call_groq_json_with_retry(
             client,
-            messages=[
-                {"role": "system", "content": REFINEMENT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
+            system_prompt=REFINEMENT_SYSTEM_PROMPT,
+            user_msg=user_msg,
             max_tokens=1500,
+            required_key="qa_pairs",
         )
-        parsed = _safe_json_parse(resp.choices[0].message.content)
-        if not parsed or "qa_pairs" not in parsed:
-            result.warnings.append(f"Refinement pass {pass_num}: model returned unparseable output, keeping prior state.")
+        if not parsed:
+            result.warnings.append(f"Refinement pass {pass_num}: model returned unparseable output after retries, keeping prior state.")
             break
 
         new_pairs = []
