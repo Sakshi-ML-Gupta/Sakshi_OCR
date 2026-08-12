@@ -871,6 +871,34 @@ def _extract_subpart_labels(text: str) -> set:
     return set(m.group(1).lower() for m in _SUBPART_LABEL_RE.finditer(text))
 
 
+_TOKEN_SPLIT_RE = re.compile(
+    r'[\s।॥,.;:!?()\[\]{}"\'\u2018\u2019\u201c\u201d\-–—]+'
+)
+
+
+def _extract_distinctive_tokens(text: str) -> set:
+    """
+    Script-agnostic word/token extraction for the near-duplicate
+    question detector's overlap safety-check.
+
+    FIX (round 2): the first attempt at this used `re.findall(r'\\w{3,}', ...)`
+    -- but Python's `\\w` does NOT match Devanagari combining marks
+    (matras like ा/ि/ी, or the virama ्, which are Unicode category
+    Mn/Mc). That shattered every multi-syllable Hindi word into useless
+    fragments at each matra/virama (e.g. "राष्ट्रभाषा" became
+    ['र','ष','ट','रभ','ष']), which made the overlap check compare
+    garbage fragments instead of real words and still misfire.
+
+    Splitting on whitespace/punctuation instead -- rather than trying to
+    classify individual characters as "word characters" -- keeps each
+    Devanagari syllable cluster intact (base consonant + its matras/
+    virama stay together as one token), which is what actually makes
+    the overlap comparison meaningful for this script.
+    """
+    tokens = [t for t in _TOKEN_SPLIT_RE.split(text) if t]
+    return set(t for t in tokens if len(t) >= 2 and not t.isdigit())
+
+
 def _is_near_duplicate_question(q1: str, q2: str) -> bool:
     labels1 = _extract_subpart_labels(q1)
     labels2 = _extract_subpart_labels(q2)
@@ -889,10 +917,13 @@ def _is_near_duplicate_question(q1: str, q2: str) -> bool:
     if ratio < 0.90:
         return False
 
-    words1 = sorted(set(re.findall(r'[a-z]{3,}', k1)))
-    words2 = sorted(set(re.findall(r'[a-z]{3,}', k2)))
+    words1 = sorted(_extract_distinctive_tokens(k1))
+    words2 = sorted(_extract_distinctive_tokens(k2))
     if not words1 or not words2:
-        return ratio >= 0.92
+        # No extractable tokens at all (e.g. pure punctuation/symbols) --
+        # can't validate overlap, so require a much stricter character
+        # match before calling it a duplicate, rather than the old 0.92.
+        return ratio >= 0.97
 
     matched = sum(1 for w1 in words1 if any(_words_nearly_match(w1, w2) for w2 in words2))
     overlap = matched / max(len(words1), len(words2))
