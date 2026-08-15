@@ -7,6 +7,7 @@ import difflib
 import hashlib
 import threading
 import concurrent.futures
+import queue
 import fitz
 import httpx
 from pathlib import Path
@@ -96,6 +97,45 @@ def _diagnose_tuple_errors(func):
             raise
 
     return wrapper
+
+
+# =========================================================
+# THREAD-SAFE LOG BUFFERING FOR WORKER THREADS
+#
+# status_callback is very often a UI callback (e.g. Streamlit's
+# st.text()/st.write()). UI frameworks like Streamlit are only safe to
+# call from the single thread that's actually running the script --
+# calling them from a background ThreadPoolExecutor worker thread raises
+# errors (Streamlit: NoSessionContext) because there's no UI context
+# attached to that thread.
+#
+# Since parts of this module now run independent LLM calls concurrently
+# (Stage-1 chunk classification, out-of-order answer recovery), any
+# logging that happens INSIDE those worker threads must not call
+# status_callback directly. Worker threads log through
+# _ThreadSafeLogCollector.log(), which only ever does a plain print()
+# (always thread-safe) and buffers the message in a thread-safe queue.
+# The MAIN thread then periodically calls .drain(real_log) to replay
+# everything collected so far through the real log function (which does
+# call status_callback), so the UI still gets updated -- just always
+# from the main thread, never from a worker.
+# =========================================================
+
+class _ThreadSafeLogCollector:
+    def __init__(self):
+        self._queue = queue.Queue()
+
+    def log(self, msg):
+        print(msg)
+        self._queue.put(msg)
+
+    def drain(self, real_log):
+        while True:
+            try:
+                msg = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            real_log(msg)
 
 
 # =========================================================
@@ -1173,11 +1213,20 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     # =========================================================================
     STAGE1_MAX_WORKERS = 3
 
+    # FIX (NoSessionContext / Streamlit crash): _classify_one_chunk runs
+    # inside a worker thread below. It must NOT call the outer `log`
+    # (which invokes status_callback, e.g. Streamlit's st.text()) --
+    # UI callbacks are only safe to call from the main thread. It logs
+    # through a shared _ThreadSafeLogCollector instead, which is always
+    # print()-only-safe from any thread; the real `log`/status_callback
+    # is only ever invoked from the main thread, via .drain() below.
+    stage1_log_collector = _ThreadSafeLogCollector()
+
     def _classify_one_chunk(i, chunk):
         page_nums_in_chunk = [p["page_number"] for p in chunk]
-        log(f"Asking LLM to analyze chunk {i+1}/{len(chunks)} (pages {page_nums_in_chunk})...")
+        stage1_log_collector.log(f"Asking LLM to analyze chunk {i+1}/{len(chunks)} (pages {page_nums_in_chunk})...")
         try:
-            return i, _call_groq_for_chunk(client, chunk, budget, log), None
+            return i, _call_groq_for_chunk(client, chunk, budget, stage1_log_collector.log), None
         except Exception as e:
             return i, None, str(e)
 
@@ -1190,6 +1239,8 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
             for future in concurrent.futures.as_completed(futures):
                 i, result, error = future.result()
                 chunk_raw_results[i] = (result, error)
+                stage1_log_collector.drain(log)  # forward buffered messages from the MAIN thread
+        stage1_log_collector.drain(log)  # flush any remainder
 
     for i, chunk in enumerate(chunks):
         result, error = chunk_raw_results[i]
@@ -1582,16 +1633,24 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         # still done single-threaded afterward, in a fixed order, so
         # there's no race on shared state -- only the read-only search
         # work itself is parallelized.
+        #
+        # FIX (NoSessionContext / Streamlit crash): same reasoning as
+        # Stage-1 above -- _recover_one runs in a worker thread and must
+        # never call the outer `log` (-> status_callback) directly. It
+        # logs through a shared _ThreadSafeLogCollector; the real log is
+        # only invoked from the main thread, after collecting results.
+        recovery_log_collector = _ThreadSafeLogCollector()
+
         def _recover_one(ref):
             q_idx = ord(ref[-1]) - 65
             q = questions[q_idx]
-            log(f"  recovery search for {ref} across the FULL document (from line 0)...")
+            recovery_log_collector.log(f"  recovery search for {ref} across the FULL document (from line 0)...")
             recovered_start = _find_answer_start_sequential(
-                client, numbered_lines, q, ref, 0, budget, log
+                client, numbered_lines, q, ref, 0, budget, recovery_log_collector.log
             )
             if recovered_start is None:
-                log(f"  recovery LLM search also failed for {ref} -- trying zero-cost keyword-overlap fallback...")
-                recovered_start = _heuristic_find_answer_start(answer_lines, q, 0, log)
+                recovery_log_collector.log(f"  recovery LLM search also failed for {ref} -- trying zero-cost keyword-overlap fallback...")
+                recovered_start = _heuristic_find_answer_start(answer_lines, q, 0, recovery_log_collector.log)
             return ref, recovered_start
 
         RECOVERY_MAX_WORKERS = 3
@@ -1599,7 +1658,11 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
             max_workers=min(RECOVERY_MAX_WORKERS, len(unmatched_refs))
         ) as executor:
             futures = [executor.submit(_recover_one, ref) for ref in unmatched_refs]
-            recovery_results = [f.result() for f in concurrent.futures.as_completed(futures)]
+            recovery_results = []
+            for future in concurrent.futures.as_completed(futures):
+                recovery_results.append(future.result())
+                recovery_log_collector.drain(log)  # forward buffered messages from the MAIN thread
+            recovery_log_collector.drain(log)  # flush any remainder
 
         for ref, recovered_start in recovery_results:
             if recovered_start is None:
