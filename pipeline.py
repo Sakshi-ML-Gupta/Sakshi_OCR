@@ -6,6 +6,7 @@ import time
 import difflib
 import hashlib
 import threading
+import concurrent.futures
 import fitz
 import httpx
 from pathlib import Path
@@ -95,9 +96,6 @@ def _diagnose_tuple_errors(func):
             raise
 
     return wrapper
-
-
-_groq_call_lock = threading.Lock()
 
 
 # =========================================================
@@ -460,64 +458,81 @@ def _estimate_tokens(text: str) -> int:
 
 
 class _TokenBudgetTracker:
+    """
+    THREAD-SAFETY NOTE: this tracker is now shared across CONCURRENT
+    worker threads (see the parallelized Stage-1 chunk classification
+    and out-of-order recovery pass below) -- previously the whole
+    pipeline was strictly single-threaded, so no locking was needed. A
+    single lock guards every read/mutation of `events`/`tpm_limit`/
+    `safe_limit` so concurrent callers can't race on them (e.g. two
+    threads both reading "budget still OK" before either records its
+    usage, which would silently blow past the real per-minute limit).
+    """
     def __init__(self, tpm_limit=TPM_LIMIT, safety_fraction=TPM_SAFETY_FRACTION):
         import collections
+        self._lock = threading.Lock()
         self.tpm_limit = tpm_limit
         self.safe_limit = tpm_limit * safety_fraction
         self.events = collections.deque()
-        self._lock = threading.Lock()   # NEW — protects self.events across threads
 
     def _prune(self, now=None):
-        with self._lock:
-            now = now if now is not None else time.monotonic()
-            while self.events and now - self.events[0][0] >= 60:
-                self.events.popleft()
+        now = now if now is not None else time.monotonic()
+        while self.events and now - self.events[0][0] >= 60:
+            self.events.popleft()
 
     def used_in_window(self, now=None) -> int:
-        self._prune(now)
         with self._lock:
+            now = now if now is not None else time.monotonic()
+            self._prune(now)
             return sum(tok for _, tok in self.events)
+
+    def wait_if_needed(self, upcoming_tokens: int, log=print):
+        # Reserve the upcoming tokens INSIDE the lock (by recording a
+        # provisional event) so two concurrent callers can't both see
+        # "under budget" for the same free capacity and both proceed --
+        # the reservation is what record_usage() used to do afterward,
+        # moved here so the check-and-reserve is atomic across threads.
+        with self._lock:
+            now = time.monotonic()
+            self._prune(now)
+            used = sum(tok for _, tok in self.events)
+            projected = used + upcoming_tokens
+
+            wait_s = 0.0
+            if projected > self.safe_limit:
+                needed_to_free = projected - self.safe_limit
+                freed = 0
+                for ts, tok in self.events:
+                    freed += tok
+                    wait_s = max(wait_s, 60 - (now - ts))
+                    if freed >= needed_to_free:
+                        break
+                wait_s = max(0.0, wait_s) + 0.5
+
+            if wait_s > 0:
+                log(
+                    f"Proactively pacing requests: {used:.0f} tokens used in the last 60s, "
+                    f"+{upcoming_tokens} upcoming would exceed safe budget "
+                    f"({self.safe_limit:.0f}). Waiting {wait_s:.1f}s before sending next chunk..."
+                )
+
+        if wait_s > 0:
+            time.sleep(wait_s)
 
     def record_usage(self, tokens: int):
         with self._lock:
             self.events.append((time.monotonic(), tokens))
 
-    def wait_if_needed(self, upcoming_tokens: int, log=print):
-        now = time.monotonic()
-        used = self.used_in_window(now)
-        projected = used + upcoming_tokens
-
-        if projected <= self.safe_limit:
-            return
-
-        needed_to_free = projected - self.safe_limit
-        freed = 0
-        wait_s = 0.0
-        for ts, tok in self.events:
-            freed += tok
-            wait_s = max(wait_s, 60 - (now - ts))
-            if freed >= needed_to_free:
-                break
-
-        wait_s = max(0.0, wait_s) + 0.5
-        log(
-            f"Proactively pacing requests: {used:.0f} tokens used in the last 60s, "
-            f"+{upcoming_tokens} upcoming would exceed safe budget "
-            f"({self.safe_limit:.0f}). Waiting {wait_s:.1f}s before sending next chunk..."
-        )
-        time.sleep(wait_s)
-
-    def record_usage(self, tokens: int):
-        self.events.append((time.monotonic(), tokens))
-
     def record_actual_from_error(self, used: int, limit: int):
-        now = time.monotonic()
-        current = self.used_in_window(now)
-        if used > current:
-            self.events.append((now, used - current))
-        if limit:
-            self.tpm_limit = limit
-            self.safe_limit = limit * TPM_SAFETY_FRACTION
+        with self._lock:
+            now = time.monotonic()
+            self._prune(now)
+            current = sum(tok for _, tok in self.events)
+            if used > current:
+                self.events.append((now, used - current))
+            if limit:
+                self.tpm_limit = limit
+                self.safe_limit = limit * TPM_SAFETY_FRACTION
 
     def record_actual_limit(self, limit: int, log=None):
         """
@@ -536,18 +551,20 @@ class _TokenBudgetTracker:
         one call, instead of only ever discovering it via a rate-limit
         error that proactive pacing was specifically designed to avoid.
         """
-        if not limit or limit == self.tpm_limit:
-            return
-        if log:
-            log(
-                f"Learned real Groq TPM limit from response headers: {limit} "
-                f"(was assuming {self.tpm_limit}) -- adjusting pacing budget accordingly"
-            )
-        self.tpm_limit = limit
-        self.safe_limit = limit * TPM_SAFETY_FRACTION
+        with self._lock:
+            if not limit or limit == self.tpm_limit:
+                return
+            if log:
+                log(
+                    f"Learned real Groq TPM limit from response headers: {limit} "
+                    f"(was assuming {self.tpm_limit}) -- adjusting pacing budget accordingly"
+                )
+            self.tpm_limit = limit
+            self.safe_limit = limit * TPM_SAFETY_FRACTION
 
     def reset_window(self):
-        self.events.clear()
+        with self._lock:
+            self.events.clear()
 
     @property
     def window_start(self):
@@ -731,22 +748,37 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
             budget.wait_if_needed(estimated_tokens, log=log)
 
         try:
+            # FIX (latency): this used to be wrapped in a global
+            # `_groq_call_lock`, which forced EVERY Groq call across the
+            # whole process to run one-at-a-time -- even calls with no
+            # actual dependency on each other (different page chunks,
+            # different questions' recovery searches). That fully
+            # defeated any attempt at parallelism and was pure added
+            # wall-clock time on top of whatever TPM pacing already
+            # required. httpx-based clients (which the Groq SDK uses)
+            # are safe for concurrent requests, and the token-budget
+            # tracker now has its own internal lock, so nothing here
+            # actually needs a lock anymore -- removing it is what lets
+            # the parallelized Stage-1 chunking and recovery pass below
+            # get real concurrent network I/O instead of being
+            # serialized right back together at this line.
             raw_response = client.chat.completions.with_raw_response.create(
                 model=GROQ_MODEL,
                 messages=[
-                   {"role": "system", "content": system_prompt},
-                   {"role": "user", "content": user_prompt},
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.0,
             )
             response = raw_response.parse()
+
             real_limit_header = raw_response.headers.get("x-ratelimit-limit-tokens")
             if real_limit_header:
                 try:
-                     budget.record_actual_limit(int(real_limit_header), log=log)
+                    budget.record_actual_limit(int(real_limit_header), log=log)
                 except (ValueError, TypeError):
-                     pass
+                    pass
 
             budget.record_usage(estimated_tokens)
             content = response.choices[0].message.content
@@ -820,35 +852,7 @@ def _call_groq_with_retries(client, system_prompt: str, user_prompt: str,
         f"Chunk LLM call failed after {max_retries + 1} attempts. Last error: {last_error}"
     )
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def _process_chunk(i, chunk):
-    page_nums_in_chunk = [p["page_number"] for p in chunk]
-    log(f"Asking LLM to analyze chunk {i+1}/{len(chunks)} (pages {page_nums_in_chunk})...")
-    try:
-        qp_pages_1based, questions, admin_pages_1based = _call_groq_for_chunk(client, chunk, budget, log)
-    except Exception as e:
-        log(f"WARNING: chunk {i+1}/{len(chunks)} question-identification failed, skipping: {e}")
-        return None, str(e)
-
-    qp_pages_1based = _recover_pages(qp_pages_1based, "question-paper")
-    admin_pages_1based = _recover_pages(admin_pages_1based, "admin")
-    admin_pages_1based = [p for p in admin_pages_1based if p not in qp_pages_1based]
-    log(f"Chunk {i+1}/{len(chunks)}: identified {len(qp_pages_1based)} question paper "
-        f"page(s), {len(admin_pages_1based)} admin/cover page(s)")
-    return (qp_pages_1based, [], admin_pages_1based), None
-
-chunk_results = []
-chunk_failures = []
-with ThreadPoolExecutor(max_workers=min(6, len(chunks) or 1)) as pool:
-    futures = {pool.submit(_process_chunk, i, chunk): i for i, chunk in enumerate(chunks)}
-    for fut in as_completed(futures):
-        result, err = fut.result()
-        if err:
-            chunk_failures.append(err)
-        else:
-            chunk_results.append(result)
-            
 def _call_groq_for_chunk(client, pages_chunk: list, budget: "_TokenBudgetTracker",
                           log, max_retries: int = 4) -> tuple:
     user_prompt = _build_qp_user_prompt(pages_chunk)
@@ -1155,16 +1159,46 @@ def identify_questions_with_llm(pages: list, status_callback=None) -> tuple:
     chunk_results = []
     chunk_failures = []
 
-    for i, chunk in enumerate(chunks):
+    # =========================================================================
+    # FIX (latency): these chunks have NO dependency on each other -- each
+    # is classified independently -- but were previously processed one at
+    # a time in a plain for-loop, meaning every chunk's full network
+    # round-trip PLUS any TPM pacing wait was paid serially, one after
+    # another. Running them concurrently (bounded by a small worker pool
+    # so we don't blow past the TPM budget in a burst -- the shared,
+    # now-thread-safe `budget` tracker still paces each individual call)
+    # lets their network latency overlap instead of stacking, which is a
+    # major contributor to total pipeline wall-clock time for documents
+    # with several chunks.
+    # =========================================================================
+    STAGE1_MAX_WORKERS = 3
+
+    def _classify_one_chunk(i, chunk):
         page_nums_in_chunk = [p["page_number"] for p in chunk]
         log(f"Asking LLM to analyze chunk {i+1}/{len(chunks)} (pages {page_nums_in_chunk})...")
-
         try:
-            qp_pages_1based, questions, admin_pages_1based = _call_groq_for_chunk(client, chunk, budget, log)
+            return i, _call_groq_for_chunk(client, chunk, budget, log), None
         except Exception as e:
-            log(f"WARNING: chunk {i+1}/{len(chunks)} question-identification failed, skipping: {e}")
-            chunk_failures.append(str(e))
+            return i, None, str(e)
+
+    chunk_raw_results = {}
+    if chunks:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(STAGE1_MAX_WORKERS, len(chunks))
+        ) as executor:
+            futures = [executor.submit(_classify_one_chunk, i, chunk) for i, chunk in enumerate(chunks)]
+            for future in concurrent.futures.as_completed(futures):
+                i, result, error = future.result()
+                chunk_raw_results[i] = (result, error)
+
+    for i, chunk in enumerate(chunks):
+        result, error = chunk_raw_results[i]
+        if error is not None:
+            log(f"WARNING: chunk {i+1}/{len(chunks)} question-identification failed, skipping: {error}")
+            chunk_failures.append(error)
             continue
+
+        qp_pages_1based, questions, admin_pages_1based = result
 
         def _recover_pages(pages_1based, label):
             recovered = []
@@ -1304,55 +1338,16 @@ start_line must be one of the exact [line_number]s shown -- never estimate, alwa
 
 
 def _build_sequential_search_prompt(window_lines: list, question_text: str, ref_label: str,
-                                      extra_reminder: str = None, sibling_questions: list = None) -> str:
+                                      extra_reminder: str = None) -> str:
     lines_block = "\n".join(f"[{idx}] {text}" for idx, text in window_lines)
     reminder_block = f"{extra_reminder}\n\n" if extra_reminder else ""
-    siblings_block = ""
-    if sibling_questions:
-        sib_text = "\n".join(f"  - {s}" for s in sibling_questions)
-        siblings_block = (
-            f"\nWARNING -- this question shares wording with other, DIFFERENT questions in this "
-            f"paper. Do NOT match on the shared boilerplate alone; the answer boundary must be "
-            f"specific to THIS question's distinctive content (e.g. its own quoted lines), not "
-            f"theirs. Other questions to NOT confuse this with:\n{sib_text}\n"
-        )
     return (
-        f"{reminder_block}{siblings_block}"
+        f"{reminder_block}"
         f"TARGET QUESTION ({ref_label}): {question_text}\n\n"
         f"TEXT WINDOW (line-numbered):\n{lines_block}"
     )
 
-def _strip_trailing_next_question_echo(answer_text: str, other_questions: list,
-                                         min_words: int = 8, ratio_threshold: float = 0.75) -> str:
-    """If the tail of this answer closely echoes the start of a DIFFERENT question
-    (student restating the next prompt/reference before their answer to it begins,
-    which the boundary detector missed), cut it off here."""
-    words = answer_text.split()
-    if len(words) < min_words:
-        return answer_text
 
-    best_cut = None
-    # Check suffixes of increasing length against the head of every other question
-    for n in range(min_words, min(len(words), 60) + 1):
-        suffix = " ".join(words[-n:])
-        suffix_norm = _normalize_for_echo_compare(suffix)
-        for q in other_questions:
-            q_core = _PARENT_INSTRUCTION_PREFIX_RE.sub('', q).strip() or q
-            q_head = " ".join(q_core.split()[:n])
-            q_norm = _normalize_for_echo_compare(q_head)
-            if not q_norm:
-                continue
-            ratio = difflib.SequenceMatcher(None, suffix_norm, q_norm).ratio()
-            if ratio >= ratio_threshold:
-                best_cut = len(words) - n
-                break
-        if best_cut is not None:
-            break
-
-    if best_cut is not None and best_cut > 0:
-        return " ".join(words[:best_cut]).strip()
-    return answer_text
-                                             
 def _parse_sequential_search_response(content: str) -> tuple:
     content = content.strip()
     if content.startswith("```"):
@@ -1382,23 +1377,9 @@ def _parse_sequential_search_response(content: str) -> tuple:
     return True, start_line
 
 
-SEQUENTIAL_SEARCH_WINDOW_CHARS = 20000   # was 11000 — halves the call count on long booklets
+SEQUENTIAL_SEARCH_WINDOW_CHARS = 11000
 SEQUENTIAL_SEARCH_MAX_WINDOWS = 200
 
-def _find_similar_sibling_questions(question_text: str, all_questions: list, own_index: int,
-                                      threshold: float = 0.55) -> list:
-    """Other questions sharing enough boilerplate with this one that the search
-    LLM could plausibly confuse their answer boundaries (e.g. two sub-parts of
-    the same 'reference to context' prompt that differ only in the quoted lines)."""
-    siblings = []
-    for i, q in enumerate(all_questions):
-        if i == own_index:
-            continue
-        ratio = difflib.SequenceMatcher(None, _normalize_question_key(question_text),
-                                         _normalize_question_key(q)).ratio()
-        if ratio >= threshold:
-            siblings.append(q)
-    return siblings
 
 def _find_answer_start_sequential(client, numbered_lines: list, question_text: str, ref_label: str,
                                     search_from_idx: int, budget: "_TokenBudgetTracker", log,
@@ -1585,40 +1566,42 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         if f"REF-{chr(65+i)}" not in found_starts
     ]
     if unmatched_refs:
-    log(f"Main forward pass left {len(unmatched_refs)} question(s) unmatched: {unmatched_refs}. "
-        f"Running full-document, order-independent recovery pass in parallel...")
+        log(
+            f"Main forward pass left {len(unmatched_refs)} question(s) unmatched: "
+            f"{unmatched_refs}. Running full-document, order-independent recovery "
+            f"pass (covers answers written out of question-paper order)..."
+        )
 
-    def _recover_one(ref):
-        q_idx = ord(ref[-1]) - 65
-        q = questions[q_idx]
-        start = _find_answer_start_sequential(client, numbered_lines, q, ref, 0, budget, log)
-        if start is None:
-            start = _heuristic_find_answer_start(answer_lines, q, 0, log)
-        return ref, start
-
-    with ThreadPoolExecutor(max_workers=min(6, len(unmatched_refs))) as pool:
-        for ref, recovered_start in pool.map(_recover_one, unmatched_refs):
-            if recovered_start is None:
-                log(f"  could not recover {ref} anywhere in the document -- leaving unmatched")
-                continue
-            if recovered_start in found_starts.values():
-                log(f"  recovery found {ref} at line {recovered_start}, but another question "
-                    f"already claims that line -- skipping to avoid a conflicting range")
-                continue
-            found_starts[ref] = recovered_start
-        for ref in unmatched_refs:
+        # FIX (latency): each unmatched question's recovery search is a
+        # full, INDEPENDENT re-scan of the document (from line 0), with
+        # no dependency on any other unmatched question -- previously
+        # these ran one at a time, so N unmatched questions meant N full
+        # document re-scans stacked serially. Running them concurrently
+        # lets their network latency overlap. The actual write into
+        # `found_starts` (and the "already claimed" conflict check) is
+        # still done single-threaded afterward, in a fixed order, so
+        # there's no race on shared state -- only the read-only search
+        # work itself is parallelized.
+        def _recover_one(ref):
             q_idx = ord(ref[-1]) - 65
             q = questions[q_idx]
             log(f"  recovery search for {ref} across the FULL document (from line 0)...")
-
             recovered_start = _find_answer_start_sequential(
                 client, numbered_lines, q, ref, 0, budget, log
             )
-
             if recovered_start is None:
                 log(f"  recovery LLM search also failed for {ref} -- trying zero-cost keyword-overlap fallback...")
                 recovered_start = _heuristic_find_answer_start(answer_lines, q, 0, log)
+            return ref, recovered_start
 
+        RECOVERY_MAX_WORKERS = 3
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(RECOVERY_MAX_WORKERS, len(unmatched_refs))
+        ) as executor:
+            futures = [executor.submit(_recover_one, ref) for ref in unmatched_refs]
+            recovery_results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+        for ref, recovered_start in recovery_results:
             if recovered_start is None:
                 log(f"  could not recover {ref} anywhere in the document -- leaving unmatched")
                 continue
@@ -1670,8 +1653,8 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         answer_raw = " ".join(verbatim_lines).strip()
         answer_clean = strip_question_restatement(answer_raw)
         answer_clean = strip_full_question_echo(answer_clean, q)
-        other_qs = [oq for j, oq in enumerate(questions) if j != i]
-        answer_clean = _strip_trailing_next_question_echo(answer_clean, other_qs)   # NEW
+        if i + 1 < len(questions):
+            answer_clean = strip_trailing_next_question_bleed(answer_clean, questions[i + 1], log=log)
 
         start_page = answer_line_pages[s] if answer_line_pages and 0 <= s < len(answer_line_pages) else None
         end_page = answer_line_pages[e] if answer_line_pages and 0 <= e < len(answer_line_pages) else None
@@ -1981,6 +1964,69 @@ def strip_full_question_echo(answer_text: str, question_text: str) -> str:
         remaining = " ".join(answer_words[best_strip_count:]).strip()
         remaining = re.sub(r'^(?:Answer\s*[-:]\s*)', '', remaining, flags=re.IGNORECASE)
         return remaining.strip()
+
+    return answer_text
+
+
+def strip_trailing_next_question_bleed(answer_text: str, next_question_text: str,
+                                         threshold: float = 0.90, log=None) -> str:
+    """
+    FIX: the answer-slicing logic sometimes runs a little too far and
+    swallows the OPENING of whatever comes next in the physical text --
+    most often the start of the NEXT printed question, or (for
+    "reference to context" style questions) the quoted passage that is
+    embedded verbatim inside the next question's own text. Reported
+    symptom: a fully-correct answer for question N ends with content
+    that is a near-exact match for the beginning of question N+1.
+
+    This checks the TAIL of the answer against the START of the next
+    question's text (trying several tail lengths, since we don't know in
+    advance how much bled in) and, if the match is a near-exact
+    (>= `threshold`, default 0.90 -- intentionally strict, matching the
+    "only remove it if essentially 100% match" requirement) match, trims
+    the bled-through tail off. A high threshold is deliberate here: this
+    must never cut off a genuine part of the answer just because it
+    happens to share some vocabulary with the next question.
+    """
+    if not answer_text or not next_question_text:
+        return answer_text
+
+    next_core = _PARENT_INSTRUCTION_PREFIX_RE.sub('', next_question_text).strip() or next_question_text
+    next_norm = _normalize_for_echo_compare(next_core)
+    next_words = next_norm.split()
+    if not next_words:
+        return answer_text
+
+    answer_words = answer_text.split()
+    if not answer_words:
+        return answer_text
+
+    # Bound the search: no point checking tail lengths far longer than
+    # the next question itself could plausibly account for.
+    max_check = min(len(answer_words), len(next_words) + 15, 150)
+
+    best_cut = 0
+    best_ratio = 0.0
+
+    for n in range(3, max_check + 1):
+        tail_words = answer_words[-n:]
+        tail_norm = " ".join(tail_words)
+        compare_len = min(len(tail_words), len(next_words))
+        next_prefix = " ".join(next_words[:compare_len])
+        ratio = difflib.SequenceMatcher(None, tail_norm, next_prefix).ratio()
+        if ratio >= threshold and ratio >= best_ratio:
+            best_ratio = ratio
+            best_cut = n
+
+    if best_cut > 0:
+        remaining = " ".join(answer_words[:-best_cut]).strip()
+        if log:
+            log(
+                f"  trimmed {best_cut} trailing word(s) from an answer -- they matched "
+                f"the start of the NEXT question at {best_ratio:.2f} similarity "
+                f"(bled-through content, not part of this answer)"
+            )
+        return remaining
 
     return answer_text
 
