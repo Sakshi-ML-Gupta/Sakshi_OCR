@@ -1585,8 +1585,8 @@ def map_answers_sequential(answer_lines: list, questions: list, status_callback=
         if f"REF-{chr(65+i)}" not in found_starts
     ]
     if unmatched_refs:
-    log(f"Main forward pass left {len(unmatched_refs)} question(s) unmatched: {unmatched_refs}. "
-        f"Running full-document, order-independent recovery pass in parallel...")
+        log(f"Main forward pass left {len(unmatched_refs)} question(s) unmatched: {unmatched_refs}. "
+            f"Running full-document, order-independent recovery pass in parallel...")
 
     def _recover_one(ref):
         q_idx = ord(ref[-1]) - 65
